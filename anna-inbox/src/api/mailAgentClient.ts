@@ -7,8 +7,17 @@ import type {
   RuntimeState,
   ScanPlan,
 } from "../types/mail";
+import appManifest from "../../manifest.json";
 
-const TOOL_ID = "tool-zhaopy-inbox-tool-373sf2et";
+function getRequiredExecutaToolId(): string {
+  const toolId = appManifest.required_executas[0]?.tool_id;
+  if (!toolId) {
+    throw new Error("anna-inbox/manifest.json is missing required_executas[0].tool_id");
+  }
+  return toolId;
+}
+
+const TOOL_ID = getRequiredExecutaToolId();
 const INVOKE_TIMEOUT_MS = 180000;
 
 export function unwrapToolResult(result: unknown): unknown {

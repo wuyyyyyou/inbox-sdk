@@ -3,8 +3,10 @@ set -euo pipefail
 
 PORT="${PORT:-5180}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-EXECUTA_DIR="$SCRIPT_DIR/executas/tool-zhaopy-inbox-tool-373sf2et"
-VENV_DIR="${ANNA_MAIL_AGENT_VENV:-$HOME/.venvs/zhaopy-mail-agent-rd6b87r5}"
+EXECUTA_DIR="$SCRIPT_DIR/executas/inbox-tool"
+VENV_DIR="${ANNA_MAIL_AGENT_VENV:-$HOME/.venvs/anna-inbox-executa}"
+INBOX_TOOL_MANIFEST="$SCRIPT_DIR/../inbox-tool/manifest.json"
+TOOL_ID="$(python3 -c 'import json, sys; data = json.load(open(sys.argv[1], encoding="utf-8-sig")); print(data.get("tool_id") or data["name"])' "$INBOX_TOOL_MANIFEST")"
 
 export PATH="$HOME/.local/bin:$PATH"
 export NODE_OPTIONS="${NODE_OPTIONS:---dns-result-order=ipv4first}"
@@ -24,7 +26,7 @@ if [ -f "$HOME/.anna-mail-agent.env" ]; then
   set +a
 fi
 
-EXECUTA_SPEC="dir=$EXECUTA_DIR,tool_id=tool-zhaopy-inbox-tool-373sf2et,type=python,command=env UV_PROJECT_ENVIRONMENT=$VENV_DIR UV_LINK_MODE=copy uv --directory src run zhaopy-mail-agent"
+EXECUTA_SPEC="dir=$EXECUTA_DIR,tool_id=$TOOL_ID,type=python,command=env UV_PROJECT_ENVIRONMENT=$VENV_DIR UV_LINK_MODE=copy uv --directory ../../../inbox-tool/src run anna-inbox-executa"
 
 export ANNA_INBOX_TOKEN_DIR="$SCRIPT_DIR/../scripts/google_token/.secrets/gmail_tokens"
 

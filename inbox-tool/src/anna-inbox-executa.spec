@@ -7,7 +7,7 @@ hiddenimports += collect_submodules('executa_sdk')
 
 
 a = Analysis(
-    ['zhaopy_mail_agent\\main.py'],
+    ['anna_inbox_executa\\main.py'],
     pathex=['.'],
     binaries=[],
     datas=[],

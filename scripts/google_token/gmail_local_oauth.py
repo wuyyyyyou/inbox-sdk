@@ -90,7 +90,7 @@ def main() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local Gmail OAuth helper for Anna Inbox — obtains access_token + refresh_token via browser-based OAuth flow.")
-    parser.add_argument("--email", default="zhaopy2121@gmail.com", help="Mailbox email used as local token file name.")
+    parser.add_argument("--email", required=True, help="Mailbox email used as local token file name.")
     parser.add_argument("--client-secrets", help="Path to Google OAuth desktop client JSON. Defaults to scripts/google_token/.secrets/client_secret*.json when present.")
     parser.add_argument("--client-id", help="Google OAuth client id.")
     parser.add_argument("--client-secret", help="Google OAuth client secret.")

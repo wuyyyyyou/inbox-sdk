@@ -19,7 +19,7 @@
     "--directory",
     "../../../inbox-tool/src",
     "run",
-    "zhaopy-mail-agent"
+    "anna-inbox-executa"
   ],
   "protocol": {
     "type": "json-rpc-2.0",

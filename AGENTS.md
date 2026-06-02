@@ -8,9 +8,10 @@
 - `anna-inbox/src/` 是计划中的前端源码目录，使用 Vite + React + TypeScript 组织 Anna Inbox UI。
 - `anna-inbox/bundle/` 是 Anna App 读取的静态 SPA 构建产物目录，不作为主要手写源码维护。
 - `inbox-tool/` 是邮件代理的 Python Executa 工程源码目录。目录名不是协议 `tool_id`。
+- `inbox-tool/manifest.json` 是 Executa 身份的单一来源；`name` 作为协议 `tool_id` 使用。
 - `inbox-tool/src/mail_agent/` 包含 Gmail 扫描、Brief 管线、Ask 流程、存储、卡片、LLM 和本地缓存逻辑。
-- `inbox-tool/src/zhaopy_mail_agent/main.py` 是 JSON-RPC stdio 入口，同时内嵌 `describe` 返回的 Executa manifest 数据。
-- `anna-inbox/executas/inbox-tool/executa.json` 是 Anna App 开发启动用的 Executa stub；其中 `tool_id` 仍是 `tool-zhaopy-inbox-tool-373sf2et`。
+- `inbox-tool/src/anna_inbox_executa/main.py` 是 JSON-RPC stdio 入口，同时内嵌 `describe` 返回的 Executa manifest 数据。
+- `anna-inbox/executas/inbox-tool/executa.json` 是 Anna App 开发启动用的 Executa stub；其中 `tool_id` 由 `scripts/sync/sync_executa_identity.py` 从 `inbox-tool/manifest.json` 同步。
 - `anna-inbox/.docs/` 是复制到仓库内的 Anna 协议参考。修改平台协议相关行为前先读这里，不要凭印象猜。
 - `anna-inbox/docs/` 是项目设计文档和实施计划，主要为中文。
 
@@ -51,9 +52,9 @@ uv sync
 
 Executa 项目使用 `uv` 和 `pyproject.toml`：
 
-- 包名：`zhaopy-anna-mail-agent`
+- 包名：`anna-inbox-executa`
 - Python：`>=3.10`
-- 命令入口：`zhaopy-mail-agent = zhaopy_mail_agent.main:main`
+- 命令入口：`anna-inbox-executa = anna_inbox_executa.main:main`
 
 本地密钥刻意放在仓库外。本地调试时可以读取可选的本地环境文件：
 
@@ -70,7 +71,7 @@ $HOME/.anna-mail-agent.env
 Anna App 开发启动应读取 `anna-inbox/executas/inbox-tool/executa.json`。该 stub 的 command 指向根目录源码：
 
 ```sh
-uv --directory ../../../inbox-tool/src run zhaopy-mail-agent
+uv --directory ../../../inbox-tool/src run anna-inbox-executa
 ```
 
 本地 Google/Gmail OAuth helper 在 `scripts/google_token/`。使用说明见 `scripts/google_token/README.md`。
@@ -85,22 +86,28 @@ scripts/google_token/.secrets/gmail_tokens
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' \
-  | uv --directory inbox-tool/src run zhaopy-mail-agent
+  | uv --directory inbox-tool/src run anna-inbox-executa
 ```
 
 直接 smoke-test health：
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' \
-  | uv --directory inbox-tool/src run zhaopy-mail-agent
+  | uv --directory inbox-tool/src run anna-inbox-executa
 ```
 
 新增、删除或重命名工具时，保持这些文件同步：
 
-- `inbox-tool/src/zhaopy_mail_agent/main.py`
+- `inbox-tool/src/anna_inbox_executa/main.py`
 - `inbox-tool/manifest.json`
 - `anna-inbox/executas/inbox-tool/executa.json`
 - 变更已发布 Executa 版本时，同步 `anna-inbox/manifest.json` 的 `required_executas[].min_version`
+
+修改 Executa `tool_id` 或版本时，先改 `inbox-tool/manifest.json`，再从仓库根目录运行：
+
+```sh
+python scripts/sync/sync_executa_identity.py
+```
 
 ## 测试说明
 
@@ -118,7 +125,7 @@ uv run python tests/test_storage_integration.py
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' \
-  | uv --directory inbox-tool/src run zhaopy-mail-agent
+  | uv --directory inbox-tool/src run anna-inbox-executa
 ```
 
 修改前端源码后，先从 `anna-inbox/` 运行前端构建，生成 `bundle/` 静态产物，再在 Anna App UI 中验证。前端工程化后，`npm run build` 应先执行 TypeScript typecheck，再执行 Vite build。
@@ -192,7 +199,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' \
 - 不要记录 OAuth token、access token、refresh token、API key、原始 authorization header 或完整 credential context。
 - 只用于 JSON repair 的 prompt 不应泄露原始邮件正文；`test_llm_json_repair.py` 已覆盖这个行为。
 - mark-read 或类似发送/删除的 Gmail 状态变更需要明确产品审查，并沿用现有 guardrail 模式。
-- `main.py` / `mail_adapter.py` 中的 `SUPPORTED_MAILBOXES` 和 local-token fallback 行为应保持保守。
+- `main.py` / `mail_adapter.py` 中的 mailbox normalize 和 local-token fallback 行为应保持保守。
 
 ## 发布与打包
 

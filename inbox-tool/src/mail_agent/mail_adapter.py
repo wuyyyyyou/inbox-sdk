@@ -19,13 +19,6 @@ BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
-SUPPORTED_MAILBOXES = {
-    "zhaopy2121@gamil.com": "zhaopy2121@gmail.com",
-    "zhaopy2121@gmail.com": "zhaopy2121@gmail.com",
-    "kate@anna.partners": "kate@anna.partners",
-    "hr@anna.partners": "hr@anna.partners",
-}
-
 
 def beijing_now() -> str:
     return datetime.now(BEIJING_TZ).isoformat()
@@ -48,6 +41,10 @@ def sanitize_mailbox_id(mailbox: str) -> str:
 _discovered_email: str = ""
 
 
+def _looks_like_email(value: str) -> bool:
+    return "@" in value and "." in value.split("@")[-1]
+
+
 def normalize_mailbox(mailbox: str) -> str:
     global _discovered_email
     raw = str(mailbox or "").strip().lower()
@@ -61,20 +58,11 @@ def normalize_mailbox(mailbox: str) -> str:
         # Accept any mailbox that matches the discovered email; treat unknown names as the discovered email.
         if raw == _discovered_email:
             return _discovered_email
-        # Also accept known aliases from the static allowlist that resolve to the same address.
-        known = SUPPORTED_MAILBOXES.get(raw)
-        if known and known == _discovered_email:
-            return known
-        # Accept the raw input if it's a valid email format (contains @).
-        if "@" in raw and "." in raw.split("@")[-1]:
+        if _looks_like_email(raw):
             return raw
         return _discovered_email
 
-    # Local dev path — use static allowlist.
-    normalized = SUPPORTED_MAILBOXES.get(raw)
-    if normalized:
-        return normalized
-    if "@" in raw and "." in raw.split("@")[-1]:
+    if _looks_like_email(raw):
         return raw
     raise ValueError(f"Unsupported mailbox: {mailbox}")
 

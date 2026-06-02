@@ -27,7 +27,7 @@ for _stream in (sys.stdin, sys.stdout):
         log(f"reconfigure {_stream} failed")
 
 # Ensure src/ is on sys.path so mail_agent and executa_sdk are importable
-# when running via `py -3 src/zhaopy_mail_agent/main.py`
+# when running via `py -3 src/anna_inbox_executa/main.py`
 _SRC_DIR = str(Path(__file__).resolve().parents[1])
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
@@ -36,23 +36,18 @@ from executa_sdk import PROTOCOL_VERSION_V2, SamplingClient, SamplingError
 from executa_sdk.storage import StorageClient, FilesClient, StorageError, make_response_router
 
 JSONRPC_VERSION = "2.0"
-TOOL_ID = "tool-zhaopy-inbox-tool-373sf2et"
-VERSION = "1.0.2"
+DEFAULT_TOOL_ID = "inbox-tool"
+DEFAULT_VERSION = "1.0.2"
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 STDOUT_LOCK = threading.Lock()
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 MAX_STDIO_MESSAGE_BYTES = 512 * 1024
-SUPPORTED_MAILBOXES = {
-    "zhaopy2121@gamil.com": "zhaopy2121@gmail.com",
-    "kate@anna.partners": "kate@anna.partners",
-    "hr@anna.partners": "hr@anna.partners",
-}
 
-MANIFEST = {
-    "name": TOOL_ID,
+DEFAULT_MANIFEST = {
+    "name": DEFAULT_TOOL_ID,
     "display_name": "Zhaopy Mail Agent RD6B87R5",
-    "version": VERSION,
+    "version": DEFAULT_VERSION,
     "description": "Minimal Anna Executa skeleton for reading Gmail through local token files and DashScope or Anna sampling LLM.",
     "author": "Zhaopy",
     "host_capabilities": [
@@ -505,10 +500,14 @@ def load_manifest() -> dict[str, Any]:
             return manifest
     except Exception:
         pass
-    return MANIFEST
+    return DEFAULT_MANIFEST
 
 
 MANIFEST = load_manifest()
+TOOL_ID = str(MANIFEST.get("tool_id") or MANIFEST.get("name") or DEFAULT_TOOL_ID)
+VERSION = str(MANIFEST.get("version") or DEFAULT_VERSION)
+MANIFEST["name"] = TOOL_ID
+MANIFEST["version"] = VERSION
 
 
 def log(message: str) -> None:
@@ -790,7 +789,7 @@ def check_google_oauth(context: dict[str, Any]) -> dict[str, Any]:
 
 
 def repo_root() -> Path:
-    # main.py lives at inbox-tool/src/zhaopy_mail_agent/main.py.
+    # main.py lives at inbox-tool/src/anna_inbox_executa/main.py.
     return Path(__file__).resolve().parents[3]
 
 
@@ -805,9 +804,6 @@ def sanitize_mailbox_id(mailbox: str) -> str:
 
 def normalize_mailbox(mailbox: str) -> str:
     raw = str(mailbox or "").strip().lower()
-    normalized = SUPPORTED_MAILBOXES.get(raw)
-    if normalized:
-        return normalized
     if "@" in raw and "." in raw.split("@")[-1]:
         return raw
     raise ValueError(f"Unsupported mailbox: {mailbox}")
