@@ -1,0 +1,3 @@
+[tool-zhaopy-mail-agent-rd6b87r5] storage backend: local-json dir=C:\Users\24848\Desktop\anna-email-agent\new\executas\tool-zhaopy-mail-agent-rd6b87r5\src\.local_storage
+[tool-zhaopy-mail-agent-rd6b87r5] stdin.encoding=utf-8 stdout.encoding=utf-8
+[tool-zhaopy-mail-agent-rd6b87r5] ready

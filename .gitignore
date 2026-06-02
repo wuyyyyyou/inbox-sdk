@@ -1,0 +1,30 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build
+dist/
+build/
+*.tsbuildinfo
+
+# python
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+uv.lock
+
+# editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# anna-app harness state
+.anna-app-harness/
+
+# Local cache for preset-app publish scripts
+.preset-apps-cache/
+
+**/.anna
+**/bin
+**/.docs

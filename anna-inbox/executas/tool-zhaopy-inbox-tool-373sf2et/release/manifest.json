@@ -1,0 +1,15 @@
+{
+    "name": "tool-zhaopy-inbox-tool-373sf2et",
+    "version": "1.0.2",
+    "runtime": {
+        "binary": {
+            "entrypoint": {
+                "default": "bin/tool-zhaopy-inbox-tool-373sf2et.exe",
+                "windows-x86_64": "bin/tool-zhaopy-inbox-tool-373sf2et.exe"
+            },
+            "permissions": {
+                "bin/tool-zhaopy-inbox-tool-373sf2et.exe": "0o755"
+            }
+        }
+    }
+}
