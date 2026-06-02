@@ -492,7 +492,9 @@ DEFAULT_MANIFEST = {
 
 
 def load_manifest() -> dict[str, Any]:
-    manifest_path = Path(__file__).resolve().parents[2] / "manifest.json"
+    pyinstaller_root = getattr(sys, "_MEIPASS", "")
+    runtime_root = Path(pyinstaller_root) if pyinstaller_root else Path(__file__).resolve().parents[2]
+    manifest_path = runtime_root / "manifest.json"
     try:
         with open(manifest_path, "r", encoding="utf-8-sig") as manifest_file:
             manifest = json.load(manifest_file)

@@ -5,6 +5,11 @@ description = "Anna Executa mail agent."
 requires-python = ">=3.10"
 dependencies = []
 
+[dependency-groups]
+build = [
+  "pyinstaller>=6,<7"
+]
+
 [project.scripts]
 anna-inbox-executa = "anna_inbox_executa.main:main"
 

@@ -5,6 +5,9 @@ node_modules/
 # build
 dist/
 build/
+.build/
+!scripts/build/
+!scripts/build/build_binary.sh
 *.tsbuildinfo
 anna-inbox/bundle/
 

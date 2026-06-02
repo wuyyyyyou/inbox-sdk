@@ -15,7 +15,6 @@ python scripts/sync/sync_executa_identity.py
 
 - `anna-inbox/manifest.json`
 - `anna-inbox/executas/inbox-tool/executa.json`
-- `inbox-tool/src/anna-inbox-executa.spec`
 
 本地开发脚本 `anna-inbox/dev-wsl.sh` 和后端入口会直接读取 `inbox-tool/manifest.json`，不需要同步写入。
 

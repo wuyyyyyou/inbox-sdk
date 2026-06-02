@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -13,7 +12,6 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 SOURCE_MANIFEST = ROOT_DIR / "inbox-tool" / "manifest.json"
 APP_MANIFEST = ROOT_DIR / "anna-inbox" / "manifest.json"
 EXECUTA_STUB = ROOT_DIR / "anna-inbox" / "executas" / "inbox-tool" / "executa.json"
-PYINSTALLER_SPEC = ROOT_DIR / "inbox-tool" / "src" / "anna-inbox-executa.spec"
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -36,15 +34,6 @@ def write_json(path: Path, data: dict[str, Any], *, check: bool, changed: list[s
 
 def json_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
     return before != after
-
-
-def write_text_if_changed(path: Path, content: str, *, check: bool, changed: list[str]) -> None:
-    existing = path.read_text(encoding="utf-8")
-    if existing == content:
-        return
-    changed.append(str(path.relative_to(ROOT_DIR)))
-    if not check:
-        path.write_text(content, encoding="utf-8")
 
 
 def read_identity() -> tuple[str, str | None]:
@@ -102,14 +91,6 @@ def sync_executa_stub(tool_id: str, version: str | None, *, check: bool, changed
         write_json(EXECUTA_STUB, stub, check=check, changed=changed)
 
 
-def sync_pyinstaller_spec(tool_id: str, *, check: bool, changed: list[str]) -> None:
-    content = PYINSTALLER_SPEC.read_text(encoding="utf-8")
-    next_content, count = re.subn(r"name='[^']+'", f"name='{tool_id}'", content, count=1)
-    if count != 1:
-        raise ValueError("could not find EXE name in inbox-tool/src/anna-inbox-executa.spec")
-    write_text_if_changed(PYINSTALLER_SPEC, next_content, check=check, changed=changed)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Sync Anna Inbox Executa identity from inbox-tool/manifest.json.")
     parser.add_argument("--check", action="store_true", help="Only check whether generated targets are up to date.")
@@ -119,7 +100,6 @@ def main() -> int:
     tool_id, version = read_identity()
     sync_app_manifest(tool_id, version, check=args.check, changed=changed)
     sync_executa_stub(tool_id, version, check=args.check, changed=changed)
-    sync_pyinstaller_spec(tool_id, check=args.check, changed=changed)
 
     if changed:
         print("Executa identity targets differ:" if args.check else "Synced Executa identity targets:")
