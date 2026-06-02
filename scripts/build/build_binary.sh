@@ -50,11 +50,23 @@ require_command() {
   fi
 }
 
-require_command python3
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [ -z "$PYTHON_BIN" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  else
+    echo "Missing required command: python3 or python" >&2
+    exit 1
+  fi
+fi
+
+require_command "$PYTHON_BIN"
 require_command uv
 
 read_manifest_field() {
-  python3 - "$SOURCE_MANIFEST" "$1" <<'PY'
+  "$PYTHON_BIN" - "$SOURCE_MANIFEST" "$1" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -172,7 +184,7 @@ if [ "$IS_WINDOWS" -eq 0 ]; then
   fi
 fi
 
-python3 - "$PACKAGE_DIR/manifest.json" "$TOOL_ID" "$VERSION" <<'PY'
+"$PYTHON_BIN" - "$PACKAGE_DIR/manifest.json" "$TOOL_ID" "$VERSION" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -209,7 +221,7 @@ run_smoke() {
   printf '{"jsonrpc":"2.0","method":"%s","id":1}\n' "$method" \
     | env ZHAOPY_MAIL_AGENT_STORAGE_DIR="$smoke_storage_dir" "$PACKAGE_DIR/bin/$BINARY_NAME" >"$output_path" 2>"$error_path"
 
-  python3 - "$output_path" "$method" "$TOOL_ID" "$VERSION" <<'PY'
+  "$PYTHON_BIN" - "$output_path" "$method" "$TOOL_ID" "$VERSION" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -248,7 +260,7 @@ fi
 
 rm -f "$ARCHIVE_PATH" "$SHA256_PATH"
 if [ "$IS_WINDOWS" -eq 1 ]; then
-  python3 - "$PACKAGE_DIR" "$ARCHIVE_PATH" <<'PY'
+  "$PYTHON_BIN" - "$PACKAGE_DIR" "$ARCHIVE_PATH" <<'PY'
 import sys
 import zipfile
 from pathlib import Path
@@ -264,7 +276,7 @@ else
   (cd "$PACKAGE_DIR" && tar -czf "$ARCHIVE_PATH" manifest.json bin)
 fi
 
-python3 - "$ARCHIVE_PATH" "$SHA256_PATH" <<'PY'
+"$PYTHON_BIN" - "$ARCHIVE_PATH" "$SHA256_PATH" <<'PY'
 import hashlib
 import sys
 from pathlib import Path
