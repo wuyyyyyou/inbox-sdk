@@ -26,7 +26,7 @@ fi
 
 EXECUTA_SPEC="dir=$EXECUTA_DIR,tool_id=tool-zhaopy-inbox-tool-373sf2et,type=python,command=env UV_PROJECT_ENVIRONMENT=$VENV_DIR UV_LINK_MODE=copy uv --directory src run zhaopy-mail-agent"
 
-export ANNA_INBOX_TOKEN_DIR="$SCRIPT_DIR/executas/anna-inbox-tool/.secrets/gmail_tokens"
+export ANNA_INBOX_TOKEN_DIR="$SCRIPT_DIR/../scripts/google_token/.secrets/gmail_tokens"
 
 cd "$SCRIPT_DIR"
 exec anna-app dev --port "$PORT" --executa "$EXECUTA_SPEC" "$@"

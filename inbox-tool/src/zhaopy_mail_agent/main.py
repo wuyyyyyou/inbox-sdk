@@ -817,7 +817,7 @@ def token_dir() -> Path:
     override = os.environ.get("ANNA_INBOX_TOKEN_DIR")
     if override:
         return Path(override).expanduser().resolve()
-    return repo_root() / "anna-inbox" / "executas" / "anna-inbox-tool" / ".secrets" / "gmail_tokens"
+    return repo_root() / "scripts" / "google_token" / ".secrets" / "gmail_tokens"
 
 
 def cache_dir() -> Path:

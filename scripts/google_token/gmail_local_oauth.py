@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import secrets
-import sys
 import time
 import urllib.error
 import urllib.parse
@@ -15,12 +14,8 @@ from pathlib import Path
 from typing import Any
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = REPO_ROOT / "executas" / "anna-inbox-tool" / "src"
-sys.path.insert(0, str(SRC_ROOT))
-
-from utils.paths import sanitize_mailbox_id, token_dir  # noqa: E402
-from utils.time_utils import beijing_now_iso  # noqa: E402
+from utils.paths import default_client_secrets_path, sanitize_mailbox_id, token_dir
+from utils.time_utils import beijing_now_iso
 
 
 DEFAULT_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
@@ -96,7 +91,7 @@ def main() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local Gmail OAuth helper for Anna Inbox — obtains access_token + refresh_token via browser-based OAuth flow.")
     parser.add_argument("--email", default="zhaopy2121@gmail.com", help="Mailbox email used as local token file name.")
-    parser.add_argument("--client-secrets", help="Path to Google OAuth desktop client JSON.")
+    parser.add_argument("--client-secrets", help="Path to Google OAuth desktop client JSON. Defaults to scripts/google_token/.secrets/client_secret*.json when present.")
     parser.add_argument("--client-id", help="Google OAuth client id.")
     parser.add_argument("--client-secret", help="Google OAuth client secret.")
     parser.add_argument("--redirect-uri", help="Local OAuth redirect URI registered in Google Cloud.")
@@ -107,7 +102,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_client(args: argparse.Namespace) -> dict[str, str]:
-    client_secrets = args.client_secrets or os.environ.get("GOOGLE_OAUTH_CLIENT_SECRETS")
+    client_secrets = resolve_client_secrets_path(args)
     if client_secrets:
         payload = json.loads(Path(client_secrets).read_text(encoding="utf-8"))
         client = payload.get("installed") or payload.get("web") or payload
@@ -137,8 +132,17 @@ def load_client(args: argparse.Namespace) -> dict[str, str]:
             "redirect_uris": [],
         }
     raise SystemExit(
-        "Provide --client-secrets, set GOOGLE_OAUTH_CLIENT_SECRETS, or provide both --client-id and --client-secret."
+        "Provide --client-secrets, set GOOGLE_OAUTH_CLIENT_SECRETS, place client_secret*.json under "
+        "scripts/google_token/.secrets, or provide both --client-id and --client-secret."
     )
+
+
+def resolve_client_secrets_path(args: argparse.Namespace) -> str:
+    explicit = args.client_secrets or os.environ.get("GOOGLE_OAUTH_CLIENT_SECRETS")
+    if explicit:
+        return str(explicit)
+    default_path = default_client_secrets_path()
+    return str(default_path) if default_path else ""
 
 
 def resolve_redirect_uri(client: dict[str, Any], args: argparse.Namespace) -> str:

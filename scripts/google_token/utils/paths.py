@@ -9,7 +9,11 @@ DEFAULT_LOCAL_TEST_EMAIL = "kate@anna.partners"
 
 
 def tool_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[1]
+
+
+def secrets_dir() -> Path:
+    return tool_root() / ".secrets"
 
 
 def data_dir() -> Path:
@@ -23,7 +27,12 @@ def token_dir() -> Path:
     path = os.environ.get("ANNA_INBOX_TOKEN_DIR")
     if path:
         return Path(path).expanduser().resolve()
-    return tool_root() / ".secrets" / "gmail_tokens"
+    return secrets_dir() / "gmail_tokens"
+
+
+def default_client_secrets_path() -> Path | None:
+    matches = sorted(secrets_dir().glob("client_secret*.json"))
+    return matches[0] if matches else None
 
 
 def sanitize_mailbox_id(mailbox_id: str) -> str:

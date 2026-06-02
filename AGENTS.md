@@ -73,10 +73,12 @@ Anna App 开发启动应读取 `anna-inbox/executas/inbox-tool/executa.json`。�
 uv --directory ../../../inbox-tool/src run zhaopy-mail-agent
 ```
 
-本地 Gmail token 目录当前保留在：
+本地 Google/Gmail OAuth helper 在 `scripts/google_token/`。使用说明见 `scripts/google_token/README.md`。
+
+本地 Gmail token 目录默认在：
 
 ```sh
-anna-inbox/executas/anna-inbox-tool/.secrets/gmail_tokens
+scripts/google_token/.secrets/gmail_tokens
 ```
 
 直接 smoke-test Executa manifest：

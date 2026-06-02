@@ -182,8 +182,7 @@ def _token_dir() -> Path:
     override = os.environ.get("ANNA_INBOX_TOKEN_DIR")
     if override:
         return Path(override).expanduser().resolve()
-    # Local token files remain under anna-inbox/executas/anna-inbox-tool for now.
-    return _repo_root() / "anna-inbox" / "executas" / "anna-inbox-tool" / ".secrets" / "gmail_tokens"
+    return _repo_root() / "scripts" / "google_token" / ".secrets" / "gmail_tokens"
 
 
 def _load_token_record(mailbox: str) -> dict[str, Any]:
