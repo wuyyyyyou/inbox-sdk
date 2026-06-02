@@ -1,0 +1,8 @@
+{"ts": "2026-06-02T20:51:00.669", "tool": "unknown", "direction": "input", "content": "Return {\"ok\": true}.", "system_prompt": "Return JSON.", "max_tokens": "64"}
+{"ts": "2026-06-02T20:51:00.672", "tool": "unknown", "direction": "output", "content": "{\"ok\": true}", "model": "test-model", "json_repair": "False"}
+{"ts": "2026-06-02T20:51:00.672", "tool": "unknown", "direction": "input", "content": "Return an object.", "system_prompt": "Return JSON.", "max_tokens": "64"}
+{"ts": "2026-06-02T20:51:00.674", "tool": "unknown", "direction": "output", "content": "{\"a\":\"b\"\n\"c\":1}", "model": "test-model", "json_repair": "False"}
+{"ts": "2026-06-02T20:51:00.674", "tool": "unit_test", "direction": "input", "content": "## Output format\n{\"a\": \"string\"}\n\n## Emails\nSECRET EMAIL BODY", "system_prompt": "Return JSON only.", "max_tokens": "64"}
+{"ts": "2026-06-02T20:51:00.675", "tool": "unit_test", "direction": "output", "content": "{\"a\": \"b\"}", "model": "test-model", "json_repair": "True"}
+{"ts": "2026-06-02T20:51:00.675", "tool": "unknown", "direction": "input", "content": "## Output format\n{\"a\": \"string\"}", "system_prompt": "Return JSON only.", "max_tokens": "64"}
+{"ts": "2026-06-02T20:51:00.675", "tool": "unknown", "direction": "input", "content": "## Output format\n{\"a\": \"string\"}", "system_prompt": "Return JSON only.", "max_tokens": "64"}

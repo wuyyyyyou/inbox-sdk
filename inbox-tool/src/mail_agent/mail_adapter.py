@@ -36,8 +36,8 @@ def _tool_root() -> Path:
 
 
 def _repo_root() -> Path:
-    # mail_adapter.py is at src/mail_agent/ → parents[5] = repo root
-    return Path(__file__).resolve().parents[5]
+    # mail_adapter.py lives at inbox-tool/src/mail_agent/mail_adapter.py.
+    return Path(__file__).resolve().parents[3]
 
 
 def sanitize_mailbox_id(mailbox: str) -> str:
@@ -182,8 +182,8 @@ def _token_dir() -> Path:
     override = os.environ.get("ANNA_INBOX_TOKEN_DIR")
     if override:
         return Path(override).expanduser().resolve()
-    # Token files live in the sibling anna-inbox-tool directory next to this executa.
-    return _tool_root().parent / "anna-inbox-tool" / ".secrets" / "gmail_tokens"
+    # Local token files remain under anna-inbox/executas/anna-inbox-tool for now.
+    return _repo_root() / "anna-inbox" / "executas" / "anna-inbox-tool" / ".secrets" / "gmail_tokens"
 
 
 def _load_token_record(mailbox: str) -> dict[str, Any]:

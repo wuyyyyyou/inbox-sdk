@@ -790,7 +790,8 @@ def check_google_oauth(context: dict[str, Any]) -> dict[str, Any]:
 
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parents[4]
+    # main.py lives at inbox-tool/src/zhaopy_mail_agent/main.py.
+    return Path(__file__).resolve().parents[3]
 
 
 def tool_root() -> Path:
@@ -816,7 +817,7 @@ def token_dir() -> Path:
     override = os.environ.get("ANNA_INBOX_TOKEN_DIR")
     if override:
         return Path(override).expanduser().resolve()
-    return repo_root() / "executas" / "anna-inbox-tool" / ".secrets" / "gmail_tokens"
+    return repo_root() / "anna-inbox" / "executas" / "anna-inbox-tool" / ".secrets" / "gmail_tokens"
 
 
 def cache_dir() -> Path:

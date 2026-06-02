@@ -7,9 +7,10 @@
 - `anna-inbox/manifest.json` 声明 App、静态 SPA bundle、必需 Executa、Host API、权限和本地开发默认值。
 - `anna-inbox/src/` 是计划中的前端源码目录，使用 Vite + React + TypeScript 组织 Anna Inbox UI。
 - `anna-inbox/bundle/` 是 Anna App 读取的静态 SPA 构建产物目录，不作为主要手写源码维护。
-- `anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/` 是邮件代理的 Python Executa 插件。
-- `anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/src/mail_agent/` 包含 Gmail 扫描、Brief 管线、Ask 流程、存储、卡片、LLM 和本地缓存逻辑。
-- `anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/src/zhaopy_mail_agent/main.py` 是 JSON-RPC stdio 入口，同时内嵌 `describe` 返回的 Executa manifest 数据。
+- `inbox-tool/` 是邮件代理的 Python Executa 工程源码目录。目录名不是协议 `tool_id`。
+- `inbox-tool/src/mail_agent/` 包含 Gmail 扫描、Brief 管线、Ask 流程、存储、卡片、LLM 和本地缓存逻辑。
+- `inbox-tool/src/zhaopy_mail_agent/main.py` 是 JSON-RPC stdio 入口，同时内嵌 `describe` 返回的 Executa manifest 数据。
+- `anna-inbox/executas/inbox-tool/executa.json` 是 Anna App 开发启动用的 Executa stub；其中 `tool_id` 仍是 `tool-zhaopy-inbox-tool-373sf2et`。
 - `anna-inbox/.docs/` 是复制到仓库内的 Anna 协议参考。修改平台协议相关行为前先读这里，不要凭印象猜。
 - `anna-inbox/docs/` 是项目设计文档和实施计划，主要为中文。
 
@@ -44,7 +45,7 @@
 从仓库根目录执行：
 
 ```sh
-cd anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/src
+cd inbox-tool/src
 uv sync
 ```
 
@@ -54,7 +55,7 @@ Executa 项目使用 `uv` 和 `pyproject.toml`：
 - Python：`>=3.10`
 - 命令入口：`zhaopy-mail-agent = zhaopy_mail_agent.main:main`
 
-本地密钥刻意放在仓库外。`anna-inbox/dev-wsl.sh` 会读取可选的本地环境文件：
+本地密钥刻意放在仓库外。本地调试时可以读取可选的本地环境文件：
 
 ```sh
 $HOME/.anna-mail-agent.env
@@ -64,20 +65,15 @@ $HOME/.anna-mail-agent.env
 
 ## 开发流程
 
-从仓库根目录启动 Anna App：
+`anna-inbox/dev-wsl.sh` 是旧本地开发脚本，当前重构后不作为首选入口；不要把它当作新结构的权威启动说明。
+
+Anna App 开发启动应读取 `anna-inbox/executas/inbox-tool/executa.json`。该 stub 的 command 指向根目录源码：
 
 ```sh
-cd anna-inbox
-PORT=5180 ./dev-wsl.sh
+uv --directory ../../../inbox-tool/src run zhaopy-mail-agent
 ```
 
-`dev-wsl.sh` 实际启动：
-
-```sh
-anna-app dev --port "$PORT" --executa "dir=...,tool_id=tool-zhaopy-inbox-tool-373sf2et,type=python,command=env UV_PROJECT_ENVIRONMENT=... UV_LINK_MODE=copy uv --directory src run zhaopy-mail-agent"
-```
-
-开发脚本使用的本地 Gmail token 目录：
+本地 Gmail token 目录当前保留在：
 
 ```sh
 anna-inbox/executas/anna-inbox-tool/.secrets/gmail_tokens
@@ -87,22 +83,21 @@ anna-inbox/executas/anna-inbox-tool/.secrets/gmail_tokens
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' \
-  | uv --directory anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/src run zhaopy-mail-agent
+  | uv --directory inbox-tool/src run zhaopy-mail-agent
 ```
 
 直接 smoke-test health：
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' \
-  | uv --directory anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/src run zhaopy-mail-agent
+  | uv --directory inbox-tool/src run zhaopy-mail-agent
 ```
 
 新增、删除或重命名工具时，保持这些文件同步：
 
-- `anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/src/zhaopy_mail_agent/main.py`
-- `anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/manifest.json`
-- `anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/executa.json`
-- 准备 release 时同步 `anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/release/` 下的副本
+- `inbox-tool/src/zhaopy_mail_agent/main.py`
+- `inbox-tool/manifest.json`
+- `anna-inbox/executas/inbox-tool/executa.json`
 - 变更已发布 Executa 版本时，同步 `anna-inbox/manifest.json` 的 `required_executas[].min_version`
 
 ## 测试说明
@@ -110,7 +105,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' \
 从 Executa 的 `src` 目录运行本地 Python 测试：
 
 ```sh
-cd anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/src
+cd inbox-tool/src
 uv run python tests/test_llm_json_repair.py
 uv run python tests/test_storage_integration.py
 ```
@@ -121,7 +116,7 @@ uv run python tests/test_storage_integration.py
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' \
-  | uv --directory anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/src run zhaopy-mail-agent
+  | uv --directory inbox-tool/src run zhaopy-mail-agent
 ```
 
 修改前端源码后，先从 `anna-inbox/` 运行前端构建，生成 `bundle/` 静态产物，再在 Anna App UI 中验证。前端工程化后，`npm run build` 应先执行 TypeScript typecheck，再执行 Vite build。
@@ -202,7 +197,6 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' \
 - 当前 Executa 版本是 `1.0.2`。
 - `executa.json` 声明二进制分发元数据和本地开发命令。
 - `manifest.json` 声明 Executa 工具和凭据。
-- `release/describe-manifest-1.0.2.json`、`release/manifest.json`、`release/executa.json` 是 release artifact；仅在准备 release 时更新。
 - 修改二进制打包前先读 `anna-inbox/docs/PyInstaller二进制打包指南.md`。
 
 ## Agent 工作规则
