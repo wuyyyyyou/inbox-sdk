@@ -1,0 +1,258 @@
+export type RuntimeMode = "connecting" | "live" | "mock";
+export type MainView = "start" | "ask";
+export type CardStatus = "pending" | "snoozed" | "resolved" | "dismissed" | string;
+export type ResultFilter = "all" | "reply" | "review" | "cleanup";
+export type LlmProvider = "anna-llm" | "dashscope";
+export type StorageProvider = "aps" | "local";
+
+export interface RuntimeState {
+  connected: boolean;
+  mode: RuntimeMode;
+  error?: string;
+  client?: AnnaRuntimeClient;
+}
+
+export interface AnnaRuntimeClient {
+  tools?: { invoke?: (args: ToolInvokeArgs) => Promise<unknown> };
+  window?: { set_title?: (args: { title: string }) => Promise<unknown> };
+  call?: (ns: string, method: string, args?: unknown, options?: { timeout?: number; timeoutMs?: number }) => Promise<unknown>;
+}
+
+export interface ToolInvokeArgs {
+  tool_id: string;
+  method: string;
+  args: Record<string, unknown>;
+  timeoutMs: number;
+}
+
+export interface FrontendCardAction {
+  id: string;
+  label?: string;
+  buttonLabel?: string;
+  primary?: boolean;
+  statusTitle?: string;
+  status?: string;
+}
+
+export interface FrontendCard {
+  id: string;
+  title?: string;
+  summary?: string;
+  recommendation?: string;
+  label?: string;
+  priority?: string;
+  item_type?: string;
+  draft_reply?: string;
+  thread_summary?: string;
+  displaySection?: "main" | "lower" | string;
+  details?: {
+    needs?: string;
+    latestActivity?: string;
+    reviewed?: string;
+    mailbox?: string;
+  };
+  original?: {
+    source?: string;
+    thread?: string;
+    from?: string;
+    to?: string;
+    cc?: string;
+    time?: string;
+    status?: string;
+    body?: string;
+  };
+  actions?: FrontendCardAction[];
+  status?: CardStatus;
+  resolution?: string;
+  snooze_until?: string;
+  userAction?: "reply" | "review" | "cleanup" | string;
+  cardType?: "cleanup_bundle" | string;
+  bundledMessages?: CleanupMessage[];
+  bundledCount?: number;
+}
+
+export interface CleanupMessage {
+  id?: string;
+  message_id?: string;
+  from_addr?: string;
+  subject?: string;
+  snippet?: string;
+  date?: string;
+  item_type?: string;
+  reason?: string;
+}
+
+export interface ScanState {
+  last_scan_ts?: string;
+  last_message_internal_date?: string;
+  total_scans?: number;
+  total_processed?: number;
+}
+
+export interface ActiveCardsPayload {
+  cards: FrontendCard[];
+  count?: number;
+  scan_state?: ScanState;
+}
+
+export interface RunStatus {
+  success?: boolean;
+  run_id?: string;
+  status?: "queued" | "running" | "done" | "failed" | string;
+  stage?: string;
+  progress?: Record<string, unknown>;
+  partial?: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  started_at?: string;
+  updated_at?: string;
+  error?: string;
+}
+
+export interface ScanPlan {
+  mailbox?: string;
+  schedule?: string;
+  time_range?: string;
+  max_messages?: number;
+  priorities?: string[];
+  include_newsletters?: boolean;
+  include_promotions?: boolean;
+  include_archived?: boolean;
+  batch_behavior?: string;
+  active?: boolean;
+  updated_at?: string;
+}
+
+export interface RunHistoryEntry {
+  run_id?: string;
+  mailbox?: string;
+  ts?: string;
+  request?: string;
+  mode?: string;
+  strategy?: string;
+  plan_id?: string;
+  result?: string;
+  summary?: string;
+}
+
+export interface CustomPlanSummary {
+  plan_id: string;
+  user_request?: string;
+  title?: string;
+  description?: string;
+  gmail_queries?: CustomPlanQuery[];
+  read_depth?: string;
+  created_at?: string;
+  last_used_at?: string;
+  use_count?: number;
+  last_result_summary?: string;
+}
+
+export interface CustomPlanQuery {
+  query?: string;
+  purpose?: string;
+}
+
+export interface CustomRunResultItem {
+  subject?: string;
+  context?: string;
+  suggestion?: string;
+  draft?: string;
+  message_id?: string;
+  thread_id?: string;
+  from?: string;
+}
+
+export interface CustomRunResultSection {
+  heading?: string;
+  body?: string;
+  items?: CustomRunResultItem[];
+}
+
+export interface CustomRunResult {
+  runId?: string;
+  planId?: string;
+  plan_title?: string;
+  plan_description?: string;
+  plan_gmail_queries?: CustomPlanQuery[];
+  plan_read_depth?: string;
+  title?: string;
+  summary?: string;
+  sections?: CustomRunResultSection[];
+  trace?: Record<string, unknown>;
+  planner_fallback?: boolean;
+}
+
+export interface CardDetailPayload {
+  card?: FrontendCard;
+  thread_context?: Record<string, unknown>;
+}
+
+export interface GmailAuthStatus {
+  checked: boolean;
+  authorized: boolean;
+  source?: string;
+}
+
+export interface CustomRunProgress {
+  runId: string;
+  question: string;
+  status: string;
+  stage: string;
+  stageKey: string;
+  progress: Record<string, unknown>;
+  partial: Record<string, unknown>;
+  startedAt?: string;
+  updatedAt?: string;
+}
+
+export interface AppState {
+  runtime: RuntimeState;
+  view: MainView;
+  mailbox: string;
+  mailboxInput: string;
+  strategyMode: string;
+  loading: boolean;
+  cards: FrontendCard[];
+  scanState: ScanState | null;
+  history: RunHistoryEntry[];
+  scanStatus: string;
+  scanError: string;
+  isScanning: boolean;
+  isCustomScanning: boolean;
+  scanStepIndex: number;
+  scanStage: string;
+  scanProgress: Record<string, unknown>;
+  customPlans: CustomPlanSummary[];
+  customScanInput: string;
+  customRunResult: CustomRunResult | null;
+  customRunProgress: CustomRunProgress | null;
+  customTraceOpen: boolean;
+  sourcesOpen: boolean;
+  historyOpen: boolean;
+  originalOpen: boolean;
+  scanPlanOpen: boolean;
+  scanPlan: ScanPlan | null;
+  selectedCard: FrontendCard | null;
+  selectedCardDetail: CardDetailPayload | null;
+  threadSummaryById: Record<string, Record<string, unknown>>;
+  draftById: Record<string, string>;
+  revisionById: Record<string, string>;
+  replyModeById: Record<string, string>;
+  threadContextExpanded: Record<string, boolean>;
+  expandedDetails: Record<string, boolean>;
+  snoozeMenuCardId: string;
+  statusByCardId: Record<string, string>;
+  lowerPriorityOpen: boolean;
+  minimized: boolean;
+  resultFilter: ResultFilter;
+  llmProvider: LlmProvider;
+  storageProvider: StorageProvider;
+  generatingDraft: boolean;
+  draftDots: string;
+  summarizingThread: boolean;
+  cleanupReadState: Record<string, { read: boolean; readMsgIndices: number[] }>;
+  markingReadIds: Record<string, boolean>;
+  gmailAuthStatus: GmailAuthStatus;
+  askItemActions: Record<string, { read?: boolean; trashed?: boolean; replied?: boolean; sending?: boolean }>;
+  askEditDraft: Record<string, string>;
+}

@@ -6,6 +6,7 @@ node_modules/
 dist/
 build/
 *.tsbuildinfo
+anna-inbox/bundle/
 
 # python
 .venv/
@@ -28,3 +29,7 @@ uv.lock
 **/.anna
 **/bin
 **/.docs
+.scratch/
+docs/agents/
+docs/adr/
+**/.secrets/

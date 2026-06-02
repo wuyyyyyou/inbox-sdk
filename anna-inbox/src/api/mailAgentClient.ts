@@ -1,0 +1,154 @@
+import type {
+  ActiveCardsPayload,
+  CardDetailPayload,
+  CustomPlanSummary,
+  RunHistoryEntry,
+  RunStatus,
+  RuntimeState,
+  ScanPlan,
+} from "../types/mail";
+
+const TOOL_ID = "tool-zhaopy-inbox-tool-373sf2et";
+const INVOKE_TIMEOUT_MS = 180000;
+
+export function unwrapToolResult(result: unknown): unknown {
+  const envelope = result && typeof result === "object" && "result" in result && "jsonrpc" in result
+    ? (result as { result: unknown }).result
+    : result;
+  const payload = envelope && typeof envelope === "object" && "data" in envelope && "tool" in envelope
+    ? (envelope as { data: unknown }).data
+    : envelope;
+  if (payload && typeof payload === "object" && "error" in payload && (payload as { error?: unknown }).error) {
+    throw new Error(String((payload as { error: unknown }).error));
+  }
+  if (payload && typeof payload === "object" && (payload as { success?: unknown }).success === false) {
+    throw new Error(String((payload as { error?: unknown }).error || "Tool call failed"));
+  }
+  if (payload && typeof payload === "object" && (payload as { success?: unknown }).success === true && "data" in payload) {
+    return (payload as { data: unknown }).data;
+  }
+  return payload;
+}
+
+export class MailAgentClient {
+  constructor(private readonly getRuntime: () => Promise<RuntimeState>) {}
+
+  async invoke<T = unknown>(method: string, args: Record<string, unknown> = {}, options: { timeoutMs?: number } = {}): Promise<T> {
+    const runtime = await this.getRuntime();
+    if (!runtime.connected || !runtime.client) {
+      throw new Error(runtime.error || "Anna runtime is not connected.");
+    }
+    const invokeArgs = {
+      tool_id: TOOL_ID,
+      method,
+      args,
+      timeoutMs: options.timeoutMs || INVOKE_TIMEOUT_MS,
+    };
+    try {
+      const result = runtime.client.tools && typeof runtime.client.tools.invoke === "function"
+        ? await runtime.client.tools.invoke(invokeArgs)
+        : await runtime.client.call?.("tools", "invoke", invokeArgs, { timeout: INVOKE_TIMEOUT_MS, ...options });
+      return unwrapToolResult(result) as T;
+    } catch (error) {
+      const err = error as { details?: Record<string, unknown>; data?: Record<string, unknown>; code?: string | number; message?: string };
+      const details = err.details || err.data || {};
+      const data = details.data as Record<string, unknown> | undefined;
+      const traceback = String(details.traceback || data?.traceback || "");
+      const code = err.code !== undefined ? `[${err.code}] ` : "";
+      const message = err.message || String(error);
+      throw new Error(`${code}${message}${traceback ? `\n\n${traceback}` : ""}`);
+    }
+  }
+
+  checkGmailAuth(mailbox: string) {
+    return this.invoke<{ authorized?: boolean; source?: string }>("check_gmail_auth", { mailbox });
+  }
+
+  loadActiveCards(mailbox: string, storageProvider: string) {
+    return this.invoke<ActiveCardsPayload>("get_active_cards", { mailbox, storage_provider: storageProvider });
+  }
+
+  loadRunHistory() {
+    return this.invoke<{ history: RunHistoryEntry[] }>("get_run_history");
+  }
+
+  loadScanPlan(mailbox: string, storageProvider: string) {
+    return this.invoke<ScanPlan>("get_scan_plan", { mailbox, storage_provider: storageProvider });
+  }
+
+  saveScanPlanField(mailbox: string, storageProvider: string, field: string, value: unknown) {
+    return this.invoke<{ ok?: boolean; updated_at?: string }>("set_scan_plan", { mailbox, storage_provider: storageProvider, [field]: value });
+  }
+
+  startBriefRun(args: Record<string, unknown>) {
+    return this.invoke<RunStatus>("start_mail_agent_run", args);
+  }
+
+  getRun(runId: string) {
+    return this.invoke<RunStatus>("get_mail_agent_run", { run_id: runId });
+  }
+
+  getCardDetail(mailbox: string, cardId: string, storageProvider: string) {
+    return this.invoke<CardDetailPayload>("get_card_detail", { mailbox, card_id: cardId, storage_provider: storageProvider });
+  }
+
+  startSummarizeThread(args: Record<string, unknown>) {
+    return this.invoke<RunStatus>("start_summarize_thread", args);
+  }
+
+  startGenerateDraft(args: Record<string, unknown>) {
+    return this.invoke<RunStatus>("start_generate_draft", args);
+  }
+
+  recordCardDecision(args: Record<string, unknown>) {
+    return this.invoke<{ ok?: boolean }>("record_card_decision", args);
+  }
+
+  clearActiveCards(mailbox: string, storageProvider: string) {
+    return this.invoke<{ ok?: boolean }>("clear_active_cards", { mailbox, storage_provider: storageProvider });
+  }
+
+  markCleanupRead(args: Record<string, unknown>) {
+    return this.invoke<{ ok?: boolean; gmail_error?: string }>("mark_cleanup_read", args);
+  }
+
+  restoreCard(mailbox: string, cardId: string, storageProvider: string) {
+    return this.invoke<{ ok?: boolean }>("restore_card", { mailbox, card_id: cardId, storage_provider: storageProvider });
+  }
+
+  recordSnooze(args: Record<string, unknown>) {
+    return this.invoke<{ ok?: boolean; snooze_until?: string }>("record_snooze", args);
+  }
+
+  replyNow(args: Record<string, unknown>) {
+    return this.invoke<{ ok?: boolean; dry_run?: boolean; error?: string }>("reply_now", args);
+  }
+
+  loadCustomPlans(storageProvider: string) {
+    return this.invoke<{ plans: CustomPlanSummary[] }>("get_custom_plans", { storage_provider: storageProvider });
+  }
+
+  deleteCustomPlan(planId: string, storageProvider: string) {
+    return this.invoke<{ ok?: boolean }>("delete_custom_plan", { plan_id: planId, storage_provider: storageProvider });
+  }
+
+  startCustomScan(args: Record<string, unknown>) {
+    return this.invoke<RunStatus>("start_custom_scan", args);
+  }
+
+  reRunCustomScan(args: Record<string, unknown>) {
+    return this.invoke<RunStatus>("re_run_custom_scan", args);
+  }
+
+  markReadFromAsk(mailbox: string, messageIds: string[]) {
+    return this.invoke<{ ok?: boolean; error?: string }>("mark_read_from_ask", { mailbox, message_ids: messageIds });
+  }
+
+  trashFromAsk(mailbox: string, messageIds: string[]) {
+    return this.invoke<{ ok?: boolean; error?: string }>("trash_from_ask", { mailbox, message_ids: messageIds });
+  }
+
+  replyFromAsk(args: Record<string, unknown>) {
+    return this.invoke<{ ok?: boolean; dry_run?: boolean; error?: string }>("reply_from_ask", args);
+  }
+}

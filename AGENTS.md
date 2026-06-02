@@ -5,7 +5,8 @@
 这个仓库是一个 Anna App 项目，主体目录是 `anna-inbox/`。
 
 - `anna-inbox/manifest.json` 声明 App、静态 SPA bundle、必需 Executa、Host API、权限和本地开发默认值。
-- `anna-inbox/bundle/` 是已交付的静态前端，包括 `index.html`、`app.js`、`style.css` 和 runtime compatibility 脚本。当前仓库没有 npm/Vite 项目；除非后续明确新增构建链路，否则按直接维护的静态资源处理。
+- `anna-inbox/src/` 是计划中的前端源码目录，使用 Vite + React + TypeScript 组织 Anna Inbox UI。
+- `anna-inbox/bundle/` 是 Anna App 读取的静态 SPA 构建产物目录，不作为主要手写源码维护。
 - `anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/` 是邮件代理的 Python Executa 插件。
 - `anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/src/mail_agent/` 包含 Gmail 扫描、Brief 管线、Ask 流程、存储、卡片、LLM 和本地缓存逻辑。
 - `anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/src/zhaopy_mail_agent/main.py` 是 JSON-RPC stdio 入口，同时内嵌 `describe` 返回的 Executa manifest 数据。
@@ -123,7 +124,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' \
   | uv --directory anna-inbox/executas/tool-zhaopy-inbox-tool-373sf2et/src run zhaopy-mail-agent
 ```
 
-修改前端时，启动 `anna-app dev` 并在 App UI 中验证。当前仓库没有配置前端测试 runner。
+修改前端源码后，先从 `anna-inbox/` 运行前端构建，生成 `bundle/` 静态产物，再在 Anna App UI 中验证。前端工程化后，`npm run build` 应先执行 TypeScript typecheck，再执行 Vite build。
 
 ## 代码组织
 
@@ -161,11 +162,23 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' \
 
 ## 前端约束
 
-- 当前 App UI 是 `anna-inbox/bundle` 下的静态 SPA。
-- 保持 `index.html`、`app.js`、`style.css` 一致；没有明确决策前不要引入前端框架。
+- 前端工程根目录是 `anna-inbox/`；源码入口使用 `anna-inbox/src/index.html` 和 `anna-inbox/src/main.tsx`。
+- 前端技术栈使用 Vite + React + TypeScript。第一阶段不引入路由库、Redux/Zustand、Tailwind、CSS-in-JS、组件库或图标库。
+- 前端使用 npm。提交 `package-lock.json`，不要提交 `bundle/` 构建产物。
+- `package.json` 第一阶段只需要最小脚本：`typecheck`、`build`、`test`。不要添加 `npm run dev`；本地验证通过 Anna App 测试环境完成。
+- `npm run build` 必须先运行 `tsc --noEmit`，再运行 Vite build。
+- 前端测试使用 Vitest，第一阶段优先覆盖纯逻辑、DTO adapter、reducers 和 API facade。不要为了第一阶段迁移引入 React Testing Library 或 jsdom。
+- `anna-inbox/bundle/` 是构建产物目录，应由 `npm run build` 生成；`bundle/` 加入 `.gitignore`，不要把它当成源码目录手写维护。
+- 构建产物保持稳定入口文件名：`bundle/index.html`、`bundle/app.js`、`bundle/style.css`。
 - App manifest 的 CSP 当前只允许 `'self'` 下的 script 和 style；除非有意修改 `manifest.json`，否则不要引入外部 origin。
 - `anna-inbox/manifest.json` 声明的 App Host API 包括 tools、chat write、storage get/set/list/delete、LLM complete 和 window title。
-- 修改卡片渲染时，对照 `card_service.py::cards_to_frontend` 和 `storage_types.PersistentCard`，确保前后端字段名保持一致。
+- Anna Runtime 适配层是前端源码的一部分，应维护在 `src/runtime/`，保留平台注入 SDK、官方 SDK 动态导入、bundle 内 compat 的降级顺序。
+- 前端组件不要直接写 Executa tool 名称；工具调用集中在 API facade 中，例如 `src/api/mailAgentClient.ts`。
+- 修改卡片渲染时，对照 `card_service.py::cards_to_frontend` 和 `storage_types.PersistentCard`，确保前后端字段名保持一致。前端应手写 DTO 类型，贴合实际 JSON 返回边界。
+- 第一阶段迁移目标是行为等价和视觉尽量不变；不要顺手重设计 Brief、Ask、Handle、History 或 Scan Plan。
+- 前端 UI 文案第一阶段保持现有英文文案，不引入 i18n。
+- 第一阶段不要修改 Executa 工具契约或 Python 后端。API facade 只封装现有工具名、参数和返回值。
+- 推荐迁移顺序：先跑通最小 React shell 和 runtime，再迁移 API/types、Brief、Drawers/Scan Plan/History、Handle、Ask，最后补测试和整理样式。
 
 ## 存储约束
 
@@ -199,3 +212,17 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' \
 - 除非任务明确要求，不要覆盖用户密钥、生成的 token 文件、本地存储或 release artifact。
 - 保留工作树中与当前任务无关的已有改动。
 - 修改代码后，运行上面列出的聚焦脚本测试，并按改动范围运行相关 JSON-RPC smoke test。
+
+## Agent skills
+
+### Issue tracker
+
+本仓库的 issue 和 PRD 使用本地 Markdown 文件管理，写入 `.scratch/` 目录。详见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+本仓库使用默认五个 triage 状态：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`。详见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+本仓库使用 single-context 领域文档布局：根目录 `CONTEXT.md`，以及存在时的 `docs/adr/`。详见 `docs/agents/domain.md`。
