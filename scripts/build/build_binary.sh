@@ -126,6 +126,14 @@ else
   ADD_DATA_SEP=":"
 fi
 
+native_path() {
+  if [ "$IS_WINDOWS" -eq 1 ] && command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 VERSION_DIST_DIR="$ROOT_DIR/dist/inbox-tool/$VERSION"
 WORK_DIR="$BUILD_ROOT/$PLATFORM"
 PYINSTALLER_WORK_DIR="$WORK_DIR/pyinstaller-work"
@@ -145,26 +153,33 @@ echo "platform: $PLATFORM"
 rm -rf "$WORK_DIR"
 mkdir -p "$PYINSTALLER_WORK_DIR" "$PYINSTALLER_DIST_DIR" "$PYINSTALLER_SPEC_DIR" "$PACKAGE_DIR/bin" "$VERSION_DIST_DIR"
 
+PYINSTALLER_WORK_ARG="$(native_path "$PYINSTALLER_WORK_DIR")"
+PYINSTALLER_DIST_ARG="$(native_path "$PYINSTALLER_DIST_DIR")"
+PYINSTALLER_SPEC_ARG="$(native_path "$PYINSTALLER_SPEC_DIR")"
+SRC_DIR_ARG="$(native_path "$SRC_DIR")"
+SOURCE_MANIFEST_ARG="$(native_path "$SOURCE_MANIFEST")"
+ENTRY_SCRIPT_ARG="$(native_path "$SRC_DIR/anna_inbox_executa/main.py")"
+
 PYINSTALLER_ARGS=(
   --onefile
   --name "$BINARY_BASENAME"
   --clean
   --noconfirm
   --noupx
-  --distpath "$PYINSTALLER_DIST_DIR"
-  --workpath "$PYINSTALLER_WORK_DIR"
-  --specpath "$PYINSTALLER_SPEC_DIR"
-  --paths "$SRC_DIR"
+  --distpath "$PYINSTALLER_DIST_ARG"
+  --workpath "$PYINSTALLER_WORK_ARG"
+  --specpath "$PYINSTALLER_SPEC_ARG"
+  --paths "$SRC_DIR_ARG"
   --collect-submodules mail_agent
   --collect-submodules executa_sdk
-  --add-data "$SOURCE_MANIFEST${ADD_DATA_SEP}."
+  --add-data "$SOURCE_MANIFEST_ARG${ADD_DATA_SEP}."
 )
 
 if [ "$IS_WINDOWS" -eq 0 ]; then
   PYINSTALLER_ARGS+=(--strip)
 fi
 
-PYINSTALLER_ARGS+=("$SRC_DIR/anna_inbox_executa/main.py")
+PYINSTALLER_ARGS+=("$ENTRY_SCRIPT_ARG")
 
 UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$BUILD_ROOT/.venv-$PLATFORM}" \
 UV_LINK_MODE="${UV_LINK_MODE:-copy}" \
