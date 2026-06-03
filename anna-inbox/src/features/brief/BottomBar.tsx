@@ -25,10 +25,6 @@ export function BottomBar() {
       </div>
       <div className="bar-actions">
         <div className="debug-provider-controls" aria-label="Debug providers">
-          <div className="debug-provider-group" role="radiogroup" aria-label="LLM provider">
-            <button className={`debug-provider-btn ${state.llmProvider === "dashscope" ? "is-active" : ""}`} onClick={() => actions.setProvider("llm", "dashscope")}>DashScope</button>
-            <button className={`debug-provider-btn ${state.llmProvider === "anna-llm" ? "is-active" : ""}`} onClick={() => actions.setProvider("llm", "anna-llm")}>Anna</button>
-          </div>
           <div className="debug-provider-group" role="radiogroup" aria-label="Storage provider">
             <button className={`debug-provider-btn ${state.storageProvider === "aps" ? "is-active" : ""}`} onClick={() => actions.setProvider("storage", "aps")}>APS</button>
             <button className={`debug-provider-btn ${state.storageProvider === "local" ? "is-active" : ""}`} onClick={() => actions.setProvider("storage", "local")}>Local</button>
@@ -37,7 +33,6 @@ export function BottomBar() {
         <button className="soft-btn" onClick={() => actions.setDrawer("scanPlan", true)}>Next Scan</button>
         <button className="soft-btn" onClick={() => actions.setView("ask")}>Ask</button>
         <button className="primary-btn" disabled={state.isScanning || !state.runtime.connected} onClick={() => void actions.startScan("manual")}>Scan now</button>
-        {cards.length > 0 ? <button className="soft-btn" style={{ color: "var(--muted)" }} onClick={() => void actions.clearAllCards()}>Clear</button> : null}
       </div>
     </footer>
   );

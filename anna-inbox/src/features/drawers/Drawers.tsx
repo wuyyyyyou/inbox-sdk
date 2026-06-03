@@ -43,16 +43,6 @@ function SourcesDrawer() {
             <div className="source-name">{state.mailbox}</div>
             <div className="source-meta">Gmail source · {modeLabel(state.strategyMode)}</div>
           </div>
-          <div className="mailbox-edit">
-            <label className="field-label" htmlFor="mailboxInput">Mailbox</label>
-            <div className="mailbox-input-row">
-              <input type="email" id="mailboxInput" value={state.mailboxInput} onChange={(e) => actions.setInput("mailboxInput", e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void actions.applyMailbox(); }} />
-              <button className="soft-btn" onClick={() => void actions.applyMailbox()}>Apply</button>
-            </div>
-          </div>
-          <div className="mailbox-actions">
-            <button className="soft-btn" disabled={state.isScanning} onClick={() => void actions.startScan("manual")}>Rescan</button>
-          </div>
         </article>
         <section className="config-block">
           <h3>Scan window</h3>

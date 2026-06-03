@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any
 
 from datetime import datetime, timezone, timedelta
@@ -33,9 +34,15 @@ def _fmt_ts(epoch_ms: str) -> str:
         return epoch_ms
 
 
+def _extract_email(from_addr: str) -> str:
+    """从 'Name <email>' 格式中提取纯 email 地址。"""
+    match = re.search(r"<([^>]+)>", from_addr)
+    return match.group(1).strip().lower() if match else from_addr.strip().lower()
+
+
 # ── Render context for prompt ─────────────────────────────────────
 
-def _render_context_for_prompt(ctx: CandidateContext) -> str:
+def _render_context_for_prompt(ctx: CandidateContext, owner_email: str = "") -> str:
     """Render candidate context as a string for the LLM prompt."""
     c = ctx.candidate
     parts: list[str] = []
@@ -57,21 +64,65 @@ def _render_context_for_prompt(ctx: CandidateContext) -> str:
     parts.append(f"Labels: {json.dumps(c.evidence.get('labels', []), ensure_ascii=False)}")
     parts.append(f"Matched signals: {json.dumps(c.evidence.get('matched_signals', []), ensure_ascii=False)}")
 
-    if ctx.type == "message_detail" and ctx.message:
-        m = ctx.message
-        parts.append(f"\n--- Full Message Body ---")
-        parts.append(f"Body text: {m.body_text[:1200]}")
+    body_and_thread = _render_body_and_thread(ctx, owner_email)
+    if body_and_thread:
+        parts.append(body_and_thread)
 
+    return "\n".join(parts)
+
+
+def _render_body_and_thread(ctx: CandidateContext, owner_email: str = "") -> str:
+    """只渲染消息体和线程上下文，不含候选元信息。
+
+    对于 thread_context：
+    - 如果用户回复过：从最后一条用户回复截断，只展示之后的连续收信
+    - 如果从未回复：展示全部线程消息
+    """
+    parts: list[str] = []
+    if ctx.type == "message_detail" and ctx.message:
+        parts.append(f"\n--- Full Message Body ---")
+        parts.append(f"Body text: {ctx.message.body_text[:1200]}")
     if ctx.type == "thread_context" and ctx.thread:
-        t = ctx.thread
-        parts.append(f"\n--- Thread Context ({len(t.messages)} messages) ---")
-        for i, msg in enumerate(t.messages):
-            parts.append(f"\nMessage {i+1}:")
+        msgs = list(ctx.thread.messages)
+        owner_lower = (owner_email or "").strip().lower()
+
+        # 从尾部向前找用户最后回复的位置
+        cut = -1
+        for i in range(len(msgs) - 1, -1, -1):
+            if _extract_email(msgs[i].from_addr) == owner_lower:
+                cut = i
+                break
+
+        if cut >= 0:
+            visible = msgs[cut:]
+            header = (f"\n--- Thread Context ({len(visible)} of {len(msgs)} messages, "
+                      f"since your last reply) ---")
+            footer = ("\n↑ Messages marked UNREPLIED need your attention. "
+                      "Your last reply is provided for context.")
+        else:
+            visible = msgs
+            header = (f"\n--- Thread Context ({len(visible)} messages, "
+                      f"no reply from you yet) ---")
+            footer = "\n↑ Focus on the most recent messages above."
+
+        parts.append(header)
+        for i, msg in enumerate(visible):
+            if cut >= 0 and i == 0:
+                label = " (your last reply)"
+            elif cut >= 0 and i == len(visible) - 1:
+                label = " ← LATEST UNREPLIED"
+            elif cut >= 0:
+                label = " ← UNREPLIED"
+            elif i == len(visible) - 1:
+                label = " ← LATEST"
+            else:
+                label = ""
+            parts.append(f"\nMessage {i+1}{label}:")
             parts.append(f"  From: {msg.from_addr}")
             parts.append(f"  Date: {_fmt_ts(msg.internal_date)}")
             parts.append(f"  Subject: {msg.subject}")
             parts.append(f"  Body: {msg.body_text[:400]}")
-
+        parts.append(footer)
     return "\n".join(parts)
 
 
@@ -225,7 +276,7 @@ Match by EMAIL ADDRESS (between < >), not by display name.
   DRAFT: user hasn't sent it yet → surface as unsent draft reminder.
 
 ## Email
-{_render_context_for_prompt(candidate_context)}
+{_render_context_for_prompt(candidate_context, mailbox_profile.mailbox_id)}
 
 ## User request
 {task_plan.raw_user_request}
@@ -255,12 +306,12 @@ Return a JSON object:
 - If the sender IS the mailbox owner: user_facing_summary MUST say "Unsent draft" not "Reply needed".
 - NEVER suggest send_email / delete_email / unsubscribe
 - Before output: re-read user_facing_recommendation. If it contains a time constraint ("before X", "by Friday", "today"), priority MUST NOT be low.
-- CRITICAL — Time format: NEVER use relative time words ("tomorrow", "next Monday", "this Friday", "yesterday", "in 2 days", "next week"). ALWAYS use absolute calendar dates from the email Date field (e.g. "Jun 3", "May 28, 2:30 PM"). If no date is available, say "recently" rather than guessing a relative day.
+- CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM". If no date is available, say "recently".
 - Output ONLY valid JSON"""
     return prompt
 
 
-def _render_context_for_batch_prompt(ctx: CandidateContext) -> str:
+def _render_context_for_batch_prompt(ctx: CandidateContext, owner_email: str = "") -> str:
     """把单个候选项压缩成批量评估提示词中的一段。"""
     c = ctx.candidate
     parts: list[str] = [
@@ -278,12 +329,42 @@ def _render_context_for_batch_prompt(ctx: CandidateContext) -> str:
         parts.append(f"Body: {ctx.message.body_text[:800]}")
     if ctx.type == "thread_context" and ctx.thread:
         thread_parts: list[str] = []
-        for i, msg in enumerate(ctx.thread.messages[:4], start=1):
+        msgs = list(ctx.thread.messages)
+        owner_lower = (owner_email or "").strip().lower()
+
+        # 从尾部向前找用户最后回复的位置
+        cut = -1
+        for i in range(len(msgs) - 1, -1, -1):
+            if _extract_email(msgs[i].from_addr) == owner_lower:
+                cut = i
+                break
+
+        if cut >= 0:
+            visible = msgs[cut:]
+            header = f"Thread ({len(visible)} of {len(msgs)} msgs, since your last reply):"
+            footer = "↑ Messages marked UNREPLIED need your attention."
+        else:
+            visible = msgs[-4:]
+            header = f"Thread ({len(visible)} of {len(msgs)} msgs, latest shown):"
+            footer = "↑ Focus on the most recent messages."
+
+        for i, msg in enumerate(visible):
+            if cut >= 0 and i == 0:
+                label = " (your last reply)"
+            elif cut >= 0 and i == len(visible) - 1:
+                label = " ← LATEST UNREPLIED"
+            elif cut >= 0:
+                label = " ← UNREPLIED"
+            elif i == len(visible) - 1:
+                label = " ← LATEST"
+            else:
+                label = ""
             thread_parts.append(
-                f"Message {i}: from={msg.from_addr}; date={_fmt_ts(msg.internal_date)}; "
+                f"Msg {i+1}{label}: from={msg.from_addr}; date={_fmt_ts(msg.internal_date)}; "
                 f"subject={msg.subject}; body={msg.body_text[:260]}"
             )
-        parts.append("Thread:\n" + "\n".join(thread_parts))
+        thread_parts.append(footer)
+        parts.append("\n".join(thread_parts))
     return "\n".join(parts)
 
 
@@ -304,7 +385,7 @@ def build_batch_judgment_prompt(
 
     rendered_items = []
     for index, ctx in enumerate(candidate_contexts, start=1):
-        rendered_items.append(f"### Candidate {index}\n{_render_context_for_batch_prompt(ctx)}")
+        rendered_items.append(f"### Candidate {index}\n{_render_context_for_batch_prompt(ctx, mailbox_profile.mailbox_id)}")
 
     rendered_text = chr(10).join(rendered_items)
     snooze_text = _render_snooze_prefs_context(snooze_prefs)
@@ -374,7 +455,7 @@ subject: {c.evidence.get('subject', '')}
 snippet: {c.evidence.get('snippet', '')}
 date: {c.evidence.get('date', '')}
 context_type: {ctx.type}
-{_render_context_for_batch_prompt(ctx)}
+{_render_body_and_thread(ctx, mailbox_profile.mailbox_id)}
 
 ## User request
 {task_plan.raw_user_request}
@@ -413,7 +494,7 @@ Allowed action: create_draft, create_reminder, save_note, do_nothing.
 - NEVER suggest send_email / delete_email / unsubscribe. Use create_draft for reply suggestions, create_reminder for things to review, save_note for info worth recording, do_nothing when no action is needed.
 - needs: concise category like "Reply to Kate", "Timing decision", "Receipt check", "Manual review".
 - Before output: re-read your suggestion. If it contains a time constraint, priority MUST NOT be low.
-- CRITICAL — Time format: NEVER use relative time words ("tomorrow", "next Monday", "this Friday", "yesterday", "in 2 days", "next week"). ALWAYS use absolute calendar dates from the email Date field (e.g. "Jun 3", "May 28, 2:30 PM"). If no date is available, say "recently" rather than guessing a relative day.
+- CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM". If no date is available, say "recently".
 - Output ONLY valid JSON."""
     return prompt
 

@@ -1,4 +1,3 @@
-export const DEFAULT_MAILBOX = "hr@anna.partners";
 export const MAILBOX_STORAGE_KEY = "anna-inbox-mailbox";
 export const DEFAULT_MODE = "default_secretary";
 export const POLL_INTERVAL_MS = 2500;
@@ -20,9 +19,9 @@ export const CATEGORY_NOTE: Record<string, string> = {
 
 export function getSavedMailbox(): string {
   try {
-    return localStorage.getItem(MAILBOX_STORAGE_KEY) || DEFAULT_MAILBOX;
+    return localStorage.getItem(MAILBOX_STORAGE_KEY) || "";
   } catch {
-    return DEFAULT_MAILBOX;
+    return "";
   }
 }
 

@@ -31,4 +31,4 @@ EXECUTA_SPEC="dir=$EXECUTA_DIR,tool_id=$TOOL_ID,type=python,command=env UV_PROJE
 export ANNA_INBOX_TOKEN_DIR="$SCRIPT_DIR/../scripts/google_token/.secrets/gmail_tokens"
 
 cd "$SCRIPT_DIR"
-exec anna-app dev --port "$PORT" --executa "$EXECUTA_SPEC" "$@"
+exec anna-app dev --port "$PORT" --executa "$EXECUTA_SPEC" --storage aps "$@"

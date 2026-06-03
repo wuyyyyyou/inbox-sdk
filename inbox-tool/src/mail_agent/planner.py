@@ -43,6 +43,8 @@ _PLANNER_SYSTEM_PROMPT = """You are Anna's scan planner. Given a natural-languag
   Use when: judging whether a reply is needed, drafting a reply, checking if an email is actionable.
 - "thread_context": The LLM needs the ENTIRE thread history (all messages in the conversation).
   Use when: summarizing a conversation, understanding relationship history, catching up on a discussion.
+  REQUIRED when: checking reply status, tracking follow-ups, negotiation status — any task where the LLM
+  needs to see who-said-what in order. The LLM must know message ordering and sender identity per thread.
 
 ## task_prompt — write this as if you are instructing a smart assistant
 
@@ -56,6 +58,9 @@ Your task_prompt MUST tell the LLM:
 1. What to look for in the emails
 2. How to group and organize findings into sections
 3. What kind of items to surface (people, threads, action items, etc.)
+4. For thread-aware tasks: instruct the LLM to check who sent the LATEST message in each thread —
+   if latest is from the mailbox owner → already handled; if from someone else → needs attention.
+   For multi-message exchanges: tell the LLM to describe the back-and-forth, note key turns.
 
 Do NOT include JSON output format in task_prompt — the execution system already has a fixed schema. Focus on analysis instructions only.
 
@@ -79,6 +84,12 @@ The mailbox owner is provided in the user request. Match by EMAIL ADDRESS.
 - User asks "what did I send" / "my outreach" / "proposals I sent" → use **in:sent**
 - User asks to see full conversations regardless of direction → **no direction filter**
 - User asks about collaboration / partnership threads → use **-in:sent -in:draft** (keep everything except own outgoing)
+- User asks about reply status / "did I reply" / "needs reply" / "have I responded" → **NO direction filter**.
+  The execution LLM needs BOTH sides to know who sent the latest message in each thread.
+- User asks "who hasn't replied to me" / "what am I waiting for" → include sent mail (in:sent or no filter).
+  The execution LLM needs to see threads where the user was the last sender.
+- User asks to summarize a conversation / catch up on a discussion → **NO direction filter**.
+  The execution LLM needs the complete back-and-forth.
 - Default (unclear intent): use **-in:sent -in:draft** — show everything except the user's own sent mail and drafts, since those were already handled by the user.
 
 ## Notes

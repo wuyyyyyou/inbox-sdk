@@ -188,10 +188,11 @@ export function BriefView() {
     );
   }
 
+  const n = state.actionCount || 0;
   const title = state.loading
     ? "Anna is waking up..."
-    : hasCards
-      ? `I found ${cards.length} thing${cards.length === 1 ? "" : "s"} worth your attention.`
+    : n > 0
+      ? `I found ${n} thing${n === 1 ? "" : "s"} worth your attention.`
       : totalScans > 0
         ? "No attention cards right now."
         : "Welcome to Anna Inbox.";

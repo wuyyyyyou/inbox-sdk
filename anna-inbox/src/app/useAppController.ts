@@ -6,10 +6,8 @@ import type { AppState, FrontendCard, RunStatus } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
-  MAILBOX_STORAGE_KEY,
   POLL_INTERVAL_MS,
   POLL_LIMIT,
-  isValidMailbox,
   requestForMode,
 } from "./constants";
 import { createInitialState } from "./state";
@@ -45,7 +43,7 @@ export interface AppActions {
   showToast(message: string): void;
   closeDrawers(): void;
   setView(view: "start" | "ask"): void;
-  setInput(field: "customScanInput" | "mailboxInput", value: string): void;
+  setInput(field: "customScanInput", value: string): void;
   setDraft(cardId: string, value: string): void;
   setRevision(cardId: string, value: string): void;
   setReplyMode(cardId: string, value: string): void;
@@ -58,8 +56,7 @@ export interface AppActions {
   setProvider(kind: "llm" | "storage", value: string): void;
   setDrawer(drawer: "sources" | "history" | "scanPlan", open: boolean): void;
   minimize(value: boolean): void;
-  applyMailbox(): Promise<void>;
-  checkGmailAuth(): Promise<void>;
+  checkGmailAuth(mailboxOverride?: string): Promise<{ authorized: boolean; source: string }>;
   loadActiveCards(): Promise<void>;
   loadRunHistory(): Promise<void>;
   loadCustomPlans(): Promise<void>;
@@ -84,6 +81,7 @@ export interface AppActions {
   updateAskDraft(key: string, value: string): void;
   cancelAskDraft(key: string): void;
   sendAskDraft(key: string, threadId: string, to: string): Promise<void>;
+  toggleAskHistory(idx: number): void;
   copyDraft(text: string): Promise<void>;
 }
 
@@ -127,13 +125,15 @@ export function useAppController() {
     });
   }, []);
 
-  const loadActiveCards = useCallback(async () => {
+  const loadActiveCards = useCallback(async (storageOverride?: string, mailboxOverride?: string) => {
+    const provider = storageOverride ?? state.storageProvider;
+    const mailbox = mailboxOverride ?? state.mailbox;
     try {
-      const payload = await client.loadActiveCards(state.mailbox, state.storageProvider);
+      const payload = await client.loadActiveCards(mailbox, provider);
       refreshStoredCardFields(payload.cards || []);
-      setState((s) => ({ ...s, cards: payload.cards || [], scanState: payload.scan_state || null, scanError: "", loading: false }));
+      setState((s) => ({ ...s, cards: payload.cards || [], actionCount: payload.action_count ?? 0, scanState: payload.scan_state || null, scanError: "", loading: false }));
     } catch (error) {
-      setState((s) => ({ ...s, scanError: error instanceof Error ? error.message : String(error), cards: [], scanState: null, loading: false }));
+      setState((s) => ({ ...s, scanError: error instanceof Error ? error.message : String(error), cards: [], actionCount: 0, scanState: null, loading: false }));
     }
   }, [client, refreshStoredCardFields, state.mailbox, state.storageProvider]);
 
@@ -146,30 +146,36 @@ export function useAppController() {
     }
   }, [client]);
 
-  const loadCustomPlans = useCallback(async () => {
+  const loadCustomPlans = useCallback(async (storageOverride?: string) => {
+    const provider = storageOverride ?? state.storageProvider;
     try {
-      const payload = await client.loadCustomPlans(state.storageProvider);
+      const payload = await client.loadCustomPlans(provider);
       setState((s) => ({ ...s, customPlans: Array.isArray(payload.plans) ? payload.plans : [] }));
     } catch {
       setState((s) => ({ ...s, customPlans: [] }));
     }
   }, [client, state.storageProvider]);
 
-  const loadScanPlan = useCallback(async () => {
+  const loadScanPlan = useCallback(async (mailboxOverride?: string) => {
+    const mailbox = mailboxOverride ?? state.mailbox;
     try {
-      const plan = await client.loadScanPlan(state.mailbox, state.storageProvider);
+      const plan = await client.loadScanPlan(mailbox, state.storageProvider);
       setState((s) => ({ ...s, scanPlan: plan }));
     } catch {
       setState((s) => ({ ...s, scanPlan: { time_range: "auto", max_messages: 50, schedule: "manual", include_newsletters: false, include_promotions: false } }));
     }
   }, [client, state.mailbox, state.storageProvider]);
 
-  const checkGmailAuth = useCallback(async () => {
+  const checkGmailAuth = useCallback(async (mailboxOverride?: string): Promise<{ authorized: boolean; source: string }> => {
+    const mailbox = mailboxOverride ?? state.mailbox;
     try {
-      const result = await client.checkGmailAuth(state.mailbox);
-      setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: Boolean(result && result.authorized), source: result.source || "none" } }));
+      const result = await client.checkGmailAuth(mailbox);
+      const status = { authorized: Boolean(result && result.authorized), source: (result && result.source) || "none" };
+      setState((s) => ({ ...s, gmailAuthStatus: { checked: true, ...status } }));
+      return status;
     } catch {
       setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: true, source: "unknown" } }));
+      return { authorized: true, source: "unknown" };
     }
   }, [client, state.mailbox]);
 
@@ -184,22 +190,37 @@ export function useAppController() {
     return {};
   }, [client]);
 
+  const discoverMailbox = useCallback(async (): Promise<string> => {
+    try {
+      const result = await client.getAuthorizedMailbox();
+      if (result?.mailbox) {
+        const email = String(result.mailbox);
+        setState((s) => ({ ...s, mailbox: email }));
+        return email;
+      }
+    } catch {
+      // keep current mailbox
+    }
+    return "";
+  }, [client]);
+
   const initialize = useCallback(async () => {
     const runtime = await getRuntime();
     setState((s) => ({ ...s, runtime, loading: runtime.connected ? s.loading : false }));
-    await checkGmailAuth();
+    const mailbox = await discoverMailbox();
+    const currentMailbox = mailbox || state.mailbox;
+    const auth = await checkGmailAuth(currentMailbox);
     if (runtime.connected) {
-      const auth: { authorized?: boolean; source?: string } = await client.checkGmailAuth(state.mailbox).catch(() => ({ authorized: true }));
       if (!auth.authorized) {
-        setState((s) => ({ ...s, loading: false, gmailAuthStatus: { checked: true, authorized: false, source: auth.source || "none" } }));
+        setState((s) => ({ ...s, loading: false }));
         return;
       }
       await loadRunHistory();
       await loadCustomPlans();
-      await loadScanPlan();
-      await loadActiveCards();
+      await loadScanPlan(currentMailbox);
+      await loadActiveCards(undefined, currentMailbox);
     }
-  }, [checkGmailAuth, client, getRuntime, loadActiveCards, loadCustomPlans, loadRunHistory, loadScanPlan, state.mailbox]);
+  }, [checkGmailAuth, client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadRunHistory, loadScanPlan, state.mailbox]);
 
   const actions: AppActions = {
     showToast,
@@ -207,7 +228,7 @@ export function useAppController() {
       setState((s) => ({ ...s, sourcesOpen: false, historyOpen: false, originalOpen: false, scanPlanOpen: false, selectedCard: null }));
     },
     setView(view) {
-      setState((s) => ({ ...s, view, customRunResult: view === "start" ? null : s.customRunResult, sourcesOpen: false, historyOpen: false, originalOpen: false, scanPlanOpen: false, lowerPriorityOpen: view === "start" ? false : s.lowerPriorityOpen }));
+      setState((s) => ({ ...s, view, sourcesOpen: false, historyOpen: false, originalOpen: false, scanPlanOpen: false, lowerPriorityOpen: view === "start" ? false : s.lowerPriorityOpen }));
       if (view === "ask") void loadCustomPlans();
     },
     setInput(field, value) {
@@ -249,9 +270,9 @@ export function useAppController() {
         setState((s) => ({ ...s, storageProvider: value, customPlans: [] }));
         showToast(value === "aps" ? "Storage: APS" : "Storage: local");
         setTimeout(() => {
-          void loadActiveCards();
+          void loadActiveCards(value);
           void loadRunHistory();
-          void loadCustomPlans();
+          void loadCustomPlans(value);
         }, 0);
       }
     },
@@ -267,39 +288,6 @@ export function useAppController() {
     },
     minimize(value) {
       setState((s) => ({ ...s, minimized: value }));
-    },
-    async applyMailbox() {
-      const nextMailbox = String(state.mailboxInput || "").trim().toLowerCase();
-      if (!isValidMailbox(nextMailbox)) {
-        showToast("Enter a valid email address");
-        return;
-      }
-      if (nextMailbox === state.mailbox) return;
-      try {
-        localStorage.setItem(MAILBOX_STORAGE_KEY, nextMailbox);
-      } catch {
-      }
-      setState((s) => ({
-        ...s,
-        mailbox: nextMailbox,
-        mailboxInput: nextMailbox,
-        cards: [],
-        selectedCard: null,
-        selectedCardDetail: null,
-        history: [],
-        scanPlan: null,
-        customPlans: [],
-        scanError: "",
-        gmailAuthStatus: { checked: false, authorized: false, source: "none" },
-      }));
-      showToast(`Mailbox: ${nextMailbox}`);
-      setTimeout(() => {
-        void checkGmailAuth();
-        void loadRunHistory();
-        void loadCustomPlans();
-        void loadScanPlan();
-        void loadActiveCards();
-      }, 0);
     },
     checkGmailAuth,
     loadActiveCards,
@@ -447,7 +435,7 @@ export function useAppController() {
     async clearAllCards() {
       try {
         await client.clearActiveCards(state.mailbox, state.storageProvider);
-        setState((s) => ({ ...s, cards: [], scanState: null, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {} }));
+        setState((s) => ({ ...s, cards: [], actionCount: 0, scanState: null, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {} }));
         showToast("All cards cleared.");
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
@@ -505,7 +493,7 @@ export function useAppController() {
         isCustomScanning: true,
         scanError: "",
         scanStatus: "Planning scan strategy...",
-        customRunResult: null,
+        askItemActions: {},
         customRunProgress: { runId: "", question: userRequest, status: "queued", stage: "planning", stageKey: "planning", progress: {}, partial: {}, startedAt: "" },
       }));
       try {
@@ -533,11 +521,12 @@ export function useAppController() {
         await loadRunHistory();
         await loadCustomPlans();
         const doneStatus = await client.getRun(started.run_id);
+        const result = buildCustomRunResult(started.run_id || "", doneStatus.result || {});
         setState((s) => ({
           ...s,
           scanStatus: "",
           customScanInput: "",
-          customRunResult: buildCustomRunResult(started.run_id || "", doneStatus.result || {}),
+          askHistory: [{ query: userRequest, result, timestamp: new Date().toISOString() }, ...s.askHistory],
           customRunProgress: null,
         }));
         showToast("Custom scan complete.");
@@ -557,7 +546,7 @@ export function useAppController() {
         isCustomScanning: true,
         scanError: "",
         scanStatus: "Re-running saved scan...",
-        customRunResult: null,
+        askItemActions: {},
         customRunProgress: { runId: "", question: plan?.user_request || "Re-run saved scan", status: "queued", stage: "planning_done", stageKey: "planning", progress: {}, partial: { plan: plan || {} }, startedAt: "" },
       }));
       try {
@@ -584,7 +573,9 @@ export function useAppController() {
         await loadRunHistory();
         await loadCustomPlans();
         const doneStatus = await client.getRun(started.run_id);
-        setState((s) => ({ ...s, scanStatus: "", customRunResult: buildCustomRunResult(started.run_id || "", doneStatus.result || {}), customRunProgress: null }));
+        const result = buildCustomRunResult(started.run_id || "", doneStatus.result || {});
+        const query = plan?.user_request || "Re-run saved scan";
+        setState((s) => ({ ...s, scanStatus: "", askHistory: [{ query, result, timestamp: new Date().toISOString() }, ...s.askHistory], customRunProgress: null }));
         showToast("Re-run complete.");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -661,6 +652,9 @@ export function useAppController() {
         setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [key]: { ...s.askItemActions[key], sending: false } } }));
         showToast(error instanceof Error ? error.message : String(error));
       }
+    },
+    toggleAskHistory(idx) {
+      setState((s) => ({ ...s, askHistoryExpanded: { ...s.askHistoryExpanded, [idx]: !s.askHistoryExpanded[idx] } }));
     },
     async copyDraft(text) {
       try {

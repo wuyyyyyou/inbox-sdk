@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -31,6 +32,22 @@ def _tool_root() -> Path:
 def _repo_root() -> Path:
     # mail_adapter.py lives at inbox-tool/src/mail_agent/mail_adapter.py.
     return Path(__file__).resolve().parents[3]
+
+
+def _is_platform() -> bool:
+    """检测是否运行在 Anna 平台（非本地 dev）。"""
+    if getattr(sys, "_MEIPASS", ""):
+        return True
+    if os.environ.get("GMAIL_ACCESS_TOKEN") or os.environ.get("GOOGLE_ACCESS_TOKEN"):
+        return True
+    return False
+
+
+def _data_root() -> Path:
+    """返回统一的数据根目录。"""
+    if _is_platform():
+        return Path("./.data/").resolve()
+    return _tool_root() / ".data"
 
 
 def sanitize_mailbox_id(mailbox: str) -> str:
@@ -71,8 +88,8 @@ def normalize_mailbox(mailbox: str) -> str:
 
 def cache_dir() -> Path:
     override = os.environ.get("ZHAOPY_MAIL_AGENT_DATA_DIR")
-    base = Path(override).expanduser().resolve() if override else _tool_root() / ".data"
-    path = base / "gmail_cache" / "mailboxes"
+    base = Path(override).expanduser().resolve() if override else _data_root() / "gmail_cache"
+    path = base / "mailboxes"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

@@ -92,6 +92,7 @@ export interface ScanState {
 export interface ActiveCardsPayload {
   cards: FrontendCard[];
   count?: number;
+  action_count?: number;
   scan_state?: ScanState;
 }
 
@@ -209,10 +210,10 @@ export interface AppState {
   runtime: RuntimeState;
   view: MainView;
   mailbox: string;
-  mailboxInput: string;
   strategyMode: string;
   loading: boolean;
   cards: FrontendCard[];
+  actionCount: number;
   scanState: ScanState | null;
   history: RunHistoryEntry[];
   scanStatus: string;
@@ -255,4 +256,12 @@ export interface AppState {
   gmailAuthStatus: GmailAuthStatus;
   askItemActions: Record<string, { read?: boolean; trashed?: boolean; replied?: boolean; sending?: boolean }>;
   askEditDraft: Record<string, string>;
+  askHistory: AskHistoryEntry[];
+  askHistoryExpanded: Record<number, boolean>;
+}
+
+export interface AskHistoryEntry {
+  query: string;
+  result: CustomRunResult;
+  timestamp: string;
 }

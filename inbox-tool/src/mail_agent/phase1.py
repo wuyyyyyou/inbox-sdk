@@ -86,7 +86,7 @@ Self-check: before outputting, re-read your own reason. If the reason says
 the email is "useful", requires "awareness", "attention", or contains a
 "signal" or "deadline", user_action CANNOT be ignore — use review instead.
 
-CRITICAL — Time format: NEVER use relative time ("tomorrow", "next Monday", "this Friday"). ALWAYS use absolute calendar dates (e.g. "Jun 3", "May 28, 2:30 PM"). The Date field in each header is already in absolute format — use it directly.
+CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM". The Date field in each header is already in absolute format — use it directly.
 
 ## Output Constraint
 Your entire response must be a single JSON object. The very first character you output must be `{`. Do NOT wrap the JSON in markdown fences. Do NOT write any text before or after the JSON."""

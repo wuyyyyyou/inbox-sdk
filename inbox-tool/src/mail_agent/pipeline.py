@@ -57,7 +57,7 @@ async def _determine_scan_window(mailbox: str) -> int:
     断档 >7 天 → 7天
     """
     if not _storage_ready():
-        return 3
+        raise RuntimeError("Storage not available — please check APS authorization")
 
     try:
         from .storage_ops import get_scan_state
@@ -66,7 +66,7 @@ async def _determine_scan_window(mailbox: str) -> int:
         return 3
 
     if state.total_scans == 0 or not state.last_scan_ts:
-        return 7
+        return 10
 
     from datetime import datetime, timezone, timedelta
     beijing_tz = timezone(timedelta(hours=8))
@@ -157,6 +157,38 @@ def _dedupe_by_thread(messages: list[Any]) -> list[Any]:
         # else: 纯 SENT → 丢弃
 
     return result
+
+
+def _thread_latest_is_from_owner(mailbox: str, thread_id: str, owner_email: str) -> bool:
+    """通过 Gmail API 检查线程最新一封是否来自用户本人（即已回复过）。"""
+    import re
+    import urllib.parse
+    from .mail_adapter import gmail_request
+
+    try:
+        path = f"/users/me/threads/{urllib.parse.quote(thread_id, safe='')}"
+        data = gmail_request(mailbox, path, {"fields": "messages(id,internalDate,payload/headers)"})
+    except Exception:
+        return False
+
+    messages = data.get("messages") or []
+    if not messages:
+        return False
+
+    latest = max(messages, key=lambda m: int(m.get("internalDate", "0") or 0))
+    headers = (latest.get("payload") or {}).get("headers") or []
+
+    from_addr = ""
+    for h in headers:
+        if (h.get("name") or "").lower() == "from":
+            from_addr = h.get("value") or ""
+            break
+
+    match = re.search(r"<([^>]+)>", from_addr)
+    if match:
+        from_addr = match.group(1)
+
+    return from_addr.strip().lower() == (owner_email or "").strip().lower()
 
 
 async def _get_scan_plan_config(mailbox: str) -> Any | None:
@@ -252,6 +284,19 @@ async def run_mail_task(
 
     new_messages = _dedupe_by_thread(new_messages)
     _report_progress(progress_callback, "thread_dedup", before=len(new_id_set), after=len(new_messages))
+
+    # 过滤已回复线程：最新一封来自用户本人 → 已处理过，跳过
+    already_replied_count = 0
+    filtered_messages: list[Any] = []
+    for m in new_messages:
+        tid = m.thread_id or m.message_id
+        if _thread_latest_is_from_owner(input_.mailbox_id, tid, input_.mailbox_id):
+            already_replied_count += 1
+            continue
+        filtered_messages.append(m)
+    if already_replied_count:
+        _report_progress(progress_callback, "already_replied_filter", filtered=already_replied_count)
+    new_messages = filtered_messages
 
     _report_progress(progress_callback, "phase1", scanned=len(new_messages))
     phase1_result = await run_phase1_batch_classify(new_messages, strategy, mailbox_profile, sampling_create_message)
@@ -395,7 +440,7 @@ async def run_mail_task(
     return action_plan
 
 
-_EXECUTION_SYSTEM_PROMPT = """You are Anna, an executive email assistant. Analyze the emails below based on the task instructions. Output a single JSON object — the very first character of your response MUST be `{`. Do NOT wrap the JSON in markdown fences.
+_EXECUTION_SYSTEM_PROMPT = """You are Anna, an executive email assistant. The mailbox owner is your principal — address them directly as "you" in all title, summary, context, and suggestion text. Analyze the emails below based on the task instructions. Output a single JSON object — the very first character of your response MUST be `{`. Do NOT wrap the JSON in markdown fences.
 
 ## Output format
 {
@@ -439,7 +484,7 @@ _EXECUTION_SYSTEM_PROMPT = """You are Anna, an executive email assistant. Analyz
 - Base your answer ONLY on the emails provided. If nothing matches, say so in summary.
 - Use verifiable facts from the emails — no speculation, no AI reasoning.
 - Be specific in suggestions. Avoid generic 'evaluate and respond.'
-- CRITICAL — Time format: NEVER use relative time ("tomorrow", "next Monday", "this Friday", "yesterday", "in 2 days", "next week"). ALWAYS use absolute calendar dates from the email Date field (e.g. "Jun 3", "May 28, 2:30 PM"). If no date is available, say "recently" rather than guessing a relative day."""
+- CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM". If no date is available, say "recently"."""
 
 
 async def run_custom_scan(
@@ -566,12 +611,14 @@ async def run_custom_scan(
 
     def _build_user_prompt(rendered_emails: str) -> str:
         # 中文注释：执行阶段会多次降载重试，只替换邮件正文渲染，保持任务约束一致。
-        return f"""## Mailbox Owner
-You are evaluating mail for: {mailbox}
+        return f"""## Your Identity
+You are Anna, executive assistant to {mailbox}.
+In all output text, address your principal directly as "you" / "your".
+Say "You received an email from Sarah" — NOT "the user received" or "Kate received".
 Match by EMAIL ADDRESS (between < >), not by display name.
-- If the sender's email IS the mailbox owner → this is OUTGOING mail (sent or draft).
-  SENT: the user already sent it. Include or exclude based on the user's request.
-  DRAFT: the user started writing but didn't send yet.
+- If the sender's email IS your principal → this is OUTGOING mail (sent or draft).
+  SENT: your principal already sent it. Include or exclude based on the user's request.
+  DRAFT: your principal started writing but didn't send yet.
 
 ## User request
 {plan.user_request}

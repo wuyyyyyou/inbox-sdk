@@ -7,10 +7,10 @@ export function createInitialState(): AppState {
     runtime: { connected: false, mode: "connecting" },
     view: "start",
     mailbox,
-    mailboxInput: mailbox,
     strategyMode: DEFAULT_MODE,
     loading: true,
     cards: [],
+    actionCount: 0,
     scanState: null,
     history: [],
     scanStatus: "",
@@ -44,7 +44,7 @@ export function createInitialState(): AppState {
     minimized: false,
     resultFilter: "all",
     llmProvider: "anna-llm",
-    storageProvider: "aps",
+    storageProvider: "local",
     generatingDraft: false,
     draftDots: "",
     summarizingThread: false,
@@ -53,5 +53,7 @@ export function createInitialState(): AppState {
     gmailAuthStatus: { checked: false, authorized: true },
     askItemActions: {},
     askEditDraft: {},
+    askHistory: [],
+    askHistoryExpanded: {},
   };
 }

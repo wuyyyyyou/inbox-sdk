@@ -79,7 +79,7 @@ Output a JSON object with these fields:
 - tone: neutral | warm | urgent | waiting
 
 Keep it factual. Do not invent details not present in the thread.
-CRITICAL — Time format: NEVER use relative time ("tomorrow", "next Monday"). ALWAYS use absolute dates (e.g. "Jun 3", "May 28, 2:30 PM")."""
+CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM"."""
 
 
 def build_thread_summary_prompt(thread_context: dict[str, Any], card: PersistentCard) -> str:
@@ -118,7 +118,7 @@ Guidelines:
 - If no existing draft, generate from scratch based on the thread and user instructions
 - Never make commitments or promises on the user's behalf
 - Do not include email headers (To, From, CC) in the body
-- CRITICAL — Time format: NEVER use relative time ("tomorrow", "next Monday"). ALWAYS use absolute dates (e.g. "Jun 3", "May 28, 2:30 PM")."""
+- CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM"."""
 
 
 def _build_draft_prompt(

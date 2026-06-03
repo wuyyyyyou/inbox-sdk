@@ -1,6 +1,6 @@
 [project]
 name = "anna-inbox-executa"
-version = "1.0.2"
+version = "1.0.4"
 description = "Anna Executa mail agent."
 requires-python = ">=3.10"
 dependencies = []

@@ -449,6 +449,8 @@ def cards_to_frontend(cards: ActiveCards) -> list[dict[str, Any]]:
     """Serialize active cards to the V2 frontend format."""
     result: list[dict[str, Any]] = []
     for card in cards.cards:
+        if card.status in ("resolved", "dismissed"):
+            continue
         frontend_card: dict[str, Any] = {
             "id": card.card_id,
             "title": card.title,

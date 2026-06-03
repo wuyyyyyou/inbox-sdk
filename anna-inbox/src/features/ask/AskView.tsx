@@ -1,5 +1,5 @@
 import { useApp } from "../../app/AppContext";
-import type { CustomPlanQuery, CustomRunResult, CustomRunResultItem } from "../../types/mail";
+import type { AskHistoryEntry, CustomPlanQuery, CustomRunResult, CustomRunResultItem } from "../../types/mail";
 import { formatBeijingTimestamp, normalizeSubject } from "../../shared/format";
 import { CUSTOM_PROGRESS_STEPS, customStageCopy } from "../brief/runHelpers";
 
@@ -178,8 +178,27 @@ function CustomRunResultCard({ result }: { result: CustomRunResult }) {
   );
 }
 
+function HistoryEntry({ entry, index }: { entry: AskHistoryEntry; index: number }) {
+  const { state, actions } = useApp();
+  const expanded = state.askHistoryExpanded[index] || false;
+  return (
+    <div className="history-list-item" onClick={() => actions.toggleAskHistory(index)} style={{ cursor: "pointer" }}>
+      <p className="history-item-head">
+        <span className="history-arrow">{expanded ? "▾" : "▸"}</span>
+        <strong>{entry.query.slice(0, 60)}{entry.query.length > 60 ? "…" : ""}</strong>
+        <span className="history-item-time">{formatBeijingTimestamp(entry.timestamp)}</span>
+      </p>
+      {expanded ? <CustomRunResultCard result={entry.result} /> : null}
+    </div>
+  );
+}
+
 export function AskView() {
   const { state, actions } = useApp();
+  const latest = state.askHistory.length > 0 ? state.askHistory[0] : null;
+  const older = state.askHistory.length > 1 ? state.askHistory.slice(1) : [];
+  const isRunning = state.isCustomScanning || !!(state.customRunProgress && state.customRunProgress.status !== "failed");
+
   return (
     <div className="ask-layout">
       <section className="assistant-card">
@@ -187,18 +206,35 @@ export function AskView() {
         <h1 className="assistant-says">Ask Anna to do a custom scan</h1>
         <p className="assistant-copy">Describe what you need in natural language. Anna will scan {state.mailbox} based on your request without changing your default daily briefing.</p>
       </section>
-      <section className="composer-card">
-        <textarea id="customScanInput" placeholder="e.g. Find all unread emails and check which need a reply..." rows={3} value={state.customScanInput} onChange={(e) => actions.setInput("customScanInput", e.target.value)} />
-        <div className="proposal-actions" style={{ justifyContent: "flex-end" }}>
-          <button className="primary-btn" disabled={state.isCustomScanning} onClick={() => void actions.startCustomScan()}>{state.isCustomScanning ? "Planning & scanning..." : "Run custom scan"}</button>
+      <section className="ask-composer" aria-label="Custom scan prompt">
+        <textarea
+          className="ask-composer-input"
+          id="customScanInput"
+          placeholder="e.g. Find all unread emails and check which need a reply..."
+          rows={1}
+          value={state.customScanInput}
+          onChange={(e) => actions.setInput("customScanInput", e.target.value)}
+          onInput={(e) => { const t = e.currentTarget; t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 160) + "px"; }}
+        />
+        <div className="ask-composer-footer">
+          <span className="ask-composer-hint">{isRunning ? "Anna is scanning" : "Custom mailbox scan"}</span>
+          <button className="ask-run-btn" disabled={isRunning} onClick={() => void actions.startCustomScan()} aria-label="Run custom scan">{isRunning ? "..." : "Run"}</button>
         </div>
       </section>
-      {state.customRunProgress && !state.customRunResult ? <AskProgress /> : null}
-      {state.scanError ? <section className="custom-error-card">{state.scanError}</section> : null}
-      {state.customRunResult ? <CustomRunResultCard result={state.customRunResult} /> : null}
+      {isRunning && state.customRunProgress ? <AskProgress /> : null}
+      {state.scanError && !isRunning ? <section className="custom-error-card">{state.scanError}</section> : null}
+
+      {latest ? <CustomRunResultCard result={latest.result} /> : null}
+
+      {older.length ? (
+        <section className="noticed-section">
+          {older.map((entry, idx) => <HistoryEntry key={idx} entry={entry} index={idx + 1} />)}
+        </section>
+      ) : null}
+
       {state.customPlans.length ? (
         <section className="noticed-section">
-          <h2 className="noticed-title">Past custom scans</h2>
+          <h2 className="noticed-title">Saved scan plans</h2>
           <p className="noticed-subtitle">Click Re-run to execute a saved plan again without re-planning.</p>
           <div className="history-list">
             {state.customPlans.map((plan) => {

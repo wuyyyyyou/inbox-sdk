@@ -69,6 +69,10 @@ export class MailAgentClient {
     }
   }
 
+  getAuthorizedMailbox() {
+    return this.invoke<{ mailbox?: string; source?: string }>("get_authorized_email");
+  }
+
   checkGmailAuth(mailbox: string) {
     return this.invoke<{ authorized?: boolean; source?: string }>("check_gmail_auth", { mailbox });
   }

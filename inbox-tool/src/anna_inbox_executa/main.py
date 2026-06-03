@@ -32,12 +32,28 @@ _SRC_DIR = str(Path(__file__).resolve().parents[1])
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
+
+def _is_platform() -> bool:
+    """检测是否运行在 Anna 平台（非本地 dev）。"""
+    if getattr(sys, "_MEIPASS", ""):
+        return True
+    if os.environ.get("GMAIL_ACCESS_TOKEN") or os.environ.get("GOOGLE_ACCESS_TOKEN"):
+        return True
+    return False
+
+
+def data_root() -> Path:
+    """返回统一的数据根目录。平台模式用 CWD/.data，本地 dev 用 src/.data。"""
+    if _is_platform():
+        return Path("./.data/").resolve()
+    return (Path(__file__).resolve().parents[1] / ".data").resolve()
+
 from executa_sdk import PROTOCOL_VERSION_V2, SamplingClient, SamplingError
 from executa_sdk.storage import StorageClient, FilesClient, StorageError, make_response_router
 
 JSONRPC_VERSION = "2.0"
 DEFAULT_TOOL_ID = "inbox-tool"
-DEFAULT_VERSION = "1.0.2"
+DEFAULT_VERSION = "1.0.4"
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 STDOUT_LOCK = threading.Lock()
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
@@ -63,30 +79,16 @@ DEFAULT_MANIFEST = {
             "name": "GMAIL_ACCESS_TOKEN",
             "display_name": "Gmail Access Token",
             "description": "Optional Google OAuth access token. Local token files are used when platform injection is unavailable.",
-            "required": False,
+            "required": True,
             "sensitive": True,
         },
         {
             "name": "GOOGLE_ACCESS_TOKEN",
             "display_name": "Google Access Token",
             "description": "Alternative Google OAuth access token name supported by Anna platform credential mapping.",
-            "required": False,
+            "required": True,
             "sensitive": True,
-        },
-        {
-            "name": "DASHSCOPE_API_KEY",
-            "display_name": "DashScope API Key",
-            "description": "DashScope API key used by the mail-agent LLM evaluator.",
-            "required": False,
-            "sensitive": True,
-        },
-        {
-            "name": "DASHSCOPE_MODEL",
-            "display_name": "DashScope Model",
-            "description": "Optional DashScope model override. Defaults to qwen3-max.",
-            "required": False,
-            "sensitive": False,
-        },
+        }
     ],
     "tools": [
         {
@@ -596,7 +598,7 @@ def _normalize_storage_provider(value: Any = "") -> str:
         return "aps"
     if raw in {"local", "local-json", "json", "file"}:
         return "local"
-    return "aps"
+    return "local"
 
 
 _aps_storage = StorageClient(write_frame=write_frame)
@@ -604,7 +606,7 @@ _aps_files = FilesClient(write_frame=write_frame)
 _aps_route_storage_response = make_response_router(_aps_storage, _aps_files)
 
 from mail_agent.local_storage import make_local_clients
-_local_data_dir = Path(os.environ.get("ZHAOPY_MAIL_AGENT_STORAGE_DIR") or (Path(__file__).resolve().parents[1] / ".local_storage")).expanduser().resolve()
+_local_data_dir = Path(os.environ.get("ZHAOPY_MAIL_AGENT_STORAGE_DIR") or data_root()).expanduser().resolve()
 _local_storage, _local_files = make_local_clients(_local_data_dir)
 
 from mail_agent.storage_client import init as init_storage_singleton
@@ -645,7 +647,7 @@ loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
 loop_thread.start()
 MAIL_AGENT_RUNS: dict[str, dict[str, Any]] = {}
 RUN_STATE_LOCK = threading.RLock()
-RUN_CHECKPOINT_DIR = Path(__file__).resolve().parents[1] / ".local_storage" / "runs" / "background"
+RUN_CHECKPOINT_DIR = data_root() / "runs" / "background"
 
 
 def _run_checkpoint_path(run_id: str) -> Path:
@@ -820,8 +822,8 @@ def token_dir() -> Path:
 
 def cache_dir() -> Path:
     override = os.environ.get("ZHAOPY_MAIL_AGENT_DATA_DIR")
-    base = Path(override).expanduser().resolve() if override else tool_root() / ".data"
-    path = base / "gmail_cache" / "mailboxes"
+    base = Path(override).expanduser().resolve() if override else data_root() / "gmail_cache"
+    path = base / "mailboxes"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -1855,9 +1857,12 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
         "total_processed": getattr(state, "total_processed", 0),
     }
 
+    action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
+
     return {
         "cards": cards_to_frontend(active),
         "count": len(active.cards),
+        "action_count": action_count,
         "scan_state": scan_state,
     }
 
@@ -2372,7 +2377,17 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     if tool == "get_authorized_email":
         from mail_agent.mail_adapter import get_authorized_email
         email = get_authorized_email()
-        return {"success": True, "tool": tool, "data": {"email": email}}
+        if email:
+            return {"success": True, "tool": tool, "data": {"mailbox": email, "source": "platform"}}
+        # 本地 dev：扫描 gmail_tokens 目录
+        td = token_dir()
+        if td.exists():
+            for f in sorted(td.iterdir()):
+                if f.suffix == ".json" and f.stem != "default":
+                    local_email = f.stem.replace("_", "@", 1) if "_" in f.stem else f.stem
+                    if "@" in local_email:
+                        return {"success": True, "tool": tool, "data": {"mailbox": local_email, "source": "local_tokens"}}
+        return {"success": True, "tool": tool, "data": {"mailbox": "", "source": "none"}}
     if tool == "get_custom_plans":
         return {"success": True, "tool": tool, "data": _sync_get_custom_plans()}
     if tool == "get_custom_plan_detail":
@@ -2504,7 +2519,7 @@ def handle_line(line: str) -> None:
 
 def main() -> None:
     # Write startup log so we can diagnose harness crashes even without stderr.
-    _diag_dir = (Path(__file__).resolve().parents[1] / ".local_storage")
+    _diag_dir = data_root() / "diagnostics"
     _diag_dir.mkdir(parents=True, exist_ok=True)
     _diag_path = _diag_dir / "agent_startup.log"
     with open(_diag_path, "a", encoding="utf-8") as _df:

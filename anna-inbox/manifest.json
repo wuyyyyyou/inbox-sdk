@@ -16,7 +16,7 @@
   "required_executas": [
     {
       "tool_id": "tool-zhaopy-inbox-tool-373sf2et",
-      "min_version": "1.0.2"
+      "min_version": "1.0.4"
     }
   ],
   "optional_executas": [],
