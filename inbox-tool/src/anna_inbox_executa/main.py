@@ -747,11 +747,17 @@ def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
         sampling.disable(
             f"host did not negotiate v2 (got {protocol_version!r}); sampling/createMessage requires Executa protocol 2.0"
         )
+        _aps_storage.disable(
+            f"host did not negotiate v2 (got {protocol_version!r}); APS storage reverse RPC requires Executa protocol 2.0"
+        )
+        _aps_files.disable(
+            f"host did not negotiate v2 (got {protocol_version!r}); APS files reverse RPC requires Executa protocol 2.0"
+        )
     return {
         "protocolVersion": PROTOCOL_VERSION_V2 if v2 else "1.1",
         "serverInfo": {"name": TOOL_ID, "version": VERSION},
-        "client_capabilities": {"sampling": {}, "storage": {}} if v2 else {},
-        "capabilities": {"storage": {}} if v2 else {},
+        "client_capabilities": {"sampling": {}, "storage": {"kv": True}} if v2 else {},
+        "capabilities": {"storage": {"kv": True}} if v2 else {},
     }
 
 

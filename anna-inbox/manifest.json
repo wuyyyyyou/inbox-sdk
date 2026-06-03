@@ -15,8 +15,8 @@
   ],
   "required_executas": [
     {
-      "tool_id": "tool-zhaopy-inbox-tool-373sf2et",
-      "min_version": "1.0.2"
+      "tool_id": "tool-lightvoss-inbox-znperv24",
+      "min_version": "1.0.1"
     }
   ],
   "optional_executas": [],
@@ -54,7 +54,7 @@
     ],
     "host_api": {
       "tools": [
-        "required:tool-zhaopy-inbox-tool-373sf2et"
+        "required:tool-lightvoss-inbox-znperv24"
       ],
       "chat": [
         "write_message"
