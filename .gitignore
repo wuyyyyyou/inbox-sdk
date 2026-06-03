@@ -36,3 +36,5 @@ uv.lock
 docs/agents/
 docs/adr/
 **/.secrets/
+**/.data
+**/.local_storage
