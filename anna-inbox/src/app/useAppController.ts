@@ -2,7 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { AppState, FrontendCard, RunStatus } from "../types/mail";
+import type { AppState, FrontendCard, RunStatus, SamplingTestResult } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -61,6 +61,7 @@ export interface AppActions {
   loadRunHistory(): Promise<void>;
   loadCustomPlans(): Promise<void>;
   loadScanPlan(): Promise<void>;
+  testAnnaSampling(): Promise<void>;
   saveScanPlanField(field: string, value: unknown): Promise<void>;
   startScan(reason?: string): Promise<void>;
   openCard(cardId: string): Promise<void>;
@@ -294,6 +295,27 @@ export function useAppController() {
     loadRunHistory,
     loadCustomPlans,
     loadScanPlan,
+    async testAnnaSampling() {
+      if (!state.runtime.connected || state.samplingTestRunning) return;
+      setState((s) => ({ ...s, samplingTestRunning: true, samplingTestResult: null }));
+      try {
+        const result = await client.testAnnaSampling();
+        setState((s) => ({ ...s, samplingTestResult: result }));
+        const diagnostics = result.diagnostics || {};
+        const tokenText = diagnostics.context_has_sampling_token ? "token yes" : "token no";
+        const invokeText = diagnostics.context_has_invoke_id ? "invoke yes" : "invoke no";
+        showToast(result.success ? `Anna sampling OK (${tokenText}, ${invokeText})` : `Anna sampling failed (${tokenText}, ${invokeText})`);
+      } catch (error) {
+        const result: SamplingTestResult = {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+        setState((s) => ({ ...s, samplingTestResult: result }));
+        showToast(result.error || "Anna sampling failed");
+      } finally {
+        setState((s) => ({ ...s, samplingTestRunning: false }));
+      }
+    },
     async saveScanPlanField(field, value) {
       try {
         await client.saveScanPlanField(state.mailbox, state.storageProvider, field, value);

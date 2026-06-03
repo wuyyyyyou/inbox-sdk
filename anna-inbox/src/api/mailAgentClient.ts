@@ -6,6 +6,7 @@ import type {
   RunStatus,
   RuntimeState,
   ScanPlan,
+  SamplingTestResult,
 } from "../types/mail";
 import appManifest from "../../manifest.json";
 
@@ -87,6 +88,10 @@ export class MailAgentClient {
 
   loadScanPlan(mailbox: string, storageProvider: string) {
     return this.invoke<ScanPlan>("get_scan_plan", { mailbox, storage_provider: storageProvider });
+  }
+
+  testAnnaSampling() {
+    return this.invoke<SamplingTestResult>("test_anna_sampling", { max_tokens: 64 }, { timeoutMs: 120000 });
   }
 
   saveScanPlanField(mailbox: string, storageProvider: string, field: string, value: unknown) {

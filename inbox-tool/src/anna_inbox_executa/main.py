@@ -746,15 +746,9 @@ def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
     protocol_version = str((params or {}).get("protocolVersion") or "1.1")
     v2 = protocol_version == PROTOCOL_VERSION_V2
     if not v2:
-        manifest_has_llm = "llm.sample" in MANIFEST.get("host_capabilities", [])
-        lines = [
-            "Sampling unavailable — pre-condition check:",
-            f"  [{'OK' if manifest_has_llm else 'MISSING'}  ] Executa manifest host_capabilities includes 'llm.sample'",
-            f"  [{'OK' if v2 else 'FAILED'}] Host protocol is 2.0 (got {protocol_version!r})",
-            f"  [UNKNOWN] App manifest includes 'llm.sample' in host_capabilities — check Anna platform",
-            f"  [UNKNOWN] User granted sampling permission — check Anna platform Settings → App Permissions",
-        ]
-        sampling.disable("\n".join(lines))
+        sampling.disable(
+            f"host did not negotiate v2 (got {protocol_version!r}); sampling/createMessage requires Executa protocol 2.0"
+        )
     return {
         "protocolVersion": PROTOCOL_VERSION_V2 if v2 else "1.1",
         "serverInfo": {"name": TOOL_ID, "version": VERSION},
@@ -1259,19 +1253,27 @@ async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]
     }
 
 
-async def run_anna_sampling_text(arguments: dict[str, Any], invoke_id: str, *, tool_name: str, default_max_tokens: int) -> dict[str, Any]:
-    """调用 Anna sampling/createMessage，并返回文本结果。"""
+async def run_anna_sampling_text(arguments: dict[str, Any], invoke_id: str, *, tool_name: str, default_max_tokens: int, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    """调用 Anna sampling/createMessage，并返回文本结果和上下文诊断。"""
     from mail_agent.llm import extract_sampling_text
 
+    context = context if isinstance(context, dict) else {}
     prompt = str(arguments.get("message") or arguments.get("prompt") or "").strip()
     if not prompt:
-        return {"success": False, "error": "message is required"}
+        prompt = "Reply with one short JSON object: {\"ok\": true, \"message\": \"sampling works\"}."
 
     max_tokens = int(arguments.get("max_tokens") or default_max_tokens)
     temperature = float(arguments.get("temperature") if arguments.get("temperature") is not None else 0.2)
+    metadata_invoke_id = invoke_id or f"local_{uuid.uuid4().hex}"
     metadata = {
-        "executa_invoke_id": invoke_id or f"local_{uuid.uuid4().hex}",
+        "executa_invoke_id": metadata_invoke_id,
         "tool": tool_name,
+    }
+    diagnostics = {
+        "context_has_invoke_id": bool(str(context.get("invoke_id") or "").strip()),
+        "context_has_sampling_token": bool(str(context.get("sampling_token") or "").strip()),
+        "manifest_has_llm_sample": "llm.sample" in MANIFEST.get("host_capabilities", []),
+        "metadata_invoke_id": metadata_invoke_id,
     }
     model_preference = str(arguments.get("model_preference") or "").strip()
     model_preferences = {"hints": [{"name": model_preference}]} if model_preference else None
@@ -1301,6 +1303,7 @@ async def run_anna_sampling_text(arguments: dict[str, Any], invoke_id: str, *, t
             "error": exc.message,
             "error_code": exc.code,
             "error_data": exc.data,
+            "diagnostics": diagnostics,
             "started_at": started_at,
             "finished_at": beijing_now(),
             "elapsed_ms": int((time.time() - started) * 1000),
@@ -1314,15 +1317,16 @@ async def run_anna_sampling_text(arguments: dict[str, Any], invoke_id: str, *, t
         "model": result.get("model") if isinstance(result, dict) else None,
         "usage": result.get("usage") if isinstance(result, dict) else None,
         "stop_reason": result.get("stopReason") if isinstance(result, dict) else None,
+        "diagnostics": diagnostics,
         "started_at": started_at,
         "finished_at": beijing_now(),
         "elapsed_ms": int((time.time() - started) * 1000),
     }
 
 
-async def run_anna_sampling_smoke(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
+async def run_anna_sampling_smoke(arguments: dict[str, Any], invoke_id: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
     """只验证 Anna sampling/createMessage 的最小链路。"""
-    return await run_anna_sampling_text(arguments, invoke_id, tool_name="test_anna_sampling", default_max_tokens=64)
+    return await run_anna_sampling_text(arguments, invoke_id, tool_name="test_anna_sampling", default_max_tokens=64, context=context)
 
 
 async def run_aps_storage_smoke(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2333,8 +2337,10 @@ def _serialize_card_for_frontend(card: Any) -> dict[str, Any]:
 def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     tool = params.get("tool")
     arguments = params.get("arguments") or {}
-    context = params.get("context") or {}
-    invoke_id = str(params.get("invoke_id") or "")
+    raw_context = params.get("context") or {}
+    context = raw_context if isinstance(raw_context, dict) else {}
+    # 中文注释：Anna v2 按文档把 invoke_id 放在 context 里，sampling metadata 必须使用这个值。
+    invoke_id = str(context.get("invoke_id") or params.get("invoke_id") or "")
     apply_runtime_credentials(context)
     _apply_storage_provider(arguments)
 
@@ -2348,7 +2354,7 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError(json.dumps({"code": exc.code, "message": exc.message, "data": exc.data}, ensure_ascii=False)) from exc
     if tool == "ask_anna_sampling":
         future = asyncio.run_coroutine_threadsafe(
-            run_anna_sampling_text(arguments, invoke_id, tool_name="ask_anna_sampling", default_max_tokens=512),
+            run_anna_sampling_text(arguments, invoke_id, tool_name="ask_anna_sampling", default_max_tokens=512, context=context),
             loop,
         )
         try:
@@ -2356,7 +2362,7 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         except SamplingError as exc:
             raise RuntimeError(json.dumps({"code": exc.code, "message": exc.message, "data": exc.data}, ensure_ascii=False)) from exc
     if tool == "test_anna_sampling":
-        future = asyncio.run_coroutine_threadsafe(run_anna_sampling_smoke(arguments, invoke_id), loop)
+        future = asyncio.run_coroutine_threadsafe(run_anna_sampling_smoke(arguments, invoke_id, context), loop)
         try:
             return {"success": True, "tool": tool, "data": future.result(timeout=180.0)}
         except SamplingError as exc:
