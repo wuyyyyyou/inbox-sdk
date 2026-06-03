@@ -8,7 +8,6 @@
   ],
   "host_capabilities": [
     "llm.sample",
-    "storage.user",
     "aps.kv",
     "aps.scope.user.read",
     "aps.scope.user.write"
@@ -66,7 +65,8 @@
         "delete"
       ],
       "llm": [
-        "complete"
+        "complete",
+        "sampling"
       ],
       "window": [
         "set_title"

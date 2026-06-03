@@ -746,14 +746,20 @@ def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
     protocol_version = str((params or {}).get("protocolVersion") or "1.1")
     v2 = protocol_version == PROTOCOL_VERSION_V2
     if not v2:
-        sampling.disable(
-            f"host did not negotiate v2 (got {protocol_version!r}); sampling/createMessage requires Executa protocol 2.0"
-        )
+        manifest_has_llm = "llm.sample" in MANIFEST.get("host_capabilities", [])
+        lines = [
+            "Sampling unavailable — pre-condition check:",
+            f"  [{'OK' if manifest_has_llm else 'MISSING'}  ] Executa manifest host_capabilities includes 'llm.sample'",
+            f"  [{'OK' if v2 else 'FAILED'}] Host protocol is 2.0 (got {protocol_version!r})",
+            f"  [UNKNOWN] App manifest includes 'llm.sample' in host_capabilities — check Anna platform",
+            f"  [UNKNOWN] User granted sampling permission — check Anna platform Settings → App Permissions",
+        ]
+        sampling.disable("\n".join(lines))
     return {
         "protocolVersion": PROTOCOL_VERSION_V2 if v2 else "1.1",
         "serverInfo": {"name": TOOL_ID, "version": VERSION},
         "client_capabilities": {"sampling": {}, "storage": {}} if v2 else {},
-        "capabilities": {"storage": {}} if v2 else {},
+        "capabilities": {"sampling": {}, "storage": {}} if v2 else {},
     }
 
 
