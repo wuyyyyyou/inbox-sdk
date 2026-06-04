@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 from collections.abc import Callable
 from dataclasses import asdict
@@ -11,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
+_logger = logging.getLogger(__name__)
 
 
 def _fmt_ts(epoch_ms: str) -> str:
@@ -27,12 +29,12 @@ from .candidate import generate_candidates
 from .context import read_candidate_context
 from .phase1 import run_phase1_batch_classify
 from .guards import apply_rule_guards
-from .intent import parse_intent
-from .judgment import evaluate_item, evaluate_items_batch
+from ..planning.intent import parse_intent
+from ..judgment_engine.service import evaluate_item, evaluate_items_batch
 from .plan import create_run_id, generate_action_plan
 from .scan import build_scan_plan, run_mail_scan
-from .strategies import get as get_strategy
-from .types import (
+from ..planning.strategies import get as get_strategy
+from ..domain.types import (
     ActionPlan,
     CustomScanPlan,
     MailTaskInput,
@@ -60,7 +62,7 @@ async def _determine_scan_window(mailbox: str) -> int:
         raise RuntimeError("Storage not available — please check APS authorization")
 
     try:
-        from .storage_ops import get_scan_state
+        from ..storage.ops import get_scan_state
         state = await get_scan_state(mailbox)
     except Exception:
         return 3
@@ -110,7 +112,7 @@ def _storage_ready() -> bool:
     global _storage_available
     if _storage_available is None:
         try:
-            from .storage_client import is_ready
+            from ..storage.client import is_ready
             _storage_available = is_ready()
         except Exception:
             _storage_available = False
@@ -159,17 +161,30 @@ def _dedupe_by_thread(messages: list[Any]) -> list[Any]:
     return result
 
 
-def _thread_latest_is_from_owner(mailbox: str, thread_id: str, owner_email: str) -> bool:
-    """通过 Gmail API 检查线程最新一封是否来自用户本人（即已回复过）。"""
+def _thread_latest_is_from_owner(mailbox: str, thread_id: str, owner_email: str) -> bool | None:
+    """通过 Gmail API 检查线程最新一封是否来自用户本人（即已回复过）。
+
+    返回 True=已回复, False=未回复, None=检查失败（超时/网络错误）。
+    """
     import re
     import urllib.parse
-    from .mail_adapter import gmail_request
+    import urllib.request
+    from ..mail_providers.gmail.adapter import get_access_token, GMAIL_API_BASE
 
     try:
+        token = get_access_token(mailbox)
         path = f"/users/me/threads/{urllib.parse.quote(thread_id, safe='')}"
-        data = gmail_request(mailbox, path, {"fields": "messages(id,internalDate,payload/headers)"})
-    except Exception:
-        return False
+        url = GMAIL_API_BASE + path + "?fields=messages(id,internalDate,payload/headers)"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        _logger.warning("thread_latest_is_from_owner failed for thread %s: %s", thread_id, exc)
+        return None
 
     messages = data.get("messages") or []
     if not messages:
@@ -196,7 +211,7 @@ async def _get_scan_plan_config(mailbox: str) -> Any | None:
     if not _storage_ready():
         return None
     try:
-        from .storage_ops import get_scan_plan
+        from ..storage.ops import get_scan_plan
         return await get_scan_plan(mailbox)
     except Exception:
         return None
@@ -236,7 +251,7 @@ async def run_mail_task(
     last_message_internal_date = ""
     if _storage_ready():
         try:
-            from .storage_ops import get_scan_state
+            from ..storage.ops import get_scan_state
             state = await get_scan_state(input_.mailbox_id)
             last_message_internal_date = state.last_message_internal_date
         except Exception:
@@ -268,41 +283,64 @@ async def run_mail_task(
     scan_plan["budget"] = budget
 
     _report_progress(progress_callback, "scan", max_messages=budget["max_messages"], window_days=scan_window_days)
-    messages = await run_mail_scan(input_.mailbox_id, scan_plan)
+    _logger.info("scan started: mailbox=%s max_messages=%s window_days=%s", input_.mailbox_id, budget["max_messages"], scan_window_days)
+    messages = await run_mail_scan(input_.mailbox_id, scan_plan, progress_callback=progress_callback)
     _report_progress(progress_callback, "scan_done", scanned=len(messages), max_messages=budget["max_messages"])
+    _logger.info("scan done: %d messages fetched", len(messages))
 
     # ── Storage: filter already-processed messages ─────────────────
     all_message_ids = [m.message_id for m in messages if m.message_id]
     new_message_ids = all_message_ids
     if _storage_ready() and all_message_ids:
-        from .storage_ops import filter_unprocessed
+        from ..storage.ops import filter_unprocessed
         new_message_ids = await filter_unprocessed(input_.mailbox_id, all_message_ids)
         skipped = len(all_message_ids) - len(new_message_ids)
         _report_progress(progress_callback, "storage_filter", total=len(all_message_ids), new=len(new_message_ids), skipped=skipped)
+        _logger.info("storage_filter: %d total, %d new, %d skipped", len(all_message_ids), len(new_message_ids), skipped)
     new_id_set = set(new_message_ids)
     new_messages = [m for m in messages if m.message_id in new_id_set]
 
     new_messages = _dedupe_by_thread(new_messages)
     _report_progress(progress_callback, "thread_dedup", before=len(new_id_set), after=len(new_messages))
+    _logger.info("thread_dedup: %d messages → %d after dedup", len(new_id_set), len(new_messages))
 
     # 过滤已回复线程：最新一封来自用户本人 → 已处理过，跳过
     already_replied_count = 0
+    check_timeouts = 0
     filtered_messages: list[Any] = []
-    for m in new_messages:
+    total_after_dedup = len(new_messages)
+    for i, m in enumerate(new_messages):
         tid = m.thread_id or m.message_id
-        if _thread_latest_is_from_owner(input_.mailbox_id, tid, input_.mailbox_id):
-            already_replied_count += 1
-            continue
+        _report_progress(progress_callback, "check_replied", current=i + 1, total=total_after_dedup)
+        try:
+            result = _thread_latest_is_from_owner(input_.mailbox_id, tid, input_.mailbox_id)
+            if result is None:
+                check_timeouts += 1
+            elif result:
+                already_replied_count += 1
+                continue
+        except Exception:
+            _logger.warning("check_replied error for thread %s, keeping message", tid)
+            check_timeouts += 1
         filtered_messages.append(m)
-    if already_replied_count:
-        _report_progress(progress_callback, "already_replied_filter", filtered=already_replied_count)
+    _logger.info("already_replied_filter: %d filtered (already replied), %d timeouts, %d remaining",
+                 already_replied_count, check_timeouts, len(filtered_messages))
+    _report_progress(
+        progress_callback,
+        "already_replied_filter",
+        filtered=already_replied_count,
+        remaining=len(filtered_messages),
+        timeout=check_timeouts,
+    )
     new_messages = filtered_messages
 
     _report_progress(progress_callback, "phase1", scanned=len(new_messages))
+    _logger.info("phase1 started: %d messages to classify", len(new_messages))
     phase1_result = await run_phase1_batch_classify(new_messages, strategy, mailbox_profile, sampling_create_message)
     candidates = phase1_result["candidates"]
     low_value_items = phase1_result["low_value_items"]
     _report_progress(progress_callback, "phase1_done", scanned=len(messages), candidates=len(candidates), low_value=len(low_value_items))
+    _logger.info("phase1 done: %d candidates, %d low_value", len(candidates), len(low_value_items))
 
     contexts = []
     for index, candidate in enumerate(candidates, start=1):
@@ -310,12 +348,13 @@ async def run_mail_task(
         ctx = await read_candidate_context(input_.mailbox_id, candidate)
         contexts.append(ctx)
     _report_progress(progress_callback, "read_context_done", total=len(contexts))
+    _logger.info("read_context done: %d candidates", len(contexts))
 
     # Load snooze preferences once for both evaluation paths
     snooze_prefs = None
     if _storage_ready():
         try:
-            from .storage_ops import get_user_prefs
+            from ..storage.ops import get_user_prefs
             prefs = await get_user_prefs()
             snooze_prefs = prefs.snooze
         except Exception:
@@ -392,7 +431,7 @@ async def run_mail_task(
                 )
                 judgment = apply_rule_guards(judgment, strategy)
             except Exception as exc:
-                from .judgment import create_fallback_judgment
+                from ..judgment_engine.service import create_fallback_judgment
                 judgment = create_fallback_judgment(
                     ctx.candidate.candidate_id,
                     strategy,
@@ -499,8 +538,8 @@ async def run_custom_scan(
     与 Brief 管线完全解耦。不走 phase1/judgment/guards/cards。
     执行 LLM 根据 plan.task_prompt 直接完成分析和输出。
     """
-    from mail_agent.mail_adapter import normalize_mailbox, get_message_detail
-    from mail_agent.llm import call_llm_json_safe
+    from mail_agent.mail_providers.gmail.adapter import normalize_mailbox, get_message_detail
+    from mail_agent.llm_runtime.service import call_llm_json_safe
 
     query_count = len(plan.gmail_queries or [])
     _report_progress(
@@ -525,7 +564,7 @@ async def run_custom_scan(
         "queries": list(plan.gmail_queries),
         "budget": plan.scan_budget or {"max_messages": 200, "max_threads": 100},
     }
-    messages = await run_mail_scan(mailbox, scan_plan)
+    messages = await run_mail_scan(mailbox, scan_plan, progress_callback=progress_callback)
     sources = [
         {
             "subject": getattr(msg, "subject", "") or "",
@@ -579,7 +618,7 @@ async def run_custom_scan(
 
         if read_depth == "thread_context":
             try:
-                from mail_agent.mail_adapter import get_thread_context
+                from mail_agent.mail_providers.gmail.adapter import get_thread_context
                 thread_ctx = get_thread_context(normalized_mailbox, msg.thread_id or msg.message_id)
                 if thread_ctx and thread_ctx.messages:
                     entry["thread"] = []
@@ -812,7 +851,7 @@ async def _persist_run_results_locked(
     plan_id: str = "",
     low_value_items: list[dict[str, Any]] | None = None,
 ) -> None:
-    from .storage_ops import (
+    from ..storage.ops import (
         mark_messages_processed_batch,
         save_run_record,
         append_run_history,
@@ -821,14 +860,14 @@ async def _persist_run_results_locked(
         set_active_cards,
         set_scan_state,
     )
-    from .storage_types import (
+    from ..storage.types import (
         ProcessedMessage,
         RunRecord,
         RunHistoryEntry,
         ScanState,
         _now,
     )
-    from .card_service import build_card, build_action_memo, build_cleanup_bundle, cards_to_frontend, merge_cards
+    from ..cards.service import build_card, build_action_memo, build_cleanup_bundle, cards_to_frontend, merge_cards
 
     # 1. Mark ALL scanned messages as processed
     processed_msgs: list[ProcessedMessage] = []

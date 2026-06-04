@@ -15,7 +15,7 @@ import re
 import uuid
 from typing import Any
 
-from .types import (
+from ..domain.types import (
     CandidateItem,
     CandidateKind,
     MailStrategy,

@@ -3196,7 +3196,7 @@
       top: 8px;
       right: 8px;
       bottom: 8px;
-      width: min(380px, calc(100% - 16px));
+      width: min(420px, calc(100% - 16px));
       border-radius: 22px;
       border-color: rgba(255,255,255,0.68);
       background: rgba(250,250,252,0.86);
@@ -3574,7 +3574,11 @@
       background: rgba(217,48,37,0.06);
     }
     .preset-row-sm { display:flex; flex-wrap:wrap; gap:6px; }
-    .scan-plan-saved-text { font-size:12px; color:var(--muted); }
+    .scan-plan-saved-text {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-align: right;
+    }
 
 /* ── Fullscreen detail shell (Handle thread) ─────────────────────── */
 .detail-shell {
@@ -4093,6 +4097,190 @@
   margin-top: 3px;
   font-size: 11px;
   color: var(--text-muted);
+}
+
+/* ── History — collapsible groups ─────────────────────────────────── */
+.history-group {
+  margin-bottom: 2px;
+}
+
+.history-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  background: rgba(93,82,128,0.04);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text-main);
+  text-align: left;
+  transition: background 0.15s;
+}
+
+.history-group-header:hover {
+  background: rgba(93,82,128,0.08);
+}
+
+.history-group-icon {
+  font-size: 15px;
+  flex-shrink: 0;
+}
+
+.history-group-label {
+  flex: 1;
+  font-weight: 650;
+}
+
+.history-group-count {
+  font-size: 12px;
+  color: var(--text-muted);
+  background: rgba(93,82,128,0.08);
+  padding: 1px 7px;
+  border-radius: 10px;
+}
+
+.history-group-arrow {
+  font-size: 12px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.history-group-body {
+  display: grid;
+  gap: 2px;
+  padding: 4px 0 4px 12px;
+}
+
+.history-subfilter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-bottom: 6px;
+}
+
+.history-subfilter-row .preset-chip {
+  min-height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+.history-entry {
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.history-entry-time {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  min-width: 88px;
+}
+
+.history-entry-text {
+  color: var(--text-main);
+  font-weight: 550;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.history-entry-detail {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-entry-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+}
+
+.history-entry-row.is-expandable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.history-entry-row.is-expandable:hover {
+  background: var(--bg-hover, rgba(0,0,0,0.03));
+  border-radius: 4px;
+}
+
+.history-entry-arrow {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  margin-left: 0;
+  line-height: 1;
+}
+
+.history-entry-body {
+  padding: 8px 0 8px 96px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-main);
+}
+
+.history-entry-line {
+  margin-bottom: 3px;
+  word-break: break-word;
+}
+
+.history-entry-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-right: 6px;
+}
+
+.history-restore-btn {
+  width: 26px;
+  height: 26px;
+  margin: -3px 0 0 auto;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(93, 82, 128, 0.08);
+  border-radius: 999px;
+  background: rgba(255,255,255,0.42);
+  color: var(--text-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.history-restore-btn:hover {
+  color: var(--text-main);
+  border-color: rgba(93, 82, 128, 0.14);
+  background: rgba(255,255,255,0.74);
+}
+
+.history-restore-icon {
+  width: 14px;
+  height: 14px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 /* ── Handle view — review blocks ─────────────────────────────────── */

@@ -19,7 +19,7 @@ import asyncio
 import json
 from typing import Any
 
-from .types import (
+from ..domain.types import (
     CandidateItem,
     CandidateKind,
     MailStrategy,
@@ -398,7 +398,7 @@ async def _run_phase1_single_batch(
     batch_index: int | None = None,
     batch_total: int | None = None,
 ) -> dict[str, Any]:
-    from .llm import call_llm_json_safe
+    from ..llm_runtime.service import call_llm_json_safe
 
     system_prompt = _PHASE1_SYSTEM
     user_prompt = build_phase1_user_prompt(messages, strategy, profile)

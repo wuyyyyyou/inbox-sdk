@@ -1,7 +1,7 @@
 """Local JSON file storage that mirrors the APS StorageClient interface.
 
 Usage in main.py:
-    from mail_agent.local_storage import LocalStorageClient
+    from mail_agent.storage.local import LocalStorageClient
     storage = LocalStorageClient(data_dir)
     init_storage_singleton(storage, storage, scope="user")
 """

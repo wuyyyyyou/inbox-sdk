@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from .types import (
+from ..domain.types import (
     ActionPlan,
     DisplayItem,
     JudgmentResult,

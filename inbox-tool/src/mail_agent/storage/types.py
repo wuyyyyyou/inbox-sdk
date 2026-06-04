@@ -217,3 +217,14 @@ class RunHistoryEntry:
     plan_id: str = ""
     result: str = ""      # 1-line summary
     summary: str = ""     # multi-line detail
+    # card-action fields (entry_type="card_action")
+    entry_type: str = "scan"         # "scan" | "card_action"
+    card_id: str = ""
+    card_title: str = ""
+    action: str = ""                 # "snooze" | "reply" | "handled_manually" | "no_action_needed" | "cleanup_read" | "restore"
+    detail: str = ""
+    # card context for rendering history entries without an extra API call
+    card_summary: str = ""
+    card_from: str = ""
+    card_subject: str = ""
+    card_body: str = ""

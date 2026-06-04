@@ -9,8 +9,8 @@ export const SCAN_STEPS = [
 ];
 
 const STAGE_STEP_MAP: Record<string, number> = {
-  queued: 0, parse_intent: 0, scan: 0, scan_done: 0,
-  storage_filter: 1, thread_dedup: 1, phase1: 1, phase1_done: 1,
+  queued: 0, parse_intent: 0, scan: 0, scan_done: 0, scan_fallback: 0, scan_fallback_empty: 0,
+  storage_filter: 1, thread_dedup: 1, check_replied: 1, already_replied_filter: 1, phase1: 1, phase1_done: 1,
   read_context: 2, read_context_done: 2,
   evaluate: 3, evaluate_done: 3,
   plan: 4, storage_saved: 4, done: 4,
@@ -29,7 +29,12 @@ export function scanStageLabel(stage: string | undefined, progress: Record<strin
     parse_intent: "Choosing scan strategy.",
     scan: "Reading Gmail source.",
     scan_done: "New messages loaded.",
+    scan_fallback: "Gmail API unreachable — using cached emails.",
+    scan_fallback_empty: "Gmail API unreachable and cache empty — no emails available.",
     storage_filter: "Skipping messages already processed.",
+    thread_dedup: "Deduplicating threads.",
+    check_replied: "Checking thread reply status.",
+    already_replied_filter: "Filtering already-replied threads.",
     phase1: "Finding candidate attention items.",
     phase1_done: "Candidate scan complete.",
     read_context: "Reading context for candidates.",
@@ -49,8 +54,12 @@ export function scanProgressLabel(stage: string | undefined, progress: Record<st
   if (!stage || stage === "queued") return "";
   if (stage === "scan" || stage === "parse_intent") return "Connecting to Gmail...";
   if (stage === "scan_done") return `${p.scanned || 0} emails loaded`;
+  if (stage === "scan_fallback") return `Gmail unreachable, using ${p.cached_count || 0} cached`;
+  if (stage === "scan_fallback_empty") return "No cache available — check network & token";
   if (stage === "storage_filter") return `${p.skipped || 0} skipped, ${p.new || 0} new`;
   if (stage === "thread_dedup") return `${p.after || 0} after dedup`;
+  if (stage === "check_replied") return `Checking reply status ${p.current || 0}/${p.total || 0}`;
+  if (stage === "already_replied_filter") return `${p.filtered || 0} already replied`;
   if (stage === "phase1") return `Classifying ${p.scanned || 0} emails...`;
   if (stage === "phase1_done") return `${p.candidates || 0} candidates, ${p.low_value || 0} low-priority`;
   if (stage === "read_context") return `Reading context ${p.current || 0}/${p.total || 0}`;

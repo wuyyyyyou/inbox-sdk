@@ -11,12 +11,24 @@ TOOL_ID="$(python3 -c 'import json, sys; data = json.load(open(sys.argv[1], enco
 export PATH="$HOME/.local/bin:$PATH"
 export NODE_OPTIONS="${NODE_OPTIONS:---dns-result-order=ipv4first}"
 
-# WSL proxy — 通过 Windows 宿主机代理访问外网
-HOST_IP=$(ip route show default 2>/dev/null | awk '{print $3}' | head -1)
-if [ -n "${HOST_IP:-}" ]; then
-  export HTTP_PROXY="http://$HOST_IP:7890"
-  export HTTPS_PROXY="http://$HOST_IP:7890"
+# WSL proxy — 通过 Windows 宿主机 Clash 代理访问外网（Google API 等）
+# 宿主机 IP 探测：先用 ip route 拿网关（最可靠），失败再用 /etc/resolv.conf nameserver
+HOST_IP=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+if [ -z "${HOST_IP:-}" ] && [ -f /etc/resolv.conf ]; then
+  HOST_IP=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null)
+fi
+
+PROXY_PORT="${ANNA_PROXY_PORT:-7890}"
+if [ -n "${HOST_IP:-}" ] && curl -s --connect-timeout 1 --max-time 2 "http://$HOST_IP:$PROXY_PORT" >/dev/null 2>&1; then
+  export HTTP_PROXY="http://$HOST_IP:$PROXY_PORT"
+  export HTTPS_PROXY="http://$HOST_IP:$PROXY_PORT"
+  export http_proxy="http://$HOST_IP:$PROXY_PORT"
+  export https_proxy="http://$HOST_IP:$PROXY_PORT"
   export NO_PROXY="localhost,127.0.0.1,::1"
+  export no_proxy="localhost,127.0.0.1,::1"
+  echo "[dev-wsl] proxy enabled: $HOST_IP:$PROXY_PORT" >&2
+else
+  echo "[dev-wsl] proxy skipped (host=$HOST_IP port=$PROXY_PORT unreachable)" >&2
 fi
 
 if [ -f "$HOME/.anna-mail-agent.env" ]; then

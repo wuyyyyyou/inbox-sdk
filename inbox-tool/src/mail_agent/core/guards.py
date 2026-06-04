@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from .types import JudgmentResult, MailStrategy
+from ..domain.types import JudgmentResult, MailStrategy
 
 
 def apply_rule_guards(result: JudgmentResult, strategy: MailStrategy) -> JudgmentResult:

@@ -23,7 +23,7 @@ def _llm_log_dir() -> Path | None:
     if os.environ.get("GMAIL_ACCESS_TOKEN") or os.environ.get("GOOGLE_ACCESS_TOKEN"):
         return None  # Platform — skip logging
     # Use the executa's .data/llm_logs/ directory
-    return Path(__file__).resolve().parents[2] / ".data" / "llm_logs"
+    return Path(__file__).resolve().parents[3] / ".data" / "llm_logs"
 
 
 def _write_llm_log(tool: str, direction: str, content: str, extra: dict[str, str] | None = None) -> None:

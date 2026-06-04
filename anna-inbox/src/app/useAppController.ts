@@ -405,6 +405,7 @@ export function useAppController() {
         await client.recordCardDecision({ mailbox: state.mailbox, card_id: cid, decision, storage_provider: state.storageProvider });
         setState((s) => ({ ...s, originalOpen: false, selectedCard: null, expandedDetails: { ...s.expandedDetails, [cid]: false } }));
         await loadActiveCards();
+        await loadRunHistory();
         showToast("Card removed from this briefing.");
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
@@ -428,6 +429,7 @@ export function useAppController() {
         setState((s) => ({ ...s, originalOpen: false, selectedCard: null }));
         showToast("Reply sent successfully.");
         await loadActiveCards();
+        await loadRunHistory();
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       }
@@ -455,6 +457,7 @@ export function useAppController() {
         } else {
           showToast(result.gmail_error || "Failed to mark as read in Gmail.");
         }
+        await loadRunHistory();
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       } finally {
@@ -469,6 +472,7 @@ export function useAppController() {
       try {
         await client.restoreCard(state.mailbox, cardId, state.storageProvider);
         await loadActiveCards();
+        await loadRunHistory();
         showToast("Card restored.");
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
@@ -480,6 +484,7 @@ export function useAppController() {
         await client.recordSnooze({ mailbox: state.mailbox, card_id: cardId, snooze_option: optionMap[option] || option, storage_provider: state.storageProvider });
         setState((s) => ({ ...s, snoozeMenuCardId: "" }));
         await loadActiveCards();
+        await loadRunHistory();
         showToast(option === "dont-prioritize" ? "Preference saved." : "Card snoozed.");
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));

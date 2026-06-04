@@ -31,7 +31,7 @@ export function BottomBar() {
           </div>
         </div>
         <button className="soft-btn" onClick={() => actions.setDrawer("scanPlan", true)}>Next Scan</button>
-        <button className="soft-btn" onClick={() => actions.setView("ask")}>Ask</button>
+
         <button className="primary-btn" disabled={state.isScanning || !state.runtime.connected} onClick={() => void actions.startScan("manual")}>Scan now</button>
       </div>
     </footer>

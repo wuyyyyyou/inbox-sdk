@@ -10,14 +10,17 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .strategies import get as get_strategy
-from .types import MailStrategy, MailTaskPlan, MessageLite, ScanPolicy, ScanBudget
+from ..planning.strategies import get as get_strategy
+from ..domain.types import MailStrategy, MailTaskPlan, MessageLite, ScanPolicy, ScanBudget
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
+_logger = logging.getLogger(__name__)
 
 
 # ── 扫描计划构建 ─────────────────────────────────────────────────
@@ -71,6 +74,8 @@ def _apply_user_scope_to_queries(
 async def run_mail_scan(
     mailbox: str,
     scan_plan: dict[str, Any],
+    *,
+    progress_callback: Any = None,
 ) -> list[MessageLite]:
     """使用真实 Gmail API 执行邮件扫描。
 
@@ -87,7 +92,7 @@ async def run_mail_scan(
         MessageLite 列表，按 internalDate 排序
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from .mail_adapter import live_search_and_cache, get_messages_lite, normalize_mailbox, list_messages
+    from ..mail_providers.gmail.adapter import live_search_and_cache, get_messages_lite, normalize_mailbox, list_messages
 
     normalized_mailbox = normalize_mailbox(mailbox)
     budget = scan_plan.get("budget", {})
@@ -96,7 +101,12 @@ async def run_mail_scan(
     queries = scan_plan.get("queries", [])
 
     # Phase 1: concurrent Gmail search across all queries
+    gmail_errors: list[str] = []
+    fallback_used = False
+    _errors_lock = threading.Lock()
+
     def _run_one_query(q: dict[str, Any]) -> tuple[list[str], str]:
+        nonlocal fallback_used
         query = q.get("query", "")
         max_results = min(int(q.get("max_results", 100)), 500)
         stop_at = str(q.get("stop_at_internal_date") or "")
@@ -104,6 +114,11 @@ async def run_mail_scan(
             ids = live_search_and_cache(normalized_mailbox, query, max_results, stop_at_internal_date=stop_at)
             return ids, ""
         except Exception as exc:
+            fallback_used = True
+            err_msg = f"Gmail API failed for query \"{query}\": {exc}"
+            _logger.warning("fallback to cache: %s", err_msg)
+            with _errors_lock:
+                gmail_errors.append(err_msg)
             all_cached = list_messages(normalized_mailbox)
             ids = [str(m.get("id")) for m in all_cached if m.get("id")]
             return ids[:max_results], str(exc)
@@ -126,5 +141,27 @@ async def run_mail_scan(
     # 从缓存中将消息 ID 转换为 MessageLite 对象
     limited_ids = matched_ids[:max_messages]
     messages = get_messages_lite(normalized_mailbox, limited_ids)
+
+    if fallback_used:
+        _logger.warning("Gmail API 不可用，回退到本地缓存：%d 封缓存邮件", len(messages))
+        if progress_callback:
+            progress_callback("scan_fallback", {
+                "gmail_api_failed": True,
+                "cached_count": len(messages),
+                "errors": gmail_errors[-3:],  # 最多返回最后3条错误
+            })
+
+    if fallback_used and not messages:
+        _logger.error(
+            "Gmail API 不可用且本地缓存为空，无法获取任何邮件。请检查网络连接和 token 是否有效。\n错误详情: %s",
+            "\n".join(gmail_errors[-3:]),
+        )
+        if progress_callback:
+            progress_callback("scan_fallback_empty", {
+                "gmail_api_failed": True,
+                "cached_count": 0,
+                "errors": gmail_errors[-3:],
+                "hint": "请检查网络连接和 Gmail token 是否有效",
+            })
 
     return messages

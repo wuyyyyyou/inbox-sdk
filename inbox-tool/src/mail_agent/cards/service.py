@@ -10,8 +10,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from .types import CandidateItem, JudgmentResult, MessageLite, ReadDepth
-from .storage_types import (
+from ..domain.types import CandidateItem, JudgmentResult, MessageLite, ReadDepth
+from ..storage.types import (
     BEIJING_TZ,
     ActiveCards,
     CardAction,
@@ -401,6 +401,45 @@ def build_cleanup_bundle(
 
 # ── Merge new and existing cards ────────────────────────────────────
 
+def _merge_cleanup_bundles(
+    old: PersistentCard | None,
+    new: PersistentCard | None,
+) -> PersistentCard | None:
+    """Merge old and new cleanup bundles, deduplicating by message_id.
+
+    Keeps the old card identity (card_id, status) so pending state is preserved.
+    New messages are appended; old ones that no longer appear in the scan are kept.
+    """
+    if not old and not new:
+        return None
+    if not old:
+        return new
+    if not new:
+        return old
+
+    seen: set[str] = set()
+    merged_msgs: list[dict[str, Any]] = []
+
+    for m in old.bundled_messages:
+        mid = str(m.get("message_id", ""))
+        if mid and mid not in seen:
+            seen.add(mid)
+            merged_msgs.append(m)
+
+    for m in new.bundled_messages:
+        mid = str(m.get("message_id", ""))
+        if mid and mid not in seen:
+            seen.add(mid)
+            merged_msgs.append(m)
+
+    n = len(merged_msgs)
+    old.bundled_messages = merged_msgs
+    old.title = f"Cleanup · {n} low-priority email{'s' if n != 1 else ''}"
+    old.original.status = f"{n} messages total"
+    old.updated_at = _now()
+    return old
+
+
 def merge_cards(existing: ActiveCards, new_cards: list[PersistentCard]) -> ActiveCards:
     """Merge new scan results with existing active cards.
 
@@ -411,17 +450,29 @@ def merge_cards(existing: ActiveCards, new_cards: list[PersistentCard]) -> Activ
     - Resolved/dismissed cards → drop.
     - Deduplicate: if a new card has the same thread_id as an existing one,
       prefer the new version (updated judgment).
-    - Cleanup bundles: new one replaces old one (only keep latest scan's cleanup).
+    - Cleanup bundles: old and new are merged (dedup by message_id).
+      Old card identity is preserved so pending state is not lost.
     """
     now = _now()
     merged: dict[str, PersistentCard] = {}
+
+    # Separate cleanup bundles from regular cards in the new batch
+    new_cleanup: PersistentCard | None = None
+    new_regular: list[PersistentCard] = []
+    for c in new_cards:
+        if c.card_type == "cleanup_bundle":
+            new_cleanup = c
+        else:
+            new_regular.append(c)
+
+    old_cleanup: PersistentCard | None = None
 
     # Process existing cards
     for card in existing.cards:
         if card.status == "resolved" or card.status == "dismissed":
             continue
-        # Drop old cleanup bundles — new scan will produce a fresh one
         if card.card_type == "cleanup_bundle":
+            old_cleanup = card
             continue
         if card.status == "snoozed":
             if card.snooze_until and card.snooze_until < now:
@@ -433,12 +484,17 @@ def merge_cards(existing: ActiveCards, new_cards: list[PersistentCard]) -> Activ
                 continue
         merged[card.thread_id or card.card_id] = card
 
-    # Merge new cards (overwrite existing by thread_id or card_id)
-    for card in new_cards:
+    # Merge new regular cards (overwrite existing by thread_id or card_id)
+    for card in new_regular:
         if card.priority == "ignore":
             continue
         key = card.thread_id or card.card_id
         merged[key] = card
+
+    # Merge cleanup bundles: combine old + new, dedup by message_id
+    final_cleanup = _merge_cleanup_bundles(old_cleanup, new_cleanup)
+    if final_cleanup:
+        merged[final_cleanup.thread_id or final_cleanup.card_id] = final_cleanup
 
     return ActiveCards(cards=list(merged.values()), updated_at=now)
 

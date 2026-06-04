@@ -10,8 +10,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .types import CandidateItem, MailboxProfile, MailStrategy
-from .storage_types import PersistentCard
+from ..domain.types import CandidateItem, MailboxProfile, MailStrategy
+from ..storage.types import PersistentCard
 
 
 # ── Thread context fetch ────────────────────────────────────────────
@@ -24,7 +24,7 @@ def _fetch_thread_context_sync(
 
     Returns structured thread data for the Handle Panel header.
     """
-    from .mail_adapter import get_thread_context
+    from ..mail_providers.gmail.adapter import get_thread_context
 
     try:
         thread = get_thread_context(mailbox, card.thread_id, max_messages=10)
@@ -172,7 +172,7 @@ async def summarize_thread(
     sampling_create_message: Any = None,
 ) -> dict[str, Any]:
     """Call LLM to summarize a thread. Returns the summary JSON."""
-    from .llm import call_llm_json_safe
+    from ..llm_runtime.service import call_llm_json_safe
 
     thread_ctx = _fetch_thread_context_sync(mailbox, card)
     prompt = build_thread_summary_prompt(thread_ctx, card)
@@ -211,7 +211,7 @@ async def generate_draft_reply(
     revision_input: str = "",
 ) -> dict[str, Any]:
     """Generate or revise a draft reply. If current_draft is non-empty, revises it."""
-    from .llm import call_llm_json_safe
+    from ..llm_runtime.service import call_llm_json_safe
 
     thread_ctx = _fetch_thread_context_sync(mailbox, card)
     prompt = _build_draft_prompt(card, thread_ctx, reply_mode, current_draft, revision_input)
@@ -251,7 +251,7 @@ async def reply_now(
     dry_run=True (default): 仅验证参数并返回模拟结果，不真实发送邮件。
     dry_run=False: 通过 Gmail API 真实发送。
     """
-    from .mail_adapter import send_reply
+    from ..mail_providers.gmail.adapter import send_reply
     import sys
 
     print(f"[handle_service.reply_now] mailbox={mailbox} thread_id={card.thread_id} to={card.original.from_addr} dry_run={dry_run} body_len={len(draft_body)}", file=sys.stderr)

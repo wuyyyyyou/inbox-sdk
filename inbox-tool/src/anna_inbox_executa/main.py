@@ -605,11 +605,11 @@ _aps_storage = StorageClient(write_frame=write_frame)
 _aps_files = FilesClient(write_frame=write_frame)
 _aps_route_storage_response = make_response_router(_aps_storage, _aps_files)
 
-from mail_agent.local_storage import make_local_clients
+from mail_agent.storage.local import make_local_clients
 _local_data_dir = Path(os.environ.get("ZHAOPY_MAIL_AGENT_STORAGE_DIR") or data_root()).expanduser().resolve()
 _local_storage, _local_files = make_local_clients(_local_data_dir)
 
-from mail_agent.storage_client import init as init_storage_singleton
+from mail_agent.storage.client import init as init_storage_singleton
 _active_storage_provider = ""
 _route_storage_response = lambda msg: False
 
@@ -653,6 +653,16 @@ RUN_CHECKPOINT_DIR = data_root() / "runs" / "background"
 def _run_checkpoint_path(run_id: str) -> Path:
     safe_id = "".join(ch for ch in str(run_id or "") if ch.isalnum() or ch in {"_", "-"})
     return RUN_CHECKPOINT_DIR / f"{safe_id}.json"
+
+
+def _is_warning_stage(stage: str) -> bool:
+    """判断 stage 是否为需要持久化的警告/错误阶段。"""
+    return bool(stage) and (
+        stage.endswith("_empty")
+        or "fallback" in stage
+        or "error" in stage
+        or "failed" in stage
+    )
 
 
 def _save_run_checkpoint(run_id: str) -> None:
@@ -1157,7 +1167,7 @@ async def run_dashscope_llm(message: str, invoke_id: str) -> dict[str, Any]:
     if not clean_message:
         return {"text": "", "note": "empty message"}
 
-    from mail_agent.llm import call_dashscope_text
+    from mail_agent.llm_runtime.service import call_dashscope_text
 
     result = await asyncio.to_thread(
         call_dashscope_text,
@@ -1182,7 +1192,7 @@ def _check_gmail_auth(mailbox: str) -> dict[str, Any]:
     Local dev: token file exists on disk (content/expiry not validated).
     """
     import os as _os
-    from mail_agent.mail_adapter import _token_dir, sanitize_mailbox_id
+    from mail_agent.mail_providers.gmail.adapter import _token_dir, sanitize_mailbox_id
     from pathlib import Path as _Path
 
     # Platform path — check for injected OAuth credential
@@ -1218,7 +1228,7 @@ async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]
     try:
         import json as _json2
         import urllib.request as _ur
-        from mail_agent.mail_adapter import get_access_token
+        from mail_agent.mail_providers.gmail.adapter import get_access_token
         token = get_access_token(mailbox)
         body = _json2.dumps({
             "ids": message_ids,
@@ -1240,7 +1250,7 @@ async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]
 
     # 2. Update the cleanup card in local storage
     try:
-        from mail_agent.storage_ops import get_active_cards, set_active_cards
+        from mail_agent.storage.ops import get_active_cards, set_active_cards
         cards = await get_active_cards(mailbox)
         for c in cards.cards:
             if c.card_id == card_id:
@@ -1250,6 +1260,18 @@ async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]
         await set_active_cards(mailbox, cards)
     except Exception:
         pass
+
+    # Write history
+    card_title = card_id
+    try:
+        from mail_agent.storage.ops import get_active_cards as _cards_for_title
+        cards_obj = await _cards_for_title(mailbox)
+        card_obj = next((c for c in cards_obj.cards if c.card_id == card_id), None)
+        card_title = card_obj.title if card_obj else card_id
+    except Exception:
+        pass
+    from mail_agent.storage.ops import append_card_action
+    await append_card_action(mailbox, card_id, card_title, "cleanup_read", f"{len(message_ids)} emails")
 
     return {
         "ok": gmail_error == "",
@@ -1261,7 +1283,7 @@ async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]
 
 async def run_anna_sampling_text(arguments: dict[str, Any], invoke_id: str, *, tool_name: str, default_max_tokens: int) -> dict[str, Any]:
     """调用 Anna sampling/createMessage，并返回文本结果。"""
-    from mail_agent.llm import extract_sampling_text
+    from mail_agent.llm_runtime.service import extract_sampling_text
 
     prompt = str(arguments.get("message") or arguments.get("prompt") or "").strip()
     if not prompt:
@@ -1327,7 +1349,7 @@ async def run_anna_sampling_smoke(arguments: dict[str, Any], invoke_id: str) -> 
 
 async def run_aps_storage_smoke(arguments: dict[str, Any]) -> dict[str, Any]:
     """只验证 APS KV 的最小读写链路，不触碰业务邮箱数据。"""
-    from mail_agent.storage_client import get_storage, scope as default_scope
+    from mail_agent.storage.client import get_storage, scope as default_scope
 
     storage = get_storage()
     suffix = str(arguments.get("key_suffix") or uuid.uuid4().hex[:8]).strip()
@@ -1385,9 +1407,9 @@ async def run_mail_agent_pipeline(
 ) -> dict[str, Any]:
     """Run the full mail agent pipeline."""
     from dataclasses import asdict
-    from mail_agent.llm import dashscope_available
-    from mail_agent.pipeline import run_mail_task
-    from mail_agent.types import MailTaskInput
+    from mail_agent.llm_runtime.service import dashscope_available
+    from mail_agent.core.pipeline import run_mail_task
+    from mail_agent.domain.types import MailTaskInput
 
     provider = str(ai_provider or "anna-llm").strip()
     invoke_id = invoke_id or f"local_{uuid.uuid4().hex}"
@@ -1445,10 +1467,10 @@ async def run_mail_agent_pipeline(
     # Read active cards from storage for V2 frontend
     active_cards: list[dict[str, Any]] = []
     try:
-        from mail_agent.storage_client import is_ready
+        from mail_agent.storage.client import is_ready
         if is_ready():
-            from mail_agent.storage_ops import get_active_cards
-            from mail_agent.card_service import cards_to_frontend
+            from mail_agent.storage.ops import get_active_cards
+            from mail_agent.cards.service import cards_to_frontend
             stored = await get_active_cards(input_.mailbox_id)
             active_cards = cards_to_frontend(stored)
     except Exception:
@@ -1483,6 +1505,14 @@ async def run_mail_agent_background(run_id: str, arguments: dict[str, Any], invo
         MAIL_AGENT_RUNS[run_id]["stage"] = stage
         MAIL_AGENT_RUNS[run_id]["progress"] = progress
         MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
+        # 持久化警告/错误阶段，不被后续正常阶段覆盖
+        if _is_warning_stage(stage):
+            warnings = MAIL_AGENT_RUNS[run_id].setdefault("warnings", [])
+            entry = {"stage": stage, "at": beijing_now(), "detail": progress}
+            # 去重：同一个 stage 只保留最新一次
+            existing = [w for w in warnings if w.get("stage") != stage]
+            existing.append(entry)
+            MAIL_AGENT_RUNS[run_id]["warnings"] = existing[-10:]  # 最多保留 10 条
         _save_run_checkpoint(run_id)
 
     try:
@@ -1528,10 +1558,18 @@ async def run_custom_scan_background(run_id: str, plan: Any, arguments: dict[str
         MAIL_AGENT_RUNS[run_id]["stage"] = stage
         MAIL_AGENT_RUNS[run_id]["progress"] = progress
         MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
+        # 持久化警告/错误阶段，不被后续正常阶段覆盖
+        if _is_warning_stage(stage):
+            warnings = MAIL_AGENT_RUNS[run_id].setdefault("warnings", [])
+            entry = {"stage": stage, "at": beijing_now(), "detail": progress}
+            # 去重：同一个 stage 只保留最新一次
+            existing = [w for w in warnings if w.get("stage") != stage]
+            existing.append(entry)
+            MAIL_AGENT_RUNS[run_id]["warnings"] = existing[-10:]  # 最多保留 10 条
         _save_run_checkpoint(run_id)
 
     try:
-        from mail_agent.pipeline import run_custom_scan
+        from mail_agent.core.pipeline import run_custom_scan
         result = await run_custom_scan(
             plan=plan,
             mailbox=arguments.get("mailbox", ""),
@@ -1539,7 +1577,7 @@ async def run_custom_scan_background(run_id: str, plan: Any, arguments: dict[str
             progress_callback=_update_progress,
         )
         # Update plan result metadata
-        from mail_agent.storage_ops import update_plan_result
+        from mail_agent.storage.ops import update_plan_result
         section_count = len(result.get("sections", []))
         item_count = sum(len(s.get("items", [])) for s in result.get("sections", []))
         await update_plan_result(plan.plan_id, f"{section_count} sections, {item_count} items")
@@ -1582,6 +1620,19 @@ async def run_custom_scan_background(run_id: str, plan: Any, arguments: dict[str
             "result": result_data,
         })
         _save_run_checkpoint(run_id)
+        # Write run history
+        from mail_agent.storage.ops import append_run_history
+        from mail_agent.storage.types import RunHistoryEntry, _now
+        history_entry = RunHistoryEntry(
+            run_id=run_id,
+            mailbox=arguments.get("mailbox", ""),
+            ts=_now(),
+            entry_type="scan",
+            request=str(arguments.get("user_request", ""))[:100],
+            result=f"{section_count} sections, {item_count} items",
+            summary=result.get("summary", "")[:200],
+        )
+        await append_run_history(history_entry)
     except Exception as exc:
         MAIL_AGENT_RUNS[run_id].update({
             "status": "failed",
@@ -1617,6 +1668,7 @@ def start_mail_agent_run(arguments: dict[str, Any], invoke_id: str) -> dict[str,
         "status": "queued",
         "stage": "queued",
         "progress": {},
+        "warnings": [],
         "started_at": beijing_now(),
         "updated_at": beijing_now(),
         "result": None,
@@ -1658,6 +1710,7 @@ def start_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, An
         "status": "queued",
         "stage": "planning",
         "progress": {},
+        "warnings": [],
         "started_at": beijing_now(),
         "updated_at": beijing_now(),
         "result": None,
@@ -1696,8 +1749,8 @@ def start_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, An
 
 async def _start_custom_scan_async(run_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
     """Async portion: generate plan (LLM), save it, then execute."""
-    from mail_agent.planner import generate_custom_plan
-    from mail_agent.storage_ops import save_custom_plan
+    from mail_agent.planning.custom import generate_custom_plan
+    from mail_agent.storage.ops import save_custom_plan
 
     try:
         MAIL_AGENT_RUNS[run_id]["status"] = "running"
@@ -1749,6 +1802,7 @@ def re_run_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, A
         "status": "queued",
         "stage": "planning_done",
         "progress": {},
+        "warnings": [],
         "started_at": beijing_now(),
         "updated_at": beijing_now(),
         "result": None,
@@ -1772,8 +1826,8 @@ def re_run_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, A
 
 async def _re_run_custom_scan_async(run_id: str, plan_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
     """Async portion: load plan and execute."""
-    from mail_agent.storage_ops import get_custom_plan
-    from mail_agent.types import CustomScanPlan
+    from mail_agent.storage.ops import get_custom_plan
+    from mail_agent.domain.types import CustomScanPlan
 
     try:
         MAIL_AGENT_RUNS[run_id]["status"] = "running"
@@ -1827,7 +1881,7 @@ def _run_storage_query(coro: Any, timeout: float = 60.0) -> Any:
 
 def _sync_get_custom_plans() -> dict[str, Any]:
     """同步入口通过统一 storage_ops 读取，兼容本地 JSON 和 APS。"""
-    from mail_agent.storage_ops import list_custom_plans
+    from mail_agent.storage.ops import list_custom_plans
 
     return {"plans": _run_storage_query(list_custom_plans())}
 
@@ -1837,7 +1891,7 @@ def _sync_get_custom_plan_detail(arguments: dict[str, Any]) -> dict[str, Any]:
     plan_id = str(arguments.get("plan_id", "")).strip()
     if not plan_id:
         return {"error": "plan_id is required"}
-    from mail_agent.storage_ops import get_custom_plan
+    from mail_agent.storage.ops import get_custom_plan
 
     plan = _run_storage_query(get_custom_plan(plan_id))
     if plan:
@@ -1851,8 +1905,8 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
     if not mailbox:
         return {"error": "mailbox is required"}
 
-    from mail_agent.card_service import cards_to_frontend
-    from mail_agent.storage_ops import get_active_cards, get_scan_state
+    from mail_agent.cards.service import cards_to_frontend
+    from mail_agent.storage.ops import get_active_cards, get_scan_state
 
     active = _run_storage_query(get_active_cards(mailbox))
     state = _run_storage_query(get_scan_state(mailbox))
@@ -1873,7 +1927,7 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 def _sync_get_run_history() -> dict[str, Any]:
-    from mail_agent.storage_ops import get_run_history
+    from mail_agent.storage.ops import get_run_history
 
     history = _run_storage_query(get_run_history(limit=20))
     return {"history": [serialize_value(entry) for entry in history]}
@@ -1891,6 +1945,7 @@ def get_mail_agent_run(run_id_arg: str) -> dict[str, Any]:
         "stage": state.get("stage") or "",
         "progress": state.get("progress") or {},
         "partial": state.get("partial") or {},
+        "warnings": state.get("warnings") or [],
         "started_at": state.get("started_at"),
         "updated_at": state.get("updated_at"),
         "error": state.get("error") or "",
@@ -1905,8 +1960,8 @@ async def _handle_summarize_background(run_id: str, arguments: dict[str, Any], i
     mailbox = str(arguments.get("mailbox", "")).strip()
     card_id = str(arguments.get("card_id", "")).strip()
     try:
-        from mail_agent.storage_ops import get_active_cards as storage_get_cards, set_active_cards
-        from mail_agent.handle_service import summarize_thread
+        from mail_agent.storage.ops import get_active_cards as storage_get_cards, set_active_cards
+        from mail_agent.actions.service import summarize_thread
         cards = await storage_get_cards(mailbox)
         card = next((c for c in cards.cards if c.card_id == card_id), None)
         if not card:
@@ -1933,8 +1988,8 @@ async def _handle_generate_draft_background(run_id: str, arguments: dict[str, An
     current_draft = str(arguments.get("current_draft", "")).strip()
     revision_input = str(arguments.get("revision_input", "")).strip()
     try:
-        from mail_agent.storage_ops import get_active_cards as storage_get_cards, set_active_cards
-        from mail_agent.handle_service import generate_draft_reply
+        from mail_agent.storage.ops import get_active_cards as storage_get_cards, set_active_cards
+        from mail_agent.actions.service import generate_draft_reply
         cards = await storage_get_cards(mailbox)
         card = next((c for c in cards.cards if c.card_id == card_id), None)
         if not card:
@@ -1954,9 +2009,23 @@ async def _handle_generate_draft_background(run_id: str, arguments: dict[str, An
     _save_run_checkpoint(run_id)
 
 
+def _card_context(card: Any) -> dict[str, str]:
+    """Extract display fields from a PersistentCard for history entries."""
+    try:
+        original = getattr(card, "original", None)
+        return {
+            "card_summary": (getattr(card, "summary", "") or "")[:200],
+            "card_from": (getattr(original, "from_addr", "") or "")[:120] if original else "",
+            "card_subject": (getattr(original, "thread", "") or "")[:200] if original else "",
+            "card_body": (getattr(original, "body", "") or "")[:300] if original else "",
+        }
+    except Exception:
+        return {}
+
+
 async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
     """Handle V2 interaction tools (async, runs on the event loop)."""
-    from mail_agent.storage_ops import (
+    from mail_agent.storage.ops import (
         get_active_cards as storage_get_cards,
         get_scan_plan,
         get_scan_state,
@@ -1967,14 +2036,14 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         append_learning,
         get_run_history,
     )
-    from mail_agent.card_service import cards_to_frontend
-    from mail_agent.handle_service import (
+    from mail_agent.cards.service import cards_to_frontend
+    from mail_agent.actions.service import (
         _fetch_thread_context_sync,
         summarize_thread,
         generate_draft_reply,
         reply_now,
     )
-    from mail_agent.storage_types import PersistentCard
+    from mail_agent.storage.types import PersistentCard
 
     mailbox = str(arguments.get("mailbox", "")).strip()
     card_id = str(arguments.get("card_id", "")).strip()
@@ -2050,7 +2119,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if not mailbox or not card_id:
             return {"error": "mailbox and card_id are required"}
         run_id = f"bg_{uuid.uuid4().hex[:12]}"
-        MAIL_AGENT_RUNS[run_id] = {"run_id": run_id, "status": "queued", "stage": "summarize_thread", "progress": {}, "started_at": beijing_now(), "updated_at": beijing_now(), "result": None, "error": "", "partial": {}}
+        MAIL_AGENT_RUNS[run_id] = {"run_id": run_id, "status": "queued", "stage": "summarize_thread", "progress": {}, "warnings": [], "started_at": beijing_now(), "updated_at": beijing_now(), "result": None, "error": "", "partial": {}}
         _save_run_checkpoint(run_id)
         asyncio.ensure_future(_handle_summarize_background(run_id, arguments, invoke_id))
         return {"success": True, "run_id": run_id, "status": "queued"}
@@ -2059,7 +2128,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if not mailbox or not card_id:
             return {"error": "mailbox and card_id are required"}
         run_id = f"bg_{uuid.uuid4().hex[:12]}"
-        MAIL_AGENT_RUNS[run_id] = {"run_id": run_id, "status": "queued", "stage": "generate_draft_reply", "progress": {}, "started_at": beijing_now(), "updated_at": beijing_now(), "result": None, "error": "", "partial": {}}
+        MAIL_AGENT_RUNS[run_id] = {"run_id": run_id, "status": "queued", "stage": "generate_draft_reply", "progress": {}, "warnings": [], "started_at": beijing_now(), "updated_at": beijing_now(), "result": None, "error": "", "partial": {}}
         _save_run_checkpoint(run_id)
         asyncio.ensure_future(_handle_generate_draft_background(run_id, arguments, invoke_id))
         return {"success": True, "run_id": run_id, "status": "queued"}
@@ -2076,7 +2145,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if isinstance(summary, dict):
             import json as _json
             card.thread_summary = _json.dumps(summary, ensure_ascii=False)
-            from mail_agent.storage_ops import set_active_cards
+            from mail_agent.storage.ops import set_active_cards
             await set_active_cards(mailbox, cards)
         return result
 
@@ -2092,7 +2161,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         draft_body = (result.get("draft") or {}).get("body", "") if isinstance(result, dict) else ""
         if draft_body:
             card.draft_reply = draft_body
-            from mail_agent.storage_ops import set_active_cards
+            from mail_agent.storage.ops import set_active_cards
             await set_active_cards(mailbox, cards)
         return result
 
@@ -2111,7 +2180,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         draft_body = (result.get("draft") or {}).get("body", "") if isinstance(result, dict) else ""
         if draft_body:
             card.draft_reply = draft_body
-            from mail_agent.storage_ops import set_active_cards
+            from mail_agent.storage.ops import set_active_cards
             await set_active_cards(mailbox, cards)
         return result
 
@@ -2122,19 +2191,24 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if decision not in ("no_action_needed", "handled_manually", "dismissed"):
             return {"error": f"Invalid decision: {decision}"}
         updated = await update_card_status(mailbox, card_id, "resolved" if decision != "dismissed" else "dismissed", decision)
+        # Record card title for history
+        cards = await storage_get_cards(mailbox)
+        card = next((c for c in cards.cards if c.card_id == card_id), None)
+        card_title = card.title if card else card_id
         # Record weak signal: no_action_needed → LearningRecord
         if decision == "no_action_needed":
-            cards = await storage_get_cards(mailbox)
-            card = next((c for c in cards.cards if c.card_id == card_id), None)
             if card:
                 await append_learning(card.original.from_addr, "no_action_needed")
+        # Write history
+        from mail_agent.storage.ops import append_card_action
+        await append_card_action(mailbox, card_id, card_title, decision, "", **_card_context(card) if card else {})
         return {"ok": updated is not None, "card_id": card_id, "decision": decision}
 
     if tool == "clear_active_cards":
         if not mailbox:
             return {"error": "mailbox is required"}
-        from mail_agent.storage_ops import set_active_cards as _set_active, set_scan_state
-        from mail_agent.storage_types import ActiveCards, ScanState, _now
+        from mail_agent.storage.ops import set_active_cards as _set_active, set_scan_state
+        from mail_agent.storage.types import ActiveCards, ScanState, _now
         await _set_active(mailbox, ActiveCards(cards=[], updated_at=_now()))
         # Reset scan state so the UI shows first-run welcome
         await set_scan_state(mailbox, ScanState(
@@ -2153,46 +2227,56 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if not mailbox or not card_id:
             return {"error": "mailbox and card_id are required"}
         snooze_option = str(arguments.get("snooze_option", "")).strip()
+        cards = await storage_get_cards(mailbox)
+        card = next((c for c in cards.cards if c.card_id == card_id), None)
+        card_title = card.title if card else card_id
         if snooze_option == "dont_prioritize":
-            cards = await storage_get_cards(mailbox)
-            card = next((c for c in cards.cards if c.card_id == card_id), None)
             if card:
                 await add_snooze_sender(card.original.from_addr)
                 await add_snooze_thread(card.original.thread)
                 await update_card_status(mailbox, card_id, "resolved", "dont_prioritize")
+            from mail_agent.storage.ops import append_card_action
+            await append_card_action(mailbox, card_id, card_title, "snooze", "dont_prioritize", **_card_context(card) if card else {})
             return {"ok": True, "card_id": card_id, "option": snooze_option}
         else:
             from datetime import datetime, timedelta
-            from mail_agent.storage_types import BEIJING_TZ
-            now = datetime.now(BEIJING_TZ)
+            from mail_agent.storage.types import BEIJING_TZ
+            now_ts = datetime.now(BEIJING_TZ)
             if snooze_option == "tomorrow":
-                until = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+                until = (now_ts + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
             elif snooze_option == "next_week":
-                days_until_monday = (7 - now.weekday()) % 7 or 7
-                until = (now + timedelta(days=days_until_monday)).replace(hour=9, minute=0, second=0, microsecond=0)
+                days_until_monday = (7 - now_ts.weekday()) % 7 or 7
+                until = (now_ts + timedelta(days=days_until_monday)).replace(hour=9, minute=0, second=0, microsecond=0)
             else:
                 return {"error": f"Unknown snooze option: {snooze_option}"}
-            cards = await storage_get_cards(mailbox)
             for c in cards.cards:
                 if c.card_id == card_id:
                     c.status = "snoozed"
                     c.snooze_until = until.isoformat()
-                    from mail_agent.storage_ops import set_active_cards
+                    from mail_agent.storage.ops import set_active_cards
                     await set_active_cards(mailbox, cards)
                     break
+            from mail_agent.storage.ops import append_card_action
+            await append_card_action(mailbox, card_id, card_title, "snooze", snooze_option, **_card_context(card) if card else {})
             return {"ok": True, "card_id": card_id, "option": snooze_option, "snooze_until": until.isoformat()}
 
     if tool == "restore_card":
         if not mailbox or not card_id:
             return {"error": "mailbox and card_id are required"}
         await update_card_status(mailbox, card_id, "pending")
+        # Write history
+        cards = await storage_get_cards(mailbox)
+        card = next((c for c in cards.cards if c.card_id == card_id), None)
+        card_title = card.title if card else card_id
+        from mail_agent.storage.ops import append_card_action
+        await append_card_action(mailbox, card_id, card_title, "restore", "", **_card_context(card) if card else {})
         return {"ok": True, "card_id": card_id}
 
     if tool == "delete_custom_plan":
         plan_id = str(arguments.get("plan_id", "")).strip()
         if not plan_id:
             return {"error": "plan_id is required"}
-        from mail_agent.storage_ops import delete_custom_plan
+        from mail_agent.storage.ops import delete_custom_plan
         await delete_custom_plan(plan_id)
         return {"ok": True, "plan_id": plan_id}
 
@@ -2217,6 +2301,10 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         log(f"[reply_now] result: ok={result.get('ok')} dry_run={result.get('dry_run')} error={result.get('error', '')}")
         if result.get("ok") and not dry_run:
             await update_card_status(mailbox, card_id, "resolved", "replied")
+        # Write history
+        from mail_agent.storage.ops import append_card_action
+        detail_preview = draft_body[:80]
+        await append_card_action(mailbox, card_id, card.title, "reply", detail_preview, **_card_context(card))
         return result
 
     if tool == "reply_from_ask":
@@ -2231,12 +2319,14 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         dry_run = arguments.get("dry_run", True)
         if not isinstance(dry_run, bool):
             dry_run = True
-        from mail_agent.mail_adapter import send_reply
+        from mail_agent.mail_providers.gmail.adapter import send_reply
         import asyncio as _asyncio
         if dry_run:
             return {"ok": True, "dry_run": True, "message": "Mock: reply was NOT sent."}
         try:
             result = await _asyncio.to_thread(send_reply, mailbox, thread_id, to_addr, body, reply_mode=reply_mode)
+            from mail_agent.storage.ops import append_card_action
+            await append_card_action(mailbox, "", thread_id, "reply_from_ask", body[:80])
             return {"ok": True, "dry_run": False, "result": result}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -2248,10 +2338,12 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         message_ids = [str(mid).strip() for mid in raw_ids if str(mid).strip()] if isinstance(raw_ids, list) else []
         if not message_ids:
             return {"error": "message_ids (non-empty array) is required"}
-        from mail_agent.mail_adapter import batch_mark_read
+        from mail_agent.mail_providers.gmail.adapter import batch_mark_read
         import asyncio as _asyncio
         try:
             result = await _asyncio.to_thread(batch_mark_read, mailbox, message_ids)
+            from mail_agent.storage.ops import append_card_action
+            await append_card_action(mailbox, "", "", "mark_read_from_ask", f"{len(message_ids)} emails")
             return {"ok": True, "marked": len(message_ids), "result": result}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -2263,7 +2355,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         message_ids = [str(mid).strip() for mid in raw_ids if str(mid).strip()] if isinstance(raw_ids, list) else []
         if not message_ids:
             return {"error": "message_ids (non-empty array) is required"}
-        from mail_agent.mail_adapter import trash_email
+        from mail_agent.mail_providers.gmail.adapter import trash_email
         import asyncio as _asyncio
         errors = []
         for mid in message_ids:
@@ -2271,6 +2363,8 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 await _asyncio.to_thread(trash_email, mailbox, mid)
             except Exception as exc:
                 errors.append(f"{mid}: {exc}")
+        from mail_agent.storage.ops import append_card_action
+        await append_card_action(mailbox, "", "", "trash_from_ask", f"{len(message_ids)} emails")
         if errors:
             return {"ok": False, "trashed": len(message_ids) - len(errors), "errors": errors}
         return {"ok": True, "trashed": len(message_ids)}
@@ -2381,7 +2475,7 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     if tool == "re_run_custom_scan":
         return {"success": True, "tool": tool, "data": re_run_custom_scan(arguments, invoke_id)}
     if tool == "get_authorized_email":
-        from mail_agent.mail_adapter import get_authorized_email
+        from mail_agent.mail_providers.gmail.adapter import get_authorized_email
         email = get_authorized_email()
         if email:
             return {"success": True, "tool": tool, "data": {"mailbox": email, "source": "platform"}}

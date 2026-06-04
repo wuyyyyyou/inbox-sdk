@@ -32,7 +32,7 @@ class SamplingStub:
 
 
 async def test_valid_json_does_not_trigger_repair() -> None:
-    from mail_agent.llm import call_llm_json
+    from mail_agent.llm_runtime.service import call_llm_json
 
     stub = SamplingStub(['{"ok": true}'])
     result = await call_llm_json(
@@ -50,7 +50,7 @@ async def test_valid_json_does_not_trigger_repair() -> None:
 
 
 async def test_local_json_repair_does_not_trigger_llm_repair() -> None:
-    from mail_agent.llm import call_llm_json
+    from mail_agent.llm_runtime.service import call_llm_json
 
     stub = SamplingStub(['{"a":"b"\n"c":1}'])
     result = await call_llm_json(
@@ -68,7 +68,7 @@ async def test_local_json_repair_does_not_trigger_llm_repair() -> None:
 
 
 async def test_invalid_json_triggers_one_sampling_repair() -> None:
-    from mail_agent.llm import call_llm_json
+    from mail_agent.llm_runtime.service import call_llm_json
 
     stub = SamplingStub(['{"a": "b", broken}', '{"a": "b"}'])
     result = await call_llm_json(
@@ -93,7 +93,7 @@ async def test_invalid_json_triggers_one_sampling_repair() -> None:
 
 
 async def test_repair_failure_uses_safe_fallback() -> None:
-    from mail_agent.llm import call_llm_json_safe
+    from mail_agent.llm_runtime.service import call_llm_json_safe
 
     stub = SamplingStub(["not json", "still not json"])
     result = await call_llm_json_safe(
@@ -112,7 +112,7 @@ async def test_repair_failure_uses_safe_fallback() -> None:
 
 
 async def test_empty_sampling_response_does_not_trigger_repair() -> None:
-    from mail_agent.llm import call_llm_json_safe
+    from mail_agent.llm_runtime.service import call_llm_json_safe
 
     stub = SamplingStub([""])
     result = await call_llm_json_safe(

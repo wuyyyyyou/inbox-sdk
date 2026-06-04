@@ -103,10 +103,17 @@ export interface RunStatus {
   stage?: string;
   progress?: Record<string, unknown>;
   partial?: Record<string, unknown>;
+  warnings?: RunWarning[];
   result?: Record<string, unknown>;
   started_at?: string;
   updated_at?: string;
   error?: string;
+}
+
+export interface RunWarning {
+  stage: string;
+  at: string;
+  detail: Record<string, unknown>;
 }
 
 export interface ScanPlan {
@@ -133,6 +140,17 @@ export interface RunHistoryEntry {
   plan_id?: string;
   result?: string;
   summary?: string;
+  // card-action fields
+  entry_type?: string;       // "scan" | "card_action"
+  card_id?: string;
+  card_title?: string;
+  action?: string;            // "snooze" | "reply" | "handled_manually" | "no_action_needed" | "cleanup_read" | "restore"
+  detail?: string;
+  // card context for rendering history entries
+  card_summary?: string;
+  card_from?: string;
+  card_subject?: string;
+  card_body?: string;
 }
 
 export interface CustomPlanSummary {

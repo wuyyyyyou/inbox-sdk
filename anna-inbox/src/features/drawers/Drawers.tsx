@@ -1,7 +1,17 @@
+import { useState } from "react";
 import { modeLabel } from "../../app/constants";
 import { useApp } from "../../app/AppContext";
 import { formatBeijingTimestamp } from "../../shared/format";
-import { resolvedCards } from "../brief/cardHelpers";
+import type { RunHistoryEntry } from "../../types/mail";
+
+function RestoreIcon() {
+  return (
+    <svg className="history-restore-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M3 7v6h6" />
+      <path d="M21 17a9 9 0 0 0-15.4-6.4L3 13" />
+    </svg>
+  );
+}
 
 export function Drawers() {
   const { state, actions } = useApp();
@@ -23,11 +33,9 @@ function SourcesDrawer() {
   const totalScans = Number(state.scanState?.total_scans || 0);
   const timeRange = plan.time_range || "auto";
   const maxMessages = plan.max_messages || 50;
-  const schedule = plan.schedule || "manual";
   const windowLabel = timeRange !== "auto"
     ? ({ last_24h: "1 day", last_7d: "7 days", unread_backlog: "30 days", since_last: "since last scan" }[timeRange] || timeRange)
     : totalScans === 0 ? "7 days (first scan)" : "adaptive";
-  const scheduleLabel = { manual: "manual", every_morning: "morning", every_afternoon: "afternoon", twice_daily: "2x/day", workdays: "workdays" }[schedule] || schedule;
   const storageLabel = state.storageProvider === "aps" ? "APS (Anna Persistent Storage)" : "local JSON files";
   const initials = (state.mailbox || "A").charAt(0).toUpperCase();
   return (
@@ -53,9 +61,8 @@ function SourcesDrawer() {
           </ul>
         </section>
         <section className="config-block">
-          <h3>Schedule &amp; storage</h3>
+          <h3>Storage</h3>
           <ul className="config-list">
-            <li>Schedule: <strong>{scheduleLabel}</strong></li>
             <li>Storage: {storageLabel}</li>
             {plan.include_newsletters ? <li>Including newsletters</li> : null}
             {plan.include_promotions ? <li>Including promotions</li> : null}
@@ -66,50 +73,192 @@ function SourcesDrawer() {
   );
 }
 
+const HISTORY_GROUPS = [
+  { key: "brief", label: "Brief scans", icon: "📋" },
+  { key: "ask", label: "Ask", icon: "🔍" },
+  { key: "reply", label: "Replied", icon: "✉️" },
+  { key: "handled", label: "Handled manually", icon: "✅" },
+  { key: "no_action", label: "No action needed", icon: "✔️" },
+  { key: "snooze", label: "Snoozed", icon: "🔕" },
+  { key: "cleanup", label: "Cleaned up", icon: "📭" },
+  { key: "trash", label: "Trashed", icon: "🗑️" },
+  { key: "restore", label: "Restored", icon: "↩️" },
+];
+
+function classifyEntry(run: RunHistoryEntry): string {
+  if (run.entry_type !== "card_action") {
+    return run.strategy ? "brief" : "ask";
+  }
+  const action = run.action || "";
+  if (action === "reply" || action === "reply_from_ask") return "reply";
+  if (action === "handled_manually") return "handled";
+  if (action === "no_action_needed") return "no_action";
+  if (action === "snooze") return "snooze";
+  if (action === "cleanup_read" || action === "mark_read_from_ask") return "cleanup";
+  if (action === "trash_from_ask") return "trash";
+  if (action === "restore") return "restore";
+  return "other";
+}
+
+const ACTION_TITLES: Record<string, string> = {
+  reply: "Replied", reply_from_ask: "Replied (Ask)",
+  handled_manually: "Handled", no_action_needed: "No action",
+  snooze: "Snoozed", cleanup_read: "Cleanup",
+  mark_read_from_ask: "Marked read (Ask)", trash_from_ask: "Trashed (Ask)",
+  restore: "Restored",
+};
+
+const RESTORABLE_ACTIONS = new Set(["snooze", "handled_manually", "no_action_needed", "cleanup_read"]);
+
 function HistoryDrawer() {
   const { state, actions } = useApp();
-  const resolved = resolvedCards(state.cards);
-  const groups = {
-    snoozed: resolved.filter((c) => c.status === "snoozed"),
-    dismissed: resolved.filter((c) => c.status === "dismissed"),
-    resolved: resolved.filter((c) => c.status === "resolved"),
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  // Entries that have been restored — hidden from list immediately
+  const [restoredRunIds, setRestoredRunIds] = useState<Set<string>>(new Set());
+
+  // Group entries
+  const grouped: Record<string, RunHistoryEntry[]> = {};
+  for (const run of state.history) {
+    const gk = classifyEntry(run);
+    (grouped[gk] ||= []).push(run);
+  }
+
+  const toggleGroup = (key: string) => setCollapsed((c) => ({ ...c, [key]: !c[key] }));
+
+  const entryKey = (run: RunHistoryEntry) => run.run_id || `${run.ts}-${run.request}`;
+
+  const toggleExpand = (run: RunHistoryEntry) => {
+    const key = entryKey(run);
+    setExpanded((c) => ({ ...c, [key]: !c[key] }));
   };
-  const statusLabel = (card: { status?: string; snooze_until?: string; resolution?: string }) => {
-    if (card.status === "snoozed") return card.snooze_until ? `Until ${formatBeijingTimestamp(card.snooze_until)}` : "Snoozed";
-    if (card.status === "dismissed") return "Dismissed";
-    const resolutionMap: Record<string, string> = { no_action_needed: "No action", handled_manually: "Handled", replied: "Replied", dont_prioritize: "Muted" };
-    return resolutionMap[card.resolution || ""] || card.resolution || "Resolved";
+
+  // ── Snooze sub-filter ──────────────────────────────────────────
+
+  const SNOOZE_FILTERS = [
+    { key: "tomorrow", label: "Tomorrow" },
+    { key: "next_week", label: "Next Week" },
+    { key: "dont_prioritize", label: "Don't Prioritize" },
+  ];
+  const [snoozeFilter, setSnoozeFilter] = useState<string>("tomorrow");
+
+  const _filterVisible = (entries: RunHistoryEntry[]) => {
+    const byFilter = new Map<string, RunHistoryEntry[]>();
+    for (const e of entries) {
+      const k = e.detail || "";
+      if (!byFilter.has(k)) byFilter.set(k, []);
+      byFilter.get(k)!.push(e);
+    }
+    return { byFilter, selected: byFilter.get(snoozeFilter) || [] };
   };
-  const renderGroup = (label: string, cards: typeof resolved) => cards.length ? (
-    <div className="resolved-group">
-      <div className="resolved-group-title">{label}</div>
-      {cards.map((card) => (
-        <div className="resolved-card" key={card.id}>
-          <div><div className="resolved-card-title">{card.title || "Untitled"}</div><div className="resolved-card-meta">{statusLabel(card)}</div></div>
-          <button className="detail-back" onClick={() => void actions.restoreCard(card.id)}>Restore</button>
+
+  const handleRestore = (run: RunHistoryEntry) => {
+    if (!run.card_id) return;
+    setRestoredRunIds((prev) => new Set(prev).add(entryKey(run)));
+    void actions.restoreCard(run.card_id);
+  };
+
+  const renderEntry = (run: RunHistoryEntry, hideDetail?: boolean) => {
+    const isCard = run.entry_type === "card_action";
+    const isExpanded = expanded[entryKey(run)] || false;
+    const hasCardContext = !!(run.card_from || run.card_subject || run.card_summary || run.card_body);
+    const canRestore = isCard && RESTORABLE_ACTIONS.has(run.action || "") && !!run.card_id;
+
+    const title = isCard
+      ? (run.card_title || run.card_id || "")
+      : (run.request || run.strategy || "Mailbox scan");
+
+    return (
+      <div className="history-entry" key={entryKey(run)}>
+        <div
+          className={`history-entry-row ${isCard ? "is-expandable" : ""}`}
+          onClick={isCard ? () => toggleExpand(run) : undefined}
+        >
+          <span className="history-entry-time">{formatBeijingTimestamp(run.ts)}</span>
+          <span className="history-entry-text">{title}</span>
+          {run.detail && !hideDetail ? <span className="history-entry-detail">{run.detail}</span> : null}
+          {run.result && !isCard ? <span className="history-entry-detail">{run.result}</span> : null}
+          {canRestore ? (
+            <button
+              className="history-restore-btn"
+              type="button"
+              title="Restore"
+              aria-label="Restore card"
+              onClick={(e) => { e.stopPropagation(); handleRestore(run); }}
+            >
+              <RestoreIcon />
+            </button>
+          ) : null}
+          {isCard ? <span className="history-entry-arrow">{isExpanded ? "▾" : "▸"}</span> : null}
         </div>
-      ))}
-    </div>
-  ) : null;
+        {isExpanded ? (
+          <div className="history-entry-body">
+            {hasCardContext ? (
+              <>
+                {run.card_from ? <div className="history-entry-line"><span className="history-entry-label">From</span> {run.card_from}</div> : null}
+                {run.card_subject ? <div className="history-entry-line"><span className="history-entry-label">Subject</span> {run.card_subject}</div> : null}
+                {run.card_summary ? <div className="history-entry-line"><span className="history-entry-label">Summary</span> {run.card_summary}</div> : null}
+                {(!run.card_summary && run.card_body) ? <div className="history-entry-line">{run.card_body}</div> : null}
+              </>
+            ) : (
+              <div className="history-entry-line">Card details will appear here after the next mail scan.</div>
+            )}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
+  const visibleGroups = HISTORY_GROUPS.filter((g) => (grouped[g.key]?.length || 0) > 0);
+  const hasAny = visibleGroups.length > 0;
+
   return (
     <aside className={`drawer ${state.historyOpen ? "is-open" : ""}`} aria-label="History drawer">
       <div className="drawer-head">
-        <div><h2 className="drawer-title">History</h2><p className="drawer-copy">Cards you've processed and past runs.</p></div>
+        <div><h2 className="drawer-title">History</h2><p className="drawer-copy">All scans and card actions you've taken.</p></div>
         <button className="icon-btn" onClick={actions.closeDrawers}>×</button>
       </div>
       <div className="drawer-body">
-        {resolved.length ? <section className="resolved-section">{renderGroup("Snoozed", groups.snoozed)}{renderGroup("Dismissed", groups.dismissed)}{renderGroup("Resolved", groups.resolved)}</section> : <p className="assistant-copy">No processed cards yet.</p>}
-        {state.history.length ? (
-          <section style={{ marginTop: 18 }}>
-            <div className="resolved-group-title" style={{ marginBottom: 8 }}>Past runs</div>
-            {state.history.map((run) => (
-              <article className="source-card" key={run.run_id || `${run.ts}-${run.request}`}>
-                <div className="source-icon">A</div>
-                <div><div className="source-name">{run.request || run.strategy || "Mailbox scan"}</div><div className="source-meta">{formatBeijingTimestamp(run.ts) || "-"} · {run.result || ""}</div></div>
-              </article>
-            ))}
-          </section>
-        ) : null}
+        {!hasAny ? <p className="assistant-copy">No history yet.</p> : null}
+        {visibleGroups.map((g) => {
+          const allEntries = (grouped[g.key] || []).filter((e) => !restoredRunIds.has(entryKey(e)));
+          const isCollapsed = collapsed[g.key] || false;
+          const isSnooze = g.key === "snooze";
+          const { byFilter, selected } = isSnooze ? _filterVisible(allEntries) : { byFilter: new Map(), selected: allEntries };
+          const displayed = isSnooze ? selected : allEntries;
+
+          return (
+            <section className="history-group" key={g.key}>
+              <button className="history-group-header" onClick={() => toggleGroup(g.key)}>
+                <span className="history-group-icon">{g.icon}</span>
+                <span className="history-group-label">{g.label}</span>
+                <span className="history-group-count">{allEntries.length}</span>
+                <span className="history-group-arrow">{isCollapsed ? "▸" : "▾"}</span>
+              </button>
+              {!isCollapsed ? (
+                <div className="history-group-body">
+                  {isSnooze ? (
+                    <div className="history-subfilter-row">
+                      {SNOOZE_FILTERS.map((f) => {
+                        const count = byFilter.get(f.key)?.length || 0;
+                        return (
+                          <button
+                            key={f.key}
+                            className={`preset-chip ${snoozeFilter === f.key ? "is-active" : ""}`}
+                            onClick={() => setSnoozeFilter(f.key)}
+                          >
+                            {f.label}{count ? ` (${count})` : ""}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                  {displayed.map((e) => renderEntry(e, isSnooze))}
+                </div>
+              ) : null}
+            </section>
+          );
+        })}
       </div>
     </aside>
   );
@@ -119,7 +268,6 @@ function ScanPlanDrawer() {
   const { state, actions } = useApp();
   const plan = state.scanPlan || {};
   const rangeLabels: Record<string, string> = { auto: "Adaptive (auto)", since_last: "Since last brief", last_24h: "Last 24 hours", last_7d: "Last 7 days", unread_backlog: "Unread backlog" };
-  const scheduleLabels: Record<string, string> = { manual: "Manual only", every_morning: "Every morning", every_afternoon: "Every afternoon", twice_daily: "Twice a day", workdays: "Workdays only" };
   return (
     <aside className={`drawer ${state.scanPlanOpen ? "is-open" : ""}`} aria-label="Scan plan drawer">
       <div className="drawer-head">
@@ -127,7 +275,6 @@ function ScanPlanDrawer() {
         <button className="icon-btn" onClick={actions.closeDrawers}>×</button>
       </div>
       <div className="drawer-body">
-        <PlanButtonGroup title="Schedule" entries={scheduleLabels} current={plan.schedule} onSet={(v) => void actions.saveScanPlanField("schedule", v)} />
         <PlanButtonGroup title="Time range" entries={rangeLabels} current={plan.time_range} onSet={(v) => void actions.saveScanPlanField("time_range", v)} />
         <section className="config-block">
           <h3>Messages per scan</h3>

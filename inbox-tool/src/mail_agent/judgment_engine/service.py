@@ -8,7 +8,7 @@ import re
 from typing import Any
 
 from datetime import datetime, timezone, timedelta
-from .types import (
+from ..domain.types import (
     BaseJudgment,
     CandidateContext,
     FinalDecision,
@@ -18,7 +18,7 @@ from .types import (
     MailboxProfile,
     StrategyMode,
 )
-from .storage_types import SnoozePrefs
+from ..storage.types import SnoozePrefs
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -765,7 +765,7 @@ async def evaluate_item(
     snooze_prefs: SnoozePrefs | None = None,
 ) -> JudgmentResult:
     """Evaluate a single candidate item using LLM (DashScope path)."""
-    from .llm import call_llm_json_safe
+    from ..llm_runtime.service import call_llm_json_safe
 
     prompt = build_judgment_prompt(task_plan, strategy, mailbox_profile, candidate_context, snooze_prefs)
 
@@ -809,7 +809,7 @@ async def evaluate_items_batch(
     progress_callback: Any = None,
 ) -> list[JudgmentResult]:
     """Use Anna sampling to evaluate all candidates in batches without dropping candidates."""
-    from .llm import call_llm_json_safe
+    from ..llm_runtime.service import call_llm_json_safe
 
     if not candidate_contexts:
         return []

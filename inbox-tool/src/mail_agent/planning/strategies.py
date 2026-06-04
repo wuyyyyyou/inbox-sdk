@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from .types import (
+from ..domain.types import (
     ActionPolicy,
     CandidatePolicy,
     ContextPolicy,

@@ -1,4 +1,4 @@
-﻿"""Mail adapter — reads from local Gmail cache and live Gmail API."""
+"""Mail adapter — reads from local Gmail cache and live Gmail API."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .types import MessageDetail, MessageLite, ThreadContext
+from ...domain.types import MessageDetail, MessageLite, ThreadContext
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
@@ -26,12 +26,12 @@ def beijing_now() -> str:
 
 
 def _tool_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[4]
 
 
 def _repo_root() -> Path:
-    # mail_adapter.py lives at inbox-tool/src/mail_agent/mail_adapter.py.
-    return Path(__file__).resolve().parents[3]
+    # adapter.py lives at inbox-tool/src/mail_agent/mail_providers/gmail/adapter.py.
+    return Path(__file__).resolve().parents[5]
 
 
 def _is_platform() -> bool:

@@ -9,8 +9,8 @@ from __future__ import annotations
 import json
 from typing import Any, Sequence
 
-from .storage_client import get_storage, get_files, scope as default_scope
-from .storage_types import (
+from .client import get_storage, get_files, scope as default_scope
+from .types import (
     ActiveCards,
     CardAction,
     CardDetails,
@@ -212,6 +212,41 @@ async def append_run_history(entry: RunHistoryEntry) -> dict:
     return await get_storage().set(RUN_HISTORY_KEY, raw, scope=default_scope())
 
 
+async def append_card_action(
+    mailbox: str,
+    card_id: str,
+    card_title: str,
+    action: str,
+    detail: str = "",
+    *,
+    card_summary: str = "",
+    card_from: str = "",
+    card_subject: str = "",
+    card_body: str = "",
+) -> dict:
+    """Record a card-level action (snooze, reply, handle, etc.) in run history."""
+    from uuid import uuid4
+    from .types import _now
+
+    entry = RunHistoryEntry(
+        run_id=f"act_{uuid4().hex[:12]}",
+        mailbox=mailbox,
+        ts=_now(),
+        entry_type="card_action",
+        card_id=card_id,
+        card_title=card_title,
+        action=action,
+        detail=detail,
+        result=f"{action}: {card_title}",
+        summary=detail or action,
+        card_summary=card_summary,
+        card_from=card_from,
+        card_subject=card_subject,
+        card_body=card_body,
+    )
+    return await append_run_history(entry)
+
+
 # ── User preferences ────────────────────────────────────────────────
 
 SNOOZE_KEY = "prefs/snooze"
@@ -325,6 +360,15 @@ def _dict_to_run_history_entry(d: dict) -> RunHistoryEntry:
         plan_id=d.get("plan_id", ""),
         result=d.get("result", ""),
         summary=d.get("summary", ""),
+        entry_type=d.get("entry_type", "scan"),
+        card_id=d.get("card_id", ""),
+        card_title=d.get("card_title", ""),
+        action=d.get("action", ""),
+        detail=d.get("detail", ""),
+        card_summary=d.get("card_summary", ""),
+        card_from=d.get("card_from", ""),
+        card_subject=d.get("card_subject", ""),
+        card_body=d.get("card_body", ""),
     )
 
 

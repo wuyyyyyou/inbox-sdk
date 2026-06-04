@@ -95,13 +95,13 @@ async def main():
     fake = FakeStorageClient()
     fake_files = FakeStorageClient()  # type: ignore[assignment]
 
-    from mail_agent.storage_client import init
+    from mail_agent.storage.client import init
     init(fake, fake_files, scope="user")  # type: ignore[arg-type]
     print("  Fake StorageClient wired into singleton")
 
     # 2. Test storage_types
     print("\n── storage_types ──")
-    from mail_agent.storage_types import (
+    from mail_agent.storage.types import (
         ScanState, ProcessedMessage, PersistentCard, CardDetails,
         OriginalEmail, CardAction, ActiveCards, RunRecord,
         RunHistoryEntry, UserPreferences, SnoozePrefs, LearningRecord,
@@ -128,7 +128,7 @@ async def main():
 
     # 3. Test storage_ops — scan state
     print("\n── storage_ops: scan state ──")
-    from mail_agent.storage_ops import (
+    from mail_agent.storage.ops import (
         get_scan_state, set_scan_state, mark_message_processed,
         mark_messages_processed_batch, get_processed_message_ids,
         filter_unprocessed, get_active_cards, set_active_cards,
@@ -167,10 +167,10 @@ async def main():
 
     # 5. Test card_service
     print("\n── card_service ──")
-    from mail_agent.card_service import (
+    from mail_agent.cards.service import (
         build_card, merge_cards, cards_to_frontend, build_action_memo,
      )
-    from mail_agent.types import CandidateItem, JudgmentResult, FinalDecision, BaseJudgment
+    from mail_agent.domain.types import CandidateItem, JudgmentResult, FinalDecision, BaseJudgment
 
     # Build a mock judgment for use with build_card
     # (we already tested PersistentCard construction; focus on merge/format)
@@ -234,7 +234,7 @@ async def main():
     prefs = await get_user_prefs()
     check("get_user_prefs (empty)", len(prefs.snooze.senders) == 0)
 
-    from mail_agent.storage_ops import add_snooze_sender, add_snooze_thread
+    from mail_agent.storage.ops import add_snooze_sender, add_snooze_thread
     await add_snooze_sender("newsletter@spam.com")
     await add_snooze_thread("Weekly digest")
     prefs2 = await get_user_prefs()
@@ -254,7 +254,7 @@ async def main():
 
 
 async def _is_processed(mailbox: str, msg_id: str) -> bool:
-    from mail_agent.storage_ops import is_message_processed
+    from mail_agent.storage.ops import is_message_processed
     return await is_message_processed(mailbox, msg_id)
 
 

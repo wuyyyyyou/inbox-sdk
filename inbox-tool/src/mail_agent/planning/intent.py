@@ -15,7 +15,7 @@ import re
 from typing import Any
 
 from .strategies import get as get_strategy
-from .types import MailTaskInput, MailTaskPlan, StrategyMode
+from ..domain.types import MailTaskInput, MailTaskPlan, StrategyMode
 
 
 # ── 规则式关键词匹配 ─────────────────────────────────────────────

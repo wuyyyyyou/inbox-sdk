@@ -73,7 +73,7 @@ export function primaryAction(card: FrontendCard): { id: string; label: string }
     || { id: "handle", label: "Handle", buttonLabel: "" };
   return {
     id: primary.id || "handle",
-    label: primary.buttonLabel || primary.label || "Handle",
+    label: "Handle",
   };
 }
 

@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .types import CustomScanPlan
+from ..domain.types import CustomScanPlan
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
@@ -186,7 +186,7 @@ async def generate_custom_plan(
     Planner LLM 输出 gmail_queries + read_depth + task_prompt，
     执行 LLM 根据 task_prompt 直接完成分析和输出。
     """
-    from .llm import call_llm_json_safe
+    from ..llm_runtime.service import call_llm_json_safe
 
     user_message = _PLANNER_USER_TEMPLATE.format(
         user_request=user_request,

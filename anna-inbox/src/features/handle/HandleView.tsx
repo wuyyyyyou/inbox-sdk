@@ -69,6 +69,10 @@ export function HandleView() {
             </div>
             {cc && cc !== "None" ? null : <span className="reply-mode-note">No CC recipients</span>}
           </div>
+          <div className="revise-row">
+            <input type="text" placeholder={draft ? "Tell Anna how to revise this draft..." : "Tell Anna how to write the reply (optional)"} value={state.revisionById[card.id] || ""} disabled={state.generatingDraft} onChange={(e) => actions.setRevision(card.id, e.target.value)} />
+            <button className="soft-btn generate-draft-btn is-glow" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>{state.generatingDraft ? "Working..." : draft ? "Ask Anna to revise" : "Generate draft"}</button>
+          </div>
           <textarea className={`draft-textarea${state.generatingDraft && !draft ? " is-draft-loading" : ""}`} placeholder="Click 'Generate draft' to have Anna write a reply based on this thread." value={draftDisplay} onChange={(e) => actions.setDraft(card.id, e.target.value)} />
           {draft ? (
             <div className="preset-row">
@@ -77,10 +81,6 @@ export function HandleView() {
               <button className="preset-chip" disabled={state.generatingDraft} onClick={() => void actions.generateDraft("Make it more direct")}>More direct</button>
             </div>
           ) : null}
-          <div className="revise-row">
-            <input type="text" placeholder={draft ? "Tell Anna how to revise this draft..." : "Tell Anna how to write the reply (optional)"} value={state.revisionById[card.id] || ""} disabled={state.generatingDraft} onChange={(e) => actions.setRevision(card.id, e.target.value)} />
-            <button className="soft-btn generate-draft-btn is-glow" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>{state.generatingDraft ? "Working..." : draft ? "Ask Anna to revise" : "Generate draft"}</button>
-          </div>
         </section>
         <section className="review-block is-quiet">
           <button className="thread-context-toggle" aria-expanded={contextExpanded} onClick={() => actions.toggleThreadContext(card.id)}>

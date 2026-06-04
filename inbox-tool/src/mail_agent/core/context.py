@@ -12,8 +12,8 @@
 
 from __future__ import annotations
 
-from .mail_adapter import get_message_detail, get_thread_context
-from .types import CandidateContext, CandidateItem
+from ..mail_providers.gmail.adapter import get_message_detail, get_thread_context
+from ..domain.types import CandidateContext, CandidateItem
 
 
 async def read_candidate_context(
