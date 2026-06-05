@@ -47,7 +47,7 @@ export function createInitialState(): AppState {
     lowerPriorityOpen: false,
     minimized: false,
     resultFilter: "all",
-    llmProvider: "anna-llm",
+    llmProvider: "dashscope",
     storageProvider: "local",
     samplingTestRunning: false,
     samplingTestResult: null,

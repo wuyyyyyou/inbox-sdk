@@ -53,7 +53,7 @@ from executa_sdk.storage import StorageClient, FilesClient, StorageError, make_r
 
 JSONRPC_VERSION = "2.0"
 DEFAULT_TOOL_ID = "inbox-tool"
-DEFAULT_VERSION = "0.1.0"
+DEFAULT_VERSION = "0.2.0"
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 STDOUT_LOCK = threading.Lock()
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"

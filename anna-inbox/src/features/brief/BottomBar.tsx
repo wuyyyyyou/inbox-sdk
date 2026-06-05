@@ -5,11 +5,6 @@ import { visibleCards } from "./cardHelpers";
 export function BottomBar() {
   const { state, actions } = useApp();
   const cards = visibleCards(state.cards);
-  const samplingResult = state.samplingTestResult;
-  const samplingDiagnostics = samplingResult?.diagnostics || {};
-  const samplingTitle = samplingResult
-    ? `${samplingResult.success ? "Sampling OK" : samplingResult.error || "Sampling failed"} | token=${samplingDiagnostics.context_has_sampling_token ? "yes" : "no"} | invoke=${samplingDiagnostics.context_has_invoke_id ? "yes" : "no"}`
-    : "Run test_anna_sampling";
   if (state.isScanning) {
     const step = SCAN_STEPS[Math.min(state.scanStepIndex, SCAN_STEPS.length - 1)] || SCAN_STEPS[0];
     return (
@@ -30,23 +25,14 @@ export function BottomBar() {
       </div>
       <div className="bar-actions">
         <div className="debug-provider-controls" aria-label="Debug providers">
+          <div className="debug-provider-group" role="radiogroup" aria-label="LLM provider">
+            <button className={`debug-provider-btn ${state.llmProvider === "dashscope" ? "is-active" : ""}`} onClick={() => actions.setProvider("llm", "dashscope")}>DashScope</button>
+            <button className={`debug-provider-btn ${state.llmProvider === "anna-llm" ? "is-active" : ""}`} onClick={() => actions.setProvider("llm", "anna-llm")}>Anna</button>
+          </div>
           <div className="debug-provider-group" role="radiogroup" aria-label="Storage provider">
             <button className={`debug-provider-btn ${state.storageProvider === "aps" ? "is-active" : ""}`} onClick={() => actions.setProvider("storage", "aps")}>APS</button>
             <button className={`debug-provider-btn ${state.storageProvider === "local" ? "is-active" : ""}`} onClick={() => actions.setProvider("storage", "local")}>Local</button>
           </div>
-          <button
-            className={`debug-provider-btn sampling-test-btn ${samplingResult ? (samplingResult.success ? "is-ok" : "is-error") : ""}`}
-            disabled={state.samplingTestRunning || !state.runtime.connected}
-            title={samplingTitle}
-            onClick={() => void actions.testAnnaSampling()}
-          >
-            {state.samplingTestRunning ? "Testing..." : samplingResult?.success ? "LLM OK" : samplingResult ? "LLM Fail" : "Test LLM"}
-          </button>
-          {samplingResult ? (
-            <span className={`sampling-test-pill ${samplingResult.success ? "is-ok" : "is-error"}`} title={samplingTitle}>
-              {samplingDiagnostics.context_has_sampling_token ? "token yes" : "token no"}
-            </span>
-          ) : null}
         </div>
         <button className="soft-btn" onClick={() => actions.setDrawer("scanPlan", true)}>Next Scan</button>
 

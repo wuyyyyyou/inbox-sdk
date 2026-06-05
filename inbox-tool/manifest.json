@@ -26,6 +26,20 @@
       "description": "Alternative Google OAuth access token name supported by Anna platform credential mapping.",
       "required": true,
       "sensitive": true
+    },
+    {
+      "name": "DASHSCOPE_API_KEY",
+      "display_name": "DashScope API Key",
+      "description": "DashScope API key for direct LLM access. Required when ai_provider is set to dashscope.",
+      "required": true,
+      "sensitive": true
+    },
+    {
+      "name": "DASHSCOPE_MODEL",
+      "display_name": "DashScope Model",
+      "description": "DashScope model name (e.g. qwen3-max). Defaults to qwen3-max if not set.",
+      "required": false,
+      "sensitive": false
     }
   ],
   "tools": [
