@@ -3783,7 +3783,66 @@
       color: var(--danger, #d93025);
       background: rgba(217,48,37,0.06);
     }
-    .preset-row-sm { display:flex; flex-wrap:wrap; gap:6px; }
+    .preset-row-sm { display:flex; flex-wrap:wrap; gap:6px; align-items: center; }
+    .custom-days-input {
+      padding: 0 10px;
+      font-size: 12px;
+      border: 1px solid rgba(93,82,128,0.14);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.52);
+      color: var(--text-main);
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    .custom-days-input.inline {
+      width: 52px;
+      min-height: 28px;
+      padding: 0 4px;
+      text-align: center;
+      -moz-appearance: textfield;
+    }
+
+    .custom-days-input.inline::-webkit-inner-spin-button,
+    .custom-days-input.inline::-webkit-outer-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
+    }
+
+    .custom-step-btn {
+      width: 22px;
+      height: 22px;
+      padding: 0;
+      font-size: 12px;
+      line-height: 22px;
+      text-align: center;
+      border: 1px solid rgba(93,82,128,0.12);
+      border-radius: 6px;
+      background: rgba(255,255,255,0.52);
+      color: var(--text-muted);
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: color 0.15s, border-color 0.15s;
+    }
+
+    .custom-step-btn:hover {
+      color: #5348c8;
+      border-color: rgba(139,124,248,0.24);
+    }
+
+    .custom-days-input.is-custom {
+      color: #5348c8;
+      background: rgba(139,124,248,0.12);
+      border-color: rgba(139,124,248,0.2);
+    }
+
+    .custom-days-input:focus {
+      border-color: rgba(93,82,128,0.24);
+    }
+
+    .custom-days-input::placeholder {
+      color: var(--text-muted);
+    }
     .scan-plan-saved-text {
       font-size: 12px;
       color: var(--text-muted);

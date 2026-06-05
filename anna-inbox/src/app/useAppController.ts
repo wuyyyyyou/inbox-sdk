@@ -110,7 +110,7 @@ export interface AppActions {
   loadRunHistory(): Promise<void>;
   loadCustomPlans(): Promise<void>;
   loadScanPlan(): Promise<void>;
-  saveScanPlanField(field: string, value: unknown): Promise<void>;
+  saveScanPlanField(field: string, value: unknown): void;
   startScan(reason?: string): Promise<void>;
   openCard(cardId: string): Promise<void>;
   summarizeSelectedThread(): Promise<void>;
@@ -226,7 +226,7 @@ export function useAppController() {
       const plan = await client.loadScanPlan(mailbox, state.storageProvider);
       setState((s) => ({ ...s, scanPlan: plan }));
     } catch {
-      setState((s) => ({ ...s, scanPlan: { time_range: "auto", max_messages: 50, schedule: "manual", include_newsletters: false, include_promotions: false } }));
+      setState((s) => ({ ...s, scanPlan: { first_scan_days: 7, incremental_days: 7, max_messages: 100, scan_categories: [] } }));
     }
   }, [client, state.mailbox, state.storageProvider]);
 
@@ -429,14 +429,9 @@ export function useAppController() {
     loadRunHistory,
     loadCustomPlans,
     loadScanPlan,
-    async saveScanPlanField(field, value) {
-      try {
-        await client.saveScanPlanField(state.mailbox, state.storageProvider, field, value);
-        setState((s) => ({ ...s, scanPlan: { ...(s.scanPlan || {}), [field]: value, updated_at: new Date().toISOString() } }));
-        showToast("Scan plan updated");
-      } catch (error) {
-        showToast("Failed: " + (error instanceof Error ? error.message : "unknown"));
-      }
+    saveScanPlanField(field, value) {
+      setState((s) => ({ ...s, scanPlan: { ...(s.scanPlan || {}), [field]: value, updated_at: new Date().toISOString() } }));
+      client.saveScanPlanField(state.mailbox, state.storageProvider, field, value).catch(() => {});
     },
     async startScan(reason = "manual") {
       if (!state.runtime.connected || state.isScanning) return;

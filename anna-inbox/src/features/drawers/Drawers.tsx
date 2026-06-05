@@ -21,7 +21,6 @@ export function Drawers() {
       <div className={`drawer-overlay ${overlayOpen ? "is-open" : ""}`} onClick={actions.closeDrawers} />
       <SourcesDrawer />
       <HistoryDrawer />
-      <ScanPlanDrawer />
       <aside className="drawer" aria-label="Original message drawer" />
     </>
   );
@@ -30,12 +29,15 @@ export function Drawers() {
 function SourcesDrawer() {
   const { state, actions } = useApp();
   const plan = state.scanPlan || {};
-  const totalScans = Number(state.scanState?.total_scans || 0);
-  const timeRange = plan.time_range || "auto";
-  const maxMessages = plan.max_messages || 50;
-  const windowLabel = timeRange !== "auto"
-    ? ({ last_24h: "1 day", last_7d: "7 days", unread_backlog: "30 days", since_last: "since last scan" }[timeRange] || timeRange)
-    : totalScans === 0 ? "7 days (first scan)" : "adaptive";
+  const firstDays = plan.first_scan_days || 7;
+  const incrDays = plan.incremental_days || 7;
+  const maxMsgs = plan.max_messages || 100;
+  const isCustomFirst = ![7, 14].includes(firstDays);
+  const isCustomIncr = ![4, 7, 14].includes(incrDays);
+  const isCustomMax = ![50, 100, 150].includes(maxMsgs);
+  const [customFirst, setCustomFirst] = useState(isCustomFirst ? String(firstDays) : "");
+  const [customIncr, setCustomIncr] = useState(isCustomIncr ? String(incrDays) : "");
+  const [customMax, setCustomMax] = useState(isCustomMax ? String(maxMsgs) : "");
   const storageLabel = state.storageProvider === "aps" ? "APS (Anna Persistent Storage)" : "local JSON files";
   const mailboxes = state.mailboxes.length
     ? state.mailboxes
@@ -78,19 +80,60 @@ function SourcesDrawer() {
           {!state.selectedMailboxes.length ? <p className="assistant-copy is-error">Select at least one mailbox to run Brief.</p> : null}
         </section>
         <section className="config-block">
-          <h3>Scan window</h3>
-          <ul className="config-list">
-            <li>Range: <strong>{windowLabel}</strong></li>
-            {totalScans > 0 ? <li>Incremental: stops at last processed message time.</li> : <li>First scan covers the full window above.</li>}
-            <li>Max messages per scan: <strong>{maxMessages}</strong></li>
-          </ul>
+          <h3>Scan config</h3>
+          <div className="config-block" style={{ marginBottom: 0 }}>
+            <h4 style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 4px" }}>First scan range</h4>
+            <div className="preset-row preset-row-sm">
+              {[7, 14].map((d) => (
+                <button key={d} className={`preset-chip ${firstDays === d ? "is-active" : ""}`} onClick={() => { setCustomFirst(""); actions.saveScanPlanField("first_scan_days", d); }}>{d}d</button>
+              ))}
+              <button className="custom-step-btn" onClick={() => actions.saveScanPlanField("first_scan_days", Math.max(1, firstDays - 1))}>−</button>
+              <input className={`custom-days-input inline${isCustomFirst ? " is-custom" : ""}`} type="number" min={1} max={90} placeholder="···" value={isCustomFirst ? String(firstDays) : customFirst} onChange={(e) => { setCustomFirst(e.target.value); if (e.target.value) actions.saveScanPlanField("first_scan_days", Number(e.target.value)); }} />
+              <button className="custom-step-btn" onClick={() => actions.saveScanPlanField("first_scan_days", Math.min(90, firstDays + 1))}>+</button>
+            </div>
+          </div>
+          <div className="config-block" style={{ marginBottom: 0 }}>
+            <h4 style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 4px" }}>Incremental scan range</h4>
+            <div className="preset-row preset-row-sm">
+              {[4, 7, 14].map((d) => (
+                <button key={d} className={`preset-chip ${incrDays === d ? "is-active" : ""}`} onClick={() => { setCustomIncr(""); actions.saveScanPlanField("incremental_days", d); }}>{d}d</button>
+              ))}
+              <button className="custom-step-btn" onClick={() => actions.saveScanPlanField("incremental_days", Math.max(1, incrDays - 1))}>−</button>
+              <input className={`custom-days-input inline${isCustomIncr ? " is-custom" : ""}`} type="number" min={1} max={30} placeholder="···" value={isCustomIncr ? String(incrDays) : customIncr} onChange={(e) => { setCustomIncr(e.target.value); if (e.target.value) actions.saveScanPlanField("incremental_days", Number(e.target.value)); }} />
+              <button className="custom-step-btn" onClick={() => actions.saveScanPlanField("incremental_days", Math.min(30, incrDays + 1))}>+</button>
+            </div>
+          </div>
+          <div className="config-block" style={{ marginBottom: 0 }}>
+            <h4 style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 4px" }}>Max messages</h4>
+            <div className="preset-row preset-row-sm">
+              {[50, 100, 150].map((n) => (
+                <button key={n} className={`preset-chip ${maxMsgs === n ? "is-active" : ""}`} onClick={() => { setCustomMax(""); actions.saveScanPlanField("max_messages", n); }}>{n}</button>
+              ))}
+              <button className="custom-step-btn" onClick={() => actions.saveScanPlanField("max_messages", Math.max(10, maxMsgs - 10))}>−</button>
+              <input className={`custom-days-input inline${isCustomMax ? " is-custom" : ""}`} type="number" min={10} max={500} placeholder="···" value={isCustomMax ? String(maxMsgs) : customMax} onChange={(e) => { setCustomMax(e.target.value); if (e.target.value) actions.saveScanPlanField("max_messages", Number(e.target.value)); }} />
+              <button className="custom-step-btn" onClick={() => actions.saveScanPlanField("max_messages", Math.min(500, maxMsgs + 10))}>+</button>
+            </div>
+          </div>
+          <div className="config-block">
+            <h4 style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 4px" }}>Scan categories</h4>
+            <div className="preset-row preset-row-sm">
+              <button className="preset-chip is-active" disabled>Primary</button>
+              {(["social", "promotions", "updates", "forums"] as const).map((cat) => {
+                const cats = plan.scan_categories || [];
+                const active = cats.includes(cat);
+                return (
+                  <button key={cat} className={`preset-chip ${active ? "is-active" : ""}`} onClick={() => {
+                    actions.saveScanPlanField("scan_categories", active ? cats.filter((c: string) => c !== cat) : [...cats, cat]);
+                  }}>{cat.charAt(0).toUpperCase() + cat.slice(1)}</button>
+                );
+              })}
+            </div>
+          </div>
         </section>
         <section className="config-block">
           <h3>Storage</h3>
           <ul className="config-list">
-            <li>Storage: {storageLabel}</li>
-            {plan.include_newsletters ? <li>Including newsletters</li> : null}
-            {plan.include_promotions ? <li>Including promotions</li> : null}
+            <li>{storageLabel}</li>
           </ul>
         </section>
       </div>
@@ -289,44 +332,3 @@ function HistoryDrawer() {
   );
 }
 
-function ScanPlanDrawer() {
-  const { state, actions } = useApp();
-  const plan = state.scanPlan || {};
-  const rangeLabels: Record<string, string> = { auto: "Adaptive (auto)", since_last: "Since last brief", last_24h: "Last 24 hours", last_7d: "Last 7 days", unread_backlog: "Unread backlog" };
-  return (
-    <aside className={`drawer ${state.scanPlanOpen ? "is-open" : ""}`} aria-label="Scan plan drawer">
-      <div className="drawer-head">
-        <div><h2 className="drawer-title">Next Scan</h2><p className="drawer-copy">Configure when and how Anna scans your inbox.</p></div>
-        <button className="icon-btn" onClick={actions.closeDrawers}>×</button>
-      </div>
-      <div className="drawer-body">
-        <PlanButtonGroup title="Time range" entries={rangeLabels} current={plan.time_range} onSet={(v) => void actions.saveScanPlanField("time_range", v)} />
-        <section className="config-block">
-          <h3>Messages per scan</h3>
-          <div className="preset-row preset-row-sm">
-            {[50, 100, 200].map((n) => <button key={n} className={`preset-chip ${plan.max_messages === n ? "is-active" : ""}`} onClick={() => void actions.saveScanPlanField("max_messages", n)}>{n}</button>)}
-          </div>
-        </section>
-        <section className="config-block">
-          <h3>Include</h3>
-          <div className="preset-row preset-row-sm">
-            <button className={`preset-chip ${plan.include_newsletters ? "is-active" : ""}`} onClick={() => void actions.saveScanPlanField("include_newsletters", !plan.include_newsletters)}>Newsletters</button>
-            <button className={`preset-chip ${plan.include_promotions ? "is-active" : ""}`} onClick={() => void actions.saveScanPlanField("include_promotions", !plan.include_promotions)}>Promotions</button>
-          </div>
-        </section>
-        {plan.updated_at ? <p className="scan-plan-saved-text">Saved {formatBeijingTimestamp(plan.updated_at)}</p> : null}
-      </div>
-    </aside>
-  );
-}
-
-function PlanButtonGroup({ title, entries, current, onSet }: { title: string; entries: Record<string, string>; current?: string; onSet: (value: string) => void }) {
-  return (
-    <section className="config-block">
-      <h3>{title}</h3>
-      <div className="preset-row preset-row-sm">
-        {Object.entries(entries).map(([value, label]) => <button key={value} className={`preset-chip ${current === value ? "is-active" : ""}`} onClick={() => onSet(value)}>{label}</button>)}
-      </div>
-    </section>
-  );
-}

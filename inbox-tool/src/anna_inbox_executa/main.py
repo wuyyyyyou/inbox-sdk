@@ -310,13 +310,10 @@ DEFAULT_MANIFEST = {
             "description": "Save or update the scan plan for a mailbox.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
-                {"name": "schedule", "type": "string", "description": "manual | every_morning | every_afternoon | twice_daily | workdays", "required": False},
-                {"name": "time_range", "type": "string", "description": "auto | since_last | last_24h | last_7d | unread_backlog", "required": False},
-                {"name": "max_messages", "type": "integer", "description": "Maximum messages per scan (50-300).", "required": False},
-                {"name": "include_newsletters", "type": "boolean", "description": "Whether to include newsletter emails.", "required": False},
-                {"name": "include_promotions", "type": "boolean", "description": "Whether to include promotion emails.", "required": False},
-                {"name": "batch_behavior", "type": "string", "description": "ask | auto_300 | never_older", "required": False},
-                {"name": "active", "type": "boolean", "description": "Whether the plan is active.", "required": False},
+                {"name": "first_scan_days", "type": "integer", "description": "Days to look back for the first scan.", "required": False},
+                {"name": "incremental_days", "type": "integer", "description": "Max days to look back for incremental scans.", "required": False},
+                {"name": "max_messages", "type": "integer", "description": "Maximum messages per scan.", "required": False},
+                {"name": "scan_categories", "type": "array", "description": "Extra Gmail categories to scan: promotions, social, updates, forums.", "required": False},
             ],
         },
         {
@@ -2172,15 +2169,10 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         plan = await get_scan_plan(mailbox)
         return {
             "mailbox": plan.mailbox,
-            "schedule": plan.schedule,
-            "time_range": plan.time_range,
+            "first_scan_days": plan.first_scan_days,
+            "incremental_days": plan.incremental_days,
             "max_messages": plan.max_messages,
-            "priorities": plan.priorities,
-            "include_newsletters": plan.include_newsletters,
-            "include_promotions": plan.include_promotions,
-            "include_archived": plan.include_archived,
-            "batch_behavior": plan.batch_behavior,
-            "active": plan.active,
+            "scan_categories": plan.scan_categories,
             "updated_at": plan.updated_at,
         }
 
@@ -2188,15 +2180,13 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if not mailbox:
             return {"error": "mailbox is required"}
         plan = await get_scan_plan(mailbox)
-        for field in ("schedule", "time_range", "include_newsletters", "include_promotions",
-                       "batch_behavior", "active"):
+        for field in ("first_scan_days", "incremental_days", "max_messages"):
             val = arguments.get(field)
             if val is not None:
-                setattr(plan, field, str(val) if not isinstance(val, bool) else bool(val))
-        if arguments.get("max_messages") is not None:
-            plan.max_messages = max(30, min(int(arguments["max_messages"]), 300))
-        if arguments.get("priorities") is not None and isinstance(arguments["priorities"], list):
-            plan.priorities = [str(p) for p in arguments["priorities"]]
+                setattr(plan, field, int(val))
+        val = arguments.get("scan_categories")
+        if isinstance(val, list):
+            plan.scan_categories = [str(c) for c in val if str(c) in ("promotions", "social", "updates", "forums")]
         await set_scan_plan(mailbox, plan)
         return {"ok": True, "mailbox": mailbox, "updated_at": plan.updated_at}
 

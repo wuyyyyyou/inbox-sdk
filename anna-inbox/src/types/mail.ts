@@ -153,15 +153,10 @@ export interface RunWarning {
 
 export interface ScanPlan {
   mailbox?: string;
-  schedule?: string;
-  time_range?: string;
+  first_scan_days?: number;
+  incremental_days?: number;
   max_messages?: number;
-  priorities?: string[];
-  include_newsletters?: boolean;
-  include_promotions?: boolean;
-  include_archived?: boolean;
-  batch_behavior?: string;
-  active?: boolean;
+  scan_categories?: string[];
   updated_at?: string;
 }
 

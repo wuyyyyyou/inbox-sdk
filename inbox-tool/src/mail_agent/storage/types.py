@@ -68,17 +68,10 @@ class ScanState:
 @dataclass
 class ScanPlan:
     mailbox: str
-    schedule: str = "manual"         # manual | every_morning | every_afternoon | twice_daily | workdays
-    time_range: str = "auto"         # auto | since_last | last_24h | last_7d | unread_backlog
-    max_messages: int = 100
-    priorities: list[str] = field(default_factory=lambda: [
-        "inbox_first", "active_threads", "important_contacts", "security_billing",
-    ])
-    include_newsletters: bool = False
-    include_promotions: bool = False
-    include_archived: bool = False
-    batch_behavior: str = "ask"      # ask | auto_300 | never_older
-    active: bool = True
+    first_scan_days: int = 7        # 首次扫描往回看几天
+    incremental_days: int = 7       # 增量扫描最多往回看几天（断档安全网）
+    max_messages: int = 100         # 每轮最多扫几封
+    scan_categories: list[str] = field(default_factory=list)  # 额外扫描分类：promotions, social, updates, forums
     updated_at: str = field(default_factory=_now)
 
     @classmethod

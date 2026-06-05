@@ -50,54 +50,6 @@ _PERSIST_LOCKS: dict[str, asyncio.Lock] = {}
 _storage_available: bool | None = None
 
 
-async def _determine_scan_window(mailbox: str) -> int:
-    """根据用户状态返回自适应扫描窗口天数。
-
-    首次使用 → 7天
-    每天使用 → 2天（1天 + 留余量避免漏隔夜邮件）
-    断档 2-7 天 → 距上次天数
-    断档 >7 天 → 7天
-    """
-    if not _storage_ready():
-        raise RuntimeError("Storage not available — please check APS authorization")
-
-    try:
-        from ..storage.ops import get_scan_state
-        state = await get_scan_state(mailbox)
-    except Exception:
-        return 3
-
-    if state.total_scans == 0 or not state.last_scan_ts:
-        return 10
-
-    from datetime import datetime, timezone, timedelta
-    beijing_tz = timezone(timedelta(hours=8))
-    try:
-        last_scan = datetime.fromisoformat(state.last_scan_ts)
-        now = datetime.now(beijing_tz)
-        days_since = (now - last_scan).days
-    except (ValueError, TypeError):
-        return 3
-
-    if days_since <= 1:
-        return 2
-    if days_since <= 7:
-        return days_since
-    return 7
-
-
-def _apply_scan_window(scan_plan: dict[str, Any], window_days: int) -> None:
-    """替换查询中 newer_than:Nd 为自适应窗口天数。"""
-    import re
-    queries = scan_plan.get("queries") if isinstance(scan_plan.get("queries"), list) else []
-    for query in queries:
-        if not isinstance(query, dict):
-            continue
-        q = str(query.get("query") or "")
-        q = re.sub(r"newer_than:\d+d", f"newer_than:{window_days}d", q)
-        query["query"] = q
-
-
 def _apply_incremental_window(scan_plan: dict[str, Any], last_internal_date: str) -> None:
     """为增量扫描设置 stop_at_internal_date，避免重复扫描已处理的旧邮件。"""
     if not last_internal_date:
@@ -217,18 +169,6 @@ async def _get_scan_plan_config(mailbox: str) -> Any | None:
         return None
 
 
-def _time_range_to_days(time_range: str, fallback: int) -> int:
-    """将用户配置的 time_range 转换为天数。auto 返回 fallback（自适应值）。"""
-    mapping = {
-        "auto": fallback,
-        "since_last": fallback,  # 保持自适应，由 _apply_incremental_window 处理增量
-        "last_24h": 1,
-        "last_7d": 7,
-        "unread_backlog": 30,
-    }
-    return mapping.get(time_range, fallback)
-
-
 async def run_mail_task(
     input_: MailTaskInput,
     *,
@@ -248,38 +188,49 @@ async def run_mail_task(
 
     mailbox_profile = MailboxProfile(mailbox_id=input_.mailbox_id, owner=input_.mailbox_id)
     scan_plan = build_scan_plan(task_plan, strategy)
+
+    import re as _re
+
+    # Read scan state and user config
     last_message_internal_date = ""
+    is_first_scan = True
     if _storage_ready():
         try:
-            from ..storage.ops import get_scan_state
-            state = await get_scan_state(input_.mailbox_id)
-            last_message_internal_date = state.last_message_internal_date
+            from ..storage.ops import get_scan_state as _gss
+            _st = await _gss(input_.mailbox_id)
+            last_message_internal_date = _st.last_message_internal_date
+            is_first_scan = _st.total_scans == 0
         except Exception:
-            last_message_internal_date = ""
+            pass
 
-    # 自适应扫描窗口：根据用户状态确定时间范围
-    scan_window_days = await _determine_scan_window(input_.mailbox_id)
+    scan_plan_config = await _get_scan_plan_config(input_.mailbox_id)
+
+    if scan_plan_config:
+        window_days = scan_plan_config.first_scan_days if is_first_scan else scan_plan_config.incremental_days
+        configured_max = scan_plan_config.max_messages
+    else:
+        window_days = 7
+        configured_max = 100
+
+    # Stop at last processed message time (incremental scan)
     _apply_incremental_window(scan_plan, last_message_internal_date)
 
-    # 将查询中的时间窗口替换为自适应值
-    _apply_scan_window(scan_plan, scan_window_days)
-
-    # 读取用户扫描计划，覆盖自适应默认值
-    scan_plan_config = await _get_scan_plan_config(input_.mailbox_id)
-    if scan_plan_config:
-        # time_range 覆盖
-        configured_days = _time_range_to_days(scan_plan_config.time_range, scan_window_days)
-        if configured_days != scan_window_days:
-            _apply_scan_window(scan_plan, configured_days)
-            scan_window_days = configured_days
-        # max_messages 覆盖
-        plan_max = scan_plan_config.max_messages
+    # Apply scan window to Gmail queries
+    queries = scan_plan.get("queries") if isinstance(scan_plan.get("queries"), list) else []
+    for q in queries:
+        if isinstance(q, dict):
+            q_str = str(q.get("query") or "")
+            q_str = _re.sub(r"newer_than:\d+d", f"newer_than:{window_days}d", q_str)
+            # Inject extra scan categories (promotions, social, updates, forums)
+            categories = scan_plan_config.scan_categories if scan_plan_config else []
+            for cat in categories:
+                if cat in ("promotions", "social", "updates", "forums"):
+                    q_str += f" OR category:{cat} newer_than:{window_days}d"
+            q["query"] = q_str
 
     budget = dict(scan_plan.get("budget", {}))
-    requested_limit = int(input_.max_messages or 0)
-    configured_limit = int(plan_max if scan_plan_config else (input_.max_messages or 100))
-    requested_max = max(1, min(configured_limit, requested_limit) if requested_limit > 0 else configured_limit)
-    budget["max_messages"] = min(int(budget.get("max_messages", requested_max)), requested_max)
+    requested_max = max(1, input_.max_messages or configured_max)
+    budget["max_messages"] = min(budget.get("max_messages", requested_max), requested_max, configured_max)
     scan_plan["budget"] = budget
 
     _report_progress(progress_callback, "scan", max_messages=budget["max_messages"], window_days=scan_window_days)

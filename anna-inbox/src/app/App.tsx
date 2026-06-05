@@ -19,17 +19,14 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const planLabel = state.scanPlan && state.scanPlan.time_range !== "auto"
-    ? { last_24h: "24h", last_7d: "7d", unread_backlog: "backlog", since_last: "since last" }[state.scanPlan.time_range || ""] || "custom"
-    : "auto";
-  const scheduleLabel = state.scanPlan && state.scanPlan.schedule !== "manual"
-    ? { every_morning: "morning", every_afternoon: "afternoon", twice_daily: "2x/day", workdays: "workdays" }[state.scanPlan.schedule || ""] || "scheduled"
-    : "";
-  const nextInfo = scheduleLabel ? ` · Next: ${scheduleLabel}` : "";
+  const planLabel = state.scanPlan
+    ? `${state.scanPlan.first_scan_days || 7}d first · ${state.scanPlan.incremental_days || 7}d incr · max ${state.scanPlan.max_messages || 100}`
+    : "7d first · 7d incr · max 100";
+  const nextInfo = "";
   const mailboxLabel = state.selectedMailboxes.length > 1 ? `${state.selectedMailboxes.length} mailboxes` : state.selectedMailboxes[0] || state.mailbox;
   const subtitle = state.isScanning
     ? `Scanning ${mailboxLabel}`
-    : `${visibleCards(state.cards).length} active · ${planLabel}${nextInfo} · ${mailboxLabel}`;
+    : `${visibleCards(state.cards).length} active · ${planLabel} · ${mailboxLabel}`;
 
   return (
     <AppContext.Provider value={{ state, actions }}>
