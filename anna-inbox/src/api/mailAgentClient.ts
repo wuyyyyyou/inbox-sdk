@@ -2,6 +2,7 @@ import type {
   ActiveCardsPayload,
   CardDetailPayload,
   CustomPlanSummary,
+  MailboxInfo,
   RunHistoryEntry,
   RunStatus,
   RuntimeState,
@@ -75,6 +76,18 @@ export class MailAgentClient {
 
   checkGmailAuth(mailbox: string) {
     return this.invoke<{ authorized?: boolean; source?: string }>("check_gmail_auth", { mailbox });
+  }
+
+  listMailboxes(storageProvider: string) {
+    return this.invoke<{ mailboxes: MailboxInfo[]; selected: string[]; discovered?: MailboxInfo[] }>("list_mailboxes", { storage_provider: storageProvider });
+  }
+
+  setMailboxSelected(mailbox: string, selected: boolean, storageProvider: string) {
+    return this.invoke<{ ok?: boolean; mailboxes: MailboxInfo[]; selected: string[] }>("set_mailbox_selected", { mailbox, selected, storage_provider: storageProvider });
+  }
+
+  removeMailbox(mailbox: string, storageProvider: string) {
+    return this.invoke<{ ok?: boolean; mailboxes: MailboxInfo[]; selected: string[] }>("remove_mailbox", { mailbox, storage_provider: storageProvider });
   }
 
   loadActiveCards(mailbox: string, storageProvider: string) {

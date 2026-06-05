@@ -53,7 +53,7 @@ from executa_sdk.storage import StorageClient, FilesClient, StorageError, make_r
 
 JSONRPC_VERSION = "2.0"
 DEFAULT_TOOL_ID = "inbox-tool"
-DEFAULT_VERSION = "1.0.4"
+DEFAULT_VERSION = "0.1.0"
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 STDOUT_LOCK = threading.Lock()
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
@@ -274,6 +274,26 @@ DEFAULT_MANIFEST = {
         {
             "name": "get_active_cards",
             "description": "Get all active attention cards for a mailbox from persistent storage.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+            ],
+        },
+        {
+            "name": "list_mailboxes",
+            "description": "Discover and list registered mailboxes, including selected and authorization state.",
+            "parameters": [],
+        },
+        {
+            "name": "set_mailbox_selected",
+            "description": "Set whether a mailbox participates in Brief scans and card display.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "selected", "type": "boolean", "description": "Whether the mailbox is selected.", "required": True},
+            ],
+        },
+        {
+            "name": "remove_mailbox",
+            "description": "Remove a mailbox from the registry without deleting its stored data.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
             ],
@@ -1192,13 +1212,20 @@ def _check_gmail_auth(mailbox: str) -> dict[str, Any]:
     Local dev: token file exists on disk (content/expiry not validated).
     """
     import os as _os
-    from mail_agent.mail_providers.gmail.adapter import _token_dir, sanitize_mailbox_id
+    from mail_agent.mail_providers.gmail.adapter import _token_dir, sanitize_mailbox_id, get_authorized_email
     from pathlib import Path as _Path
 
     # Platform path — check for injected OAuth credential
     platform_token = _os.environ.get("GMAIL_ACCESS_TOKEN") or _os.environ.get("GOOGLE_ACCESS_TOKEN")
     if platform_token and platform_token.strip():
-        return {"authorized": True, "source": "platform"}
+        authorized_email = get_authorized_email().strip().lower()
+        requested = str(mailbox or "").strip().lower()
+        authorized = bool(authorized_email and requested == authorized_email)
+        return {
+            "authorized": authorized,
+            "source": "platform",
+            "authorized_email": authorized_email,
+        }
 
     # Local dev path — check for token file existence only
     token_dir = _token_dir()
@@ -1899,6 +1926,77 @@ def _sync_get_custom_plan_detail(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"error": f"Custom plan not found: {plan_id}"}
 
 
+def _registry_to_frontend(registry: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "email": entry.email,
+            "provider": entry.provider,
+            "auth_source": entry.auth_source,
+            "authorized": entry.authorized,
+            "selected": entry.selected,
+            "last_auth_checked_at": entry.last_auth_checked_at,
+            "last_scan_at": entry.last_scan_at,
+            "last_scan_status": entry.last_scan_status,
+            "last_error": entry.last_error,
+            "card_count": entry.card_count,
+        }
+        for entry in getattr(registry, "mailboxes", [])
+    ]
+
+
+def _discover_mailboxes() -> list[dict[str, Any]]:
+    from mail_agent.mail_providers.gmail.adapter import get_authorized_email, list_available_mailboxes_from_tokens
+
+    email = get_authorized_email().strip().lower()
+    if email:
+        return [{
+            "email": email,
+            "provider": "gmail",
+            "auth_source": "platform",
+            "authorized": True,
+            "last_auth_checked_at": beijing_now(),
+        }]
+    return list_available_mailboxes_from_tokens()
+
+
+def _sync_list_mailboxes() -> dict[str, Any]:
+    from mail_agent.storage.ops import get_mailbox_registry, merge_discovered_mailboxes
+
+    discovered = _discover_mailboxes()
+    registry = _run_storage_query(merge_discovered_mailboxes(discovered)) if discovered else _run_storage_query(get_mailbox_registry())
+    mailboxes = _registry_to_frontend(registry)
+    return {
+        "mailboxes": mailboxes,
+        "selected": [item["email"] for item in mailboxes if item.get("selected")],
+        "discovered": discovered,
+    }
+
+
+def _sync_set_mailbox_selected(arguments: dict[str, Any]) -> dict[str, Any]:
+    mailbox = str(arguments.get("mailbox", "")).strip().lower()
+    if not mailbox:
+        return {"error": "mailbox is required"}
+    selected = arguments.get("selected", True)
+    if not isinstance(selected, bool):
+        selected = str(selected).lower() in ("1", "true", "yes", "on")
+    from mail_agent.storage.ops import set_mailbox_selected
+
+    registry = _run_storage_query(set_mailbox_selected(mailbox, selected))
+    mailboxes = _registry_to_frontend(registry)
+    return {"ok": True, "mailboxes": mailboxes, "selected": [item["email"] for item in mailboxes if item.get("selected")]}
+
+
+def _sync_remove_mailbox(arguments: dict[str, Any]) -> dict[str, Any]:
+    mailbox = str(arguments.get("mailbox", "")).strip().lower()
+    if not mailbox:
+        return {"error": "mailbox is required"}
+    from mail_agent.storage.ops import remove_mailbox_from_registry
+
+    registry = _run_storage_query(remove_mailbox_from_registry(mailbox))
+    mailboxes = _registry_to_frontend(registry)
+    return {"ok": True, "mailboxes": mailboxes, "selected": [item["email"] for item in mailboxes if item.get("selected")]}
+
+
 def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
     """同步入口通过统一 storage_ops 读取 active cards 和 scan state。"""
     mailbox = str(arguments.get("mailbox", "")).strip()
@@ -1906,16 +2004,20 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
         return {"error": "mailbox is required"}
 
     from mail_agent.cards.service import cards_to_frontend
-    from mail_agent.storage.ops import get_active_cards, get_scan_state
+    from mail_agent.storage.ops import aggregate_active_cards, get_active_cards, get_scan_state
 
-    active = _run_storage_query(get_active_cards(mailbox))
-    state = _run_storage_query(get_scan_state(mailbox))
-    scan_state = {
-        "last_scan_ts": getattr(state, "last_scan_ts", ""),
-        "last_message_internal_date": getattr(state, "last_message_internal_date", ""),
-        "total_scans": getattr(state, "total_scans", 0),
-        "total_processed": getattr(state, "total_processed", 0),
-    }
+    if mailbox.lower() == "all":
+        active = _run_storage_query(aggregate_active_cards())
+        scan_state = None
+    else:
+        active = _run_storage_query(get_active_cards(mailbox))
+        state = _run_storage_query(get_scan_state(mailbox))
+        scan_state = {
+            "last_scan_ts": getattr(state, "last_scan_ts", ""),
+            "last_message_internal_date": getattr(state, "last_message_internal_date", ""),
+            "total_scans": getattr(state, "total_scans", 0),
+            "total_processed": getattr(state, "total_processed", 0),
+        }
 
     action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
 
@@ -2495,6 +2597,12 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
 
     if tool == "get_active_cards":
         return {"success": True, "tool": tool, "data": _sync_get_active_cards(arguments)}
+    if tool == "list_mailboxes":
+        return {"success": True, "tool": tool, "data": _sync_list_mailboxes()}
+    if tool == "set_mailbox_selected":
+        return {"success": True, "tool": tool, "data": _sync_set_mailbox_selected(arguments)}
+    if tool == "remove_mailbox":
+        return {"success": True, "tool": tool, "data": _sync_remove_mailbox(arguments)}
     if tool == "get_run_history":
         return {"success": True, "tool": tool, "data": _sync_get_run_history()}
 

@@ -10,14 +10,15 @@ export function HandleView() {
   const { state, actions } = useApp();
   const card = state.selectedCard;
   if (!card) return null;
+  const key = card.uiKey || card.id;
   const original = card.original || {};
   const detail = state.selectedCardDetail || {};
   const context = detail.thread_context || {};
-  const summary = state.threadSummaryById[card.id];
-  const draft = state.draftById[card.id] || "";
-  const replyMode = state.replyModeById[card.id] || "reply_to_sender";
+  const summary = state.threadSummaryById[key];
+  const draft = state.draftById[key] || "";
+  const replyMode = state.replyModeById[key] || "reply_to_sender";
   const cc = asString(context.cc || original.cc || "None");
-  const contextExpanded = Boolean(state.threadContextExpanded[card.id]);
+  const contextExpanded = Boolean(state.threadContextExpanded[key]);
   const senderName = asString(context.from || original.from || "").split("<")[0].trim().replace(/"/g, "") || "Unknown";
   const threadSubject = asString(context.subject || original.thread || card.title || "").slice(0, 80);
   const hasDraft = Boolean(draft);
@@ -64,16 +65,16 @@ export function HandleView() {
           <h3 className="review-block-title">Draft reply</h3>
           <div className="reply-mode-row">
             <div className="reply-mode-control" role="group" aria-label="Reply mode">
-              <button className={`reply-mode-btn ${replyMode === "reply_to_sender" ? "is-active" : ""}`} onClick={() => actions.setReplyMode(card.id, "reply_to_sender")}>Reply to sender</button>
-              <button className={`reply-mode-btn ${replyMode === "reply_all" ? "is-active" : ""}`} disabled={!cc || cc === "None"} onClick={() => actions.setReplyMode(card.id, "reply_all")}>Reply all</button>
+              <button className={`reply-mode-btn ${replyMode === "reply_to_sender" ? "is-active" : ""}`} onClick={() => actions.setReplyMode(key, "reply_to_sender")}>Reply to sender</button>
+              <button className={`reply-mode-btn ${replyMode === "reply_all" ? "is-active" : ""}`} disabled={!cc || cc === "None"} onClick={() => actions.setReplyMode(key, "reply_all")}>Reply all</button>
             </div>
             {cc && cc !== "None" ? null : <span className="reply-mode-note">No CC recipients</span>}
           </div>
           <div className="revise-row">
-            <input type="text" placeholder={draft ? "Tell Anna how to revise this draft..." : "Tell Anna how to write the reply (optional)"} value={state.revisionById[card.id] || ""} disabled={state.generatingDraft} onChange={(e) => actions.setRevision(card.id, e.target.value)} />
+            <input type="text" placeholder={draft ? "Tell Anna how to revise this draft..." : "Tell Anna how to write the reply (optional)"} value={state.revisionById[key] || ""} disabled={state.generatingDraft} onChange={(e) => actions.setRevision(key, e.target.value)} />
             <button className="soft-btn generate-draft-btn is-glow" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>{state.generatingDraft ? "Working..." : draft ? "Ask Anna to revise" : "Generate draft"}</button>
           </div>
-          <textarea className={`draft-textarea${state.generatingDraft && !draft ? " is-draft-loading" : ""}`} placeholder="Click 'Generate draft' to have Anna write a reply based on this thread." value={draftDisplay} onChange={(e) => actions.setDraft(card.id, e.target.value)} />
+          <textarea className={`draft-textarea${state.generatingDraft && !draft ? " is-draft-loading" : ""}`} placeholder="Click 'Generate draft' to have Anna write a reply based on this thread." value={draftDisplay} onChange={(e) => actions.setDraft(key, e.target.value)} />
           {draft ? (
             <div className="preset-row">
               <button className="preset-chip" disabled={state.generatingDraft} onClick={() => void actions.generateDraft("Make it shorter")}>Shorter</button>
@@ -83,7 +84,7 @@ export function HandleView() {
           ) : null}
         </section>
         <section className="review-block is-quiet">
-          <button className="thread-context-toggle" aria-expanded={contextExpanded} onClick={() => actions.toggleThreadContext(card.id)}>
+          <button className="thread-context-toggle" aria-expanded={contextExpanded} onClick={() => actions.toggleThreadContext(key)}>
             <strong>Thread context · {senderName} · {formatBeijingTimestamp(context.latest_time || original.time)} · {asString(context.message_count || 1)} message{Number(context.message_count || 1) === 1 ? "" : "s"}</strong>
             <span>{contextExpanded ? "Collapse" : "Expand"}</span>
           </button>

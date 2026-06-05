@@ -27,6 +27,28 @@ def _now() -> str:
 
 
 @dataclass
+class MailboxRegistryEntry:
+    email: str
+    provider: str = "gmail"
+    auth_source: str = ""
+    authorized: bool = True
+    selected: bool = True
+    last_auth_checked_at: str = ""
+    last_scan_at: str = ""
+    last_scan_status: str = ""
+    last_error: str = ""
+    card_count: int = 0
+    added_at: str = field(default_factory=_now)
+    updated_at: str = field(default_factory=_now)
+
+
+@dataclass
+class MailboxRegistry:
+    mailboxes: list[MailboxRegistryEntry] = field(default_factory=list)
+    updated_at: str = field(default_factory=_now)
+
+
+@dataclass
 class ScanState:
     mailbox: str
     last_scan_ts: str = ""             # ISO timestamp of last scan

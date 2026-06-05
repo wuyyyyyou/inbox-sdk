@@ -25,6 +25,45 @@ _logger = logging.getLogger(__name__)
 
 # ── 扫描计划构建 ─────────────────────────────────────────────────
 
+def _quote_or_term(term: str) -> str:
+    term = term.strip()
+    if not term:
+        return ""
+    if term.startswith('"') and term.endswith('"'):
+        return term
+    if " " in term and ":" not in term:
+        return '"' + term.replace('"', "") + '"'
+    return term
+
+
+def _normalize_gmail_query(query: str) -> str:
+    """把常见但 Gmail API 容易拒绝的查询写法改成兼容语法。"""
+    q = str(query or "").strip()
+    if not q:
+        return q
+    q = re.sub(r"\bin:draft\b", "in:drafts", q, flags=re.IGNORECASE)
+
+    def replace_or_group(match: re.Match[str]) -> str:
+        inner = match.group(1).strip()
+        if not re.search(r"\bOR\b", inner, flags=re.IGNORECASE):
+            return match.group(0)
+        terms = [_quote_or_term(part) for part in re.split(r"\s+OR\s+", inner, flags=re.IGNORECASE)]
+        terms = [term for term in terms if term]
+        return "{" + " ".join(terms) + "}" if terms else ""
+
+    previous = ""
+    while previous != q:
+        previous = q
+        q = re.sub(r"\(([^()]*\bOR\b[^()]*)\)", replace_or_group, q, flags=re.IGNORECASE)
+
+    if re.search(r"\bOR\b", q, flags=re.IGNORECASE) and ":" not in q and "{" not in q:
+        terms = [_quote_or_term(part) for part in re.split(r"\s+OR\s+", q, flags=re.IGNORECASE)]
+        terms = [term for term in terms if term]
+        q = "{" + " ".join(terms) + "}" if terms else q
+
+    return re.sub(r"\s+", " ", q).strip()
+
+
 def build_scan_plan(task_plan: MailTaskPlan, strategy: MailStrategy) -> dict[str, Any]:
     """从任务计划和策略配置构建扫描计划。
 
@@ -107,7 +146,7 @@ async def run_mail_scan(
 
     def _run_one_query(q: dict[str, Any]) -> tuple[list[str], str]:
         nonlocal fallback_used
-        query = q.get("query", "")
+        query = _normalize_gmail_query(str(q.get("query", "")))
         max_results = min(int(q.get("max_results", 100)), 500)
         stop_at = str(q.get("stop_at_internal_date") or "")
         try:

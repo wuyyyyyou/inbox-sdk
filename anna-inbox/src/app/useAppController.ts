@@ -2,7 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { AppState, FrontendCard, RunStatus } from "../types/mail";
+import type { AppState, FrontendCard, MailboxInfo, RunStatus } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -39,6 +39,52 @@ function buildCustomRunResult(runId: string, result: Record<string, unknown>) {
   };
 }
 
+function normalizedMailbox(mailbox: string | undefined): string {
+  return String(mailbox || "").trim().toLowerCase();
+}
+
+function cardMailbox(card: FrontendCard | null | undefined, fallback = ""): string {
+  return normalizedMailbox(card?.details?.mailbox || fallback);
+}
+
+function cardUiKey(card: FrontendCard, fallbackMailbox = ""): string {
+  return `${cardMailbox(card, fallbackMailbox)}::${card.id}`;
+}
+
+function withCardKeys(cards: FrontendCard[], fallbackMailbox = ""): FrontendCard[] {
+  return cards.map((card) => ({ ...card, uiKey: card.uiKey || cardUiKey(card, fallbackMailbox) }));
+}
+
+function filterCardsByMailboxes(cards: FrontendCard[], selected: string[]): FrontendCard[] {
+  const allowed = new Set(selected.map(normalizedMailbox).filter(Boolean));
+  if (!allowed.size) return [];
+  return cards.filter((card) => allowed.has(cardMailbox(card)));
+}
+
+function actionCount(cards: FrontendCard[]): number {
+  return cards.filter((card) => card.status !== "resolved" && card.status !== "dismissed" && (card.userAction === "reply" || card.userAction === "review")).length;
+}
+
+function selectableMailboxes(selected: string[], fallback: string): string[] {
+  const result = selected.map(normalizedMailbox).filter(Boolean);
+  return result.length ? result : [normalizedMailbox(fallback)].filter(Boolean);
+}
+
+function activeBriefMailboxes(selected: string[], filter: string[], fallback: string): string[] {
+  const selectable = selectableMailboxes(selected, fallback);
+  const allowed = new Set(selectable);
+  const scoped = filter.map(normalizedMailbox).filter((mailbox) => allowed.has(mailbox));
+  return scoped.length ? scoped : selectable;
+}
+
+function selectedOrPrimary(mailboxes: string[], fallback: string): string {
+  return normalizedMailbox(mailboxes[0] || fallback);
+}
+
+function findCard(cards: FrontendCard[], keyOrId: string): FrontendCard | undefined {
+  return cards.find((card) => card.uiKey === keyOrId) || cards.find((card) => card.id === keyOrId);
+}
+
 export interface AppActions {
   showToast(message: string): void;
   closeDrawers(): void;
@@ -57,6 +103,9 @@ export interface AppActions {
   setDrawer(drawer: "sources" | "history" | "scanPlan", open: boolean): void;
   minimize(value: boolean): void;
   checkGmailAuth(mailboxOverride?: string): Promise<{ authorized: boolean; source: string }>;
+  loadMailboxes(): Promise<void>;
+  setMailboxSelected(mailbox: string, selected: boolean): Promise<void>;
+  setBriefMailboxFilter(mailboxes: string[]): void;
   loadActiveCards(): Promise<void>;
   loadRunHistory(): Promise<void>;
   loadCustomPlans(): Promise<void>;
@@ -70,17 +119,17 @@ export interface AppActions {
   replyNow(): Promise<void>;
   clearAllCards(): Promise<void>;
   markCleanupAsRead(cardId: string): Promise<void>;
-  restoreCard(cardId: string): Promise<void>;
+  restoreCard(cardId: string, mailbox?: string): Promise<void>;
   snoozeCard(cardId: string, option: string): Promise<void>;
   startCustomScan(): Promise<void>;
   reRunCustomPlan(planId: string): Promise<void>;
   deleteCustomPlan(planId: string): Promise<void>;
-  handleAskMarkRead(messageId: string): Promise<void>;
-  handleAskTrash(messageId: string): Promise<void>;
+  handleAskMarkRead(actionKey: string, messageId: string, mailbox?: string): Promise<void>;
+  handleAskTrash(actionKey: string, messageId: string, mailbox?: string): Promise<void>;
   enterAskDraftEdit(key: string, draft: string): void;
   updateAskDraft(key: string, value: string): void;
   cancelAskDraft(key: string): void;
-  sendAskDraft(key: string, threadId: string, to: string): Promise<void>;
+  sendAskDraft(key: string, threadId: string, to: string, mailbox?: string): Promise<void>;
   toggleAskHistory(idx: number): void;
   copyDraft(text: string): Promise<void>;
 }
@@ -112,14 +161,15 @@ export function useAppController() {
       const threadSummaryById = { ...s.threadSummaryById };
       const expandedDetails = { ...s.expandedDetails };
       for (const card of cards) {
-        if (card.draft_reply && !draftById[card.id]) draftById[card.id] = card.draft_reply;
-        if (card.thread_summary && !threadSummaryById[card.id]) {
+        const key = card.uiKey || cardUiKey(card, s.mailbox);
+        if (card.draft_reply && !draftById[key]) draftById[key] = card.draft_reply;
+        if (card.thread_summary && !threadSummaryById[key]) {
           try {
-            threadSummaryById[card.id] = JSON.parse(card.thread_summary);
+            threadSummaryById[key] = JSON.parse(card.thread_summary);
           } catch {
           }
         }
-        if (card.cardType === "cleanup_bundle" && !(card.id in expandedDetails)) expandedDetails[card.id] = true;
+        if (card.cardType === "cleanup_bundle" && !(key in expandedDetails)) expandedDetails[key] = true;
       }
       return { ...s, draftById, threadSummaryById, expandedDetails };
     });
@@ -127,13 +177,27 @@ export function useAppController() {
 
   const loadActiveCards = useCallback(async (storageOverride?: string, mailboxOverride?: string) => {
     const provider = storageOverride ?? state.storageProvider;
-    const mailbox = mailboxOverride ?? state.mailbox;
+    const mailbox = mailboxOverride ?? "all";
     try {
       const payload = await client.loadActiveCards(mailbox, provider);
-      refreshStoredCardFields(payload.cards || []);
-      setState((s) => ({ ...s, cards: payload.cards || [], actionCount: payload.action_count ?? 0, scanState: payload.scan_state || null, scanError: "", loading: false }));
+      const keyedCards = withCardKeys(payload.cards || [], mailbox === "all" ? state.mailbox : mailbox);
+      refreshStoredCardFields(keyedCards);
+      setState((s) => {
+        const selected = activeBriefMailboxes(s.selectedMailboxes, s.briefMailboxFilter, s.mailbox);
+        const visible = filterCardsByMailboxes(keyedCards, selected);
+        return {
+          ...s,
+          allCards: keyedCards,
+          cards: visible,
+          briefMailboxFilter: selected,
+          actionCount: actionCount(visible),
+          scanState: payload.scan_state || s.scanState,
+          scanError: "",
+          loading: false,
+        };
+      });
     } catch (error) {
-      setState((s) => ({ ...s, scanError: error instanceof Error ? error.message : String(error), cards: [], actionCount: 0, scanState: null, loading: false }));
+      setState((s) => ({ ...s, scanError: error instanceof Error ? error.message : String(error), cards: [], allCards: [], actionCount: 0, scanState: null, loading: false }));
     }
   }, [client, refreshStoredCardFields, state.mailbox, state.storageProvider]);
 
@@ -179,6 +243,35 @@ export function useAppController() {
     }
   }, [client, state.mailbox]);
 
+  const loadMailboxes = useCallback(async (storageOverride?: string): Promise<{ mailboxes: MailboxInfo[]; selected: string[]; primary: string }> => {
+    const provider = storageOverride ?? state.storageProvider;
+    try {
+      const payload = await client.listMailboxes(provider);
+      const mailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : [];
+      const selected = (Array.isArray(payload.selected) && payload.selected.length
+        ? payload.selected
+        : mailboxes.filter((item) => item.selected !== false).map((item) => item.email)
+      ).map(normalizedMailbox).filter(Boolean);
+      const primary = selectedOrPrimary(selected, mailboxes[0]?.email || state.mailbox);
+      setState((s) => ({
+        ...s,
+        mailboxes,
+        selectedMailboxes: selected,
+        briefMailboxFilter: selected,
+        mailbox: primary || s.mailbox,
+        gmailAuthStatus: {
+          checked: true,
+          authorized: mailboxes.length ? mailboxes.some((item) => item.authorized !== false) : s.gmailAuthStatus.authorized,
+          source: mailboxes.find((item) => item.email === primary)?.auth_source || s.gmailAuthStatus.source,
+        },
+      }));
+      return { mailboxes, selected, primary };
+    } catch {
+      // 注册表不可用时回退到原来的单邮箱行为。
+      return { mailboxes: [], selected: state.mailbox ? [state.mailbox] : [], primary: state.mailbox };
+    }
+  }, [client, state.mailbox, state.storageProvider]);
+
   const pollBackgroundRun = useCallback(async (runId: string) => {
     for (let poll = 0; poll < 80; poll += 1) {
       await sleep(POLL_INTERVAL_MS);
@@ -207,8 +300,12 @@ export function useAppController() {
   const initialize = useCallback(async () => {
     const runtime = await getRuntime();
     setState((s) => ({ ...s, runtime, loading: runtime.connected ? s.loading : false }));
-    const mailbox = await discoverMailbox();
-    const currentMailbox = mailbox || state.mailbox;
+    const mailboxState = await loadMailboxes();
+    let currentMailbox = mailboxState.primary;
+    if (!currentMailbox) {
+      const mailbox = await discoverMailbox();
+      currentMailbox = mailbox || state.mailbox;
+    }
     const auth = await checkGmailAuth(currentMailbox);
     if (runtime.connected) {
       if (!auth.authorized) {
@@ -218,9 +315,9 @@ export function useAppController() {
       await loadRunHistory();
       await loadCustomPlans();
       await loadScanPlan(currentMailbox);
-      await loadActiveCards(undefined, currentMailbox);
+      await loadActiveCards(undefined, "all");
     }
-  }, [checkGmailAuth, client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadRunHistory, loadScanPlan, state.mailbox]);
+  }, [checkGmailAuth, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadMailboxes, loadRunHistory, loadScanPlan, state.mailbox]);
 
   const actions: AppActions = {
     showToast,
@@ -270,6 +367,7 @@ export function useAppController() {
         setState((s) => ({ ...s, storageProvider: value, customPlans: [] }));
         showToast(value === "aps" ? "Storage: APS" : "Storage: local");
         setTimeout(() => {
+          void loadMailboxes(value);
           void loadActiveCards(value);
           void loadRunHistory();
           void loadCustomPlans(value);
@@ -290,6 +388,43 @@ export function useAppController() {
       setState((s) => ({ ...s, minimized: value }));
     },
     checkGmailAuth,
+    async loadMailboxes() {
+      await loadMailboxes();
+    },
+    async setMailboxSelected(mailbox, selected) {
+      try {
+        const payload = await client.setMailboxSelected(mailbox, selected, state.storageProvider);
+        const mailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : state.mailboxes.map((item) => item.email === mailbox ? { ...item, selected } : item);
+        const selectedMailboxes = (Array.isArray(payload.selected) ? payload.selected : mailboxes.filter((item) => item.selected !== false).map((item) => item.email)).map(normalizedMailbox).filter(Boolean);
+        const primary = selectedOrPrimary(selectedMailboxes, state.mailbox);
+        setState((s) => ({
+          ...s,
+          mailboxes,
+          selectedMailboxes,
+          briefMailboxFilter: selectedMailboxes,
+          mailbox: primary || s.mailbox,
+          cards: filterCardsByMailboxes(s.allCards, selectedMailboxes),
+          actionCount: actionCount(filterCardsByMailboxes(s.allCards, selectedMailboxes)),
+        }));
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+      }
+    },
+    setBriefMailboxFilter(mailboxes) {
+      setState((s) => {
+        const selected = activeBriefMailboxes(s.selectedMailboxes, mailboxes, s.mailbox);
+        const visible = filterCardsByMailboxes(s.allCards, selected);
+        const selectedCardVisible = s.selectedCard ? filterCardsByMailboxes([s.selectedCard], selected).length > 0 : false;
+        return {
+          ...s,
+          briefMailboxFilter: selected,
+          cards: visible,
+          actionCount: actionCount(visible),
+          selectedCard: selectedCardVisible ? s.selectedCard : null,
+          originalOpen: selectedCardVisible ? s.originalOpen : false,
+        };
+      });
+    },
     loadActiveCards,
     loadRunHistory,
     loadCustomPlans,
@@ -305,36 +440,55 @@ export function useAppController() {
     },
     async startScan(reason = "manual") {
       if (!state.runtime.connected || state.isScanning) return;
+      const mailboxesToScan = (state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox]).map(normalizedMailbox).filter(Boolean);
+      if (!mailboxesToScan.length) {
+        showToast("Select at least one mailbox.");
+        return;
+      }
       setState((s) => ({ ...s, isScanning: true, scanError: "", scanStepIndex: 0, scanStage: "", scanProgress: {}, resultFilter: "all" }));
       try {
-        const started = await client.startBriefRun({
-          user_request: requestForMode(state.strategyMode || DEFAULT_MODE),
-          mailbox: state.mailbox,
-          mode: state.strategyMode,
-          primary_count: 30,
-          max_messages: 50,
-          ai_provider: state.llmProvider,
-          storage_provider: state.storageProvider,
-          reason,
-        });
-        if (!started.run_id) throw new Error(started.error || "start_mail_agent_run did not return a run id");
-        for (let poll = 0; poll < POLL_LIMIT; poll += 1) {
-          await sleep(POLL_INTERVAL_MS);
-          const status = await client.getRun(started.run_id);
-          setState((s) => ({
-            ...s,
-            scanStepIndex: stageToStep(status.stage || ""),
-            scanStage: status.stage || "",
-            scanProgress: status.progress || {},
-          }));
-          if (status.status === "done") break;
-          if (status.status === "failed") throw new Error(status.error || "Mail agent scan failed");
-          if (poll === POLL_LIMIT - 1) throw new Error("Mail agent scan timed out");
+        const failures: string[] = [];
+        for (let index = 0; index < mailboxesToScan.length; index += 1) {
+          const mailbox = mailboxesToScan[index];
+          setState((s) => ({ ...s, scanStatus: mailboxesToScan.length > 1 ? `Scanning ${mailbox} (${index + 1}/${mailboxesToScan.length})` : s.scanStatus }));
+          const started = await client.startBriefRun({
+            user_request: requestForMode(state.strategyMode || DEFAULT_MODE),
+            mailbox,
+            mode: state.strategyMode,
+            primary_count: 30,
+            max_messages: 50,
+            ai_provider: state.llmProvider,
+            storage_provider: state.storageProvider,
+            reason,
+          });
+          if (!started.run_id) throw new Error(started.error || "start_mail_agent_run did not return a run id");
+          try {
+            for (let poll = 0; poll < POLL_LIMIT; poll += 1) {
+              await sleep(POLL_INTERVAL_MS);
+              const status = await client.getRun(started.run_id);
+              setState((s) => ({
+                ...s,
+                scanStepIndex: stageToStep(status.stage || ""),
+                scanStage: status.stage || "",
+                scanProgress: status.progress || {},
+                scanStatus: mailboxesToScan.length > 1 ? `${status.stage || "Scanning"} · ${mailbox} · ${index + 1}/${mailboxesToScan.length}` : s.scanStatus,
+              }));
+              if (status.status === "done") break;
+              if (status.status === "failed") throw new Error(status.error || "Mail agent scan failed");
+              if (poll === POLL_LIMIT - 1) throw new Error("Mail agent scan timed out");
+            }
+          } catch (error) {
+            failures.push(`${mailbox}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          await loadActiveCards();
         }
         await loadActiveCards();
         await loadRunHistory();
-        setState((s) => ({ ...s, scanStatus: "Scan complete. Showing persisted attention cards." }));
-        showToast("Scan complete.");
+        const statusText = failures.length
+          ? `Scan complete with ${failures.length} mailbox error${failures.length === 1 ? "" : "s"}.`
+          : "Scan complete. Showing persisted attention cards.";
+        setState((s) => ({ ...s, scanStatus: statusText, scanError: failures.join("\n") }));
+        showToast(failures.length ? statusText : "Scan complete.");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         setState((s) => ({ ...s, scanError: message, scanStatus: "" }));
@@ -344,11 +498,12 @@ export function useAppController() {
       }
     },
     async openCard(cardId) {
-      const card = state.cards.find((item) => item.id === cardId && (!item.status || item.status === "pending"));
+      const card = findCard(state.cards, cardId);
+      if (card && card.status && card.status !== "pending") return;
       if (!card) return;
       setState((s) => ({ ...s, selectedCard: card, selectedCardDetail: null, originalOpen: true, sourcesOpen: false, historyOpen: false, snoozeMenuCardId: "" }));
       try {
-        const detail = await client.getCardDetail(state.mailbox, cardId, state.storageProvider);
+        const detail = await client.getCardDetail(cardMailbox(card, state.mailbox), card.id, state.storageProvider);
         setState((s) => ({ ...s, selectedCardDetail: detail }));
       } catch {
       }
@@ -356,13 +511,14 @@ export function useAppController() {
     async summarizeSelectedThread() {
       if (!state.selectedCard || state.summarizingThread) return;
       const cardId = state.selectedCard.id;
+      const key = state.selectedCard.uiKey || cardUiKey(state.selectedCard, state.mailbox);
       setState((s) => ({ ...s, summarizingThread: true }));
       try {
-        const started = await client.startSummarizeThread({ mailbox: state.mailbox, card_id: cardId, storage_provider: state.storageProvider, ai_provider: state.llmProvider });
+        const started = await client.startSummarizeThread({ mailbox: cardMailbox(state.selectedCard, state.mailbox), card_id: cardId, storage_provider: state.storageProvider, ai_provider: state.llmProvider });
         if (!started.run_id) throw new Error(started.error || "start_summarize_thread did not return a run id");
         const result = await pollBackgroundRun(started.run_id);
         const summary = (result.summary || {}) as Record<string, unknown>;
-        setState((s) => ({ ...s, threadSummaryById: { ...s.threadSummaryById, [cardId]: summary } }));
+        setState((s) => ({ ...s, threadSummaryById: { ...s.threadSummaryById, [key]: summary } }));
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       } finally {
@@ -372,14 +528,15 @@ export function useAppController() {
     async generateDraft(presetRevision) {
       if (!state.selectedCard || state.generatingDraft) return;
       const cardId = state.selectedCard.id;
-      const currentDraft = state.draftById[cardId] || "";
-      const revision = presetRevision || state.revisionById[cardId] || "";
+      const key = state.selectedCard.uiKey || cardUiKey(state.selectedCard, state.mailbox);
+      const currentDraft = state.draftById[key] || "";
+      const revision = presetRevision || state.revisionById[key] || "";
       setState((s) => ({ ...s, generatingDraft: true }));
       try {
         const started = await client.startGenerateDraft({
-          mailbox: state.mailbox,
+          mailbox: cardMailbox(state.selectedCard, state.mailbox),
           card_id: cardId,
-          reply_mode: state.replyModeById[cardId] || "reply_to_sender",
+          reply_mode: state.replyModeById[key] || "reply_to_sender",
           current_draft: currentDraft,
           revision_input: revision,
           storage_provider: state.storageProvider,
@@ -389,8 +546,8 @@ export function useAppController() {
         const result = await pollBackgroundRun(started.run_id);
         setState((s) => ({
           ...s,
-          draftById: { ...s.draftById, [cardId]: resultToDraft(result, currentDraft) },
-          revisionById: revision ? { ...s.revisionById, [cardId]: revision } : s.revisionById,
+          draftById: { ...s.draftById, [key]: resultToDraft(result, currentDraft) },
+          revisionById: revision ? { ...s.revisionById, [key]: revision } : s.revisionById,
         }));
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
@@ -399,11 +556,13 @@ export function useAppController() {
       }
     },
     async recordDecision(decision, cardId) {
-      const cid = cardId || state.selectedCard?.id;
-      if (!cid) return;
+      const card = cardId ? findCard(state.cards, cardId) : state.selectedCard;
+      const cid = card?.id;
+      const key = card?.uiKey || (card ? cardUiKey(card, state.mailbox) : "");
+      if (!card || !cid) return;
       try {
-        await client.recordCardDecision({ mailbox: state.mailbox, card_id: cid, decision, storage_provider: state.storageProvider });
-        setState((s) => ({ ...s, originalOpen: false, selectedCard: null, expandedDetails: { ...s.expandedDetails, [cid]: false } }));
+        await client.recordCardDecision({ mailbox: cardMailbox(card, state.mailbox), card_id: cid, decision, storage_provider: state.storageProvider });
+        setState((s) => ({ ...s, originalOpen: false, selectedCard: null, expandedDetails: { ...s.expandedDetails, [key]: false } }));
         await loadActiveCards();
         await loadRunHistory();
         showToast("Card removed from this briefing.");
@@ -413,17 +572,18 @@ export function useAppController() {
     },
     async replyNow() {
       if (!state.selectedCard) return;
-      const draft = state.draftById[state.selectedCard.id] || "";
+      const key = state.selectedCard.uiKey || cardUiKey(state.selectedCard, state.mailbox);
+      const draft = state.draftById[key] || "";
       if (!draft.trim()) {
         showToast("Draft is empty. Generate a draft first.");
         return;
       }
       try {
         await client.replyNow({
-          mailbox: state.mailbox,
+          mailbox: cardMailbox(state.selectedCard, state.mailbox),
           card_id: state.selectedCard.id,
           draft_body: draft,
-          reply_mode: state.replyModeById[state.selectedCard.id] || "reply_to_sender",
+          reply_mode: state.replyModeById[key] || "reply_to_sender",
           dry_run: false,
         });
         setState((s) => ({ ...s, originalOpen: false, selectedCard: null }));
@@ -436,7 +596,10 @@ export function useAppController() {
     },
     async clearAllCards() {
       try {
-        await client.clearActiveCards(state.mailbox, state.storageProvider);
+        const selected = state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox];
+        for (const mailbox of selected.map(normalizedMailbox).filter(Boolean)) {
+          await client.clearActiveCards(mailbox, state.storageProvider);
+        }
         setState((s) => ({ ...s, cards: [], actionCount: 0, scanState: null, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {} }));
         showToast("All cards cleared.");
       } catch (error) {
@@ -444,15 +607,16 @@ export function useAppController() {
       }
     },
     async markCleanupAsRead(cardId) {
-      const card = state.cards.find((c) => c.id === cardId);
+      const card = findCard(state.cards, cardId);
+      const key = card?.uiKey || (card ? cardUiKey(card, state.mailbox) : cardId);
       const messages = Array.isArray(card?.bundledMessages) ? card.bundledMessages : [];
       const messageIds = messages.map((m) => m.message_id || m.id).filter(Boolean) as string[];
       if (!card || !messageIds.length) return;
-      setState((s) => ({ ...s, markingReadIds: { ...s.markingReadIds, [cardId]: true }, cleanupReadState: { ...s.cleanupReadState, [cardId]: { read: true, readMsgIndices: messages.map((_m, i) => i) } } }));
+      setState((s) => ({ ...s, markingReadIds: { ...s.markingReadIds, [key]: true }, cleanupReadState: { ...s.cleanupReadState, [key]: { read: true, readMsgIndices: messages.map((_m, i) => i) } } }));
       try {
-        const result = await client.markCleanupRead({ mailbox: state.mailbox, card_id: cardId, message_ids: messageIds, storage_provider: state.storageProvider });
+        const result = await client.markCleanupRead({ mailbox: cardMailbox(card, state.mailbox), card_id: card.id, message_ids: messageIds, storage_provider: state.storageProvider });
         if (result.ok) {
-          setState((s) => ({ ...s, cards: s.cards.filter((c) => c.id !== cardId) }));
+          setState((s) => ({ ...s, cards: s.cards.filter((c) => (c.uiKey || c.id) !== key), allCards: s.allCards.filter((c) => (c.uiKey || c.id) !== key) }));
           showToast(`${messageIds.length} emails marked as read in Gmail.`);
         } else {
           showToast(result.gmail_error || "Failed to mark as read in Gmail.");
@@ -463,14 +627,15 @@ export function useAppController() {
       } finally {
         setState((s) => {
           const markingReadIds = { ...s.markingReadIds };
-          delete markingReadIds[cardId];
+          delete markingReadIds[key];
           return { ...s, markingReadIds };
         });
       }
     },
-    async restoreCard(cardId) {
+    async restoreCard(cardId, mailboxOverride) {
+      const card = findCard(state.allCards, cardId) || findCard(state.cards, cardId);
       try {
-        await client.restoreCard(state.mailbox, cardId, state.storageProvider);
+        await client.restoreCard(card ? cardMailbox(card, mailboxOverride || state.mailbox) : (mailboxOverride || state.mailbox), card ? card.id : cardId, state.storageProvider);
         await loadActiveCards();
         await loadRunHistory();
         showToast("Card restored.");
@@ -480,8 +645,10 @@ export function useAppController() {
     },
     async snoozeCard(cardId, option) {
       const optionMap: Record<string, string> = { tomorrow: "tomorrow", "next-week": "next_week", "dont-prioritize": "dont_prioritize" };
+      const card = findCard(state.cards, cardId);
+      if (!card) return;
       try {
-        await client.recordSnooze({ mailbox: state.mailbox, card_id: cardId, snooze_option: optionMap[option] || option, storage_provider: state.storageProvider });
+        await client.recordSnooze({ mailbox: cardMailbox(card, state.mailbox), card_id: card.id, snooze_option: optionMap[option] || option, storage_provider: state.storageProvider });
         setState((s) => ({ ...s, snoozeMenuCardId: "" }));
         await loadActiveCards();
         await loadRunHistory();
@@ -504,7 +671,7 @@ export function useAppController() {
       try {
         const started = await client.startCustomScan({
           user_request: userRequest,
-          mailbox: state.mailbox,
+          mailbox: selectedOrPrimary(state.selectedMailboxes, state.mailbox),
           primary_count: CUSTOM_SCAN_MESSAGE_LIMIT,
           max_messages: CUSTOM_SCAN_MESSAGE_LIMIT,
           ai_provider: state.llmProvider,
@@ -557,7 +724,7 @@ export function useAppController() {
       try {
         const started = await client.reRunCustomScan({
           plan_id: planId,
-          mailbox: state.mailbox,
+          mailbox: selectedOrPrimary(state.selectedMailboxes, state.mailbox),
           primary_count: CUSTOM_SCAN_MESSAGE_LIMIT,
           max_messages: CUSTOM_SCAN_MESSAGE_LIMIT,
           ai_provider: state.llmProvider,
@@ -599,25 +766,25 @@ export function useAppController() {
         showToast(error instanceof Error ? error.message : String(error));
       }
     },
-    async handleAskMarkRead(messageId) {
-      if (!messageId || state.askItemActions[messageId]?.read) return;
-      setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [messageId]: { ...s.askItemActions[messageId], read: true } } }));
+    async handleAskMarkRead(actionKey, messageId, mailboxOverride) {
+      if (!messageId || state.askItemActions[actionKey]?.read) return;
+      setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [actionKey]: { ...s.askItemActions[actionKey], read: true } } }));
       try {
-        const result = await client.markReadFromAsk(state.mailbox, [messageId]);
+        const result = await client.markReadFromAsk(selectedOrPrimary([mailboxOverride || ""], state.mailbox), [messageId]);
         if (!result.ok) throw new Error(result.error || "Failed to mark as read");
       } catch (error) {
-        setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [messageId]: { ...s.askItemActions[messageId], read: false } } }));
+        setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [actionKey]: { ...s.askItemActions[actionKey], read: false } } }));
         showToast(error instanceof Error ? error.message : String(error));
       }
     },
-    async handleAskTrash(messageId) {
-      if (!messageId || state.askItemActions[messageId]?.trashed) return;
-      setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [messageId]: { ...s.askItemActions[messageId], trashed: true } } }));
+    async handleAskTrash(actionKey, messageId, mailboxOverride) {
+      if (!messageId || state.askItemActions[actionKey]?.trashed) return;
+      setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [actionKey]: { ...s.askItemActions[actionKey], trashed: true } } }));
       try {
-        const result = await client.trashFromAsk(state.mailbox, [messageId]);
+        const result = await client.trashFromAsk(selectedOrPrimary([mailboxOverride || ""], state.mailbox), [messageId]);
         if (!result.ok) throw new Error(result.error || "Failed to trash email");
       } catch (error) {
-        setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [messageId]: { ...s.askItemActions[messageId], trashed: false } } }));
+        setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [actionKey]: { ...s.askItemActions[actionKey], trashed: false } } }));
         showToast(error instanceof Error ? error.message : String(error));
       }
     },
@@ -634,7 +801,7 @@ export function useAppController() {
         return { ...s, askEditDraft };
       });
     },
-    async sendAskDraft(key, threadId, to) {
+    async sendAskDraft(key, threadId, to, mailboxOverride) {
       const draft = (state.askEditDraft[key] || "").trim();
       if (!draft) {
         showToast("Draft is empty.");
@@ -642,7 +809,7 @@ export function useAppController() {
       }
       setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [key]: { ...s.askItemActions[key], sending: true } } }));
       try {
-        const result = await client.replyFromAsk({ mailbox: state.mailbox, thread_id: threadId, to_addr: to, body: draft, reply_mode: "reply_to_sender", dry_run: false });
+        const result = await client.replyFromAsk({ mailbox: selectedOrPrimary([mailboxOverride || ""], state.mailbox), thread_id: threadId, to_addr: to, body: draft, reply_mode: "reply_to_sender", dry_run: false });
         if (result.ok && !result.dry_run) {
           setState((s) => {
             const askEditDraft = { ...s.askEditDraft };

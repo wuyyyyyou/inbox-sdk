@@ -544,6 +544,7 @@
       display: inline-flex;
       align-items: center;
       gap: 8px;
+      min-width: 0;
       width: fit-content;
       padding: 8px 11px;
       border-radius: 999px;
@@ -558,9 +559,17 @@
       content: "";
       width: 7px;
       height: 7px;
+      flex: 0 0 7px;
       border-radius: 99px;
       background: rgba(88,184,137,0.86);
       box-shadow: 0 0 0 4px rgba(88,184,137,0.09);
+    }
+
+    .mailbox-chip-text {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .noticed-section {
@@ -2894,6 +2903,171 @@
       font-weight: 400;
     }
 
+    .mailbox-dropdown {
+      position: relative;
+      flex-shrink: 0;
+    }
+
+    .mailbox-dropdown-trigger {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      min-height: 32px;
+      padding: 0 14px;
+      font-size: 12px;
+      font-weight: 500;
+      color: #717182;
+      background: rgba(255,255,255,0.52);
+      border: 1px solid rgba(93,82,128,0.1);
+      border-radius: 10px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: border-color 0.15s, background 0.15s;
+    }
+
+    .mailbox-dropdown-trigger:hover {
+      border-color: rgba(93,82,128,0.22);
+      background: rgba(255,255,255,0.72);
+    }
+
+    .mailbox-dropdown-arrow {
+      font-size: 9px;
+      margin-left: 2px;
+    }
+
+    .mailbox-dropdown-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 9;
+    }
+
+    .mailbox-dropdown-panel {
+      position: absolute;
+      top: calc(100% + 6px);
+      right: 0;
+      min-width: 220px;
+      padding: 5px;
+      background: rgba(252,251,255,0.92);
+      backdrop-filter: blur(18px);
+      border: 1px solid rgba(40,40,70,0.08);
+      border-radius: 12px;
+      box-shadow: 0 14px 38px rgba(40,40,70,0.12);
+      z-index: 10;
+    }
+
+    .mailbox-dropdown-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 31px;
+      padding: 0 10px;
+      font-size: 13px;
+      font-weight: 400;
+      color: #3F4050;
+      border-radius: 8px;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .mailbox-dropdown-item:hover {
+      background: rgba(139,124,248,0.07);
+    }
+
+    .mailbox-dropdown-item input[type="checkbox"] {
+      width: 15px;
+      height: 15px;
+      accent-color: var(--accent);
+      cursor: pointer;
+      flex-shrink: 0;
+      margin: 0;
+    }
+
+    .mailbox-dropdown-name {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .mailbox-dropdown-count {
+      font-size: 12px;
+      color: #717182;
+      flex-shrink: 0;
+    }
+
+    .attention-card-head {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .attention-card-head .attention-title {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .attention-card-mailbox {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      color: rgba(88,184,137,0.82);
+      white-space: nowrap;
+      flex-shrink: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+      max-width: 180px;
+    }
+
+    .mailbox-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: rgba(88,184,137,0.82);
+      flex-shrink: 0;
+    }
+
+    .card-details-btn {
+      flex-shrink: 0;
+      min-height: 26px;
+      padding: 0 8px;
+      font-size: 11px;
+      border: none;
+      border-radius: 999px;
+      color: #6F7285;
+      background: rgba(255,255,255,0.34);
+      cursor: pointer;
+      line-height: 1.5;
+    }
+
+    .card-details-btn:hover {
+      color: var(--text-main);
+      background: rgba(255,255,255,0.6);
+    }
+
+    .attention-card-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 8px;
+    }
+
+    .attention-card-foot .attention-recommendation {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .attention-card-head .mailbox-chip {
+      max-width: 168px;
+      flex: none;
+      box-shadow: none;
+      background: rgba(255,255,255,0.72);
+      border-color: rgba(93,82,128,0.08);
+    }
+
     .noticed-section {
       padding: 0;
       gap: 8px;
@@ -2909,7 +3083,7 @@
     .attention-item-card {
       position: relative;
       min-height: 132px;
-      padding: 16px 196px 16px 18px;
+      padding: 16px 18px;
       gap: 0;
       border-radius: var(--radius-lg);
       border-color: rgba(40, 40, 70, 0.08);
@@ -3013,12 +3187,11 @@
       margin-top: 0;
     }
 
-    .attention-item-card > .proposal-actions {
-      position: absolute;
-      right: 18px;
-      bottom: 16px;
+    .attention-item-card > .attention-card-foot .proposal-actions {
+      display: flex;
       gap: 8px;
       align-items: center;
+      flex-shrink: 0;
     }
 
     .attention-item-card .soft-btn {
@@ -3252,6 +3425,42 @@
     .source-card.is-selected {
       background: rgba(139,124,248,0.08);
       border-color: rgba(139,124,248,0.13);
+    }
+
+    .mailbox-list {
+      display: grid;
+      gap: 9px;
+    }
+
+    .mailbox-source-row {
+      display: grid;
+      grid-template-columns: auto auto minmax(0, 1fr);
+      align-items: flex-start;
+      gap: 10px;
+      cursor: pointer;
+    }
+
+    .mailbox-source-row input {
+      margin-top: 9px;
+      accent-color: var(--accent);
+    }
+
+    .mailbox-source-main {
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+    }
+
+    .mailbox-source-main .source-name,
+    .mailbox-source-main .source-meta {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .source-meta.is-error {
+      color: var(--rose);
+      white-space: normal;
     }
 
     .source-icon {
@@ -3539,6 +3748,7 @@
 
     /* ── Ask item action buttons ── */
     .ask-item-actions { display:flex; gap:6px; margin-top:8px; }
+    .ask-mailbox-chip { display:inline-flex; max-width:100%; margin:0 0 5px; padding:2px 8px; border-radius:999px; color:#6257d2; background:rgba(139,124,248,0.08); border:1px solid rgba(139,124,248,0.12); font-size:11px; font-weight:520; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .ask-action-btn { padding:3px 10px; border-radius:999px; font-size:0.76rem; font-weight:520; border:1px solid transparent; cursor:pointer; transition:0.15s ease; }
     .ask-action-btn:disabled { opacity:0.5; cursor:default; }
     .ask-action-reply { color:#6f64d8; background:rgba(139,124,248,0.08); border-color:rgba(139,124,248,0.2); }

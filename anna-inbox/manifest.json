@@ -14,8 +14,9 @@
   ],
   "required_executas": [
     {
-      "tool_id": "tool-zhaopy-inbox-tool-373sf2et",
-      "min_version": "1.0.4"
+      "tool_id": "tool-zhaopy-inbox-executa-8jj3cw76",
+      "min_version": "0.1.0",
+      "version": "latest"
     }
   ],
   "optional_executas": [],
@@ -53,7 +54,7 @@
     ],
     "host_api": {
       "tools": [
-        "required:tool-zhaopy-inbox-tool-373sf2et"
+        "required:bundled:inbox-executa"
       ],
       "chat": [
         "write_message"

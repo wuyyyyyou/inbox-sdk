@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { CATEGORY_NOTE, CATEGORY_TABS } from "../../app/constants";
 import { useApp } from "../../app/AppContext";
 import type { CleanupMessage, FrontendCard } from "../../types/mail";
@@ -36,32 +37,41 @@ function CardDetails({ card }: { card: FrontendCard }) {
 
 function AttentionCard({ card }: { card: FrontendCard }) {
   const { state, actions } = useApp();
-  const expanded = Boolean(state.expandedDetails[card.id]);
-  const snoozeOpen = state.snoozeMenuCardId === card.id;
-  const status = state.statusByCardId[card.id];
+  const key = card.uiKey || card.id;
+  const mailbox = card.details?.mailbox || "";
+  const expanded = Boolean(state.expandedDetails[key]);
+  const snoozeOpen = state.snoozeMenuCardId === key;
+  const status = state.statusByCardId[key];
   const action = primaryAction(card);
   const recommendation = normalizeRecommendation(card.recommendation);
   return (
     <article className={`attention-item-card ${expanded ? "is-expanded" : ""}`}>
-      <h2 className="attention-title">{card.title || "Email thread needs review"}</h2>
-      <p className="attention-field">{card.summary || ""}</p>
-      <p className="attention-field attention-recommendation">
-        <span className="suggested-prefix">Suggested: </span>{recommendation.replace(/^Suggested:\s*/i, "")}
-      </p>
-      <div className="proposal-actions">
-        <span className="snooze-wrap">
-          <button className="soft-btn" aria-expanded={snoozeOpen} onClick={() => actions.toggleSnoozeMenu(card.id)}>Snooze</button>
-          {snoozeOpen ? (
-            <span className="snooze-menu" role="menu">
-              <button className="snooze-option" role="menuitem" onClick={() => void actions.snoozeCard(card.id, "tomorrow")}>Tomorrow</button>
-              <button className="snooze-option" role="menuitem" onClick={() => void actions.snoozeCard(card.id, "next-week")}>Next week</button>
-              <button className="snooze-option" role="menuitem" onClick={() => void actions.snoozeCard(card.id, "dont-prioritize")}>Don't prioritize threads like this</button>
-            </span>
-          ) : null}
-        </span>
-        <button className="primary-btn" onClick={() => void actions.openCard(card.id)}>{action.label}</button>
+      <div className="attention-card-head">
+        <h2 className="attention-title">{card.title || "Email thread needs review"}</h2>
+        {state.selectedMailboxes.length > 1 && mailbox ? (
+          <span className="attention-card-mailbox"><span className="mailbox-dot" />{mailbox}</span>
+        ) : null}
+        <button className="card-details-btn" onClick={() => actions.toggleDetails(key)}>{expanded ? "Hide" : "Details"}</button>
       </div>
-      <button className="link-btn" onClick={() => actions.toggleDetails(card.id)}>{expanded ? "Hide details" : "Details"}</button>
+      <p className="attention-field">{card.summary || ""}</p>
+      <div className="attention-card-foot">
+        <p className="attention-field attention-recommendation">
+          <span className="suggested-prefix">Suggested: </span>{recommendation.replace(/^Suggested:\s*/i, "")}
+        </p>
+        <div className="proposal-actions">
+          <span className="snooze-wrap">
+            <button className="soft-btn" aria-expanded={snoozeOpen} onClick={() => actions.toggleSnoozeMenu(key)}>Snooze</button>
+            {snoozeOpen ? (
+              <span className="snooze-menu" role="menu">
+                <button className="snooze-option" role="menuitem" onClick={() => void actions.snoozeCard(key, "tomorrow")}>Tomorrow</button>
+                <button className="snooze-option" role="menuitem" onClick={() => void actions.snoozeCard(key, "next-week")}>Next week</button>
+                <button className="snooze-option" role="menuitem" onClick={() => void actions.snoozeCard(key, "dont-prioritize")}>Don't prioritize threads like this</button>
+              </span>
+            ) : null}
+          </span>
+          <button className="primary-btn" onClick={() => void actions.openCard(key)}>{action.label}</button>
+        </div>
+      </div>
       {expanded ? <CardDetails card={card} /> : null}
       {status ? <div className="attention-status">{status}</div> : null}
     </article>
@@ -92,8 +102,9 @@ function LowValueEmailCard({ msg, index, cardId }: { msg: CleanupMessage; index:
 
 function CleanupBundleCard({ card }: { card: FrontendCard }) {
   const { state, actions } = useApp();
-  const expanded = Boolean(state.expandedDetails[card.id]);
-  const readState = state.cleanupReadState[card.id];
+  const key = card.uiKey || card.id;
+  const expanded = Boolean(state.expandedDetails[key]);
+  const readState = state.cleanupReadState[key];
   const isAllRead = readState?.read;
   const messages = Array.isArray(card.bundledMessages) ? card.bundledMessages : [];
   const count = card.bundledCount || messages.length;
@@ -101,7 +112,7 @@ function CleanupBundleCard({ card }: { card: FrontendCard }) {
   return (
     <article className={`cleanup-bundle-card ${expanded ? "is-expanded" : ""} ${isAllRead ? "is-all-read" : ""}`}>
       <div className="cleanup-bundle-top">
-        <button className="cleanup-bundle-header" onClick={() => actions.toggleDetails(card.id)}>
+        <button className="cleanup-bundle-header" onClick={() => actions.toggleDetails(key)}>
           <span className="cleanup-bundle-icon">{expanded ? "▾" : "▸"}</span>
           <span className="cleanup-bundle-info">
             <span className="cleanup-bundle-title">{card.title}</span>
@@ -109,11 +120,11 @@ function CleanupBundleCard({ card }: { card: FrontendCard }) {
           </span>
           <span className="cleanup-bundle-count">{isAllRead ? "✓" : `${readCount}/${count}`}</span>
         </button>
-        <button className="soft-btn" disabled={Boolean(isAllRead || state.markingReadIds[card.id])} onClick={() => void actions.markCleanupAsRead(card.id)}>
-          {state.markingReadIds[card.id] ? "Marking..." : isAllRead ? "All read" : "Mark all read"}
+        <button className="soft-btn" disabled={Boolean(isAllRead || state.markingReadIds[key])} onClick={() => void actions.markCleanupAsRead(key)}>
+          {state.markingReadIds[key] ? "Marking..." : isAllRead ? "All read" : "Mark all read"}
         </button>
       </div>
-      {expanded ? <div className="cleanup-bundle-body">{messages.map((msg, i) => <LowValueEmailCard key={`${card.id}-${i}`} msg={msg} index={i} cardId={card.id} />)}</div> : null}
+      {expanded ? <div className="cleanup-bundle-body">{messages.map((msg, i) => <LowValueEmailCard key={`${key}-${i}`} msg={msg} index={i} cardId={key} />)}</div> : null}
     </article>
   );
 }
@@ -130,8 +141,72 @@ function LowerPrioritySection({ cards }: { cards: FrontendCard[] }) {
         </span>
         <span className="attention-pill">{state.lowerPriorityOpen ? "Hide" : "Show"}</span>
       </button>
-      {state.lowerPriorityOpen ? <div className="attention-queue">{cards.map((card) => <AttentionCard key={card.id} card={card} />)}</div> : null}
+      {state.lowerPriorityOpen ? <div className="attention-queue">{cards.map((card) => <AttentionCard key={card.uiKey || card.id} card={card} />)}</div> : null}
     </section>
+  );
+}
+
+function normalizeMailbox(mailbox: string): string {
+  return String(mailbox || "").trim().toLowerCase();
+}
+
+function cardMailbox(card: FrontendCard): string {
+  return normalizeMailbox(card.details?.mailbox || "");
+}
+
+function MailboxFilter({ allCards }: { allCards: FrontendCard[] }) {
+  const { state, actions } = useApp();
+  const [open, setOpen] = useState(false);
+  const enabledMailboxes = (state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox]).map(normalizeMailbox).filter(Boolean);
+  if (enabledMailboxes.length <= 1) return null;
+  const enabledSet = new Set(enabledMailboxes);
+  const active = (state.briefMailboxFilter.length ? state.briefMailboxFilter : enabledMailboxes).map(normalizeMailbox).filter((mailbox) => enabledSet.has(mailbox));
+  const activeMailboxes = active.length ? active : enabledMailboxes;
+  const activeSet = new Set(activeMailboxes);
+  const allSelected = activeSet.size === enabledMailboxes.length;
+  const counts = new Map<string, number>();
+  for (const card of visibleCards(allCards)) {
+    const mailbox = cardMailbox(card);
+    if (enabledSet.has(mailbox)) counts.set(mailbox, (counts.get(mailbox) || 0) + 1);
+  }
+  const selectedCount = allSelected ? enabledMailboxes.length : activeMailboxes.length;
+
+  const toggleMailbox = (mailbox: string) => {
+    if (allSelected) {
+      actions.setBriefMailboxFilter(enabledMailboxes.filter((m) => m !== mailbox));
+      return;
+    }
+    if (activeSet.has(mailbox)) {
+      if (activeMailboxes.length === 1) return;
+      actions.setBriefMailboxFilter(activeMailboxes.filter((item) => item !== mailbox));
+      return;
+    }
+    actions.setBriefMailboxFilter([...activeMailboxes, mailbox]);
+  };
+
+  return (
+    <div className="mailbox-dropdown">
+      <button className="mailbox-dropdown-trigger" onClick={() => setOpen((v: boolean) => !v)}>
+        {selectedCount} mailbox{selectedCount !== 1 ? "es" : ""} <span className="mailbox-dropdown-arrow">▾</span>
+      </button>
+      {open ? (
+        <>
+          <div className="mailbox-dropdown-backdrop" onClick={() => setOpen(false)} />
+          <div className="mailbox-dropdown-panel">
+            {enabledMailboxes.map((mailbox) => {
+              const checked = allSelected || activeSet.has(mailbox);
+              return (
+                <label key={mailbox} className="mailbox-dropdown-item">
+                  <input type="checkbox" checked={checked} onChange={() => toggleMailbox(mailbox)} />
+                  <span className="mailbox-dropdown-name">{mailbox}</span>
+                  <span className="mailbox-dropdown-count">{counts.get(mailbox) || 0}</span>
+                </label>
+              );
+            })}
+          </div>
+        </>
+      ) : null}
+    </div>
   );
 }
 
@@ -161,9 +236,12 @@ export function BriefView() {
     );
   }
 
+  const enabledMailboxes = (state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox]).map(normalizeMailbox).filter(Boolean);
+  const enabledSet = new Set(enabledMailboxes);
+  const cardsInEnabledMailboxes = state.allCards.filter((card) => enabledSet.has(cardMailbox(card)));
   const cards = mainCards(state.cards);
   const lower = lowerCards(state.cards);
-  const hasCards = visibleCards(state.cards).length > 0;
+  const hasCards = visibleCards(cardsInEnabledMailboxes).length > 0;
   const totalScans = Number(state.scanState?.total_scans || 0);
   const isFresh = !state.loading && !state.isScanning && totalScans === 0 && !hasCards;
 
@@ -209,7 +287,6 @@ export function BriefView() {
       <section className="assistant-card">
         <div>
           <h1 className="assistant-says">{title}</h1>
-          <div className="managed-mailboxes"><span className="mailbox-watch-chip">{state.mailbox}</span></div>
           {state.scanStatus ? <p className="assistant-copy">{state.scanStatus}</p> : null}
           {state.scanError ? <p className="assistant-copy is-error">{state.scanError}</p> : null}
         </div>
@@ -224,15 +301,16 @@ export function BriefView() {
                 </button>
               ))}
             </div>
+            <MailboxFilter allCards={cardsInEnabledMailboxes} />
           </div>
           {!isAll && CATEGORY_NOTE[activeFilter] ? <p className="category-note">{CATEGORY_NOTE[activeFilter]}</p> : null}
         </>
       ) : null}
       {mainDisplayCards.length ? (
-        <section className="noticed-section"><div className="attention-queue">{mainDisplayCards.map((card) => <AttentionCard key={card.id} card={card} />)}</div></section>
+        <section className="noticed-section"><div className="attention-queue">{mainDisplayCards.map((card) => <AttentionCard key={card.uiKey || card.id} card={card} />)}</div></section>
       ) : totalVisible > 0 && !cleanupCards.length ? <p className="assistant-copy" style={{ textAlign: "center", marginTop: 12 }}>No cards in this category.</p> : null}
       {isAll ? <LowerPrioritySection cards={regularLower} /> : null}
-      {showCleanup ? cleanupCards.map((card) => <CleanupBundleCard key={card.id} card={card} />) : null}
+      {showCleanup ? cleanupCards.map((card) => <CleanupBundleCard key={card.uiKey || card.id} card={card} />) : null}
     </div>
   );
 }

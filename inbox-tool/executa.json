@@ -1,6 +1,7 @@
 {
-  "tool_id": "'tool-zhaopy-inbox-executa-8jj3cw76",
-  "name": "inbox-execute",
+  "tool_id": "'bundled:inbox-executa",
+  "slug": "inbox-executa",
+  "name": "inbox-executa",
   "display_name": "Anna Inbox Executa",
   "version": "0.1.0",
   "type": "python",

@@ -205,6 +205,35 @@ def _load_token_record(mailbox: str) -> dict[str, Any]:
     raise ValueError(f"Local Gmail token file not found for {mailbox}")
 
 
+def list_available_mailboxes_from_tokens() -> list[dict[str, Any]]:
+    """发现本地 Gmail token 文件，供多邮箱开发模式使用。"""
+    token_root = _token_dir()
+    if not token_root.exists():
+        return []
+    results: list[dict[str, Any]] = []
+    for path in sorted(token_root.glob("*.json")):
+        if path.name == "default.json":
+            continue
+        email = path.stem.replace("_", "@", 1) if "_" in path.stem else path.stem
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(record, dict):
+                email = str(record.get("email") or record.get("mailbox") or record.get("emailAddress") or email)
+        except Exception:
+            pass
+        email = email.strip().lower()
+        if _looks_like_email(email):
+            results.append({
+                "email": email,
+                "provider": "gmail",
+                "auth_source": "local_file",
+                "authorized": True,
+                "token_file": str(path),
+                "last_auth_checked_at": beijing_now(),
+            })
+    return results
+
+
 def _should_refresh_token(record: dict[str, Any]) -> bool:
     if not record.get("refresh_token"):
         return False

@@ -1,0 +1,14 @@
+{
+  "slug": "mail-assistant",
+  "name": "Anna inbox",
+  "version": "1.2.4",
+  "tagline": "Turn email chaos into reviewable actions.",
+  "description": "Finds what matters across your inbox, summarizes the context, drafts replies, and keeps you in control before anything is sent or changed.",
+  "category": "communication",
+  "pricing_model": "free",
+
+  "_comment_bundled_executas": "...",
+  "bundled_executas": {
+    "inbox-executa": { "path": "../inbox-tool" }
+  }
+}

@@ -26,9 +26,10 @@ export function App() {
     ? { every_morning: "morning", every_afternoon: "afternoon", twice_daily: "2x/day", workdays: "workdays" }[state.scanPlan.schedule || ""] || "scheduled"
     : "";
   const nextInfo = scheduleLabel ? ` · Next: ${scheduleLabel}` : "";
+  const mailboxLabel = state.selectedMailboxes.length > 1 ? `${state.selectedMailboxes.length} mailboxes` : state.selectedMailboxes[0] || state.mailbox;
   const subtitle = state.isScanning
-    ? `Scanning ${state.mailbox}`
-    : `${visibleCards(state.cards).length} active · ${planLabel}${nextInfo} · ${state.mailbox}`;
+    ? `Scanning ${mailboxLabel}`
+    : `${visibleCards(state.cards).length} active · ${planLabel}${nextInfo} · ${mailboxLabel}`;
 
   return (
     <AppContext.Provider value={{ state, actions }}>
@@ -45,7 +46,7 @@ export function App() {
                 <div className="brand-title">Anna Inbox</div>
                 <div className="brand-subtitle">{subtitle}</div>
                 <div className={`connection-status ${state.runtime.connected ? "is-live" : "is-offline"}`}>
-                  {state.runtime.connected ? `Live · ${state.mailbox}` : "Runtime not connected"}
+                  {state.runtime.connected ? `Live · ${mailboxLabel}` : "Runtime not connected"}
                 </div>
               </div>
             </div>

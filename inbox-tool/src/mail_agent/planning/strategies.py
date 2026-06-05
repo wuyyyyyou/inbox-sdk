@@ -66,9 +66,11 @@ default_secretary = register(MailStrategy(
         default_time_range="last_72_hours_plus_recent_open_threads",
         default_queries=[
             # 收件箱全部 + 星标/重要合并为一条查询（减少 Gmail API 调用）
-            {"query": "in:inbox (newer_than:3d OR is:important OR is:starred)", "purpose": "all_inbox_and_flagged", "max_results": 100, "priority": "high"},
+            {"query": "in:inbox newer_than:3d", "purpose": "recent_inbox", "max_results": 80, "priority": "high"},
+            {"query": "is:important newer_than:7d", "purpose": "important_recent", "max_results": 40, "priority": "high"},
+            {"query": "is:starred newer_than:30d", "purpose": "starred_recent", "max_results": 40, "priority": "high"},
             # 草稿（提醒发送）
-            {"query": "in:draft newer_than:7d", "purpose": "unsent_drafts", "max_results": 20, "priority": "medium"},
+            {"query": "in:drafts newer_than:7d", "purpose": "unsent_drafts", "max_results": 20, "priority": "medium"},
         ],
         # Gmail 标签权重：INBOX/IMPORTANT/STARRED 权重高，更新类中，社交/促销低
         label_weights={

@@ -168,7 +168,6 @@ def _base_schema() -> dict[str, Any]:
 
 def _secretary_schema() -> dict[str, Any]:
     return {
-        "bucket": "one of: must_review | needs_reply | needs_confirmation | agent_can_prepare | safe_cleanup | lower_priority | ignore",
         "urgency": "one of: today | this_week | later | none",
         "who_should_act": "one of: user | agent_after_approval | no_action",
     }
@@ -199,6 +198,8 @@ def _security_schema() -> dict[str, Any]:
 
 def _final_decision_schema() -> dict[str, Any]:
     return {
+        "user_action": "one of: reply | review",
+        "action_reason": "one of: question_asked | waiting_for_you | unsent_draft | courtesy_due | upcoming_event | deal_or_pipeline | security_or_billing | receipt_or_notice | cleanup",
         "display_bucket": "string (short English label)",
         "priority": "one of: critical | high | medium | low | ignore",
         "should_show_in_main_result": "boolean",
@@ -265,15 +266,46 @@ def build_judgment_prompt(
 ## Strategy
 {strategy.name}: {strategy.description}
 
-{strategy.judgment_policy.rubric}
+## Judgment Rubric — Binary Decision
+
+First, answer THIS question about the email:
+
+  **"Does this email require the user to send a reply message?"**
+
+  If YES → user_action = "reply"
+    Then pick the BEST action_reason:
+    - question_asked: the sender explicitly asked a question or made a request that needs an answer
+    - waiting_for_you: the sender is clearly waiting for the user's input, approval, or decision
+    - unsent_draft: this is a draft the user wrote but never sent
+    - courtesy_due: sender invested real effort (wrote 3+ substantive sentences, shared a document, or explicitly asked for the user's thoughts). Do NOT flag automated notifications, newsletters, receipts, or one-line status updates.
+
+  If NO → user_action = "review"
+    Then pick the BEST action_reason:
+    - upcoming_event: interview/meeting/deadline reminder — worth noting the time
+    - deal_or_pipeline: project/partnership/deal status update worth tracking
+    - security_or_billing: security alert, billing issue, subscription — needs checking
+    - receipt_or_notice: receipt, subscription confirmation, normal account notice — record only
+    - cleanup: newsletter, promotion, automated digest — safe to archive
+
+  Priority & action_reason mapping (you MUST follow):
+    question_asked → priority≥medium, should_show_in_main_result=true
+    waiting_for_you → priority≥medium, should_show_in_main_result=true
+    unsent_draft → priority≥medium, should_show_in_main_result=true
+    courtesy_due → priority≥medium, should_show_in_main_result=true
+    security_or_billing → priority≥high, should_show_in_main_result=true
+    upcoming_event → priority≥medium
+    deal_or_pipeline → priority≥medium
+    receipt_or_notice → priority=low
+    cleanup → priority=low, should_show_in_lower_priority=true
+
 {few_shot}
 
 ## Mailbox Owner
 You are evaluating mail for: {mailbox_profile.mailbox_id}
 Match by EMAIL ADDRESS (between < >), not by display name.
 - If the sender's email IS the mailbox owner → OUTGOING mail.
-  SENT: user already sent it → should_show_in_main_result=false, priority=low.
-  DRAFT: user hasn't sent it yet → surface as unsent draft reminder.
+  SENT: user already sent it → user_action=review, action_reason=cleanup, priority=low.
+  DRAFT: user hasn't sent it yet → user_action=reply, action_reason=unsent_draft, priority=medium.
 
 ## Email
 {_render_context_for_prompt(candidate_context, mailbox_profile.mailbox_id)}
@@ -292,21 +324,15 @@ Return a JSON object:
 }}
 
 ## Rules
-- user_action: "reply" if a person is waiting for a response; "review" if no reply needed but worth awareness (schedule change, pipeline update, scorecard, internal note). There is NO "ignore" here — Phase 1 already filtered those out.
-- base_judgment.risk_level: security/billing→critical/high, needs reply→medium, notifications→low/none
-- final_decision.priority MUST match risk_level
-- final_decision.should_show_in_main_result: critical/high/medium→true, low/none→false
-- requires_user_action=true when the user needs to act
-- If the email mentions a specific upcoming event (interview, meeting, deadline) within the next few days, priority must be at least medium and should_show_in_main_result must be true.
-- "Review before Thursday's interview" / "before tomorrow's sync" / "submit before hiring sync" → priority=medium or higher.
-- user_action=reply + priority=low is INVALID. If a reply is needed, priority>=medium and should_show_in_main_result=true.
+- user_action + action_reason MUST be consistent per the rubric above. question_asked/waiting_for_you/unsent_draft/courtesy_due → reply. upcoming_event/deal_or_pipeline/security_or_billing/receipt_or_notice/cleanup → review.
+- base_judgment.risk_level aliases priority: reply→medium, high-risk→high/critical, low-value→low/none
 - user_facing_summary: name the core person, project, company, or risk event. Be specific.
-- user_facing_reason: state WHAT recently happened with verifiable facts (sender name, date, action). Do NOT explain why it matters.
+- user_facing_reason: state WHAT recently happened with verifiable facts (sender name, email sent date, action). The date is the email's "Date" field from above — it is NOT a deadline or due date. Do NOT explain why it matters.
 - user_facing_recommendation: one specific, differentiated action. Not generic like "evaluate and respond."
 - If the sender IS the mailbox owner: user_facing_summary MUST say "Unsent draft" not "Reply needed".
 - NEVER suggest send_email / delete_email / unsubscribe
-- Before output: re-read user_facing_recommendation. If it contains a time constraint ("before X", "by Friday", "today"), priority MUST NOT be low.
 - CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM". If no date is available, say "recently".
+- If the body mentions a deadline or timeframe ("before this weekend", "by Friday", "next Monday"), quote it verbatim in your output. Do NOT convert relative time to an absolute calendar date. Say "before this weekend", NOT "before Jun 8".
 - Output ONLY valid JSON"""
     return prompt
 
@@ -321,7 +347,7 @@ def _render_context_for_batch_prompt(ctx: CandidateContext, owner_email: str = "
         f"From: {c.evidence.get('from', '')}",
         f"Subject: {c.evidence.get('subject', '')}",
         f"Snippet: {c.evidence.get('snippet', '')}",
-        f"Date: {c.evidence.get('date', '')}",
+        f"Date: {_fmt_ts(str(c.evidence.get('date', '')))}",
         f"Labels: {json.dumps(c.evidence.get('labels', []), ensure_ascii=False)}",
         f"Signals: {json.dumps(c.evidence.get('matched_signals', []), ensure_ascii=False)}",
     ]
@@ -394,20 +420,33 @@ def build_batch_judgment_prompt(
         "Output a single JSON object. The very first character you write MUST be `{`.\n"
         "Do NOT wrap the JSON in markdown fences. Do NOT write any text before or after the JSON.\n\n"
         f"## Strategy\n{strategy.name}: {strategy.description}\n\n"
+        "## Judgment Rubric — Binary Decision\n"
+        "For each candidate, first decide: Does the user need to send a reply?\n"
+        "  YES (user_action=\"reply\"): question_asked | waiting_for_you | unsent_draft | courtesy_due → priority≥medium, surface=true\n"
+        "  NO  (user_action=\"review\"): upcoming_event | deal_or_pipeline | security_or_billing | receipt_or_notice | cleanup\n"
+        "    security_or_billing → priority≥high; upcoming_event/deal_or_pipeline → priority≥medium; receipt_or_notice/cleanup → priority=low\n"
         f"## Mailbox Owner\n{mailbox_profile.mailbox_id} — match by EMAIL ADDRESS (between < >), not by display name.\n"
-        "- Sender IS mailbox owner → OUTGOING. SENT: surface=false, priority=low.\n"
-        "  DRAFT: surface=true, priority=medium, item_type=reply_required (unsent draft).\n\n"
+        "- Sender IS mailbox owner → OUTGOING. SENT: surface=false, priority=low, user_action=review, action_reason=cleanup.\n"
+        "  DRAFT: surface=true, priority=medium, user_action=reply, action_reason=unsent_draft.\n\n"
         f"## User request\n{task_plan.raw_user_request}\n{snooze_text}\n\n"
         "## Candidates\n"
         + rendered_text + "\n\n"
         '## Output\nReturn EXACTLY:\n\n'
         '{"items":[\n'
         '  {"candidate_id":"<copy from input>","priority":"medium","surface":true,\n'
-        '   "item_type":"reply_required","title":"Person re: subject","context":"Person sent X on date. No reply yet.",\n'
+        '   "user_action":"reply","action_reason":"question_asked",\n'
+        '   "title":"Person re: subject","context":"Person sent X on date. No reply yet.",\n'
         '   "suggestion":"Reply to person about X by Friday.","action":"create_draft","needs":"Reply to person",\n'
         '   "latest_action":"sent a follow-up","latest_actor":"Sender Name","confidence":0.85}\n'
         ']}\n\n'
         'Every input Candidate MUST have one entry in items. Do NOT skip or add.\n'
+        '\n'
+        '## Rules\n'
+        '- user_action + action_reason must be consistent per rubric above.\n'
+        '- context: state WHAT recently happened with verifiable facts (sender name, email sent date, action). The date is the email\'s Date field from the input — it is NOT a deadline or due date. Do NOT explain why it matters.\n'
+        '- suggestion: one specific, differentiated next action.\n'
+        '- CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format.\n'
+        '- If the body mentions a deadline or timeframe ("before this weekend", "by Friday"), quote it verbatim. Do NOT convert to an absolute calendar date. Say "before this weekend", NOT "before Jun 8".\n'
     )
     return prompt
 
@@ -436,15 +475,46 @@ Output ONLY a single JSON object. Do NOT wrap in markdown. Do NOT explain. The v
 ## Strategy
 {strategy.name}: {strategy.description}
 
-{strategy.judgment_policy.rubric}
+## Judgment Rubric — Binary Decision
+
+First, answer THIS question about the email:
+
+  **"Does this email require the user to send a reply message?"**
+
+  If YES → user_action = "reply"
+    Then pick the BEST action_reason:
+    - question_asked: the sender explicitly asked a question or made a request that needs an answer
+    - waiting_for_you: the sender is clearly waiting for the user's input, approval, or decision
+    - unsent_draft: this is a draft the user wrote but never sent
+    - courtesy_due: sender invested real effort (wrote 3+ substantive sentences, shared a document, or explicitly asked for the user's thoughts). Do NOT flag automated notifications, newsletters, receipts, or one-line status updates.
+
+  If NO → user_action = "review"
+    Then pick the BEST action_reason:
+    - upcoming_event: interview/meeting/deadline reminder — worth noting the time
+    - deal_or_pipeline: project/partnership/deal status update worth tracking
+    - security_or_billing: security alert, billing issue, subscription — needs checking
+    - receipt_or_notice: receipt, subscription confirmation, normal account notice — record only
+    - cleanup: newsletter, promotion, automated digest — safe to archive
+
+  Priority & action_reason mapping (you MUST follow):
+    question_asked → priority≥medium, surface=true
+    waiting_for_you → priority≥medium, surface=true
+    unsent_draft → priority≥medium, surface=true
+    courtesy_due → priority≥medium, surface=true
+    security_or_billing → priority≥high, surface=true
+    upcoming_event → priority≥medium
+    deal_or_pipeline → priority≥medium
+    receipt_or_notice → priority=low
+    cleanup → priority=low
+
 {few_shot}
 
 ## Mailbox Owner
 You are evaluating mail for: {mailbox_profile.mailbox_id}
 Match by EMAIL ADDRESS (between < >), not by display name.
 - If the sender's email IS the mailbox owner → OUTGOING mail.
-  SENT: user already sent it → surface=false, priority=low.
-  DRAFT: user hasn't sent it yet → surface as unsent draft reminder.
+  SENT: user already sent it → surface=false, priority=low, user_action=review, action_reason=cleanup.
+  DRAFT: user hasn't sent it yet → user_action=reply, action_reason=unsent_draft, priority=medium.
 
 ## Email
 candidate_id: {c.candidate_id}
@@ -453,7 +523,7 @@ priority_hint: {c.priority_hint}
 from: {c.evidence.get('from', '')}
 subject: {c.evidence.get('subject', '')}
 snippet: {c.evidence.get('snippet', '')}
-date: {c.evidence.get('date', '')}
+date: {_fmt_ts(str(c.evidence.get('date', '')))}
 context_type: {ctx.type}
 {_render_body_and_thread(ctx, mailbox_profile.mailbox_id)}
 
@@ -469,6 +539,7 @@ Return exactly this JSON shape:
   "priority": "medium",
   "surface": true,
   "user_action": "reply",
+  "action_reason": "question_asked",
   "title": "Short card title (English ≤12 words)",
   "context": "WHAT happened: who did what, when, and current status. Verifiable facts only. English ≤30 words.",
   "suggestion": "Specific next action. Be concrete, not generic. English ≤15 words.",
@@ -480,61 +551,83 @@ Return exactly this JSON shape:
 }}}}
 
 Allowed user_action: reply, review.
+Allowed action_reason: question_asked, waiting_for_you, unsent_draft, courtesy_due, upcoming_event, deal_or_pipeline, security_or_billing, receipt_or_notice, cleanup.
 Allowed priority: critical, high, medium, low, ignore.
 Allowed action: create_draft, create_reminder, save_note, do_nothing.
 
 ## Rules
-- user_action: "reply" if a person is waiting for a response; "review" if no reply needed but worth awareness (schedule change, pipeline update, scorecard, internal note, calendar reschedule). There is NO "ignore" here — Phase 1 already filtered those out.
-- priority: security/risk/payment failure → critical or high. Human waiting for reply → medium or high. Schedule/logistics awareness → medium. Routine receipt/notification → low.
-- user_action=reply + priority=low is INVALID. If a reply is needed, priority>=medium and surface=true.
-- If the suggestion text mentions a deadline or time constraint ("before Thursday", "by tomorrow", "today", "before hiring sync"), priority MUST be medium or higher.
+- user_action + action_reason MUST be consistent: question_asked/waiting_for_you/unsent_draft/courtesy_due → reply. upcoming_event/deal_or_pipeline/security_or_billing/receipt_or_notice/cleanup → review.
+- priority: reply reasons → medium or high. security_or_billing → critical or high. schedule/logistics → medium. receipt/cleanup → low.
 - title: name the core person, project, company, or risk event. Be specific. If sender IS the mailbox owner, title MUST start with "Unsent draft".
-- context: state WHAT recently happened with verifiable facts (sender name, date, action). Do NOT explain why it matters.
+- context: state WHAT recently happened with verifiable facts (sender name, email sent date, action). The date is the email's "Date" field from above — it is NOT a deadline or due date. Do NOT explain why it matters.
 - suggestion: one specific, differentiated next action. Never generic like "evaluate and respond."
 - NEVER suggest send_email / delete_email / unsubscribe. Use create_draft for reply suggestions, create_reminder for things to review, save_note for info worth recording, do_nothing when no action is needed.
 - needs: concise category like "Reply to Kate", "Timing decision", "Receipt check", "Manual review".
 - Before output: re-read your suggestion. If it contains a time constraint, priority MUST NOT be low.
 - CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM". If no date is available, say "recently".
+- If the body mentions a deadline or timeframe ("before this weekend", "by Friday", "next Monday"), quote it verbatim in your output. Do NOT convert relative time to an absolute calendar date. Say "before this weekend", NOT "before Jun 8".
 - Output ONLY valid JSON."""
     return prompt
+
+
+REPLY_REASONS = frozenset({"question_asked", "waiting_for_you", "unsent_draft", "courtesy_due"})
+REVIEW_REASONS = frozenset({"upcoming_event", "deal_or_pipeline", "security_or_billing", "receipt_or_notice", "cleanup"})
 
 
 def _enforce_consistency(judgment: JudgmentResult) -> JudgmentResult:
     """Post-process a judgment to catch LLM self-contradictions.
 
-    Fixes cases where the LLM says "reply_required" but sets priority=low,
-    or where the recommendation has a time constraint but priority is low.
+    Hard constraints based on action_reason, with code-level override.
     """
     fd = judgment.final_decision
     bj = judgment.base_judgment
-    changed = False
+    action_reason = _extract_action_reason(judgment)
 
-    # Rule 0: user_action fallback
-    if not fd.user_action:
+    # 1. action_reason → user_action hard override (code is authoritative)
+    if action_reason in REPLY_REASONS:
+        fd.user_action = "reply"
+    elif action_reason in REVIEW_REASONS:
+        fd.user_action = "review"
+    elif not fd.user_action:
         fd.user_action = "review"
 
-    # Rule 1: reply → at least medium
-    if fd.user_action == "reply":
+    # 2. reply reasons → priority ≥ medium, must surface
+    if action_reason in REPLY_REASONS:
         if fd.priority in ("low", "ignore"):
             fd.priority = "medium"
-            fd.should_show_in_main_result = True
-            fd.should_show_in_lower_priority = False
-            changed = True
+        fd.should_show_in_main_result = True
+        fd.should_show_in_lower_priority = False
 
-    # Rule 2: deadline words in recommendation → at least medium
+    # 3. security_or_billing → priority ≥ high, must surface
+    if action_reason == "security_or_billing":
+        if fd.priority not in ("critical", "high"):
+            fd.priority = "high"
+        fd.should_show_in_main_result = True
+        fd.should_show_in_lower_priority = False
+
+    # 4. cleanup → low priority
+    if action_reason == "cleanup" and fd.priority not in ("low", "ignore"):
+        fd.priority = "low"
+
+    # 5. Deadline words in recommendation → at least medium
     rec = fd.user_facing_recommendation.lower()
     deadline_words = ("before", "by tomorrow", "by friday", "by thursday", "today", "asap", "tonight")
     if any(w in rec for w in deadline_words) and fd.priority == "low":
         fd.priority = "medium"
         fd.should_show_in_main_result = True
         fd.should_show_in_lower_priority = False
-        changed = True
 
-    # Rule 3: surface + low priority mismatch — if surface=true, priority can't be ignore
+    # 6. Surface → can't be ignore
     if bj.should_surface and fd.priority == "ignore":
         fd.priority = "low"
 
     return judgment
+
+
+def _extract_action_reason(judgment: JudgmentResult) -> str:
+    """action_reason is stored in mode_judgment by both parse paths."""
+    mode = judgment.mode_judgment if isinstance(judgment.mode_judgment, dict) else {}
+    return str(mode.get("action_reason") or "")
 
 
 def parse_judgment_output(raw_json: dict[str, Any], strategy: MailStrategy) -> JudgmentResult:
@@ -584,6 +677,12 @@ def parse_judgment_output(raw_json: dict[str, Any], strategy: MailStrategy) -> J
 
     if user_action not in ("reply", "review"):
         user_action = "review"
+
+    action_reason = str(decision_raw.get("action_reason") or "")
+    if not isinstance(mode_raw, dict):
+        mode_raw = {}
+    if action_reason:
+        mode_raw["action_reason"] = action_reason
 
     decision = FinalDecision(
         display_bucket=str(decision_raw.get("display_bucket") or ""),
@@ -709,6 +808,7 @@ def _parse_compact_batch_item(raw: dict[str, Any], strategy: MailStrategy) -> Ju
     summary = str(raw.get("title") or raw.get("summary") or "")[:300]
     reason = str(raw.get("context") or raw.get("reason") or "")[:500]
     recommendation = str(raw.get("suggestion") or raw.get("recommendation") or "")[:500]
+    action_reason = str(raw.get("action_reason") or "")
     display_bucket = str(raw.get("bucket") or _ITEM_TYPE_DISPLAY.get(item_type, item_type))
 
     result = JudgmentResult(
@@ -728,6 +828,7 @@ def _parse_compact_batch_item(raw: dict[str, Any], strategy: MailStrategy) -> Ju
         mode_judgment={
             "bucket": display_bucket,
             "compact_item_type": item_type,
+            "action_reason": action_reason,
             "needs": str(raw.get("needs") or ""),
             "latest_action": str(raw.get("latest_action") or ""),
             "latest_actor": str(raw.get("latest_actor") or ""),

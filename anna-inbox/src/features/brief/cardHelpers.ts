@@ -61,9 +61,10 @@ export function currentDisplayList(state: Pick<AppState, "cards" | "resultFilter
 export function nextCardId(state: Pick<AppState, "selectedCard" | "cards" | "resultFilter">): string | null {
   if (!state.selectedCard) return null;
   const list = currentDisplayList(state);
-  const idx = list.findIndex((card) => card.id === state.selectedCard?.id);
+  const currentKey = state.selectedCard.uiKey || state.selectedCard.id;
+  const idx = list.findIndex((card) => (card.uiKey || card.id) === currentKey);
   if (idx < 0 || idx >= list.length - 1) return null;
-  return list[idx + 1]?.id ?? null;
+  return list[idx + 1]?.uiKey || list[idx + 1]?.id || null;
 }
 
 export function primaryAction(card: FrontendCard): { id: string; label: string } {

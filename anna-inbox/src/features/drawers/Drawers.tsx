@@ -37,7 +37,9 @@ function SourcesDrawer() {
     ? ({ last_24h: "1 day", last_7d: "7 days", unread_backlog: "30 days", since_last: "since last scan" }[timeRange] || timeRange)
     : totalScans === 0 ? "7 days (first scan)" : "adaptive";
   const storageLabel = state.storageProvider === "aps" ? "APS (Anna Persistent Storage)" : "local JSON files";
-  const initials = (state.mailbox || "A").charAt(0).toUpperCase();
+  const mailboxes = state.mailboxes.length
+    ? state.mailboxes
+    : state.mailbox ? [{ email: state.mailbox, provider: "gmail", authorized: state.gmailAuthStatus.authorized, selected: true }] : [];
   return (
     <aside className={`drawer ${state.sourcesOpen ? "is-open" : ""}`} aria-label="Sources drawer">
       <div className="drawer-head">
@@ -45,13 +47,36 @@ function SourcesDrawer() {
         <button className="icon-btn" onClick={actions.closeDrawers}>x</button>
       </div>
       <div className="drawer-body">
-        <article className="source-card mailbox-card is-selected">
-          <div className="source-icon">{initials}</div>
-          <div>
-            <div className="source-name">{state.mailbox}</div>
-            <div className="source-meta">Gmail source · {modeLabel(state.strategyMode)}</div>
+        <section className="config-block">
+          <h3>Mailboxes</h3>
+          <div className="mailbox-list">
+            {mailboxes.map((mailbox) => {
+              const email = mailbox.email;
+              const selected = state.selectedMailboxes.includes(email) || Boolean(mailbox.selected && !state.selectedMailboxes.length);
+              const initials = (email || "A").charAt(0).toUpperCase();
+              return (
+                <article key={email} className={`source-card mailbox-card ${selected ? "is-selected" : ""}`}>
+                  <label className="mailbox-source-row">
+                    <input type="checkbox" checked={selected} onChange={(event) => void actions.setMailboxSelected(email, event.target.checked)} />
+                    <span className="source-icon">{initials}</span>
+                    <span className="mailbox-source-main">
+                      <span className="source-name">{email}</span>
+                      <span className="source-meta">
+                        {(mailbox.provider || "gmail").toUpperCase()} · {mailbox.authorized === false ? "Re-auth needed" : "Connected"} · {modeLabel(state.strategyMode)}
+                      </span>
+                      <span className="source-meta">
+                        {mailbox.last_scan_at ? `Last scan ${formatBeijingTimestamp(mailbox.last_scan_at)}` : "No scan yet"}
+                        {typeof mailbox.card_count === "number" ? ` · ${mailbox.card_count} cards` : ""}
+                      </span>
+                      {mailbox.last_error ? <span className="source-meta is-error">{mailbox.last_error}</span> : null}
+                    </span>
+                  </label>
+                </article>
+              );
+            })}
           </div>
-        </article>
+          {!state.selectedMailboxes.length ? <p className="assistant-copy is-error">Select at least one mailbox to run Brief.</p> : null}
+        </section>
         <section className="config-block">
           <h3>Scan window</h3>
           <ul className="config-list">
@@ -155,7 +180,7 @@ function HistoryDrawer() {
   const handleRestore = (run: RunHistoryEntry) => {
     if (!run.card_id) return;
     setRestoredRunIds((prev) => new Set(prev).add(entryKey(run)));
-    void actions.restoreCard(run.card_id);
+    void actions.restoreCard(run.card_id, run.mailbox);
   };
 
   const renderEntry = (run: RunHistoryEntry, hideDetail?: boolean) => {

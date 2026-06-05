@@ -16,6 +16,8 @@ from .types import (
     CardDetails,
     CardStatus,
     LearningRecord,
+    MailboxRegistry,
+    MailboxRegistryEntry,
     OriginalEmail,
     PersistentCard,
     ProcessedMessage,
@@ -40,6 +42,167 @@ def _mailbox_prefix(mailbox: str) -> str:
     return f"mailbox/{_sanitize(mailbox)}"
 
 
+# ── 邮箱注册表 ────────────────────────────────────────────────
+
+MAILBOX_REGISTRY_KEY = "mailboxes/registry"
+
+
+def _normalize_email(email: str) -> str:
+    return str(email or "").strip().lower()
+
+
+def _dict_to_mailbox_registry_entry(raw: dict[str, Any]) -> MailboxRegistryEntry:
+    allowed = MailboxRegistryEntry.__dataclass_fields__
+    data = {key: raw.get(key) for key in allowed if key in raw}
+    email = _normalize_email(str(data.get("email") or ""))
+    return MailboxRegistryEntry(
+        **{
+            **data,
+            "email": email,
+            "provider": str(data.get("provider") or "gmail"),
+            "authorized": bool(data.get("authorized", True)),
+            "selected": bool(data.get("selected", True)),
+        }
+    )
+
+
+async def get_mailbox_registry() -> MailboxRegistry:
+    result = await get_storage().get(MAILBOX_REGISTRY_KEY, scope=default_scope())
+    if result.get("exists") and isinstance(result.get("value"), dict):
+        raw = result["value"]
+        entries = []
+        for item in raw.get("mailboxes", []) if isinstance(raw.get("mailboxes"), list) else []:
+            if isinstance(item, dict) and _normalize_email(str(item.get("email") or "")):
+                entries.append(_dict_to_mailbox_registry_entry(item))
+        return MailboxRegistry(mailboxes=entries, updated_at=str(raw.get("updated_at") or _now()))
+    return MailboxRegistry()
+
+
+async def set_mailbox_registry(registry: MailboxRegistry) -> dict:
+    registry.updated_at = _now()
+    return await get_storage().set(MAILBOX_REGISTRY_KEY, _dataclass_to_dict(registry), scope=default_scope())
+
+
+async def upsert_mailbox_registry_entry(entry: MailboxRegistryEntry) -> MailboxRegistry:
+    email = _normalize_email(entry.email)
+    registry = await get_mailbox_registry()
+    found = False
+    for idx, existing in enumerate(registry.mailboxes):
+        if _normalize_email(existing.email) == email:
+            entry.added_at = existing.added_at or entry.added_at
+            entry.updated_at = _now()
+            registry.mailboxes[idx] = entry
+            found = True
+            break
+    if not found:
+        entry.email = email
+        entry.updated_at = _now()
+        registry.mailboxes.append(entry)
+    await set_mailbox_registry(registry)
+    return registry
+
+
+async def merge_discovered_mailboxes(discovered: list[dict[str, Any]]) -> MailboxRegistry:
+    registry = await get_mailbox_registry()
+    by_email: dict[str, MailboxRegistryEntry] = {
+        _normalize_email(entry.email): entry for entry in registry.mailboxes if _normalize_email(entry.email)
+    }
+    changed = False
+    for raw in discovered:
+        email = _normalize_email(str(raw.get("email") or raw.get("mailbox") or ""))
+        if not email:
+            continue
+        existing = by_email.get(email)
+        if existing:
+            existing.provider = str(raw.get("provider") or existing.provider or "gmail")
+            existing.auth_source = str(raw.get("auth_source") or raw.get("source") or existing.auth_source or "")
+            existing.authorized = bool(raw.get("authorized", existing.authorized))
+            existing.last_auth_checked_at = str(raw.get("last_auth_checked_at") or existing.last_auth_checked_at or "")
+            existing.updated_at = _now()
+        else:
+            by_email[email] = MailboxRegistryEntry(
+                email=email,
+                provider=str(raw.get("provider") or "gmail"),
+                auth_source=str(raw.get("auth_source") or raw.get("source") or ""),
+                authorized=bool(raw.get("authorized", True)),
+                selected=True,
+                last_auth_checked_at=str(raw.get("last_auth_checked_at") or ""),
+            )
+        changed = True
+    if changed:
+        registry.mailboxes = sorted(by_email.values(), key=lambda item: item.email)
+        await set_mailbox_registry(registry)
+    return registry
+
+
+async def set_mailbox_selected(mailbox: str, selected: bool) -> MailboxRegistry:
+    email = _normalize_email(mailbox)
+    registry = await get_mailbox_registry()
+    for entry in registry.mailboxes:
+        if _normalize_email(entry.email) == email:
+            entry.selected = bool(selected)
+            entry.updated_at = _now()
+            await set_mailbox_registry(registry)
+            return registry
+    entry = MailboxRegistryEntry(email=email, selected=bool(selected), provider="gmail")
+    registry.mailboxes.append(entry)
+    await set_mailbox_registry(registry)
+    return registry
+
+
+async def remove_mailbox_from_registry(mailbox: str) -> MailboxRegistry:
+    email = _normalize_email(mailbox)
+    registry = await get_mailbox_registry()
+    registry.mailboxes = [entry for entry in registry.mailboxes if _normalize_email(entry.email) != email]
+    await set_mailbox_registry(registry)
+    return registry
+
+
+async def update_mailbox_registry_fields(mailbox: str, **fields: Any) -> MailboxRegistry:
+    email = _normalize_email(mailbox)
+    if not email:
+        return await get_mailbox_registry()
+    registry = await get_mailbox_registry()
+    for entry in registry.mailboxes:
+        if _normalize_email(entry.email) == email:
+            for key, value in fields.items():
+                if key in MailboxRegistryEntry.__dataclass_fields__:
+                    setattr(entry, key, value)
+            entry.updated_at = _now()
+            await set_mailbox_registry(registry)
+            return registry
+    entry = MailboxRegistryEntry(email=email, provider="gmail")
+    for key, value in fields.items():
+        if key in MailboxRegistryEntry.__dataclass_fields__:
+            setattr(entry, key, value)
+    entry.updated_at = _now()
+    registry.mailboxes.append(entry)
+    await set_mailbox_registry(registry)
+    return registry
+
+
+async def aggregate_active_cards(mailboxes: list[str] | None = None) -> ActiveCards:
+    registry = await get_mailbox_registry()
+    allowed = {_normalize_email(mailbox) for mailbox in (mailboxes or []) if _normalize_email(mailbox)}
+    if not allowed:
+        allowed = {_normalize_email(entry.email) for entry in registry.mailboxes if _normalize_email(entry.email)}
+    cards: list[PersistentCard] = []
+    latest_updated = ""
+    for mailbox in sorted(allowed):
+        active = await get_active_cards(mailbox)
+        latest_updated = max(latest_updated, active.updated_at or "")
+        for card in active.cards:
+            if not card.details.mailbox:
+                card.details.mailbox = mailbox
+            cards.append(card)
+    cards.sort(key=lambda card: (card.status == "pending", _priority_rank(card.priority), card.updated_at or card.created_at or ""), reverse=True)
+    return ActiveCards(cards=cards, updated_at=latest_updated or _now())
+
+
+def _priority_rank(priority: str) -> int:
+    return {"high": 3, "medium": 2, "low": 1}.get(str(priority or "").lower(), 0)
+
+
 # ── Scan state ──────────────────────────────────────────────────────
 
 async def get_scan_state(mailbox: str) -> ScanState:
@@ -55,7 +218,9 @@ async def get_scan_state(mailbox: str) -> ScanState:
 
 async def set_scan_state(mailbox: str, state: ScanState) -> dict:
     key = f"{_mailbox_prefix(mailbox)}/scan_state"
-    return await get_storage().set(key, _dataclass_to_dict(state), scope=default_scope())
+    result = await get_storage().set(key, _dataclass_to_dict(state), scope=default_scope())
+    await update_mailbox_registry_fields(mailbox, last_scan_at=state.last_scan_ts or _now(), last_scan_status="ok", last_error="")
+    return result
 
 
 # ── Scan plan ────────────────────────────────────────────────────────
@@ -147,7 +312,9 @@ async def \
 
 async def set_active_cards(mailbox: str, cards: ActiveCards) -> dict:
     cards.updated_at = _now()
-    return await get_storage().set(_cards_key(mailbox), _dataclass_to_dict(cards), scope=default_scope())
+    result = await get_storage().set(_cards_key(mailbox), _dataclass_to_dict(cards), scope=default_scope())
+    await update_mailbox_registry_fields(mailbox, card_count=len(cards.cards))
+    return result
 
 
 async def update_card_status(

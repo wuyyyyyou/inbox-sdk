@@ -77,7 +77,8 @@ function AskProgress() {
 function AskItemActions({ item }: { item: CustomRunResultItem }) {
   const { state, actions } = useApp();
   const mid = item.message_id || "";
-  const actionKey = mid || item.thread_id || "";
+  const itemMailbox = item.mailbox || state.selectedMailboxes[0] || state.mailbox;
+  const actionKey = `${itemMailbox}::${mid || item.thread_id || ""}`;
   const acts = state.askItemActions[actionKey] || state.askItemActions[mid] || {};
   const hasDraft = Boolean(item.draft && item.draft.trim());
   const canReply = hasDraft && item.thread_id && item.from;
@@ -91,10 +92,10 @@ function AskItemActions({ item }: { item: CustomRunResultItem }) {
       <div className="ask-item-actions">
         <textarea className="ask-edit-textarea" rows={4} value={state.askEditDraft[actionKey]} onChange={(e) => actions.updateAskDraft(actionKey, e.target.value)} />
         <div className="ask-item-actions">
-          <button className="ask-action-btn ask-action-reply" onClick={() => void actions.sendAskDraft(actionKey, item.thread_id || "", item.from || "")}>Send</button>
+          <button className="ask-action-btn ask-action-reply" onClick={() => void actions.sendAskDraft(actionKey, item.thread_id || "", item.from || "", itemMailbox)}>Send</button>
           <button className="ask-action-btn ask-action-cancel" onClick={() => actions.cancelAskDraft(actionKey)}>Cancel</button>
-          {canMark ? <button className="ask-action-btn ask-action-read" disabled={acts.read} onClick={() => void actions.handleAskMarkRead(mid)}>{acts.read ? "Read" : "Mark read"}</button> : null}
-          {canTrash ? <button className="ask-action-btn ask-action-trash" onClick={() => void actions.handleAskTrash(mid)}>Trash</button> : null}
+          {canMark ? <button className="ask-action-btn ask-action-read" disabled={acts.read} onClick={() => void actions.handleAskMarkRead(actionKey, mid, itemMailbox)}>{acts.read ? "Read" : "Mark read"}</button> : null}
+          {canTrash ? <button className="ask-action-btn ask-action-trash" onClick={() => void actions.handleAskTrash(actionKey, mid, itemMailbox)}>Trash</button> : null}
         </div>
       </div>
     );
@@ -102,8 +103,8 @@ function AskItemActions({ item }: { item: CustomRunResultItem }) {
   return (
     <div className="ask-item-actions">
       {canReply ? <button className="ask-action-btn ask-action-reply" disabled={acts.replied || acts.sending} onClick={() => actions.enterAskDraftEdit(actionKey, item.draft || "")}>{acts.sending ? "Sending..." : acts.replied ? "Replied" : "Reply"}</button> : null}
-      {canMark ? <button className="ask-action-btn ask-action-read" disabled={acts.read || acts.sending} onClick={() => void actions.handleAskMarkRead(mid)}>{acts.read ? "Read" : "Mark read"}</button> : null}
-      {canTrash ? <button className="ask-action-btn ask-action-trash" disabled={acts.sending} onClick={() => void actions.handleAskTrash(mid)}>Trash</button> : null}
+      {canMark ? <button className="ask-action-btn ask-action-read" disabled={acts.read || acts.sending} onClick={() => void actions.handleAskMarkRead(actionKey, mid, itemMailbox)}>{acts.read ? "Read" : "Mark read"}</button> : null}
+      {canTrash ? <button className="ask-action-btn ask-action-trash" disabled={acts.sending} onClick={() => void actions.handleAskTrash(actionKey, mid, itemMailbox)}>Trash</button> : null}
       {acts.trashed ? <span className="ask-action-done">Trashed</span> : null}
     </div>
   );
@@ -145,7 +146,7 @@ function CustomTrace({ result }: { result: CustomRunResult }) {
 }
 
 function CustomRunResultCard({ result }: { result: CustomRunResult }) {
-  const { actions } = useApp();
+  const { state, actions } = useApp();
   const sections = Array.isArray(result.sections) ? result.sections : [];
   return (
     <section className="custom-result-card">
@@ -162,6 +163,7 @@ function CustomRunResultCard({ result }: { result: CustomRunResult }) {
             <ul className="simple-list simple-list-sm">
               {sec.items.map((it, j) => (
                 <li key={j}>
+                  {it.mailbox && state.selectedMailboxes.length > 1 ? <span className="ask-mailbox-chip">{it.mailbox}</span> : null}
                   <strong>{it.subject || ""}</strong>
                   {it.context ? <><br /><span className="text-muted-inline">{it.context}</span></> : null}
                   {it.suggestion ? <><br /><span className="text-accent-inline">→ {it.suggestion}</span></> : null}
@@ -198,13 +200,14 @@ export function AskView() {
   const latest = state.askHistory.length > 0 ? state.askHistory[0] : null;
   const older = state.askHistory.length > 1 ? state.askHistory.slice(1) : [];
   const isRunning = state.isCustomScanning || !!(state.customRunProgress && state.customRunProgress.status !== "failed");
+  const mailboxLabel = state.selectedMailboxes.length > 1 ? `${state.selectedMailboxes.length} selected mailboxes` : state.selectedMailboxes[0] || state.mailbox;
 
   return (
     <div className="ask-layout">
       <section className="assistant-card">
         <div className="assistant-kicker">Custom scan</div>
         <h1 className="assistant-says">Ask Anna to do a custom scan</h1>
-        <p className="assistant-copy">Describe what you need in natural language. Anna will scan {state.mailbox} based on your request without changing your default daily briefing.</p>
+        <p className="assistant-copy">Describe what you need in natural language. Anna will scan {mailboxLabel} based on your request without changing your default daily briefing.</p>
       </section>
       <section className="ask-composer" aria-label="Custom scan prompt">
         <textarea

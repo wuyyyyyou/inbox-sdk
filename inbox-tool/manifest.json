@@ -1,7 +1,7 @@
 {
-  "name": "tool-zhaopy-inbox-tool-373sf2et",
+  "name": "inbox-executa",
   "display_name": "Zhaopy Mail Agent RD6B87R5",
-  "version": "1.0.4",
+  "version": "0.1.0",
   "description": "Minimal Anna Executa skeleton for reading Gmail through local token files and DashScope or Anna sampling LLM.",
   "author": "Zhaopy",
   "host_capabilities": [
@@ -307,6 +307,41 @@
     {
       "name": "get_active_cards",
       "description": "Get all active attention cards for a mailbox from persistent storage.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "list_mailboxes",
+      "description": "Discover and list registered mailboxes, including selected and authorization state.",
+      "parameters": []
+    },
+    {
+      "name": "set_mailbox_selected",
+      "description": "Set whether a mailbox participates in Brief scans and card display.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "selected",
+          "type": "boolean",
+          "description": "Whether the mailbox is selected.",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "remove_mailbox",
+      "description": "Remove a mailbox from the registry without deleting its stored data.",
       "parameters": [
         {
           "name": "mailbox",

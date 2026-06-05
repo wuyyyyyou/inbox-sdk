@@ -5,6 +5,19 @@ export type ResultFilter = "all" | "reply" | "review" | "cleanup";
 export type LlmProvider = "anna-llm" | "dashscope";
 export type StorageProvider = "aps" | "local";
 
+export interface MailboxInfo {
+  email: string;
+  provider?: "gmail" | "outlook" | string;
+  auth_source?: string;
+  authorized?: boolean;
+  selected?: boolean;
+  last_auth_checked_at?: string;
+  last_scan_at?: string;
+  last_scan_status?: string;
+  last_error?: string;
+  card_count?: number;
+}
+
 export interface RuntimeState {
   connected: boolean;
   mode: RuntimeMode;
@@ -35,6 +48,7 @@ export interface FrontendCardAction {
 }
 
 export interface FrontendCard {
+  uiKey?: string;
   id: string;
   title?: string;
   summary?: string;
@@ -176,6 +190,7 @@ export interface CustomRunResultItem {
   context?: string;
   suggestion?: string;
   draft?: string;
+  mailbox?: string;
   message_id?: string;
   thread_id?: string;
   from?: string;
@@ -228,6 +243,10 @@ export interface AppState {
   runtime: RuntimeState;
   view: MainView;
   mailbox: string;
+  mailboxes: MailboxInfo[];
+  selectedMailboxes: string[];
+  briefMailboxFilter: string[];
+  allCards: FrontendCard[];
   strategyMode: string;
   loading: boolean;
   cards: FrontendCard[];
