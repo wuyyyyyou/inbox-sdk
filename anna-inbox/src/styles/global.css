@@ -4243,6 +4243,49 @@
   box-shadow: 0 5px 14px rgba(43,35,86,0.07);
 }
 
+.sampling-test-btn {
+  border: 1px solid rgba(93,82,128,0.08);
+  background: rgba(255,255,255,0.55);
+}
+
+.sampling-test-btn.is-ok {
+  color: #2f7b57;
+  background: rgba(88,184,137,0.14);
+  border-color: rgba(88,184,137,0.22);
+}
+
+.sampling-test-btn.is-error {
+  color: #b43d56;
+  background: rgba(217,116,140,0.12);
+  border-color: rgba(217,116,140,0.2);
+}
+
+.sampling-test-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 9px;
+  border-radius: 999px;
+  color: #717182;
+  background: rgba(255,255,255,0.5);
+  border: 1px solid rgba(93,82,128,0.07);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sampling-test-pill.is-ok {
+  color: #2f7b57;
+  background: rgba(88,184,137,0.12);
+  border-color: rgba(88,184,137,0.2);
+}
+
+.sampling-test-pill.is-error {
+  color: #b43d56;
+  background: rgba(217,116,140,0.1);
+  border-color: rgba(217,116,140,0.18);
+}
+
 .bar-actions .debug-provider-controls {
   margin-left: 0;
   margin-right: 6px;

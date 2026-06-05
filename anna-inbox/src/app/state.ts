@@ -49,6 +49,8 @@ export function createInitialState(): AppState {
     resultFilter: "all",
     llmProvider: "anna-llm",
     storageProvider: "local",
+    samplingTestRunning: false,
+    samplingTestResult: null,
     generatingDraft: false,
     draftDots: "",
     summarizingThread: false,
