@@ -38,3 +38,4 @@ docs/adr/
 **/.secrets/
 **/.data
 **/.local_storage
+/.claude/.claude/settings.local.json
