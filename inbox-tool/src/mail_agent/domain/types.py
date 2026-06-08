@@ -329,6 +329,7 @@ class CandidateContext:
     message: MessageDetail | None = None      # type=message_detail 时有值
     thread: ThreadContext | None = None        # type=thread_context 时有值
     messages: list[MessageLite] | None = None  # type=batch_summary 时有值
+    contact_context: str = ""                  # 联系人记忆检索得到的简短上下文
 
 
 # ── 评估类型 ────────────────────────────────────────────────────────

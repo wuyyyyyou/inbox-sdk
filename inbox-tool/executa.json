@@ -41,6 +41,13 @@
       "description": "Alternative Google OAuth access token name supported by Anna platform credential mapping.",
       "required": true,
       "sensitive": true
+    },
+    {
+      "name": "GMAIL_MULTI_TOKENS",
+      "display_name": "Gmail Multi-Mailbox Tokens",
+      "description": "JSON array of {email, access_token, refresh_token, client_id, client_secret, expires_at} for additional mailboxes.",
+      "required": false,
+      "sensitive": true
     }
   ],
   "tools": []

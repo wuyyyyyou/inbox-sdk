@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { CATEGORY_NOTE, CATEGORY_TABS } from "../../app/constants";
 import { useApp } from "../../app/AppContext";
+import { scanProgressLabel, SCAN_STEPS } from "./runHelpers";
 import type { CleanupMessage, FrontendCard } from "../../types/mail";
 import { formatBeijingTimestamp } from "../../shared/format";
 import {
@@ -44,8 +45,11 @@ function AttentionCard({ card }: { card: FrontendCard }) {
   const status = state.statusByCardId[key];
   const action = primaryAction(card);
   const recommendation = normalizeRecommendation(card.recommendation);
+  const isResolved = card.status === "resolved" || card.status === "snoozed";
+  const resolutionLabel: Record<string, string> = { replied: "Replied", no_action_needed: "No action", handled_manually: "Handled", dismissed: "Dismissed" };
+  const resolvedLabel = card.status === "snoozed" ? "Snoozed" : (resolutionLabel[card.resolution || ""] || "Resolved");
   return (
-    <article className={`attention-item-card ${expanded ? "is-expanded" : ""}`}>
+    <article className={`attention-item-card ${expanded ? "is-expanded" : ""} ${isResolved ? "is-resolved" : ""}`}>
       <div className="attention-card-head">
         <h2 className="attention-title">{card.title || "Email thread needs review"}</h2>
         {state.selectedMailboxes.length > 1 && mailbox ? (
@@ -54,23 +58,32 @@ function AttentionCard({ card }: { card: FrontendCard }) {
         <button className="card-details-btn" onClick={() => actions.toggleDetails(key)}>{expanded ? "Hide" : "Details"}</button>
       </div>
       <p className="attention-field">{card.summary || ""}</p>
-      <div className="attention-card-foot">
-        <p className="attention-field attention-recommendation">
-          <span className="suggested-prefix">Suggested: </span>{recommendation.replace(/^Suggested:\s*/i, "")}
-        </p>
-        <div className="proposal-actions">
-          <span className="snooze-wrap">
-            <button className="soft-btn" aria-expanded={snoozeOpen} onClick={() => actions.toggleSnoozeMenu(key)}>Snooze</button>
-            {snoozeOpen ? (
-              <span className="snooze-menu" role="menu">
-                <button className="snooze-option" role="menuitem" onClick={() => void actions.snoozeCard(key, "tomorrow")}>Tomorrow</button>
-                <button className="snooze-option" role="menuitem" onClick={() => void actions.snoozeCard(key, "next-week")}>Next week</button>
-                <button className="snooze-option" role="menuitem" onClick={() => void actions.snoozeCard(key, "dont-prioritize")}>Don't prioritize threads like this</button>
-              </span>
-            ) : null}
+      <p className="attention-field attention-recommendation">
+        <span className="suggested-prefix">Suggested: </span>{recommendation.replace(/^Suggested:\s*/i, "")}
+      </p>
+      <div className="proposal-actions">
+        {isResolved ? (
+          <span className="resolution-row">
+            <button className="history-restore-btn" title="Restore" aria-label="Restore card" onClick={(e) => { e.stopPropagation(); void actions.restoreCard(card.id, card.details?.mailbox); }}>
+              <svg className="history-restore-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15.4-6.4L3 13"/></svg>
+            </button>
+            <span className="resolution-label">{resolvedLabel}</span>
           </span>
-          <button className="primary-btn" onClick={() => void actions.openCard(key)}>{action.label}</button>
-        </div>
+        ) : (
+          <>
+            <span className="snooze-wrap">
+              <button className="soft-btn" aria-expanded={snoozeOpen} onClick={() => actions.toggleSnoozeMenu(key)}>Snooze</button>
+              {snoozeOpen ? (
+                <span className="snooze-menu" role="menu">
+                  <button className="snooze-option" role="menuitem" onClick={() => void actions.snoozeCard(key, "tomorrow")}>Tomorrow</button>
+                  <button className="snooze-option" role="menuitem" onClick={() => void actions.snoozeCard(key, "next-week")}>Next week</button>
+                  <button className="snooze-option" role="menuitem" onClick={() => void actions.snoozeCard(key, "dont-prioritize")}>Don't prioritize threads like this</button>
+                </span>
+              ) : null}
+            </span>
+            <button className="primary-btn" onClick={() => void actions.openCard(key)}>{action.label}</button>
+          </>
+        )}
       </div>
       {expanded ? <CardDetails card={card} /> : null}
       {status ? <div className="attention-status">{status}</div> : null}
@@ -125,6 +138,27 @@ function CleanupBundleCard({ card }: { card: FrontendCard }) {
         </button>
       </div>
       {expanded ? <div className="cleanup-bundle-body">{messages.map((msg, i) => <LowValueEmailCard key={`${key}-${i}`} msg={msg} index={i} cardId={key} />)}</div> : null}
+    </article>
+  );
+}
+
+function CleanupIndividualCard({ msg, index, cardId }: { msg: CleanupMessage; index: number; cardId: string }) {
+  const { state } = useApp();
+  const readState = state.cleanupReadState[cardId];
+  const isRead = Boolean(readState && readState.readMsgIndices.includes(index));
+  const displayDate = msg.date ? formatBeijingTimestamp(Number(msg.date)) : "";
+  return (
+    <article className={`cleanup-single-card ${isRead ? "is-read" : ""}`}>
+      <div className="cleanup-single-header">
+        <span className="cleanup-single-from">{msg.from_addr || "Unknown"}</span>
+        {displayDate ? <span className="cleanup-single-date">{displayDate}</span> : null}
+      </div>
+      <div className="cleanup-single-subject">{msg.subject || "(no subject)"}</div>
+      {msg.snippet ? <div className="cleanup-single-snippet">{msg.snippet}</div> : null}
+      <div className="low-value-email-meta">
+        <span className="low-value-email-type">low priority</span>
+        {msg.reason ? <span className="low-value-email-reason">{msg.reason}</span> : null}
+      </div>
     </article>
   );
 }
@@ -279,16 +313,31 @@ export function BriefView() {
   const showCleanup = isAll || activeFilter === "cleanup";
   const totalVisible = visibleCards(state.cards).length;
   const mainDisplayCards = isAll ? mainCards(state.cards) : (activeFilter === "cleanup" || activeFilter === "review") ? filteredCards(state.cards, activeFilter) : filteredCards(state.cards, activeFilter).filter(isMainCard);
-  const cleanupCards = lower.filter((c) => c.cardType === "cleanup_bundle");
-  const regularLower = lower.filter((c) => c.cardType !== "cleanup_bundle");
+  const cleanupCards = lowerCards(state.cards).filter((c) => c.cardType === "cleanup_bundle");
+  const regularLower = lowerCards(state.cards).filter((c) => c.cardType !== "cleanup_bundle");
+  const cleanupMessages = cleanupCards.flatMap((c) =>
+    (Array.isArray(c.bundledMessages) ? c.bundledMessages : []).map((msg, i) => ({ msg, index: i, cardId: c.uiKey || c.id }))
+  );
+  const cleanupCount = cleanupMessages.length;
 
   return (
     <div className="start-grid">
       <section className="assistant-card">
         <div>
-          <h1 className="assistant-says">{title}</h1>
-          {state.scanStatus ? <p className="assistant-copy">{state.scanStatus}</p> : null}
-          {state.scanError ? <p className="assistant-copy is-error">{state.scanError}</p> : null}
+          <h1 className="assistant-says">{state.isScanning && totalVisible > 0 ? "Anna is scanning your inbox." : title}</h1>
+          {state.isScanning && totalVisible > 0 ? (
+            <div className="scan-progress-bar">
+              <div className="scan-progress-track">
+                <div className="scan-progress-fill" style={{ width: `${Math.round((state.scanStepIndex / (SCAN_STEPS.length - 1)) * 100)}%` }} />
+              </div>
+              <p className="assistant-copy" style={{ flexShrink: 0 }}>{scanProgressLabel(state.scanStage, state.scanProgress) || SCAN_STEPS[state.scanStepIndex]?.title || "Scanning..."}</p>
+            </div>
+          ) : (
+            <>
+              {state.scanStatus ? <p className="assistant-copy">{state.scanStatus}</p> : null}
+              {state.scanError ? <p className="assistant-copy is-error">{state.scanError}</p> : null}
+            </>
+          )}
         </div>
       </section>
       {totalVisible > 0 ? (
@@ -297,7 +346,7 @@ export function BriefView() {
             <div className="category-segment" role="tablist" aria-label="Card filters">
               {CATEGORY_TABS.map((tab) => (
                 <button key={tab.id} className={`category-tab ${activeFilter === tab.id ? "is-active" : ""}`} role="tab" aria-selected={activeFilter === tab.id} onClick={() => actions.setResultFilter(tab.id)}>
-                  {tab.label}&nbsp;{filteredCards(state.cards, tab.id).length}
+                  {tab.label}&nbsp;{tab.id === "cleanup" ? cleanupCount : filteredCards(state.cards, tab.id).length}
                 </button>
               ))}
             </div>
@@ -310,7 +359,24 @@ export function BriefView() {
         <section className="noticed-section"><div className="attention-queue">{mainDisplayCards.map((card) => <AttentionCard key={card.uiKey || card.id} card={card} />)}</div></section>
       ) : totalVisible > 0 && !cleanupCards.length ? <p className="assistant-copy" style={{ textAlign: "center", marginTop: 12 }}>No cards in this category.</p> : null}
       {isAll ? <LowerPrioritySection cards={regularLower} /> : null}
-      {showCleanup ? cleanupCards.map((card) => <CleanupBundleCard key={card.uiKey || card.id} card={card} />) : null}
+      {showCleanup && isAll ? cleanupCards.map((card) => <CleanupBundleCard key={card.uiKey || card.id} card={card} />) : null}
+      {showCleanup && !isAll ? (
+        <>
+          {cleanupCards.map((card) => {
+            const key = card.uiKey || card.id;
+            const readState = state.cleanupReadState[key];
+            const isAllRead = readState?.read;
+            return (
+              <div className="cleanup-mark-all-row" key={`mark-${key}`}>
+                <button className="soft-btn" disabled={Boolean(isAllRead || state.markingReadIds[key])} onClick={() => void actions.markCleanupAsRead(key)}>
+                  {state.markingReadIds[key] ? "Marking..." : isAllRead ? "All read" : "Mark all read"}
+                </button>
+              </div>
+            );
+          })}
+          {cleanupMessages.map(({ msg, index, cardId }, i) => <CleanupIndividualCard key={msg.message_id || `${i}`} msg={msg} index={index} cardId={cardId} />)}
+        </>
+      ) : null}
     </div>
   );
 }

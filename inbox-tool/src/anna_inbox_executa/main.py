@@ -88,7 +88,28 @@ DEFAULT_MANIFEST = {
             "description": "Alternative Google OAuth access token name supported by Anna platform credential mapping.",
             "required": True,
             "sensitive": True,
-        }
+        },
+        {
+            "name": "DASHSCOPE_API_KEY",
+            "display_name": "DashScope API Key",
+            "description": "DashScope API key for direct LLM access.",
+            "required": True,
+            "sensitive": True,
+        },
+        {
+            "name": "DASHSCOPE_MODEL",
+            "display_name": "DashScope Model",
+            "description": "DashScope model name (e.g. qwen3-max).",
+            "required": False,
+            "sensitive": False,
+        },
+        {
+            "name": "GMAIL_MULTI_TOKENS",
+            "display_name": "Gmail Multi-Mailbox Tokens",
+            "description": "JSON array of {email, access_token, refresh_token, client_id, client_secret, expires_at} for additional mailboxes.",
+            "required": False,
+            "sensitive": True,
+        },
     ],
     "tools": [
         {
@@ -310,8 +331,7 @@ DEFAULT_MANIFEST = {
             "description": "Save or update the scan plan for a mailbox.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
-                {"name": "first_scan_days", "type": "integer", "description": "Days to look back for the first scan.", "required": False},
-                {"name": "incremental_days", "type": "integer", "description": "Max days to look back for incremental scans.", "required": False},
+                {"name": "scan_window_days", "type": "integer", "description": "Days to look back for all scans.", "required": False},
                 {"name": "max_messages", "type": "integer", "description": "Maximum messages per scan.", "required": False},
                 {"name": "scan_categories", "type": "array", "description": "Extra Gmail categories to scan: promotions, social, updates, forums.", "required": False},
             ],
@@ -503,6 +523,42 @@ DEFAULT_MANIFEST = {
             "description": "Get a single custom plan's full details.",
             "parameters": [
                 {"name": "plan_id", "type": "string", "description": "Plan ID from get_custom_plans.", "required": True},
+            ],
+        },
+        {
+            "name": "list_contact_memories",
+            "description": "List contact memory summaries for one or more mailboxes.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address, or all.", "required": False},
+                {"name": "mailboxes", "type": "array", "description": "Mailbox email addresses.", "required": False},
+                {"name": "storage_provider", "type": "string", "description": "Storage backend: local or aps.", "required": False},
+            ],
+        },
+        {
+            "name": "get_contact_memory",
+            "description": "Get one contact memory file.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "contact_email", "type": "string", "description": "Contact email address.", "required": True},
+                {"name": "storage_provider", "type": "string", "description": "Storage backend: local or aps.", "required": False},
+            ],
+        },
+        {
+            "name": "delete_contact_memory",
+            "description": "Delete one contact memory file.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "contact_email", "type": "string", "description": "Contact email address.", "required": True},
+                {"name": "storage_provider", "type": "string", "description": "Storage backend: local or aps.", "required": False},
+            ],
+        },
+        {
+            "name": "clear_contact_memories",
+            "description": "Delete all contact memories for one or more mailboxes.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address, or all.", "required": False},
+                {"name": "mailboxes", "type": "array", "description": "Mailbox email addresses.", "required": False},
+                {"name": "storage_provider", "type": "string", "description": "Storage backend: local or aps.", "required": False},
             ],
         },
     ],
@@ -809,18 +865,35 @@ def apply_runtime_credentials(context: dict[str, Any]) -> None:
         if value:
             os.environ[name] = str(value)
 
+    # 多 token 凭证：解析 JSON → 合并进 APS 工作副本 → 加载到内存
+    multi_raw = credentials.get("GMAIL_MULTI_TOKENS", "")
+    if multi_raw and multi_raw.strip():
+        try:
+            tokens = json.loads(multi_raw)
+            if isinstance(tokens, list) and len(tokens) > 0:
+                _run_storage_query(_merge_multi_tokens_seed(tokens), timeout=10.0)
+                all_tokens = _run_storage_query(_get_all_multi_tokens(), timeout=10.0)
+                from mail_agent.mail_providers.gmail.adapter import set_multi_tokens
+                set_multi_tokens(all_tokens)
+        except (json.JSONDecodeError, Exception):
+            pass
+
 
 def check_google_oauth(context: dict[str, Any]) -> dict[str, Any]:
     credentials = read_credentials(context)
     has_gmail = bool(credentials["GMAIL_ACCESS_TOKEN"])
     has_google = bool(credentials["GOOGLE_ACCESS_TOKEN"])
+    from mail_agent.mail_providers.gmail.adapter import get_multi_token_emails
+    multi_emails = get_multi_token_emails()
     return {
-        "authorized": has_gmail or has_google,
+        "authorized": has_gmail or has_google or len(multi_emails) > 0,
         "credential_names": {
             "gmail": "present" if has_gmail else "missing",
             "google": "present" if has_google else "missing",
         },
-        "next_step": "Google OAuth credential is available." if has_gmail or has_google else "Authorize Google/Gmail in Anna platform authorizations, then retry.",
+        "multi_token_count": len(multi_emails),
+        "multi_token_emails": multi_emails,
+        "next_step": "Google OAuth credential is available." if has_gmail or has_google or multi_emails else "Authorize Google/Gmail in Anna platform authorizations, then retry.",
         "checked_at": beijing_now(),
     }
 
@@ -1206,23 +1279,29 @@ def _check_gmail_auth(mailbox: str) -> dict[str, Any]:
     """Check Gmail authorization status.
 
     Platform: GMAIL_ACCESS_TOKEN or GOOGLE_ACCESS_TOKEN env var is set.
+    Multi-token: checks _multi_token_map.
     Local dev: token file exists on disk (content/expiry not validated).
     """
     import os as _os
-    from mail_agent.mail_providers.gmail.adapter import _token_dir, sanitize_mailbox_id, get_authorized_email
+    from mail_agent.mail_providers.gmail.adapter import _token_dir, sanitize_mailbox_id, get_authorized_email, get_multi_token_map
     from pathlib import Path as _Path
+
+    requested = str(mailbox or "").strip().lower()
 
     # Platform path — check for injected OAuth credential
     platform_token = _os.environ.get("GMAIL_ACCESS_TOKEN") or _os.environ.get("GOOGLE_ACCESS_TOKEN")
     if platform_token and platform_token.strip():
         authorized_email = get_authorized_email().strip().lower()
-        requested = str(mailbox or "").strip().lower()
         authorized = bool(authorized_email and requested == authorized_email)
         return {
             "authorized": authorized,
             "source": "platform",
             "authorized_email": authorized_email,
         }
+
+    # Multi-token path — check in-memory map
+    if requested in get_multi_token_map():
+        return {"authorized": True, "source": "platform_multi", "authorized_email": requested}
 
     # Local dev path — check for token file existence only
     token_dir = _token_dir()
@@ -1268,23 +1347,12 @@ async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]
             method="POST",
         )
         with _ur.urlopen(req, timeout=30) as resp:
-            gmail_result = _json2.loads(resp.read().decode("utf-8"))
+            raw_body = resp.read().decode("utf-8")
+            gmail_result = _json2.loads(raw_body) if raw_body.strip() else {"ok": True}
     except Exception as exc:
         gmail_error = str(exc)
 
-    # 2. Update the cleanup card in local storage
-    try:
-        from mail_agent.storage.ops import get_active_cards, set_active_cards
-        cards = await get_active_cards(mailbox)
-        for c in cards.cards:
-            if c.card_id == card_id:
-                c.status = "resolved"
-                c.resolution = "marked_read"
-                break
-        await set_active_cards(mailbox, cards)
-    except Exception:
-        pass
-
+    # 2. Keep card visible (pending) — read state is tracked frontend-side
     # Write history
     card_title = card_id
     try:
@@ -1923,6 +1991,56 @@ def _sync_get_custom_plan_detail(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"error": f"Custom plan not found: {plan_id}"}
 
 
+def _memory_mailboxes(arguments: dict[str, Any]) -> list[str]:
+    raw_mailboxes = arguments.get("mailboxes")
+    if isinstance(raw_mailboxes, list):
+        mailboxes = [str(item).strip().lower() for item in raw_mailboxes if str(item).strip()]
+        if mailboxes:
+            return sorted(dict.fromkeys(mailboxes))
+    mailbox = str(arguments.get("mailbox", "")).strip().lower()
+    if mailbox and mailbox != "all":
+        return [mailbox]
+    from mail_agent.storage.ops import get_mailbox_registry
+
+    registry = _run_storage_query(get_mailbox_registry())
+    selected = [entry.email for entry in getattr(registry, "mailboxes", []) if getattr(entry, "selected", False)]
+    if selected:
+        return sorted(dict.fromkeys(str(item).strip().lower() for item in selected if str(item).strip()))
+    discovered = _discover_mailboxes()
+    return sorted(dict.fromkeys(str(item.get("email", "")).strip().lower() for item in discovered if str(item.get("email", "")).strip()))
+
+
+def _sync_list_contact_memories(arguments: dict[str, Any]) -> dict[str, Any]:
+    from mail_agent.contact_memory.manager import list_memory_summaries
+
+    mailboxes = _memory_mailboxes(arguments)
+    return _run_storage_query(list_memory_summaries(mailboxes))
+
+
+def _sync_get_contact_memory(arguments: dict[str, Any]) -> dict[str, Any]:
+    from mail_agent.contact_memory.manager import get_memory_detail
+
+    return _run_storage_query(get_memory_detail(
+        str(arguments.get("mailbox", "")).strip().lower(),
+        str(arguments.get("contact_email", "")).strip().lower(),
+    ))
+
+
+def _sync_delete_contact_memory(arguments: dict[str, Any]) -> dict[str, Any]:
+    from mail_agent.contact_memory.manager import delete_memory
+
+    return _run_storage_query(delete_memory(
+        str(arguments.get("mailbox", "")).strip().lower(),
+        str(arguments.get("contact_email", "")).strip().lower(),
+    ))
+
+
+def _sync_clear_contact_memories(arguments: dict[str, Any]) -> dict[str, Any]:
+    from mail_agent.contact_memory.manager import clear_memory
+
+    return _run_storage_query(clear_memory(_memory_mailboxes(arguments)))
+
+
 def _registry_to_frontend(registry: Any) -> list[dict[str, Any]]:
     return [
         {
@@ -1941,19 +2059,69 @@ def _registry_to_frontend(registry: Any) -> list[dict[str, Any]]:
     ]
 
 
-def _discover_mailboxes() -> list[dict[str, Any]]:
-    from mail_agent.mail_providers.gmail.adapter import get_authorized_email, list_available_mailboxes_from_tokens
+async def _merge_multi_tokens_seed(seed_tokens: list[dict[str, Any]]) -> None:
+    """将 credential seed 合并到 APS 工作副本，避免用旧 seed 覆盖已刷新的 token。"""
+    from mail_agent.storage.ops import get_multi_tokens, set_multi_tokens
 
+    existing = await get_multi_tokens()
+    by_email: dict[str, dict[str, Any]] = {
+        str(e.get("email", "")).strip().lower(): e for e in existing if e.get("email")
+    }
+
+    for seed in seed_tokens:
+        email = str(seed.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            continue
+        if email in by_email:
+            existing_token = by_email[email].get("access_token", "")
+            new_token = seed.get("access_token", "")
+            if new_token and new_token != existing_token:
+                by_email[email] = dict(seed)
+        else:
+            by_email[email] = dict(seed)
+
+    await set_multi_tokens(list(by_email.values()))
+
+
+async def _get_all_multi_tokens() -> list[dict[str, Any]]:
+    from mail_agent.storage.ops import get_multi_tokens
+    return await get_multi_tokens()
+
+
+def _discover_mailboxes() -> list[dict[str, Any]]:
+    from mail_agent.mail_providers.gmail.adapter import get_authorized_email, list_available_mailboxes_from_tokens, get_multi_token_emails
+
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    # 1. 平台单 token — 最高优先级，auth_source="platform"
     email = get_authorized_email().strip().lower()
-    if email:
-        return [{
-            "email": email,
-            "provider": "gmail",
-            "auth_source": "platform",
-            "authorized": True,
+    if email and email not in seen:
+        seen.add(email)
+        results.append({
+            "email": email, "provider": "gmail",
+            "auth_source": "platform", "authorized": True,
             "last_auth_checked_at": beijing_now(),
-        }]
-    return list_available_mailboxes_from_tokens()
+        })
+
+    # 2. 多 token 邮箱 — auth_source="platform_multi"，去重跳过 platform 已覆盖的
+    for multi_email in get_multi_token_emails():
+        if multi_email not in seen:
+            seen.add(multi_email)
+            results.append({
+                "email": multi_email, "provider": "gmail",
+                "auth_source": "platform_multi", "authorized": True,
+                "last_auth_checked_at": beijing_now(),
+            })
+
+    # 3. 本地 dev token 文件兜底
+    for local in list_available_mailboxes_from_tokens():
+        local_email = str(local.get("email", "")).strip().lower()
+        if local_email and local_email not in seen:
+            seen.add(local_email)
+            results.append(local)
+
+    return results
 
 
 def _sync_list_mailboxes() -> dict[str, Any]:
@@ -2086,6 +2254,7 @@ async def _handle_generate_draft_background(run_id: str, arguments: dict[str, An
     reply_mode = str(arguments.get("reply_mode", "reply_to_sender")).strip() or "reply_to_sender"
     current_draft = str(arguments.get("current_draft", "")).strip()
     revision_input = str(arguments.get("revision_input", "")).strip()
+    user_answers = arguments.get("user_answers") if isinstance(arguments.get("user_answers"), dict) else None
     try:
         from mail_agent.storage.ops import get_active_cards as storage_get_cards, set_active_cards
         from mail_agent.actions.service import generate_draft_reply
@@ -2097,6 +2266,7 @@ async def _handle_generate_draft_background(run_id: str, arguments: dict[str, An
         result = await generate_draft_reply(
             card, mailbox, reply_mode, sampling_create_message=_sampling,
             current_draft=current_draft, revision_input=revision_input,
+            user_answers=user_answers,
         )
         draft_body = (result.get("draft") or {}).get("body", "") if isinstance(result, dict) else ""
         if draft_body:
@@ -2165,30 +2335,44 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
 
     if tool == "get_scan_plan":
         if not mailbox:
-            return {"error": "mailbox is required"}
+            return {
+                "mailbox": "",
+                "first_scan_days": 7,
+                "incremental_days": 7,
+                "max_messages": 100,
+                "scan_categories": [],
+                "updated_at": "",
+            }
         plan = await get_scan_plan(mailbox)
         return {
             "mailbox": plan.mailbox,
-            "first_scan_days": plan.first_scan_days,
-            "incremental_days": plan.incremental_days,
+            "scan_window_days": plan.scan_window_days,
             "max_messages": plan.max_messages,
             "scan_categories": plan.scan_categories,
             "updated_at": plan.updated_at,
         }
 
     if tool == "set_scan_plan":
-        if not mailbox:
-            return {"error": "mailbox is required"}
-        plan = await get_scan_plan(mailbox)
-        for field in ("first_scan_days", "incremental_days", "max_messages"):
-            val = arguments.get(field)
-            if val is not None:
-                setattr(plan, field, int(val))
-        val = arguments.get("scan_categories")
-        if isinstance(val, list):
-            plan.scan_categories = [str(c) for c in val if str(c) in ("promotions", "social", "updates", "forums")]
-        await set_scan_plan(mailbox, plan)
-        return {"ok": True, "mailbox": mailbox, "updated_at": plan.updated_at}
+        # Get target mailboxes: empty = all registered
+        if mailbox:
+            targets = [mailbox]
+        else:
+            from mail_agent.storage.ops import get_mailbox_registry
+            registry = await get_mailbox_registry()
+            targets = [e.email for e in registry.mailboxes if e.email]
+            if not targets:
+                return {"error": "no registered mailboxes"}
+        for mb in targets:
+            plan = await get_scan_plan(mb)
+            for field in ("scan_window_days", "max_messages"):
+                val = arguments.get(field)
+                if val is not None:
+                    setattr(plan, field, int(val))
+            val = arguments.get("scan_categories")
+            if isinstance(val, list):
+                plan.scan_categories = [str(c) for c in val if str(c) in ("promotions", "social", "updates", "forums")]
+            await set_scan_plan(mb, plan)
+        return {"ok": True, "mailbox": mailbox or "all", "targets": targets}
 
     if tool == "get_card_detail":
         if not mailbox or not card_id:
@@ -2198,9 +2382,28 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if not card:
             return {"error": f"Card {card_id} not found"}
         thread_ctx = _fetch_thread_context_sync(mailbox, card)
+        contact_ctx = {}
+        try:
+            from mail_agent.contact_memory.retriever import contact_email_from_header, retrieve_contact_context
+            from mail_agent.contact_memory.types import ContactMemoryQuery
+            contact_email = contact_email_from_header(card.original.from_addr)
+            _detail_sampling = _build_sampling_for_run(arguments, invoke_id)
+            contact = await retrieve_contact_context(ContactMemoryQuery(
+                mailbox=mailbox,
+                contact_email=contact_email,
+                current_subject=card.original.thread or card.title,
+                current_body=card.original.body,
+                current_thread_id=card.thread_id,
+                purpose="thread_summary",
+            ), sampling_create_message=_detail_sampling)
+            from dataclasses import asdict
+            contact_ctx = asdict(contact)
+        except Exception:
+            contact_ctx = {}
         return {
             "card": _serialize_card_for_frontend(card),
             "thread_context": thread_ctx,
+            "contact_context": contact_ctx,
         }
 
     # Build sampling for Anna LLM path (same logic as _build_sampling_for_run)
@@ -2249,7 +2452,8 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         card = next((c for c in cards.cards if c.card_id == card_id), None)
         if not card:
             return {"error": f"Card {card_id} not found"}
-        result = await generate_draft_reply(card, mailbox, reply_mode, sampling_create_message=_sampling)
+        user_answers = arguments.get("user_answers") if isinstance(arguments.get("user_answers"), dict) else None
+        result = await generate_draft_reply(card, mailbox, reply_mode, sampling_create_message=_sampling, user_answers=user_answers)
         draft_body = (result.get("draft") or {}).get("body", "") if isinstance(result, dict) else ""
         if draft_body:
             card.draft_reply = draft_body
@@ -2262,6 +2466,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             return {"error": "mailbox and card_id are required"}
         current_draft = str(arguments.get("current_draft", "")).strip()
         revision_input = str(arguments.get("revision_input", "")).strip()
+        user_answers = arguments.get("user_answers") if isinstance(arguments.get("user_answers"), dict) else None
         if not current_draft and not revision_input:
             return {"error": "current_draft or revision_input is required"}
         cards = await storage_get_cards(mailbox)
@@ -2291,6 +2496,19 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if decision == "no_action_needed":
             if card:
                 await append_learning(card.original.from_addr, "no_action_needed")
+        if card:
+            try:
+                from mail_agent.contact_memory.indexer import ingest_card_event
+                await ingest_card_event(
+                    mailbox,
+                    card,
+                    event_type="user_decision",
+                    source="handle_action",
+                    user_action=decision,
+                    sampling_create_message=_sampling,
+                )
+            except Exception:
+                pass
         # Write history
         from mail_agent.storage.ops import append_card_action
         await append_card_action(mailbox, card_id, card_title, decision, "", **_card_context(card) if card else {})
@@ -2331,14 +2549,14 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             await append_card_action(mailbox, card_id, card_title, "snooze", "dont_prioritize", **_card_context(card) if card else {})
             return {"ok": True, "card_id": card_id, "option": snooze_option}
         else:
-            from datetime import datetime, timedelta
+            from datetime import datetime as _datetime, timedelta as _timedelta
             from mail_agent.storage.types import BEIJING_TZ
-            now_ts = datetime.now(BEIJING_TZ)
+            now_ts = _datetime.now(BEIJING_TZ)
             if snooze_option == "tomorrow":
-                until = (now_ts + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+                until = (now_ts + _timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
             elif snooze_option == "next_week":
                 days_until_monday = (7 - now_ts.weekday()) % 7 or 7
-                until = (now_ts + timedelta(days=days_until_monday)).replace(hour=9, minute=0, second=0, microsecond=0)
+                until = (now_ts + _timedelta(days=days_until_monday)).replace(hour=9, minute=0, second=0, microsecond=0)
             else:
                 return {"error": f"Unknown snooze option: {snooze_option}"}
             for c in cards.cards:
@@ -2356,9 +2574,29 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if not mailbox or not card_id:
             return {"error": "mailbox and card_id are required"}
         await update_card_status(mailbox, card_id, "pending")
-        # Write history
+        # If it's a cleanup bundle card, mark messages as UNREAD in Gmail
         cards = await storage_get_cards(mailbox)
         card = next((c for c in cards.cards if c.card_id == card_id), None)
+        if card and card.card_type == "cleanup_bundle" and card.bundled_messages:
+            try:
+                import json as _json3
+                import urllib.request as _ur2
+                from mail_agent.mail_providers.gmail.adapter import get_access_token as _gt2
+                msg_ids = [str(m.get("message_id", "")) for m in card.bundled_messages if str(m.get("message_id", ""))]
+                if msg_ids:
+                    token = _gt2(mailbox)
+                    body = _json3.dumps({"ids": msg_ids, "addLabelIds": ["UNREAD"]}).encode("utf-8")
+                    req = _ur2.Request(
+                        "https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify",
+                        data=body,
+                        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with _ur2.urlopen(req, timeout=30) as resp:
+                        pass
+            except Exception:
+                pass
+        # Write history
         card_title = card.title if card else card_id
         from mail_agent.storage.ops import append_card_action
         await append_card_action(mailbox, card_id, card_title, "restore", "", **_card_context(card) if card else {})
@@ -2393,6 +2631,20 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         log(f"[reply_now] result: ok={result.get('ok')} dry_run={result.get('dry_run')} error={result.get('error', '')}")
         if result.get("ok") and not dry_run:
             await update_card_status(mailbox, card_id, "resolved", "replied")
+        if result.get("ok"):
+            try:
+                from mail_agent.contact_memory.indexer import ingest_card_event
+                await ingest_card_event(
+                    mailbox,
+                    card,
+                    event_type="user_replied",
+                    source="handle_action",
+                    user_action="reply",
+                    draft_excerpt=draft_body,
+                    sampling_create_message=_sampling,
+                )
+            except Exception:
+                pass
         # Write history
         from mail_agent.storage.ops import append_card_action
         detail_preview = draft_body[:80]
@@ -2471,17 +2723,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
 
     if tool == "get_run_history":
         history = await get_run_history(limit=20)
-        return {"history": [{
-            "run_id": h.run_id,
-            "mailbox": h.mailbox,
-            "ts": h.ts,
-            "request": h.request,
-            "mode": h.mode,
-            "strategy": h.strategy,
-            "plan_id": getattr(h, 'plan_id', ''),
-            "result": h.result,
-            "summary": h.summary,
-        } for h in history]}
+        return {"history": [serialize_value(h) for h in history]}
 
     return {"error": f"Unknown V2 tool: {tool}"}
 
@@ -2567,23 +2809,29 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     if tool == "re_run_custom_scan":
         return {"success": True, "tool": tool, "data": re_run_custom_scan(arguments, invoke_id)}
     if tool == "get_authorized_email":
-        from mail_agent.mail_providers.gmail.adapter import get_authorized_email
-        email = get_authorized_email()
-        if email:
-            return {"success": True, "tool": tool, "data": {"mailbox": email, "source": "platform"}}
-        # 本地 dev：扫描 gmail_tokens 目录
-        td = token_dir()
-        if td.exists():
-            for f in sorted(td.iterdir()):
-                if f.suffix == ".json" and f.stem != "default":
-                    local_email = f.stem.replace("_", "@", 1) if "_" in f.stem else f.stem
-                    if "@" in local_email:
-                        return {"success": True, "tool": tool, "data": {"mailbox": local_email, "source": "local_tokens"}}
-        return {"success": True, "tool": tool, "data": {"mailbox": "", "source": "none"}}
+        discovered = _discover_mailboxes()
+        authorized = [d["email"] for d in discovered if d.get("authorized")]
+        return {
+            "success": True, "tool": tool,
+            "data": {
+                "mailboxes": authorized,
+                "primary": authorized[0] if authorized else "",
+                "source": discovered[0]["auth_source"] if discovered else "none",
+                "discovered": discovered,
+            }
+        }
     if tool == "get_custom_plans":
         return {"success": True, "tool": tool, "data": _sync_get_custom_plans()}
     if tool == "get_custom_plan_detail":
         return {"success": True, "tool": tool, "data": _sync_get_custom_plan_detail(arguments)}
+    if tool == "list_contact_memories":
+        return {"success": True, "tool": tool, "data": _sync_list_contact_memories(arguments)}
+    if tool == "get_contact_memory":
+        return {"success": True, "tool": tool, "data": _sync_get_contact_memory(arguments)}
+    if tool == "delete_contact_memory":
+        return {"success": True, "tool": tool, "data": _sync_delete_contact_memory(arguments)}
+    if tool == "clear_contact_memories":
+        return {"success": True, "tool": tool, "data": _sync_clear_contact_memories(arguments)}
 
     if tool == "get_active_cards":
         return {"success": True, "tool": tool, "data": _sync_get_active_cards(arguments)}
@@ -2686,6 +2934,8 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def handle_line(line: str) -> None:
+    # Windows 管道偶尔会在首行带 BOM，这里只清理协议行开头的 BOM。
+    line = line.lstrip("\ufeff")
     # Diagnostic: check if stdin encoding is working for CJK text
     try:
         _diag_bytes = line.encode("utf-8")

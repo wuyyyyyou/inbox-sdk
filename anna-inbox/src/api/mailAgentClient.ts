@@ -1,6 +1,8 @@
 import type {
   ActiveCardsPayload,
   CardDetailPayload,
+  ContactMemoryDetailPayload,
+  ContactMemorySummary,
   CustomPlanSummary,
   MailboxInfo,
   RunHistoryEntry,
@@ -121,6 +123,22 @@ export class MailAgentClient {
 
   getCardDetail(mailbox: string, cardId: string, storageProvider: string) {
     return this.invoke<CardDetailPayload>("get_card_detail", { mailbox, card_id: cardId, storage_provider: storageProvider });
+  }
+
+  listContactMemories(mailboxes: string[], storageProvider: string) {
+    return this.invoke<{ contacts: ContactMemorySummary[]; count?: number; mailboxes?: string[] }>("list_contact_memories", { mailboxes, storage_provider: storageProvider });
+  }
+
+  getContactMemory(mailbox: string, contactEmail: string, storageProvider: string) {
+    return this.invoke<ContactMemoryDetailPayload>("get_contact_memory", { mailbox, contact_email: contactEmail, storage_provider: storageProvider });
+  }
+
+  deleteContactMemory(mailbox: string, contactEmail: string, storageProvider: string) {
+    return this.invoke<{ ok?: boolean; error?: string }>("delete_contact_memory", { mailbox, contact_email: contactEmail, storage_provider: storageProvider });
+  }
+
+  clearContactMemories(mailboxes: string[], storageProvider: string) {
+    return this.invoke<{ ok?: boolean; deleted?: number; error?: string }>("clear_contact_memories", { mailboxes, storage_provider: storageProvider });
   }
 
   startSummarizeThread(args: Record<string, unknown>) {

@@ -2,7 +2,7 @@ import { useState } from "react";
 import { modeLabel } from "../../app/constants";
 import { useApp } from "../../app/AppContext";
 import { formatBeijingTimestamp } from "../../shared/format";
-import type { RunHistoryEntry } from "../../types/mail";
+import type { ContactMemorySummary, ContactThreadMemory, RunHistoryEntry } from "../../types/mail";
 
 function RestoreIcon() {
   return (
@@ -15,30 +15,70 @@ function RestoreIcon() {
 
 export function Drawers() {
   const { state, actions } = useApp();
-  const overlayOpen = state.sourcesOpen || state.historyOpen || state.scanPlanOpen;
+  const overlayOpen = state.sourcesOpen || state.historyOpen || state.memoryOpen || state.scanPlanOpen;
   return (
     <>
       <div className={`drawer-overlay ${overlayOpen ? "is-open" : ""}`} onClick={actions.closeDrawers} />
       <SourcesDrawer />
+      <MemoryDrawer />
       <HistoryDrawer />
       <aside className="drawer" aria-label="Original message drawer" />
     </>
   );
 }
 
-function SourcesDrawer() {
+function PerMailboxConfig() {
   const { state, actions } = useApp();
   const plan = state.scanPlan || {};
-  const firstDays = plan.first_scan_days || 7;
-  const incrDays = plan.incremental_days || 7;
+  const windowDays = plan.scan_window_days || 7;
   const maxMsgs = plan.max_messages || 100;
-  const isCustomFirst = ![7, 14].includes(firstDays);
-  const isCustomIncr = ![4, 7, 14].includes(incrDays);
+  const isCustomWindow = ![4, 7, 14].includes(windowDays);
   const isCustomMax = ![50, 100, 150].includes(maxMsgs);
-  const [customFirst, setCustomFirst] = useState(isCustomFirst ? String(firstDays) : "");
-  const [customIncr, setCustomIncr] = useState(isCustomIncr ? String(incrDays) : "");
+  const [customWindow, setCustomWindow] = useState(isCustomWindow ? String(windowDays) : "");
   const [customMax, setCustomMax] = useState(isCustomMax ? String(maxMsgs) : "");
+  const save = actions.saveScanPlanField;
+
+  return (
+    <div className="mailbox-config-body">
+      <p className="mailbox-config-hint">Configure scan settings for this mailbox.</p>
+      <div className="mailbox-config-section">
+        <h4 className="mailbox-config-label">Scan window</h4>
+        <div className="preset-row preset-row-sm">
+          {[4, 7, 14].map((d) => <button key={d} className={`preset-chip ${windowDays === d ? "is-active" : ""}`} onClick={() => { setCustomWindow(""); save("scan_window_days", d); }}>{d}d</button>)}
+          <button className="custom-step-btn" onClick={() => save("scan_window_days", Math.max(1, windowDays - 1))}>−</button>
+          <input className={`custom-days-input inline${isCustomWindow ? " is-custom" : ""}`} type="number" min={1} max={90} placeholder="···" value={isCustomWindow ? String(windowDays) : customWindow} onChange={(e) => { setCustomWindow(e.target.value); if (e.target.value) save("scan_window_days", Number(e.target.value)); }} />
+          <button className="custom-step-btn" onClick={() => save("scan_window_days", Math.min(90, windowDays + 1))}>+</button>
+        </div>
+      </div>
+      <div className="mailbox-config-section">
+        <h4 className="mailbox-config-label">Max messages</h4>
+        <div className="preset-row preset-row-sm">
+          {[50, 100, 150].map((n) => <button key={n} className={`preset-chip ${maxMsgs === n ? "is-active" : ""}`} onClick={() => { setCustomMax(""); save("max_messages", n); }}>{n}</button>)}
+          <button className="custom-step-btn" onClick={() => save("max_messages", Math.max(10, maxMsgs - 10))}>−</button>
+          <input className={`custom-days-input inline${isCustomMax ? " is-custom" : ""}`} type="number" min={10} max={500} placeholder="···" value={isCustomMax ? String(maxMsgs) : customMax} onChange={(e) => { setCustomMax(e.target.value); if (e.target.value) save("max_messages", Number(e.target.value)); }} />
+          <button className="custom-step-btn" onClick={() => save("max_messages", Math.min(500, maxMsgs + 10))}>+</button>
+        </div>
+      </div>
+      <div className="mailbox-config-section">
+        <h4 className="mailbox-config-label">Categories</h4>
+        <div className="preset-row preset-row-sm">
+          <button className="preset-chip is-active" disabled>Primary</button>
+          {(["social", "promotions", "updates", "forums"] as const).map((cat) => {
+            const cats = plan.scan_categories || [];
+            const active = cats.includes(cat);
+            return <button key={cat} className={`preset-chip ${active ? "is-active" : ""}`} onClick={() => save("scan_categories", active ? cats.filter((c: string) => c !== cat) : [...cats, cat])}>{cat.charAt(0).toUpperCase() + cat.slice(1)}</button>;
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SourcesDrawer() {
+  const { state, actions } = useApp();
   const storageLabel = state.storageProvider === "aps" ? "APS (Anna Persistent Storage)" : "local JSON files";
+  const plan = state.scanPlan || {};
+  const expanded = state.configMailbox;
   const mailboxes = state.mailboxes.length
     ? state.mailboxes
     : state.mailbox ? [{ email: state.mailbox, provider: "gmail", authorized: state.gmailAuthStatus.authorized, selected: true }] : [];
@@ -56,85 +96,253 @@ function SourcesDrawer() {
               const email = mailbox.email;
               const selected = state.selectedMailboxes.includes(email) || Boolean(mailbox.selected && !state.selectedMailboxes.length);
               const initials = (email || "A").charAt(0).toUpperCase();
+              const isExpanded = expanded === email;
               return (
-                <article key={email} className={`source-card mailbox-card ${selected ? "is-selected" : ""}`}>
-                  <label className="mailbox-source-row">
-                    <input type="checkbox" checked={selected} onChange={(event) => void actions.setMailboxSelected(email, event.target.checked)} />
-                    <span className="source-icon">{initials}</span>
-                    <span className="mailbox-source-main">
-                      <span className="source-name">{email}</span>
-                      <span className="source-meta">
-                        {(mailbox.provider || "gmail").toUpperCase()} · {mailbox.authorized === false ? "Re-auth needed" : "Connected"} · {modeLabel(state.strategyMode)}
+                <>
+                  <article key={email} className={`source-card mailbox-card ${selected ? "is-selected" : ""}`}>
+                    <div className="mailbox-source-row" style={{ cursor: "pointer" }} onClick={(e) => {
+                      if ((e.target as HTMLElement).tagName === "INPUT") return;
+                      const next = isExpanded ? "" : email;
+                      void actions.setConfigMailbox(next);
+                    }}>
+                      <input type="checkbox" checked={selected} onChange={(event) => { void actions.setMailboxSelected(email, event.target.checked); }} />
+                      <span className="source-icon">{initials}</span>
+                      <span className="mailbox-source-main">
+                        <span className="source-name">{email}</span>
+                        <span className="source-meta">
+                          {(mailbox.provider || "gmail").toUpperCase()} · {mailbox.authorized === false ? "Re-auth needed" : "Connected"} · {modeLabel(state.strategyMode)}
+                        </span>
+                        <span className="source-meta">
+                          {mailbox.last_scan_at ? `Last scan ${formatBeijingTimestamp(mailbox.last_scan_at)}` : "No scan yet"}
+                          {typeof mailbox.card_count === "number" ? ` · ${mailbox.card_count} cards` : ""}
+                        </span>
+                        {mailbox.last_error ? <span className="source-meta is-error">{mailbox.last_error}</span> : null}
                       </span>
-                      <span className="source-meta">
-                        {mailbox.last_scan_at ? `Last scan ${formatBeijingTimestamp(mailbox.last_scan_at)}` : "No scan yet"}
-                        {typeof mailbox.card_count === "number" ? ` · ${mailbox.card_count} cards` : ""}
-                      </span>
-                      {mailbox.last_error ? <span className="source-meta is-error">{mailbox.last_error}</span> : null}
-                    </span>
-                  </label>
-                </article>
+                      <span className="mailbox-config-arrow">{isExpanded ? "▼" : "▶"}</span>
+                    </div>
+                  </article>
+                  {isExpanded ? <PerMailboxConfig /> : null}
+                </>
               );
             })}
           </div>
           {!state.selectedMailboxes.length ? <p className="assistant-copy is-error">Select at least one mailbox to run Brief.</p> : null}
         </section>
         <section className="config-block">
-          <h3>Scan config</h3>
-          <div className="config-block" style={{ marginBottom: 0 }}>
-            <h4 style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 4px" }}>First scan range</h4>
-            <div className="preset-row preset-row-sm">
-              {[7, 14].map((d) => (
-                <button key={d} className={`preset-chip ${firstDays === d ? "is-active" : ""}`} onClick={() => { setCustomFirst(""); actions.saveScanPlanField("first_scan_days", d); }}>{d}d</button>
-              ))}
-              <button className="custom-step-btn" onClick={() => actions.saveScanPlanField("first_scan_days", Math.max(1, firstDays - 1))}>−</button>
-              <input className={`custom-days-input inline${isCustomFirst ? " is-custom" : ""}`} type="number" min={1} max={90} placeholder="···" value={isCustomFirst ? String(firstDays) : customFirst} onChange={(e) => { setCustomFirst(e.target.value); if (e.target.value) actions.saveScanPlanField("first_scan_days", Number(e.target.value)); }} />
-              <button className="custom-step-btn" onClick={() => actions.saveScanPlanField("first_scan_days", Math.min(90, firstDays + 1))}>+</button>
-            </div>
-          </div>
-          <div className="config-block" style={{ marginBottom: 0 }}>
-            <h4 style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 4px" }}>Incremental scan range</h4>
-            <div className="preset-row preset-row-sm">
-              {[4, 7, 14].map((d) => (
-                <button key={d} className={`preset-chip ${incrDays === d ? "is-active" : ""}`} onClick={() => { setCustomIncr(""); actions.saveScanPlanField("incremental_days", d); }}>{d}d</button>
-              ))}
-              <button className="custom-step-btn" onClick={() => actions.saveScanPlanField("incremental_days", Math.max(1, incrDays - 1))}>−</button>
-              <input className={`custom-days-input inline${isCustomIncr ? " is-custom" : ""}`} type="number" min={1} max={30} placeholder="···" value={isCustomIncr ? String(incrDays) : customIncr} onChange={(e) => { setCustomIncr(e.target.value); if (e.target.value) actions.saveScanPlanField("incremental_days", Number(e.target.value)); }} />
-              <button className="custom-step-btn" onClick={() => actions.saveScanPlanField("incremental_days", Math.min(30, incrDays + 1))}>+</button>
-            </div>
-          </div>
-          <div className="config-block" style={{ marginBottom: 0 }}>
-            <h4 style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 4px" }}>Max messages</h4>
-            <div className="preset-row preset-row-sm">
-              {[50, 100, 150].map((n) => (
-                <button key={n} className={`preset-chip ${maxMsgs === n ? "is-active" : ""}`} onClick={() => { setCustomMax(""); actions.saveScanPlanField("max_messages", n); }}>{n}</button>
-              ))}
-              <button className="custom-step-btn" onClick={() => actions.saveScanPlanField("max_messages", Math.max(10, maxMsgs - 10))}>−</button>
-              <input className={`custom-days-input inline${isCustomMax ? " is-custom" : ""}`} type="number" min={10} max={500} placeholder="···" value={isCustomMax ? String(maxMsgs) : customMax} onChange={(e) => { setCustomMax(e.target.value); if (e.target.value) actions.saveScanPlanField("max_messages", Number(e.target.value)); }} />
-              <button className="custom-step-btn" onClick={() => actions.saveScanPlanField("max_messages", Math.min(500, maxMsgs + 10))}>+</button>
-            </div>
-          </div>
-          <div className="config-block">
-            <h4 style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 4px" }}>Scan categories</h4>
-            <div className="preset-row preset-row-sm">
-              <button className="preset-chip is-active" disabled>Primary</button>
-              {(["social", "promotions", "updates", "forums"] as const).map((cat) => {
-                const cats = plan.scan_categories || [];
-                const active = cats.includes(cat);
-                return (
-                  <button key={cat} className={`preset-chip ${active ? "is-active" : ""}`} onClick={() => {
-                    actions.saveScanPlanField("scan_categories", active ? cats.filter((c: string) => c !== cat) : [...cats, cat]);
-                  }}>{cat.charAt(0).toUpperCase() + cat.slice(1)}</button>
-                );
-              })}
-            </div>
-          </div>
-        </section>
-        <section className="config-block">
           <h3>Storage</h3>
           <ul className="config-list">
             <li>{storageLabel}</li>
           </ul>
+        </section>
+      </div>
+    </aside>
+  );
+}
+
+function memoryKey(item: ContactMemorySummary): string {
+  return `${String(item.mailbox || "").trim().toLowerCase()}::${String(item.contact_email || "").trim().toLowerCase()}`;
+}
+
+function statusLabel(status?: string): string {
+  if (status === "open") return "Open";
+  if (status === "waiting_for_them") return "Waiting";
+  if (status === "closed") return "Closed";
+  return "Unknown";
+}
+
+function normalizeMemoryText(value?: string): string {
+  return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function isRepeatedMemoryText(value: string | undefined, seen: string[]): boolean {
+  const normalized = normalizeMemoryText(value);
+  if (!normalized) return true;
+  return seen.some((item) => {
+    const other = normalizeMemoryText(item);
+    if (!other) return false;
+    if (normalized === other) return true;
+    if (normalized.length >= 24 && other.includes(normalized)) return true;
+    return other.length >= 24 && normalized.includes(other);
+  });
+}
+
+function cleanMemoryText(value?: string): string {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const tagStart = raw.search(/<\s*[a-z][^>]*>/i);
+  if (tagStart > 24) return raw.slice(0, tagStart).trim();
+  return raw
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/<\/p>|<\/div>|<\/li>|<\/tr>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isGenericMemoryState(value?: string): boolean {
+  const normalized = normalizeMemoryText(value);
+  return normalized === "the contact may be waiting for the user."
+    || normalized === "the user has replied and is waiting for the contact."
+    || normalized === "no follow-up is currently needed."
+    || normalized === "the current state is unclear.";
+}
+
+function MemoryDrawer() {
+  const { state, actions } = useApp();
+  const [expandedThreads, setExpandedThreads] = useState<Record<string, boolean>>({});
+  const contacts = state.contactMemories || [];
+  const selected = state.selectedMemory;
+  const selectedSummary = contacts.find((item) => memoryKey(item) === state.selectedMemoryKey);
+  const selectedMailboxes = state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox].filter(Boolean);
+  const totalThreads = contacts.reduce((sum, item) => sum + (item.thread_count || 0), 0);
+  const totalMessages = contacts.reduce((sum, item) => sum + (item.message_count || 0), 0);
+
+  const openContact = (item: ContactMemorySummary) => {
+    if (memoryKey(item) === state.selectedMemoryKey) {
+      actions.closeContactMemory();
+      return;
+    }
+    void actions.openContactMemory(item.mailbox, item.contact_email);
+  };
+
+  const deleteSelected = () => {
+    if (!selected) return;
+    const label = selected.display_name || selected.contact_email;
+    if (!window.confirm(`Delete memory for ${label}?`)) return;
+    void actions.deleteContactMemory(selected.mailbox, selected.contact_email);
+  };
+
+  const clearAll = () => {
+    const scope = selectedMailboxes.join(", ") || "selected mailboxes";
+    if (!window.confirm(`Clear all contact memory for ${scope}?`)) return;
+    void actions.clearContactMemories();
+  };
+
+  const toggleThread = (threadId: string) => {
+    setExpandedThreads((current) => ({ ...current, [threadId]: !current[threadId] }));
+  };
+
+  const renderMemoryDetail = () => (
+    <section className="memory-detail">
+      <div className="memory-detail-head">
+        <div>
+          <h3>{selected?.display_name || selectedSummary?.display_name || selected?.contact_email || selectedSummary?.contact_email}</h3>
+          <p>{selected?.contact_email || selectedSummary?.contact_email} -&gt; {selected?.mailbox || selectedSummary?.mailbox}</p>
+        </div>
+        <button className="soft-btn compact danger" onClick={deleteSelected} disabled={!selected}>Delete</button>
+      </div>
+      {selected?.threads?.length ? (
+        <div className="memory-thread-list">
+          {selected.threads.map((thread: ContactThreadMemory) => {
+            const open = expandedThreads[thread.thread_id] || false;
+            const summary = thread.thread_summary || {};
+            const headline = cleanMemoryText(summary.summary || summary.current_state || "No summary");
+            const detailSeen = [headline];
+            const currentState = cleanMemoryText(summary.current_state || "");
+            if (currentState) detailSeen.push(currentState);
+            const cleanOpenLoop = cleanMemoryText(summary.open_loop || "");
+            const openLoop = isGenericMemoryState(cleanOpenLoop) || isRepeatedMemoryText(cleanOpenLoop, detailSeen) ? "" : cleanOpenLoop;
+            if (openLoop) detailSeen.push(openLoop);
+            const visibleMessages = (thread.message_summaries || [])
+              .map((message) => ({ ...message, summary: cleanMemoryText(message.summary || "") }))
+              .filter((message) => {
+                if (isRepeatedMemoryText(message.summary, detailSeen)) return false;
+                detailSeen.push(message.summary || "");
+                return true;
+              });
+            return (
+              <article className="memory-thread" key={thread.thread_id}>
+                <button className="memory-thread-head" onClick={() => toggleThread(thread.thread_id)}>
+                  <span>
+                    <span className="memory-thread-title">{thread.subject || "Untitled thread"}</span>
+                    <span className="memory-thread-summary">{headline}</span>
+                  </span>
+                  <span className="memory-thread-side">
+                    <span className={`memory-status-dot status-${summary.status || "unknown"}`} title={statusLabel(summary.status)} />
+                    <span className={`memory-thread-toggle ${open ? "is-open" : ""}`} aria-hidden="true">{open ? "-" : "+"}</span>
+                  </span>
+                </button>
+                {open ? (
+                  <div className="memory-thread-body">
+                    {openLoop ? <p><span>Open loop</span>{openLoop}</p> : null}
+                    {visibleMessages.length ? (
+                      <div className="memory-message-list">
+                        {visibleMessages.map((message) => (
+                          <div className="memory-message" key={message.message_id || `${message.date}-${message.summary}`}>
+                            <span className="memory-message-meta">{message.direction || "inbound"} at {formatBeijingTimestamp(message.date || "")}</span>
+                            <span>{message.summary || "No message summary"}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                    {!openLoop && !visibleMessages.length ? <p className="memory-empty-detail">No extra detail beyond the thread summary.</p> : null}
+                  </div>
+                ) : null}
+              </article>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="assistant-copy">{state.memoryLoading ? "Loading memory..." : "No thread memory for this contact."}</p>
+      )}
+    </section>
+  );
+
+  return (
+    <aside className={`drawer memory-drawer ${state.memoryOpen ? "is-open" : ""}`} aria-label="Memory drawer">
+      <div className="drawer-head">
+        <div>
+          <h2 className="drawer-title">Memory</h2>
+          <p className="drawer-copy">Mailbox-scoped contact memory.</p>
+        </div>
+        <button className="icon-btn" onClick={actions.closeDrawers}>x</button>
+      </div>
+      <div className="drawer-body memory-body">
+        <section className="memory-toolbar">
+          <div>
+            <div className="memory-count">{contacts.length} contacts</div>
+            <div className="memory-meta">{totalThreads} threads · {totalMessages} messages</div>
+          </div>
+          <div className="memory-actions">
+            <button className="soft-btn compact" onClick={() => void actions.loadContactMemories()} disabled={state.memoryLoading}>Refresh</button>
+            <button className="soft-btn compact danger" onClick={clearAll} disabled={!contacts.length || state.memoryLoading}>Clear</button>
+          </div>
+        </section>
+
+        {state.memoryError ? <div className="memory-error">{state.memoryError}</div> : null}
+        {state.memoryLoading && !contacts.length ? <p className="assistant-copy">Loading memory...</p> : null}
+        {!state.memoryLoading && !contacts.length && !state.memoryError ? <p className="assistant-copy">No contact memory yet.</p> : null}
+
+        <section className="memory-list">
+          {contacts.map((item) => {
+            const active = memoryKey(item) === state.selectedMemoryKey;
+            const name = item.display_name || item.contact_email;
+            return (
+              <div className="memory-contact-block" key={memoryKey(item)}>
+                <button className={`memory-contact ${active ? "is-active" : ""}`} onClick={() => openContact(item)}>
+                  <span className="memory-avatar">{name.charAt(0).toUpperCase()}</span>
+                  <span className="memory-contact-main">
+                    <span className="memory-contact-title">{name}</span>
+                    <span className="memory-contact-email">{item.contact_email}</span>
+                    <span className="memory-contact-subject">{item.latest_subject || "No subject"}</span>
+                  </span>
+                  <span className="memory-contact-side">
+                    <span className="memory-contact-count">{item.thread_count || 0}t</span>
+                    <span className={`memory-contact-toggle ${active ? "is-open" : ""}`} aria-hidden="true">{active ? "-" : "+"}</span>
+                  </span>
+                </button>
+                {active ? renderMemoryDetail() : null}
+              </div>
+            );
+          })}
         </section>
       </div>
     </aside>
@@ -183,7 +391,7 @@ function HistoryDrawer() {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   // Entries that have been restored — hidden from list immediately
-  const [restoredRunIds, setRestoredRunIds] = useState<Set<string>>(new Set());
+  const restoredCardIds = state.restoredCardIds;
 
   // Group entries
   const grouped: Record<string, RunHistoryEntry[]> = {};
@@ -222,7 +430,6 @@ function HistoryDrawer() {
 
   const handleRestore = (run: RunHistoryEntry) => {
     if (!run.card_id) return;
-    setRestoredRunIds((prev) => new Set(prev).add(entryKey(run)));
     void actions.restoreCard(run.card_id, run.mailbox);
   };
 
@@ -230,7 +437,7 @@ function HistoryDrawer() {
     const isCard = run.entry_type === "card_action";
     const isExpanded = expanded[entryKey(run)] || false;
     const hasCardContext = !!(run.card_from || run.card_subject || run.card_summary || run.card_body);
-    const canRestore = isCard && RESTORABLE_ACTIONS.has(run.action || "") && !!run.card_id;
+    const canRestore = isCard && RESTORABLE_ACTIONS.has(run.action || "") && !!run.card_id && !restoredCardIds.has(run.card_id);
 
     const title = isCard
       ? (run.card_title || run.card_id || "")
@@ -289,7 +496,7 @@ function HistoryDrawer() {
       <div className="drawer-body">
         {!hasAny ? <p className="assistant-copy">No history yet.</p> : null}
         {visibleGroups.map((g) => {
-          const allEntries = (grouped[g.key] || []).filter((e) => !restoredRunIds.has(entryKey(e)));
+          const allEntries = (grouped[g.key] || []).filter((e) => !restoredCardIds.has(e.card_id || ""));
           const isCollapsed = collapsed[g.key] || false;
           const isSnooze = g.key === "snooze";
           const { byFilter, selected } = isSnooze ? _filterVisible(allEntries) : { byFilter: new Map(), selected: allEntries };
@@ -331,4 +538,3 @@ function HistoryDrawer() {
     </aside>
   );
 }
-

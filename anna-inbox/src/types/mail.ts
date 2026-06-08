@@ -68,6 +68,19 @@ export interface FrontendCardAction {
   status?: string;
 }
 
+export interface GapQuestion {
+  id: string;
+  question: string;
+  hint?: string;
+  required?: boolean;
+}
+
+export interface ReplyGaps {
+  needs_user_input: boolean;
+  summary?: string;
+  questions: GapQuestion[];
+}
+
 export interface FrontendCard {
   uiKey?: string;
   id: string;
@@ -100,10 +113,12 @@ export interface FrontendCard {
   status?: CardStatus;
   resolution?: string;
   snooze_until?: string;
+  resolved_at?: string;
   userAction?: "reply" | "review" | "cleanup" | string;
   cardType?: "cleanup_bundle" | string;
   bundledMessages?: CleanupMessage[];
   bundledCount?: number;
+  replyGaps?: ReplyGaps;
 }
 
 export interface CleanupMessage {
@@ -153,8 +168,7 @@ export interface RunWarning {
 
 export interface ScanPlan {
   mailbox?: string;
-  first_scan_days?: number;
-  incremental_days?: number;
+  scan_window_days?: number;
   max_messages?: number;
   scan_categories?: string[];
   updated_at?: string;
@@ -235,6 +249,63 @@ export interface CustomRunResult {
 export interface CardDetailPayload {
   card?: FrontendCard;
   thread_context?: Record<string, unknown>;
+  contact_context?: Record<string, unknown>;
+}
+
+export interface ContactMemorySummary {
+  mailbox: string;
+  contact_email: string;
+  display_name?: string;
+  thread_count: number;
+  message_count: number;
+  open_count: number;
+  waiting_count: number;
+  closed_count: number;
+  unknown_count?: number;
+  updated_at?: string;
+  latest_subject?: string;
+  latest_summary?: string;
+  latest_status?: string;
+}
+
+export interface ContactMemoryFile {
+  mailbox: string;
+  contact_email: string;
+  display_name?: string;
+  threads: ContactThreadMemory[];
+  stats?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface ContactThreadMemory {
+  thread_id: string;
+  subject?: string;
+  thread_summary?: {
+    summary?: string;
+    current_state?: string;
+    open_loop?: string;
+    status?: string;
+    importance?: string;
+  };
+  message_summaries?: ContactMessageMemory[];
+  source_refs?: Record<string, unknown>[];
+  updated_at?: string;
+}
+
+export interface ContactMessageMemory {
+  message_id?: string;
+  from_addr?: string;
+  direction?: "inbound" | "outbound" | string;
+  date?: string;
+  summary?: string;
+  action_signal?: string;
+}
+
+export interface ContactMemoryDetailPayload {
+  memory?: ContactMemoryFile;
+  summary?: ContactMemorySummary;
+  error?: string;
 }
 
 export interface GmailAuthStatus {
@@ -271,6 +342,8 @@ export interface AppState {
   history: RunHistoryEntry[];
   scanStatus: string;
   scanError: string;
+  restoredCardIds: Set<string>;
+  pendingAction: string;
   isScanning: boolean;
   isCustomScanning: boolean;
   scanStepIndex: number;
@@ -283,13 +356,21 @@ export interface AppState {
   customTraceOpen: boolean;
   sourcesOpen: boolean;
   historyOpen: boolean;
+  memoryOpen: boolean;
   originalOpen: boolean;
   scanPlanOpen: boolean;
+  contactMemories: ContactMemorySummary[];
+  selectedMemory: ContactMemoryFile | null;
+  selectedMemoryKey: string;
+  memoryLoading: boolean;
+  memoryError: string;
   scanPlan: ScanPlan | null;
+  configMailbox: string;
   selectedCard: FrontendCard | null;
   selectedCardDetail: CardDetailPayload | null;
   threadSummaryById: Record<string, Record<string, unknown>>;
   draftById: Record<string, string>;
+  gapAnswersByCard: Record<string, Record<string, string>>;
   revisionById: Record<string, string>;
   replyModeById: Record<string, string>;
   threadContextExpanded: Record<string, boolean>;

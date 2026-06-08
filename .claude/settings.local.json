@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run *)",
+      "Bash(python -m py_compile src/mail_agent/core/pipeline.py src/mail_agent/storage/types.py src/anna_inbox_executa/main.py)",
+      "Bash(python -m py_compile src/mail_agent/storage/types.py src/mail_agent/core/pipeline.py src/anna_inbox_executa/main.py)",
+      "Bash(python -m py_compile src/anna_inbox_executa/main.py)",
+      "Bash(xargs grep -l \"contact_memory\")",
+      "Bash(python -m py_compile src/mail_agent/judgment_engine/service.py src/mail_agent/storage/types.py src/mail_agent/cards/service.py src/mail_agent/actions/service.py src/anna_inbox_executa/main.py)",
+      "Bash(python -m py_compile src/mail_agent/judgment_engine/service.py)",
+      "Bash(python -m py_compile src/mail_agent/storage/ops.py)",
+      "Bash(python -m py_compile src/mail_agent/cards/service.py)",
+      "Bash(python -m py_compile src/mail_agent/storage/ops.py src/anna_inbox_executa/main.py)",
+      "Bash(python -m py_compile src/mail_agent/storage/ops.py src/mail_agent/cards/service.py)",
+      "Bash(python -c \"from mail_agent.mail_providers.gmail.adapter import set_multi_tokens, get_multi_token_map, get_multi_token_emails, get_access_token, normalize_mailbox; print\\('adapter imports OK'\\)\")",
+      "Bash(PYTHONPATH=src python -c \"from mail_agent.mail_providers.gmail.adapter import set_multi_tokens, get_multi_token_map, get_multi_token_emails, get_access_token, normalize_mailbox; print\\('adapter imports OK'\\)\")",
+      "Bash(PYTHONPATH=src python -c ' *)",
+      "Bash(PYTHONPATH=src python -m pytest src/tests/test_storage_integration.py -v --tb=short)",
+      "Bash(PYTHONPATH=src python -m pytest src/tests/test_gmail_query_normalize.py src/tests/test_llm_json_repair.py -v --tb=short)",
+      "Bash(PYTHONPATH=src python src/tests/test_multi_token_integration.py)"
+    ]
+  }
+}

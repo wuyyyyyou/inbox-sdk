@@ -245,6 +245,132 @@ async def main():
     prefs3 = await get_user_prefs()
     check("append_learning", len(prefs3.learning) == 1 and prefs3.learning[0].pattern == "LinkedIn notifications")
 
+    print("\n-- contact memory --")
+    from mail_agent.contact_memory.indexer import ingest_card_event
+    from mail_agent.contact_memory.manager import backfill_active_card_memories, clear_memory, delete_memory, get_memory_detail, list_memory_summaries
+    from mail_agent.contact_memory.retriever import retrieve_contact_context
+    from mail_agent.contact_memory.store import get_contact_memory
+    from mail_agent.contact_memory.types import ContactMemoryQuery
+
+    async def fake_selector(**kwargs):
+        return {"content": {"text": '{"selected":[{"thread_id":"thread_memory_old","relevance":0.91,"reason":"same candidate follow-up context","include_message_ids":["msg_memory_old"]}],"none_reason":""}'}}
+
+    memory_card = PersistentCard(
+        card_id="card_memory_old", message_id="msg_memory_old", thread_id="thread_memory_old",
+        title="Alice follows up on Priya",
+        summary="Alice asks whether Priya should move forward.",
+        recommendation="Confirm whether to advance Priya.",
+        original=OriginalEmail(from_addr="Alice <alice@x.com>", thread="Priya next round", body="Can we move faster on Priya?"),
+    )
+    current_card = PersistentCard(
+        card_id="card_memory_current", message_id="msg_memory_current", thread_id="thread_memory_current",
+        title="Alice asks for an update",
+        summary="Alice asks whether there is a decision.",
+        recommendation="Reply with the decision status.",
+        original=OriginalEmail(from_addr="Alice <alice@x.com>", thread="Priya decision", body="Any update?"),
+    )
+    await ingest_card_event("test@example.com", memory_card)
+    await ingest_card_event("test@example.com", current_card)
+    memory_file = await get_contact_memory("test@example.com", "alice@x.com")
+    contact_ctx = await retrieve_contact_context(ContactMemoryQuery(
+        mailbox="test@example.com",
+        contact_email="alice@x.com",
+        current_subject="Priya decision",
+        current_body="Any update?",
+        current_thread_id="thread_memory_current",
+        purpose="thread_summary",
+    ), sampling_create_message=fake_selector)
+    same_thread_ctx = await retrieve_contact_context(ContactMemoryQuery(
+        mailbox="test@example.com",
+        contact_email="alice@x.com",
+        current_subject="Priya next round",
+        current_body="Priya",
+        current_thread_id="thread_memory_old",
+        purpose="thread_summary",
+    ), sampling_create_message=fake_selector)
+    isolated_ctx = await retrieve_contact_context(ContactMemoryQuery(
+        mailbox="other@example.com",
+        contact_email="alice@x.com",
+        current_subject="Priya next round",
+        current_body="Priya",
+        current_thread_id="thread_memory",
+        purpose="thread_summary",
+    ), sampling_create_message=fake_selector)
+    check("contact memory stores thread memories", memory_file is not None and len(memory_file.threads) == 2)
+    old_thread_memory = next((item for item in (memory_file.threads if memory_file else []) if item.thread_id == "thread_memory_old"), None)
+    check(
+        "contact memory thread summary uses card summary",
+        old_thread_memory is not None
+        and old_thread_memory.thread_summary.summary == "Alice asks whether Priya should move forward."
+        and old_thread_memory.thread_summary.summary != "Can we move faster on Priya?",
+    )
+    check("contact memory selector retrieves prior thread", len(contact_ctx.relevant_topics) == 1 and contact_ctx.relevant_topics[0].thread_id == "thread_memory_old")
+    check("contact memory excludes current thread", len(same_thread_ctx.relevant_topics) == 0)
+    check("contact memory mailbox isolation", len(isolated_ctx.relevant_topics) == 0)
+    memory_list = await list_memory_summaries(["test@example.com"])
+    memory_detail = await get_memory_detail("test@example.com", "alice@x.com")
+    check("contact memory manager lists contacts", memory_list.get("count") == 1 and memory_list["contacts"][0]["contact_email"] == "alice@x.com")
+    check("contact memory manager gets detail", "memory" in memory_detail and len(memory_detail["memory"]["threads"]) == 2)
+    await delete_memory("test@example.com", "alice@x.com")
+    deleted_memory = await get_contact_memory("test@example.com", "alice@x.com")
+    check("contact memory manager deletes one contact", deleted_memory is None)
+    await ingest_card_event("test@example.com", memory_card)
+    cleared = await clear_memory(["test@example.com"])
+    check("contact memory manager clears mailbox", cleared.get("deleted") == 1 and await get_contact_memory("test@example.com", "alice@x.com") is None)
+    await set_active_cards("test@example.com", ActiveCards(cards=[memory_card]))
+    backfilled = await backfill_active_card_memories(["test@example.com"])
+    backfilled_memory = await get_contact_memory("test@example.com", "alice@x.com")
+    check("contact memory backfills active cards", backfilled.get("backfilled") == 1 and backfilled_memory is not None)
+    await clear_memory(["test@example.com"])
+    from mail_agent.core.pipeline import _persist_run_results
+    from mail_agent.domain.types import CandidateItem, FinalDecision, JudgmentResult, MessageLite
+
+    persisted_msg = MessageLite(
+        message_id="msg_persist_memory",
+        thread_id="thread_persist_memory",
+        from_addr="Bob <bob@x.com>",
+        to_addr="test@example.com",
+        subject="Investor follow-up",
+        snippet="Can you send the deck?",
+        internal_date="1780000000000",
+    )
+    persisted_candidate = CandidateItem(
+        candidate_id="cand_persist_memory",
+        kind="reply_required_possible",
+        message_ids=["msg_persist_memory"],
+        thread_id="thread_persist_memory",
+        evidence={"from": "Bob <bob@x.com>", "subject": "Investor follow-up", "snippet": "Can you send the deck?"},
+        priority_hint="high",
+        read_depth_required="message_detail",
+        source="rule",
+    )
+    persisted_judgment = JudgmentResult(
+        candidate_id="cand_persist_memory",
+        final_decision=FinalDecision(
+            display_bucket="Reply",
+            priority="high",
+            should_show_in_main_result=True,
+            user_facing_summary="Bob asks for the deck",
+            user_facing_reason="Bob is waiting for materials.",
+            user_facing_recommendation="Send the deck.",
+            user_action="reply",
+        ),
+        confidence=0.9,
+    )
+    await _persist_run_results(
+        run_id="run_persist_memory",
+        mailbox="test@example.com",
+        messages=[persisted_msg],
+        candidates=[persisted_candidate],
+        judgments=[persisted_judgment],
+        strategy_mode="default_secretary",
+        user_request="test persist memory",
+        mode="auto",
+        sampling_create_message=None,
+    )
+    persisted_memory = await get_contact_memory("test@example.com", "bob@x.com")
+    check("persist run writes contact memory for generated card", persisted_memory is not None and len(persisted_memory.threads) == 1)
+
     # ── Summary ──
     print(f"\n{'='*50}")
     print(f"  {_green('PASSED')}: {passed}  {_red('FAILED')}: {failed}")

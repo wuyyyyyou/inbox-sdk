@@ -158,6 +158,22 @@ async def remove_mailbox_from_registry(mailbox: str) -> MailboxRegistry:
     return registry
 
 
+# ── 多邮箱 token 持久化 ──────────────────────────────────────────
+
+MULTI_TOKENS_KEY = "mailboxes/multi_tokens"
+
+
+async def get_multi_tokens() -> list[dict[str, Any]]:
+    result = await get_storage().get(MULTI_TOKENS_KEY, scope=default_scope())
+    if result.get("exists") and isinstance(result.get("value"), list):
+        return result["value"]
+    return []
+
+
+async def set_multi_tokens(tokens: list[dict[str, Any]]) -> dict:
+    return await get_storage().set(MULTI_TOKENS_KEY, tokens, scope=default_scope())
+
+
 async def update_mailbox_registry_fields(mailbox: str, **fields: Any) -> MailboxRegistry:
     email = _normalize_email(mailbox)
     if not email:
@@ -195,7 +211,7 @@ async def aggregate_active_cards(mailboxes: list[str] | None = None) -> ActiveCa
             if not card.details.mailbox:
                 card.details.mailbox = mailbox
             cards.append(card)
-    cards.sort(key=lambda card: (card.status == "pending", _priority_rank(card.priority), card.updated_at or card.created_at or ""), reverse=True)
+    cards.sort(key=lambda card: (card.status in ("pending", "resolved", "snoozed"), _priority_rank(card.priority), card.updated_at or card.created_at or ""), reverse=True)
     return ActiveCards(cards=cards, updated_at=latest_updated or _now())
 
 
@@ -502,6 +518,7 @@ def _dict_to_persistent_card(d: dict) -> PersistentCard:
         card_type=d.get("card_type", ""),
         bundled_messages=d.get("bundled_messages", []),
         user_action=d.get("user_action", ""),
+        reply_gaps=d.get("reply_gaps", {}) if isinstance(d.get("reply_gaps"), dict) else {},
     )
 
 

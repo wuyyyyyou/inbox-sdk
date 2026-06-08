@@ -100,7 +100,7 @@ export interface AppActions {
   toggleThreadContext(cardId: string): void;
   toggleSnoozeMenu(cardId: string): void;
   setProvider(kind: "llm" | "storage", value: string): void;
-  setDrawer(drawer: "sources" | "history" | "scanPlan", open: boolean): void;
+  setDrawer(drawer: "sources" | "history" | "memory" | "scanPlan", open: boolean): void;
   minimize(value: boolean): void;
   checkGmailAuth(mailboxOverride?: string): Promise<{ authorized: boolean; source: string }>;
   loadMailboxes(): Promise<void>;
@@ -108,9 +108,15 @@ export interface AppActions {
   setBriefMailboxFilter(mailboxes: string[]): void;
   loadActiveCards(): Promise<void>;
   loadRunHistory(): Promise<void>;
+  loadContactMemories(): Promise<void>;
+  openContactMemory(mailbox: string, contactEmail: string): Promise<void>;
+  closeContactMemory(): void;
+  deleteContactMemory(mailbox: string, contactEmail: string): Promise<void>;
+  clearContactMemories(): Promise<void>;
   loadCustomPlans(): Promise<void>;
   loadScanPlan(): Promise<void>;
   saveScanPlanField(field: string, value: unknown): void;
+  setConfigMailbox(mailbox: string): Promise<void>;
   startScan(reason?: string): Promise<void>;
   openCard(cardId: string): Promise<void>;
   summarizeSelectedThread(): Promise<void>;
@@ -131,6 +137,8 @@ export interface AppActions {
   cancelAskDraft(key: string): void;
   sendAskDraft(key: string, threadId: string, to: string, mailbox?: string): Promise<void>;
   toggleAskHistory(idx: number): void;
+  setGapAnswers(cardKey: string, answers: Record<string, string>): void;
+  generateDraftWithAnswers(answers: Record<string, string>): Promise<void>;
   copyDraft(text: string): Promise<void>;
 }
 
@@ -210,6 +218,74 @@ export function useAppController() {
     }
   }, [client]);
 
+  const memoryMailboxes = useCallback((): string[] => {
+    return selectableMailboxes(state.selectedMailboxes, state.mailbox);
+  }, [state.mailbox, state.selectedMailboxes]);
+
+  const loadContactMemories = useCallback(async () => {
+    const mailboxes = memoryMailboxes();
+    setState((s) => ({ ...s, memoryLoading: true, memoryError: "" }));
+    try {
+      const payload = await client.listContactMemories(mailboxes, state.storageProvider);
+      const contacts = Array.isArray(payload.contacts) ? payload.contacts : [];
+      setState((s) => {
+        const selectedStillExists = contacts.some((item) => `${item.mailbox}::${item.contact_email}` === s.selectedMemoryKey);
+        return {
+          ...s,
+          contactMemories: contacts,
+          selectedMemory: selectedStillExists ? s.selectedMemory : null,
+          selectedMemoryKey: selectedStillExists ? s.selectedMemoryKey : "",
+          memoryLoading: false,
+          memoryError: "",
+        };
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setState((s) => ({ ...s, memoryLoading: false, memoryError: message, contactMemories: [] }));
+    }
+  }, [client, memoryMailboxes, state.storageProvider]);
+
+  const openContactMemory = useCallback(async (mailbox: string, contactEmail: string) => {
+    const key = `${normalizedMailbox(mailbox)}::${normalizedMailbox(contactEmail)}`;
+    setState((s) => ({ ...s, selectedMemoryKey: key, selectedMemory: null, memoryLoading: true, memoryError: "" }));
+    try {
+      const payload = await client.getContactMemory(mailbox, contactEmail, state.storageProvider);
+      if (payload.error) throw new Error(payload.error);
+      setState((s) => ({ ...s, selectedMemory: payload.memory || null, memoryLoading: false, memoryError: "" }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setState((s) => ({ ...s, selectedMemory: null, memoryLoading: false, memoryError: message }));
+    }
+  }, [client, state.storageProvider]);
+
+  const closeContactMemory = useCallback(() => {
+    setState((s) => ({ ...s, selectedMemory: null, selectedMemoryKey: "", memoryLoading: false, memoryError: "" }));
+  }, []);
+
+  const deleteContactMemory = useCallback(async (mailbox: string, contactEmail: string) => {
+    try {
+      const result = await client.deleteContactMemory(mailbox, contactEmail, state.storageProvider);
+      if (result.error) throw new Error(result.error);
+      setState((s) => ({ ...s, selectedMemory: null, selectedMemoryKey: "" }));
+      await loadContactMemories();
+      showToast("Memory deleted.");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error));
+    }
+  }, [client, loadContactMemories, showToast, state.storageProvider]);
+
+  const clearContactMemories = useCallback(async () => {
+    try {
+      const result = await client.clearContactMemories(memoryMailboxes(), state.storageProvider);
+      if (result.error) throw new Error(result.error);
+      setState((s) => ({ ...s, selectedMemory: null, selectedMemoryKey: "", contactMemories: [] }));
+      await loadContactMemories();
+      showToast(`Cleared ${result.deleted || 0} memory file${result.deleted === 1 ? "" : "s"}.`);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error));
+    }
+  }, [client, loadContactMemories, memoryMailboxes, showToast, state.storageProvider]);
+
   const loadCustomPlans = useCallback(async (storageOverride?: string) => {
     const provider = storageOverride ?? state.storageProvider;
     try {
@@ -226,7 +302,7 @@ export function useAppController() {
       const plan = await client.loadScanPlan(mailbox, state.storageProvider);
       setState((s) => ({ ...s, scanPlan: plan }));
     } catch {
-      setState((s) => ({ ...s, scanPlan: { first_scan_days: 7, incremental_days: 7, max_messages: 100, scan_categories: [] } }));
+      setState((s) => ({ ...s, scanPlan: { scan_window_days: 7, max_messages: 100, scan_categories: [] } }));
     }
   }, [client, state.mailbox, state.storageProvider]);
 
@@ -322,10 +398,10 @@ export function useAppController() {
   const actions: AppActions = {
     showToast,
     closeDrawers() {
-      setState((s) => ({ ...s, sourcesOpen: false, historyOpen: false, originalOpen: false, scanPlanOpen: false, selectedCard: null }));
+      setState((s) => ({ ...s, sourcesOpen: false, historyOpen: false, memoryOpen: false, originalOpen: false, scanPlanOpen: false, selectedCard: null }));
     },
     setView(view) {
-      setState((s) => ({ ...s, view, sourcesOpen: false, historyOpen: false, originalOpen: false, scanPlanOpen: false, lowerPriorityOpen: view === "start" ? false : s.lowerPriorityOpen }));
+      setState((s) => ({ ...s, view, sourcesOpen: false, historyOpen: false, memoryOpen: false, originalOpen: false, scanPlanOpen: false, lowerPriorityOpen: view === "start" ? false : s.lowerPriorityOpen }));
       if (view === "ask") void loadCustomPlans();
     },
     setInput(field, value) {
@@ -371,6 +447,7 @@ export function useAppController() {
           void loadActiveCards(value);
           void loadRunHistory();
           void loadCustomPlans(value);
+          if (state.memoryOpen) void loadContactMemories();
         }, 0);
       }
     },
@@ -379,10 +456,12 @@ export function useAppController() {
         ...s,
         sourcesOpen: drawer === "sources" ? open : false,
         historyOpen: drawer === "history" ? open : false,
+        memoryOpen: drawer === "memory" ? open : false,
         scanPlanOpen: drawer === "scanPlan" ? open : false,
         originalOpen: false,
       }));
       if (drawer === "scanPlan" && open) void loadScanPlan();
+      if (drawer === "memory" && open) void loadContactMemories();
     },
     minimize(value) {
       setState((s) => ({ ...s, minimized: value }));
@@ -427,11 +506,21 @@ export function useAppController() {
     },
     loadActiveCards,
     loadRunHistory,
+    loadContactMemories,
+    openContactMemory,
+    closeContactMemory,
+    deleteContactMemory,
+    clearContactMemories,
     loadCustomPlans,
     loadScanPlan,
     saveScanPlanField(field, value) {
       setState((s) => ({ ...s, scanPlan: { ...(s.scanPlan || {}), [field]: value, updated_at: new Date().toISOString() } }));
-      client.saveScanPlanField(state.mailbox, state.storageProvider, field, value).catch(() => {});
+      const targetMailbox = state.configMailbox || "";
+      client.saveScanPlanField(targetMailbox, state.storageProvider, field, value).catch(() => {});
+    },
+    async setConfigMailbox(mailbox) {
+      setState((s) => ({ ...s, configMailbox: mailbox }));
+      await loadScanPlan(mailbox || undefined);
     },
     async startScan(reason = "manual") {
       if (!state.runtime.connected || state.isScanning) return;
@@ -496,7 +585,7 @@ export function useAppController() {
       const card = findCard(state.cards, cardId);
       if (card && card.status && card.status !== "pending") return;
       if (!card) return;
-      setState((s) => ({ ...s, selectedCard: card, selectedCardDetail: null, originalOpen: true, sourcesOpen: false, historyOpen: false, snoozeMenuCardId: "" }));
+      setState((s) => ({ ...s, selectedCard: card, selectedCardDetail: null, originalOpen: true, sourcesOpen: false, historyOpen: false, memoryOpen: false, snoozeMenuCardId: "" }));
       try {
         const detail = await client.getCardDetail(cardMailbox(card, state.mailbox), card.id, state.storageProvider);
         setState((s) => ({ ...s, selectedCardDetail: detail }));
@@ -513,14 +602,18 @@ export function useAppController() {
         if (!started.run_id) throw new Error(started.error || "start_summarize_thread did not return a run id");
         const result = await pollBackgroundRun(started.run_id);
         const summary = (result.summary || {}) as Record<string, unknown>;
-        setState((s) => ({ ...s, threadSummaryById: { ...s.threadSummaryById, [key]: summary } }));
+        setState((s) => ({
+          ...s,
+          selectedCardDetail: result.contact_context && s.selectedCardDetail ? { ...s.selectedCardDetail, contact_context: result.contact_context as Record<string, unknown> } : s.selectedCardDetail,
+          threadSummaryById: { ...s.threadSummaryById, [key]: summary },
+        }));
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       } finally {
         setState((s) => ({ ...s, summarizingThread: false }));
       }
     },
-    async generateDraft(presetRevision) {
+    async generateDraft(presetRevision, userAnswers?: Record<string, string>) {
       if (!state.selectedCard || state.generatingDraft) return;
       const cardId = state.selectedCard.id;
       const key = state.selectedCard.uiKey || cardUiKey(state.selectedCard, state.mailbox);
@@ -534,6 +627,7 @@ export function useAppController() {
           reply_mode: state.replyModeById[key] || "reply_to_sender",
           current_draft: currentDraft,
           revision_input: revision,
+          user_answers: userAnswers || undefined,
           storage_provider: state.storageProvider,
           ai_provider: state.llmProvider,
         });
@@ -554,7 +648,8 @@ export function useAppController() {
       const card = cardId ? findCard(state.cards, cardId) : state.selectedCard;
       const cid = card?.id;
       const key = card?.uiKey || (card ? cardUiKey(card, state.mailbox) : "");
-      if (!card || !cid) return;
+      if (!card || !cid || state.pendingAction) return;
+      setState((s) => ({ ...s, pendingAction: `decision:${cid}` }));
       try {
         await client.recordCardDecision({ mailbox: cardMailbox(card, state.mailbox), card_id: cid, decision, storage_provider: state.storageProvider });
         setState((s) => ({ ...s, originalOpen: false, selectedCard: null, expandedDetails: { ...s.expandedDetails, [key]: false } }));
@@ -563,16 +658,19 @@ export function useAppController() {
         showToast("Card removed from this briefing.");
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
+      } finally {
+        setState((s) => ({ ...s, pendingAction: "" }));
       }
     },
     async replyNow() {
-      if (!state.selectedCard) return;
+      if (!state.selectedCard || state.pendingAction) return;
       const key = state.selectedCard.uiKey || cardUiKey(state.selectedCard, state.mailbox);
       const draft = state.draftById[key] || "";
       if (!draft.trim()) {
         showToast("Draft is empty. Generate a draft first.");
         return;
       }
+      setState((s) => ({ ...s, pendingAction: `reply:${state.selectedCard!.id}` }));
       try {
         await client.replyNow({
           mailbox: cardMailbox(state.selectedCard, state.mailbox),
@@ -587,6 +685,8 @@ export function useAppController() {
         await loadRunHistory();
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
+      } finally {
+        setState((s) => ({ ...s, pendingAction: "" }));
       }
     },
     async clearAllCards() {
@@ -610,10 +710,7 @@ export function useAppController() {
       setState((s) => ({ ...s, markingReadIds: { ...s.markingReadIds, [key]: true }, cleanupReadState: { ...s.cleanupReadState, [key]: { read: true, readMsgIndices: messages.map((_m, i) => i) } } }));
       try {
         const result = await client.markCleanupRead({ mailbox: cardMailbox(card, state.mailbox), card_id: card.id, message_ids: messageIds, storage_provider: state.storageProvider });
-        if (result.ok) {
-          setState((s) => ({ ...s, cards: s.cards.filter((c) => (c.uiKey || c.id) !== key), allCards: s.allCards.filter((c) => (c.uiKey || c.id) !== key) }));
-          showToast(`${messageIds.length} emails marked as read in Gmail.`);
-        } else {
+        if (!result.ok) {
           showToast(result.gmail_error || "Failed to mark as read in Gmail.");
         }
         await loadRunHistory();
@@ -629,8 +726,10 @@ export function useAppController() {
     },
     async restoreCard(cardId, mailboxOverride) {
       const card = findCard(state.allCards, cardId) || findCard(state.cards, cardId);
+      const cid = card?.id || cardId;
+      setState((s) => { const next = new Set(s.restoredCardIds); next.add(cid); return { ...s, restoredCardIds: next }; });
       try {
-        await client.restoreCard(card ? cardMailbox(card, mailboxOverride || state.mailbox) : (mailboxOverride || state.mailbox), card ? card.id : cardId, state.storageProvider);
+        await client.restoreCard(card ? cardMailbox(card, mailboxOverride || state.mailbox) : (mailboxOverride || state.mailbox), cid, state.storageProvider);
         await loadActiveCards();
         await loadRunHistory();
         showToast("Card restored.");
@@ -830,6 +929,12 @@ export function useAppController() {
       } catch {
         showToast("Copy failed");
       }
+    },
+    setGapAnswers(cardKey, answers) {
+      setState((s) => ({ ...s, gapAnswersByCard: { ...s.gapAnswersByCard, [cardKey]: answers } }));
+    },
+    async generateDraftWithAnswers(answers) {
+      await (actions as any).generateDraft(undefined, answers);
     },
   };
 

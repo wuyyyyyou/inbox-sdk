@@ -68,8 +68,7 @@ class ScanState:
 @dataclass
 class ScanPlan:
     mailbox: str
-    first_scan_days: int = 7        # 首次扫描往回看几天
-    incremental_days: int = 7       # 增量扫描最多往回看几天（断档安全网）
+    scan_window_days: int = 7       # 扫描往回看几天（首次和增量统一）
     max_messages: int = 100         # 每轮最多扫几封
     scan_categories: list[str] = field(default_factory=list)  # 额外扫描分类：promotions, social, updates, forums
     updated_at: str = field(default_factory=_now)
@@ -164,6 +163,7 @@ class PersistentCard:
     card_type: str = ""          # "cleanup_bundle" for folded low-priority cards
     bundled_messages: list = field(default_factory=list)  # list of BundledMessage dicts
     user_action: str = ""        # "reply" | "review" — drives frontend category tabs
+    reply_gaps: dict = field(default_factory=dict)  # {needs_user_input, summary, questions: [{id, question, hint, required}]}
 
 
 @dataclass

@@ -92,6 +92,7 @@ def build_card(
         actions=actions,
         status="pending",
         user_action=user_action,
+        reply_gaps=judgment.mode_judgment.get("reply_gaps") if isinstance(judgment.mode_judgment, dict) else {},
     )
 
 
@@ -505,7 +506,7 @@ def cards_to_frontend(cards: ActiveCards) -> list[dict[str, Any]]:
     """Serialize active cards to the V2 frontend format."""
     result: list[dict[str, Any]] = []
     for card in cards.cards:
-        if card.status in ("resolved", "dismissed"):
+        if card.status == "dismissed":
             continue
         frontend_card: dict[str, Any] = {
             "id": card.card_id,
@@ -545,6 +546,9 @@ def cards_to_frontend(cards: ActiveCards) -> list[dict[str, Any]]:
                 for a in card.actions
             ],
             "status": card.status,
+            "resolution": card.resolution,
+            "snooze_until": card.snooze_until,
+            "resolved_at": card.resolved_at,
         }
         if card.user_action:
             frontend_card["userAction"] = card.user_action
@@ -553,6 +557,8 @@ def cards_to_frontend(cards: ActiveCards) -> list[dict[str, Any]]:
         if card.bundled_messages:
             frontend_card["bundledMessages"] = card.bundled_messages
             frontend_card["bundledCount"] = len(card.bundled_messages)
+        if card.reply_gaps:
+            frontend_card["replyGaps"] = card.reply_gaps
         result.append(frontend_card)
     return result
 

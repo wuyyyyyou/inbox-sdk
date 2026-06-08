@@ -206,7 +206,7 @@ async def run_mail_task(
     scan_plan_config = await _get_scan_plan_config(input_.mailbox_id)
 
     if scan_plan_config:
-        window_days = scan_plan_config.first_scan_days if is_first_scan else scan_plan_config.incremental_days
+        window_days = scan_plan_config.scan_window_days
         configured_max = scan_plan_config.max_messages
     else:
         window_days = 7
@@ -233,8 +233,8 @@ async def run_mail_task(
     budget["max_messages"] = min(budget.get("max_messages", requested_max), requested_max, configured_max)
     scan_plan["budget"] = budget
 
-    _report_progress(progress_callback, "scan", max_messages=budget["max_messages"], window_days=scan_window_days)
-    _logger.info("scan started: mailbox=%s max_messages=%s window_days=%s", input_.mailbox_id, budget["max_messages"], scan_window_days)
+    _report_progress(progress_callback, "scan", max_messages=budget["max_messages"], window_days=window_days)
+    _logger.info("scan started: mailbox=%s max_messages=%s window_days=%s", input_.mailbox_id, budget["max_messages"], window_days)
     messages = await run_mail_scan(input_.mailbox_id, scan_plan, progress_callback=progress_callback)
     _report_progress(progress_callback, "scan_done", scanned=len(messages), max_messages=budget["max_messages"])
     _logger.info("scan done: %d messages fetched", len(messages))
@@ -269,6 +269,19 @@ async def run_mail_task(
                 check_timeouts += 1
             elif result:
                 already_replied_count += 1
+                try:
+                    from ..contact_memory.indexer import ingest_thread_observation
+                    await ingest_thread_observation(
+                        input_.mailbox_id,
+                        tid,
+                        m.from_addr,
+                        m.subject,
+                        sampling_create_message=sampling_create_message,
+                        source="gmail_scan",
+                        user_action="owner_replied",
+                    )
+                except Exception:
+                    pass
                 continue
         except Exception:
             _logger.warning("check_replied error for thread %s, keeping message", tid)
@@ -297,6 +310,22 @@ async def run_mail_task(
     for index, candidate in enumerate(candidates, start=1):
         _report_progress(progress_callback, "read_context", current=index, total=len(candidates))
         ctx = await read_candidate_context(input_.mailbox_id, candidate)
+        try:
+            from ..contact_memory.retriever import contact_email_from_header, format_contact_context_for_prompt, retrieve_contact_context
+            from ..contact_memory.types import ContactMemoryQuery
+            contact_context = await retrieve_contact_context(ContactMemoryQuery(
+                mailbox=input_.mailbox_id,
+                contact_email=contact_email_from_header(str(candidate.evidence.get("from", ""))),
+                current_subject=str(candidate.evidence.get("subject", "")),
+                current_body=str(candidate.evidence.get("snippet", "")),
+                current_thread_id=candidate.thread_id,
+                purpose="card_generation",
+            ), sampling_create_message=sampling_create_message)
+            rendered_contact_context = format_contact_context_for_prompt(contact_context)
+            if rendered_contact_context != "No relevant contact memory.":
+                ctx.contact_context = rendered_contact_context
+        except Exception:
+            pass
         contexts.append(ctx)
     _report_progress(progress_callback, "read_context_done", total=len(contexts))
     _logger.info("read_context done: %d candidates", len(contexts))
@@ -349,6 +378,7 @@ async def run_mail_task(
                     user_request=input_.user_request,
                     mode=input_.mode if hasattr(input_, 'mode') else "auto",
                     low_value_items=low_value_items,
+                    sampling_create_message=sampling_create_message,
                 )
                 _report_progress(progress_callback, "storage_saved")
             except Exception as exc:
@@ -422,6 +452,7 @@ async def run_mail_task(
                 user_request=input_.user_request,
                 mode=input_.mode if hasattr(input_, 'mode') else "auto",
                 low_value_items=low_value_items,
+                sampling_create_message=sampling_create_message,
             )
             _report_progress(progress_callback, "storage_saved")
         except Exception as exc:
@@ -719,6 +750,7 @@ Match by EMAIL ADDRESS (between < >), not by display name.
                 user_request=plan.user_request,
                 mode="custom",
                 plan_id=plan.plan_id,
+                sampling_create_message=sampling_create_message,
             )
         except Exception:
             pass
@@ -778,6 +810,7 @@ async def _persist_run_results(
     mode: str,
     plan_id: str = "",
     low_value_items: list[dict[str, Any]] | None = None,
+    sampling_create_message: Any = None,
 ) -> None:
     lock = _PERSIST_LOCKS.setdefault(mailbox, asyncio.Lock())
     async with lock:
@@ -786,6 +819,7 @@ async def _persist_run_results(
             candidates=candidates, judgments=judgments,
             strategy_mode=strategy_mode, user_request=user_request, mode=mode,
             plan_id=plan_id, low_value_items=low_value_items,
+            sampling_create_message=sampling_create_message,
         )
 
 
@@ -801,6 +835,7 @@ async def _persist_run_results_locked(
     mode: str,
     plan_id: str = "",
     low_value_items: list[dict[str, Any]] | None = None,
+    sampling_create_message: Any = None,
 ) -> None:
     from ..storage.ops import (
         mark_messages_processed_batch,
@@ -894,6 +929,31 @@ async def _persist_run_results_locked(
     existing = await get_active_cards(mailbox)
     merged = merge_cards(existing, new_cards)
     await set_active_cards(mailbox, merged)
+    try:
+        from ..contact_memory.indexer import ingest_card_event, ingest_thread_observation
+        card_thread_ids = {card.thread_id for card in new_cards if getattr(card, "thread_id", "")}
+        for card in new_cards:
+            if getattr(card, "card_type", "") != "cleanup_bundle":
+                await ingest_card_event(
+                    mailbox,
+                    card,
+                    event_type="card_created",
+                    source="gmail_scan",
+                    sampling_create_message=sampling_create_message,
+                )
+        for candidate in candidates:
+            if candidate.thread_id and candidate.thread_id not in card_thread_ids:
+                await ingest_thread_observation(
+                    mailbox,
+                    candidate.thread_id,
+                    str(candidate.evidence.get("from", "")),
+                    str(candidate.evidence.get("subject", "")),
+                    sampling_create_message=sampling_create_message,
+                    source="gmail_scan",
+                    user_action="message_seen",
+                )
+    except Exception as exc:
+        _logger.warning("contact_memory_ingest_failed mailbox=%s error=%s", mailbox, exc)
 
     # 4. Save run record
     cards_summary = cards_to_frontend(merged)

@@ -1,0 +1,32 @@
+npm error config prefix cannot be changed from project config: C:\Users\24848\Desktop\inbox-sdk\anna-inbox\.npmrc.
+Port 5173 is in use, trying another one...
+
+  [32m[1mVITE[22m v8.0.16[39m  [2mready in [0m[1m186[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m5174[22m/[39m
+[2m[32m  ➜[39m[22m[2m  press [22m[1mh + enter[22m[2m to show help[22m
+[2m10:00:28[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/drawers/Drawers.tsx[22m
+[2m10:08:04[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/drawers/Drawers.tsx[22m
+[2m10:11:13[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/drawers/Drawers.tsx[22m
+[2m10:12:20[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/drawers/Drawers.tsx[22m
+[2m10:15:45[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/drawers/Drawers.tsx[22m
+[2m11:20:57[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/app/App.tsx, /features/handle/HandleView.tsx, /features/brief/BottomBar.tsx, /features/brief/BriefView.tsx[22m
+[2m11:21:22[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/brief/BriefView.tsx[22m
+[2m11:22:08[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/styles/global.css[22m
+[2m11:49:36[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/app/App.tsx, /features/handle/HandleView.tsx, /features/brief/BottomBar.tsx, /features/brief/BriefView.tsx[22m
+[2m11:49:45[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/brief/BriefView.tsx[22m
+[2m11:49:51[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/brief/BriefView.tsx[22m
+[2m11:59:36[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/brief/BriefView.tsx[22m
+[2m11:59:42[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/styles/global.css[22m
+[2m12:13:58[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/app/App.tsx, /features/handle/HandleView.tsx, /features/brief/BottomBar.tsx, /features/brief/BriefView.tsx[22m
+[2m12:14:14[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/app/App.tsx, /features/handle/HandleView.tsx, /features/brief/BottomBar.tsx, /features/brief/BriefView.tsx[22m
+[2m13:16:49[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/app/App.tsx[22m
+[2m13:17:24[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/app/App.tsx[22m
+[2m13:18:00[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/drawers/Drawers.tsx[22m
+[2m13:18:08[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/drawers/Drawers.tsx[22m
+[2m13:18:16[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/drawers/Drawers.tsx[22m
+[2m13:18:24[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/drawers/Drawers.tsx[22m
+[2m13:18:42[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/app/App.tsx[22m
+[2m13:19:24[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/app/App.tsx[22m
+[2m13:19:41[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/app/App.tsx[22m
+[2m13:20:11[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/features/handle/HandleView.tsx[22m

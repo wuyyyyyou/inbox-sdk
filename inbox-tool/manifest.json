@@ -40,6 +40,13 @@
       "description": "DashScope model name (e.g. qwen3-max). Defaults to qwen3-max if not set.",
       "required": false,
       "sensitive": false
+    },
+    {
+      "name": "GMAIL_MULTI_TOKENS",
+      "display_name": "Gmail Multi-Mailbox Tokens",
+      "description": "JSON array of {email, access_token, refresh_token, client_id, client_secret, expires_at} for additional mailboxes. Leave empty for single-mailbox mode.",
+      "required": false,
+      "sensitive": true
     }
   ],
   "tools": [
@@ -917,6 +924,102 @@
           "type": "string",
           "description": "Plan ID from get_custom_plans.",
           "required": true
+        }
+      ]
+    },
+    {
+      "name": "list_contact_memories",
+      "description": "List contact memory summaries for one or more mailboxes.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address, or all.",
+          "required": false
+        },
+        {
+          "name": "mailboxes",
+          "type": "array",
+          "description": "Mailbox email addresses.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "get_contact_memory",
+      "description": "Get one contact memory file.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "contact_email",
+          "type": "string",
+          "description": "Contact email address.",
+          "required": true
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "delete_contact_memory",
+      "description": "Delete one contact memory file.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "contact_email",
+          "type": "string",
+          "description": "Contact email address.",
+          "required": true
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "clear_contact_memories",
+      "description": "Delete all contact memories for one or more mailboxes.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address, or all.",
+          "required": false
+        },
+        {
+          "name": "mailboxes",
+          "type": "array",
+          "description": "Mailbox email addresses.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
         }
       ]
     }

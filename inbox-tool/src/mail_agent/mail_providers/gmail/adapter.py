@@ -57,14 +57,58 @@ def sanitize_mailbox_id(mailbox: str) -> str:
 
 _discovered_email: str = ""
 
+# 多邮箱 token 映射表 {email: {access_token, refresh_token, ...}}
+_multi_token_map: dict[str, dict[str, Any]] = {}
+
 
 def _looks_like_email(value: str) -> bool:
     return "@" in value and "." in value.split("@")[-1]
 
 
+def set_multi_tokens(tokens: list[dict[str, Any]]) -> None:
+    global _multi_token_map
+    for record in tokens:
+        email = str(record.get("email") or "").strip().lower()
+        if _looks_like_email(email):
+            _multi_token_map[email] = dict(record)
+
+
+def get_multi_token_map() -> dict[str, dict[str, Any]]:
+    return dict(_multi_token_map)
+
+
+def get_multi_token_emails() -> list[str]:
+    return sorted(_multi_token_map.keys())
+
+
+def _schedule_aps_persist() -> None:
+    """调度异步 APS 写入，刷新后的 token 通过 event loop 持久化。"""
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            tokens = [{"email": e, **{k: v for k, v in r.items() if not k.startswith("_")}}
+                      for e, r in _multi_token_map.items()]
+            asyncio.run_coroutine_threadsafe(_async_persist_multi_tokens(tokens), loop)
+    except RuntimeError:
+        pass
+
+
+async def _async_persist_multi_tokens(tokens: list[dict[str, Any]]) -> None:
+    try:
+        from ...storage.ops import set_multi_tokens as set_mt
+        await set_mt(tokens)
+    except Exception:
+        pass
+
+
 def normalize_mailbox(mailbox: str) -> str:
     global _discovered_email
     raw = str(mailbox or "").strip().lower()
+
+    # Multi-token path: accept any registered multi-token email.
+    if raw in _multi_token_map:
+        return raw
 
     # Platform path: if a token is available, discover the authorized email once.
     if os.environ.get("GMAIL_ACCESS_TOKEN") or os.environ.get("GOOGLE_ACCESS_TOKEN"):
@@ -72,7 +116,6 @@ def normalize_mailbox(mailbox: str) -> str:
             _discovered_email = get_authorized_email().lower()
         if not _discovered_email:
             raise ValueError("Gmail token is present but could not resolve authorized email from profile")
-        # Accept any mailbox that matches the discovered email; treat unknown names as the discovered email.
         if raw == _discovered_email:
             return _discovered_email
         if _looks_like_email(raw):
@@ -270,13 +313,36 @@ def _refresh_access_token(record: dict[str, Any]) -> None:
     if token_file:
         clean_record = {key: value for key, value in record.items() if not key.startswith("_")}
         Path(str(token_file)).write_text(json.dumps(clean_record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return
+
+    # Multi-token: update in-memory map and schedule APS persistence.
+    email = str(record.get("email") or "").strip().lower()
+    if email and email in _multi_token_map:
+        _multi_token_map[email] = record
+        _schedule_aps_persist()
 
 
 def get_access_token(mailbox: str) -> str:
-    # Platform-injected credential — use directly, no refresh needed.
+    normalized = str(mailbox or "").strip().lower()
+
+    # Platform-injected credential — auto-refreshed by platform, highest priority.
     platform_token = os.environ.get("GMAIL_ACCESS_TOKEN") or os.environ.get("GOOGLE_ACCESS_TOKEN")
     if platform_token and platform_token.strip():
-        return str(platform_token).strip()
+        global _discovered_email
+        if not _discovered_email:
+            _discovered_email = get_authorized_email().lower()
+        if normalized == _discovered_email or not _discovered_email:
+            return str(platform_token).strip()
+
+    # Multi-token path — lookup by email, with refresh support.
+    if normalized in _multi_token_map:
+        record = _multi_token_map[normalized]
+        if _should_refresh_token(record):
+            _refresh_access_token(record)
+        token = record.get("access_token")
+        if not token:
+            raise ValueError(f"Gmail access token is missing for multi-token mailbox {mailbox}")
+        return str(token)
 
     # Local dev — read from JSON token file with refresh support.
     record = _load_token_record(mailbox)

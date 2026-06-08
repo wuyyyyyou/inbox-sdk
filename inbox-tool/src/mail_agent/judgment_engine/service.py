@@ -67,6 +67,8 @@ def _render_context_for_prompt(ctx: CandidateContext, owner_email: str = "") -> 
     body_and_thread = _render_body_and_thread(ctx, owner_email)
     if body_and_thread:
         parts.append(body_and_thread)
+    if getattr(ctx, "contact_context", ""):
+        parts.append(f"\n--- Related Contact Memory ---\n{ctx.contact_context}")
 
     return "\n".join(parts)
 
@@ -208,6 +210,7 @@ def _final_decision_schema() -> dict[str, Any]:
         "user_facing_summary": "string (short English, ≤15 words)",
         "user_facing_reason": "string (English, ≤80 chars, explain to user WHY this matters)",
         "user_facing_recommendation": "string (English, ≤80 chars, tell user WHAT to do)",
+        "reply_gaps": "{needs_user_input: bool, summary: string, questions: [{id, question, hint, required}]}",
     }
 
 
@@ -258,7 +261,8 @@ def build_judgment_prompt(
     "user_facing_recommendation": "English ≤15 words. Specific next action. Be concrete, not generic. Card Line 3.",
     "needs": "English ≤4 words. Concise label for what the user needs to do or decide. Examples: 'Kate's reply', 'Timing decision', 'Receipt acknowledgement', 'Manual review'.",
     "latest_action": "English ≤8 words. What recently happened — the latest action by a person or service. Examples: 'sent collaboration briefs', 'followed up about partnership'.",
-    "latest_actor": "English name. The person or service who performed the latest action."
+    "latest_actor": "English name. The person or service who performed the latest action.",
+    "reply_gaps": {"needs_user_input": true, "summary": "one-sentence summary", "questions": [{"id":"q1", "question":"What do you want to reply?", "hint":"short hint", "required": true}]}
   }"""
 
     prompt = f"""You are Anna, an executive email assistant. Evaluate the email against the strategy below. Output ONLY JSON — no markdown, no explanation.
@@ -333,6 +337,7 @@ Return a JSON object:
 - NEVER suggest send_email / delete_email / unsubscribe
 - CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM". If no date is available, say "recently".
 - If the body mentions a deadline or timeframe ("before this weekend", "by Friday", "next Monday"), quote it verbatim in your output. Do NOT convert relative time to an absolute calendar date. Say "before this weekend", NOT "before Jun 8".
+- reply_gaps (only when user_action="reply"): analyze what key questions the email is asking that the user needs to answer before a reply can be written. needs_user_input=true ONLY when the sender explicitly asked a question (pricing, availability, opinion, confirmation of a specific fact). needs_user_input=false for thank-you, FYI, or emails requiring no substantive response. questions: max 3, merge similar ones. Refer to the contact memory above for open loops and relationship context.
 - Output ONLY valid JSON"""
     return prompt
 
@@ -391,6 +396,8 @@ def _render_context_for_batch_prompt(ctx: CandidateContext, owner_email: str = "
             )
         thread_parts.append(footer)
         parts.append("\n".join(thread_parts))
+    if getattr(ctx, "contact_context", ""):
+        parts.append(f"Contact memory: {ctx.contact_context}")
     return "\n".join(parts)
 
 
@@ -437,12 +444,14 @@ def build_batch_judgment_prompt(
         '   "user_action":"reply","action_reason":"question_asked",\n'
         '   "title":"Person re: subject","context":"Person sent X on date. No reply yet.",\n'
         '   "suggestion":"Reply to person about X by Friday.","action":"create_draft","needs":"Reply to person",\n'
-        '   "latest_action":"sent a follow-up","latest_actor":"Sender Name","confidence":0.85}\n'
+        '   "latest_action":"sent a follow-up","latest_actor":"Sender Name",\n'
+        '   "reply_gaps":{"needs_user_input":true,"summary":"Needs pricing confirmation","questions":[{"id":"q1","question":"What price should we quote?","hint":"number or range","required":true}]}}\n'
         ']}\n\n'
         'Every input Candidate MUST have one entry in items. Do NOT skip or add.\n'
         '\n'
         '## Rules\n'
         '- user_action + action_reason must be consistent per rubric above.\n'
+        '- reply_gaps (only when user_action="reply"): include needs_user_input and questions (max 3). needs_user_input=true only for explicit questions. Use contact memory for context.\n'
         '- context: state WHAT recently happened with verifiable facts (sender name, email sent date, action). The date is the email\'s Date field from the input — it is NOT a deadline or due date. Do NOT explain why it matters.\n'
         '- suggestion: one specific, differentiated next action.\n'
         '- CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format.\n'
@@ -547,6 +556,7 @@ Return exactly this JSON shape:
   "needs": "English ≤4 words label for what the user needs to decide or do.",
   "latest_action": "English ≤8 words. What recently happened — the latest action by a person or service.",
   "latest_actor": "English name or service. Who performed the latest_action.",
+  "reply_gaps": {{"needs_user_input":true, "summary":"one-sentence summary", "questions":[{{"id":"q1", "question":"What do you want to reply?", "hint":"short hint", "required":true}}]}},
   "confidence": 0.85
 }}}}
 
@@ -566,6 +576,7 @@ Allowed action: create_draft, create_reminder, save_note, do_nothing.
 - Before output: re-read your suggestion. If it contains a time constraint, priority MUST NOT be low.
 - CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM". If no date is available, say "recently".
 - If the body mentions a deadline or timeframe ("before this weekend", "by Friday", "next Monday"), quote it verbatim in your output. Do NOT convert relative time to an absolute calendar date. Say "before this weekend", NOT "before Jun 8".
+- reply_gaps (only when user_action="reply"): analyze what key questions the email is asking that need the user's input. needs_user_input=true ONLY for explicit questions. needs_user_input=false for thank-you/FYI. questions: max 3. Refer to contact memory for open loops.
 - Output ONLY valid JSON."""
     return prompt
 
@@ -683,6 +694,11 @@ def parse_judgment_output(raw_json: dict[str, Any], strategy: MailStrategy) -> J
         mode_raw = {}
     if action_reason:
         mode_raw["action_reason"] = action_reason
+
+    # Extract reply_gaps from final_decision
+    reply_gaps = decision_raw.get("reply_gaps") if isinstance(decision_raw.get("reply_gaps"), dict) else {}
+    if reply_gaps:
+        mode_raw["reply_gaps"] = reply_gaps
 
     decision = FinalDecision(
         display_bucket=str(decision_raw.get("display_bucket") or ""),
@@ -809,6 +825,7 @@ def _parse_compact_batch_item(raw: dict[str, Any], strategy: MailStrategy) -> Ju
     reason = str(raw.get("context") or raw.get("reason") or "")[:500]
     recommendation = str(raw.get("suggestion") or raw.get("recommendation") or "")[:500]
     action_reason = str(raw.get("action_reason") or "")
+    reply_gaps = raw.get("reply_gaps") if isinstance(raw.get("reply_gaps"), dict) else {}
     display_bucket = str(raw.get("bucket") or _ITEM_TYPE_DISPLAY.get(item_type, item_type))
 
     result = JudgmentResult(
@@ -829,6 +846,7 @@ def _parse_compact_batch_item(raw: dict[str, Any], strategy: MailStrategy) -> Ju
             "bucket": display_bucket,
             "compact_item_type": item_type,
             "action_reason": action_reason,
+            "reply_gaps": reply_gaps,
             "needs": str(raw.get("needs") or ""),
             "latest_action": str(raw.get("latest_action") or ""),
             "latest_actor": str(raw.get("latest_actor") or ""),

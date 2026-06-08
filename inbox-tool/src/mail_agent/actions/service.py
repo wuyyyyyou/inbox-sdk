@@ -69,21 +69,31 @@ def _fetch_thread_context_sync(
 
 # ── Thread summary ──────────────────────────────────────────────────
 
-THREAD_SUMMARY_SYSTEM = """You are Anna's thread summarizer. Summarize an email thread for the user so they can quickly understand what happened and what's needed.
+THREAD_SUMMARY_SYSTEM = """You are Anna's thread context summarizer. Help the user decide how to handle the email without repeating the card copy.
 
-Output a JSON object with these fields:
-- core_ask: what the other party is actually asking for (1 short sentence, English)
-- current_progress: where the discussion stands right now (1-2 sentences, English)
-- open_questions: any unresolved points the user should address (English)
-- user_action_needed: what specifically the user needs to respond to (English)
-- tone: neutral | warm | urgent | waiting
+Output JSON only:
+{
+  "thread_kind": "single_short | single_normal | multi_thread | long_thread",
+  "headline": "one concise sentence",
+  "what_happened": ["only for multi-message threads"],
+  "open_questions": ["explicit unresolved points only"],
+  "reply_focus": "what the reply should cover, not a repeat of headline",
+  "related_context": ["relevant contact-memory context only"],
+  "should_show": true,
+  "confidence": "high | medium | low"
+}
 
-Keep it factual. Do not invent details not present in the thread.
-CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM"."""
+Rules:
+- Do not repeat the same fact across fields.
+- For single-message threads, do not explain current progress.
+- For short single-message threads, only summarize if contact memory adds useful context.
+- Keep every sentence short and factual.
+- Do not invent details not present in the thread or contact memory.
+CRITICAL: Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM"."""
 
 
-def build_thread_summary_prompt(thread_context: dict[str, Any], card: PersistentCard) -> str:
-    """Build the user prompt for thread summarization."""
+def build_thread_summary_prompt(thread_context: dict[str, Any], card: PersistentCard, contact_context_text: str, thread_kind: str) -> str:
+    """构建 thread summary 提示词，按线程复杂度控制摘要形态。"""
     messages_text = ""
     for i, m in enumerate(thread_context.get("messages", []), start=1):
         messages_text += f"\n--- Message {i} ---\n"
@@ -94,31 +104,128 @@ def build_thread_summary_prompt(thread_context: dict[str, Any], card: Persistent
     return f"""Card context:
 Title: {card.title}
 Summary: {card.summary}
+Recommendation: {card.recommendation}
 
+Thread kind: {thread_kind}
 Thread has {thread_context.get('message_count', 0)} messages. Latest {len(thread_context.get('messages', []))} shown below:
 {messages_text}
 
-Summarize this thread. Return JSON only."""
+Relevant contact memory:
+{contact_context_text}
+
+Return the compact context JSON."""
+
+
+def classify_thread_kind(thread_context: dict[str, Any]) -> str:
+    """根据消息数量和正文长度给 summary 选择展示形态。"""
+    messages = thread_context.get("messages", []) if isinstance(thread_context.get("messages"), list) else []
+    count = int(thread_context.get("message_count") or len(messages) or 0)
+    latest_body = str(messages[-1].get("body", "") if messages else "")
+    if count <= 1:
+        return "single_short" if len(latest_body.strip()) <= 280 else "single_normal"
+    return "long_thread" if count >= 6 or sum(len(str(m.get("body", ""))) for m in messages) > 2500 else "multi_thread"
+
+
+def _summary_max_tokens(thread_kind: str) -> int:
+    """按线程复杂度限制摘要输出长度。"""
+    return {"single_normal": 256, "multi_thread": 512, "long_thread": 768}.get(thread_kind, 256)
+
+
+def _summary_thread_context(thread_ctx: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "message_count": thread_ctx.get("message_count", 0),
+        "latest_from": thread_ctx.get("from", ""),
+        "latest_time": thread_ctx.get("latest_time", ""),
+    }
+
+
+def _contact_context_payload(contact_context: Any) -> dict[str, Any]:
+    from dataclasses import asdict
+    try:
+        return asdict(contact_context)
+    except Exception:
+        return {}
+
+
+def _related_context_lines(contact_context: Any) -> list[str]:
+    lines: list[str] = []
+    for topic in getattr(contact_context, "relevant_topics", []) or []:
+        text = " | ".join(part for part in [getattr(topic, "title", ""), getattr(topic, "summary", ""), getattr(topic, "open_loop", "")] if part)
+        if text:
+            lines.append(text[:240])
+    return _dedupe_lines(lines)[:3]
+
+
+def normalize_thread_summary_payload(payload: dict[str, Any], thread_kind: str, related_context: list[str], card: PersistentCard) -> dict[str, Any]:
+    """清理 LLM 输出，避免重复和过长。"""
+    headline = _limit_line(str(payload.get("headline") or card.title or card.summary or ""), 180)
+    what_happened = _dedupe_lines(_as_list(payload.get("what_happened")))[:3]
+    open_questions = _dedupe_lines(_as_list(payload.get("open_questions")))[:3]
+    reply_focus = _limit_line(str(payload.get("reply_focus") or card.recommendation or ""), 180)
+    merged_related = _dedupe_lines(_as_list(payload.get("related_context")) + related_context)[:3]
+    if thread_kind.startswith("single"):
+        what_happened = []
+    should_show = bool(payload.get("should_show", True)) and bool(headline or what_happened or open_questions or reply_focus or merged_related)
+    confidence = str(payload.get("confidence") or "medium")
+    if confidence not in ("high", "medium", "low"):
+        confidence = "medium"
+    return {
+        "thread_kind": thread_kind,
+        "headline": headline,
+        "what_happened": what_happened,
+        "open_questions": open_questions,
+        "reply_focus": reply_focus if reply_focus != headline else "",
+        "related_context": merged_related,
+        "should_show": should_show,
+        "confidence": confidence,
+    }
+
+
+def _as_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def _dedupe_lines(lines: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for line in lines:
+        text = _limit_line(line, 240)
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            result.append(text)
+    return result
+
+
+def _limit_line(value: str, size: int) -> str:
+    return " ".join(str(value or "").split())[:size].rstrip()
 
 
 # ── Draft reply & revise (unified) ───────────────────────────────────
 
-_DRAFT_SYSTEM = """You are Anna, an executive assistant. Generate or revise a reply email for the user.
+_DRAFT_SYSTEM = """You are Anna, writing a reply ON BEHALF OF the user.
 
 Output a JSON object with:
-- subject: reply subject line (keep original subject, add "Re: " prefix only if not already present)
-- body: the draft email body (plain text, professional but warm tone)
+- subject: reply subject line (keep original subject, add "Re: " only if needed)
+- body: the draft email body (plain text)
 - tone: the tone of the reply (e.g. "warm and professional", "brief confirmation")
 - note: a short internal note about what you did (English, <=50 chars)
 
-Guidelines:
-- Match the sender's tone and formality level
-- Be concise — reply length should be proportional to the original message
-- If the user gave specific instructions, apply them precisely while keeping unmentioned parts
-- If no existing draft, generate from scratch based on the thread and user instructions
-- Never make commitments or promises on the user's behalf
+CRITICAL — Source priority (never violate):
+1. User's explicit answers (highest priority — these are FACTS from the user)
+2. Original email thread content
+3. Contact memory context (for tone, relationship, past context only — NOT for facts)
+
+- NEVER invent facts, numbers, dates, prices, commitments, or opinions
+- Use the user's OWN WORDS wherever possible — keep their casual/formal level
+- If the user's answers are insufficient to write a meaningful reply, say so in "note" and write a placeholder body asking the user for more details
+- Be concise — reply length proportional to original message
 - Do not include email headers (To, From, CC) in the body
-- CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM"."""
+- If the user provided revision instructions, apply them precisely
+- CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format."""
 
 
 def _build_draft_prompt(
@@ -127,8 +234,10 @@ def _build_draft_prompt(
     reply_mode: str,
     current_draft: str = "",
     revision_input: str = "",
+    contact_context_text: str = "",
+    user_answers: dict[str, str] | None = None,
 ) -> str:
-    """Build the unified user prompt for draft generation or revision."""
+    """构建草稿生成/修改提示词，并注入联系人上下文。"""
     latest_msg = None
     msgs = thread_context.get("messages", [])
     if msgs:
@@ -136,6 +245,7 @@ def _build_draft_prompt(
 
     has_draft = bool(current_draft.strip())
     has_instruction = bool(revision_input.strip())
+    has_answers = bool(user_answers)
 
     parts = [
         f"Card: {card.title}",
@@ -148,12 +258,23 @@ def _build_draft_prompt(
         f"Body: {latest_msg.get('body', '')[:1200] if latest_msg else 'Not available'}",
     ]
 
+    if has_answers:
+        parts.append("\nUser's answers (AUTHORITATIVE — base the reply on these):")
+        for qid, answer in user_answers.items():
+            if answer.strip():
+                parts.append(f"- {answer}")
+
+    if contact_context_text and contact_context_text != "No relevant contact memory.":
+        parts.extend(["", "Relevant contact memory:", contact_context_text])
+
     if has_draft:
         parts.append(f"\nExisting draft:\n{current_draft}")
 
     if has_instruction:
         task = "Revise the existing draft" if has_draft else "Generate a new draft incorporating these instructions"
         parts.append(f"\nUser instruction:\n{revision_input}")
+    elif has_answers:
+        task = "Draft a reply based on the user's answers above"
     else:
         task = "Revise the existing draft considering the thread context" if has_draft else "Draft a reply based on the thread above"
 
@@ -171,31 +292,90 @@ async def summarize_thread(
     mailbox: str,
     sampling_create_message: Any = None,
 ) -> dict[str, Any]:
-    """Call LLM to summarize a thread. Returns the summary JSON."""
+    """生成 thread 摘要，并兼容联系人记忆上下文。"""
     from ..llm_runtime.service import call_llm_json_safe
+    from ..contact_memory.retriever import contact_email_from_header, format_contact_context_for_prompt, retrieve_contact_context
+    from ..contact_memory.types import ContactMemoryQuery
 
     thread_ctx = _fetch_thread_context_sync(mailbox, card)
-    prompt = build_thread_summary_prompt(thread_ctx, card)
+    contact_email = contact_email_from_header(card.original.from_addr)
+    contact_context = await retrieve_contact_context(ContactMemoryQuery(
+        mailbox=mailbox,
+        contact_email=contact_email,
+        current_subject=card.original.thread or card.title,
+        current_body=card.original.body,
+        current_thread_id=card.thread_id,
+        purpose="thread_summary",
+    ), sampling_create_message=sampling_create_message)
+    contact_context_text = format_contact_context_for_prompt(contact_context)
+    thread_kind = classify_thread_kind(thread_ctx)
+    related_context = _related_context_lines(contact_context)
 
+    if thread_kind == "single_short" and not related_context:
+        payload = {
+            "thread_kind": thread_kind,
+            "headline": "",
+            "what_happened": [],
+            "open_questions": [],
+            "reply_focus": "",
+            "related_context": [],
+            "should_show": False,
+            "confidence": "high",
+        }
+        return {
+            "summary": payload,
+            "thread_context": _summary_thread_context(thread_ctx),
+            "contact_context": _contact_context_payload(contact_context),
+            "fallback_used": False,
+            "fallback_reason": "",
+        }
+
+    if thread_kind == "single_short":
+        payload = {
+            "thread_kind": thread_kind,
+            "headline": "",
+            "what_happened": [],
+            "open_questions": [],
+            "reply_focus": contact_context.reply_guidance,
+            "related_context": related_context,
+            "should_show": True,
+            "confidence": "medium",
+        }
+        return {
+            "summary": payload,
+            "thread_context": _summary_thread_context(thread_ctx),
+            "contact_context": _contact_context_payload(contact_context),
+            "fallback_used": False,
+            "fallback_reason": "",
+        }
+
+    prompt = build_thread_summary_prompt(thread_ctx, card, contact_context_text, thread_kind)
     result = await call_llm_json_safe(
         sampling_create_message,
         system_prompt=THREAD_SUMMARY_SYSTEM,
         user_message=prompt,
-        fallback={"core_ask": "Unable to summarize", "current_progress": "", "open_questions": [], "user_action_needed": "", "tone": "neutral"},
+        fallback={
+            "thread_kind": thread_kind,
+            "headline": card.title or card.summary or "Unable to summarize",
+            "what_happened": [],
+            "open_questions": [],
+            "reply_focus": card.recommendation,
+            "related_context": related_context,
+            "should_show": True,
+            "confidence": "low",
+        },
         temperature=0.2,
-        max_tokens=20480,
+        max_tokens=_summary_max_tokens(thread_kind),
         timeout=90.0,
         metadata={"tool": "summarize_thread", "card_id": card.card_id},
     )
 
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    payload = normalize_thread_summary_payload(payload, thread_kind, related_context, card)
     return {
         "summary": payload,
-        "thread_context": {
-            "message_count": thread_ctx.get("message_count", 0),
-            "latest_from": thread_ctx.get("from", ""),
-            "latest_time": thread_ctx.get("latest_time", ""),
-        },
+        "thread_context": _summary_thread_context(thread_ctx),
+        "contact_context": _contact_context_payload(contact_context),
         "fallback_used": result.get("fallback_used", False),
         "fallback_reason": result.get("fallback_reason", ""),
     }
@@ -209,12 +389,32 @@ async def generate_draft_reply(
     *,
     current_draft: str = "",
     revision_input: str = "",
+    user_answers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Generate or revise a draft reply. If current_draft is non-empty, revises it."""
     from ..llm_runtime.service import call_llm_json_safe
+    from ..contact_memory.retriever import contact_email_from_header, format_contact_context_for_prompt, retrieve_contact_context
+    from ..contact_memory.types import ContactMemoryQuery
 
     thread_ctx = _fetch_thread_context_sync(mailbox, card)
-    prompt = _build_draft_prompt(card, thread_ctx, reply_mode, current_draft, revision_input)
+    contact_email = contact_email_from_header(card.original.from_addr)
+    contact_context = await retrieve_contact_context(ContactMemoryQuery(
+        mailbox=mailbox,
+        contact_email=contact_email,
+        current_subject=card.original.thread or card.title,
+        current_body=card.original.body,
+        current_thread_id=card.thread_id,
+        purpose="draft_generation",
+    ), sampling_create_message=sampling_create_message)
+    prompt = _build_draft_prompt(
+        card,
+        thread_ctx,
+        reply_mode,
+        current_draft,
+        revision_input,
+        format_contact_context_for_prompt(contact_context),
+        user_answers=user_answers,
+    )
 
     result = await call_llm_json_safe(
         sampling_create_message,
