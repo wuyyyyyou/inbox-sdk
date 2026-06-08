@@ -1,0 +1,1 @@
+{"value": {"mailbox": "sync_test@gmail.com", "messages": [{"id": "msg_sync", "thread_id": "t1", "from": "test@test.com", "subject": "Sync"}], "updated_at": "2024-01-01"}, "etag": "local_2_c81e72"}

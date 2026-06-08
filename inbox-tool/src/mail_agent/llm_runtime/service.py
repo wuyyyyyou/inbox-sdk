@@ -464,7 +464,7 @@ async def call_llm_json(
     max_tokens: int = 512,
     timeout: float = 60.0,
     metadata: dict[str, str] | None = None,
-    allow_sampling_provider_fallback: bool = True,
+    allow_sampling_provider_fallback: bool = False,
     stop_sequences: list[str] | None = None,
     max_attempts: int | None = None,
 ) -> dict[str, Any]:
@@ -559,7 +559,7 @@ async def call_llm_json(
             )
 
         raise RuntimeError(
-            f"Anna sampling failed after {attempts} attempts and DashScope is not available: {last_error}"
+            f"Anna sampling failed after {attempts} attempts: {last_error}"
         ) from last_error
 
     # No Anna Sampling at all; go directly to DashScope
@@ -584,7 +584,7 @@ async def call_llm_json_safe(
     timeout: float = 60.0,
     metadata: dict[str, str] | None = None,
     allow_fallback: bool = True,
-    allow_sampling_provider_fallback: bool = True,
+    allow_sampling_provider_fallback: bool = False,
     stop_sequences: list[str] | None = None,
     max_attempts: int | None = None,
 ) -> dict[str, Any]:

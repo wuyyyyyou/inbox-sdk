@@ -9,7 +9,7 @@ export const SCAN_STEPS = [
 ];
 
 const STAGE_STEP_MAP: Record<string, number> = {
-  queued: 0, parse_intent: 0, scan: 0, scan_done: 0, scan_fallback: 0, scan_fallback_empty: 0,
+  queued: 0, parse_intent: 0, scan: 0, scan_cache: 0, scan_done: 0, scan_fallback: 0, scan_fallback_empty: 0,
   storage_filter: 1, thread_dedup: 1, check_replied: 1, already_replied_filter: 1, phase1: 1, phase1_done: 1,
   read_context: 2, read_context_done: 2,
   evaluate: 3, evaluate_done: 3,
@@ -28,6 +28,7 @@ export function scanStageLabel(stage: string | undefined, progress: Record<strin
     planning_done: "Plan ready. Starting scan.",
     parse_intent: "Choosing scan strategy.",
     scan: "Reading Gmail source.",
+    scan_cache: "Loading Gmail cache.",
     scan_done: "New messages loaded.",
     scan_fallback: "Gmail API unreachable — using cached emails.",
     scan_fallback_empty: "Gmail API unreachable and cache empty — no emails available.",
@@ -53,6 +54,7 @@ export function scanProgressLabel(stage: string | undefined, progress: Record<st
   const p = progress;
   if (!stage || stage === "queued") return "";
   if (stage === "scan" || stage === "parse_intent") return "Connecting to Gmail...";
+  if (stage === "scan_cache") return `${p.lite_count || 0}/${p.matched_ids || 0} cached emails ready`;
   if (stage === "scan_done") return `${p.scanned || 0} emails loaded`;
   if (stage === "scan_fallback") return `Gmail unreachable, using ${p.cached_count || 0} cached`;
   if (stage === "scan_fallback_empty") return "No cache available — check network & token";

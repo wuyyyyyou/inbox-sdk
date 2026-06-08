@@ -159,7 +159,6 @@ Return JSON:
         max_tokens=900,
         timeout=90.0,
         metadata={"tool": "contact_memory_selector", "purpose": query.purpose},
-        allow_sampling_provider_fallback=True,
     )
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
     selected = payload.get("selected") if isinstance(payload.get("selected"), list) else []

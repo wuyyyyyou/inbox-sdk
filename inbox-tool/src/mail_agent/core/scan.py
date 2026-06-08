@@ -131,7 +131,13 @@ async def run_mail_scan(
         MessageLite 列表，按 internalDate 排序
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from ..mail_providers.gmail.adapter import live_search_and_cache, get_messages_lite, normalize_mailbox, list_messages
+    from ..mail_providers.gmail.adapter import (
+        cache_debug_info,
+        get_messages_lite_async,
+        live_search_and_cache,
+        list_messages,
+        normalize_mailbox,
+    )
 
     normalized_mailbox = normalize_mailbox(mailbox)
     budget = scan_plan.get("budget", {})
@@ -179,7 +185,20 @@ async def run_mail_scan(
 
     # 从缓存中将消息 ID 转换为 MessageLite 对象
     limited_ids = matched_ids[:max_messages]
-    messages = get_messages_lite(normalized_mailbox, limited_ids)
+    messages = await get_messages_lite_async(normalized_mailbox, limited_ids)
+    if progress_callback:
+        progress_callback("scan_cache", {
+            "matched_ids": len(limited_ids),
+            "lite_count": len(messages),
+            "cache": cache_debug_info(normalized_mailbox),
+            "partial": {
+                "brief_debug": {
+                    "gmail_cache": cache_debug_info(normalized_mailbox),
+                    "matched_ids": len(limited_ids),
+                    "lite_count": len(messages),
+                }
+            },
+        })
 
     if fallback_used:
         _logger.warning("Gmail API 不可用，回退到本地缓存：%d 封缓存邮件", len(messages))

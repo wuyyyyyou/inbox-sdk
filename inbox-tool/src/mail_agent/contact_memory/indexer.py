@@ -43,7 +43,7 @@ async def ingest_card_event(
     if not mailbox or not contact_email:
         return
 
-    messages = _thread_messages(mailbox, card.thread_id)
+    messages = await _thread_messages(mailbox, card.thread_id)
     if not messages:
         messages = [_card_as_message(card)]
     if draft_excerpt:
@@ -73,7 +73,7 @@ async def ingest_thread_observation(
     source: str = "gmail_scan",
     user_action: str = "owner_replied",
 ) -> None:
-    messages = _thread_messages(mailbox, thread_id)
+    messages = await _thread_messages(mailbox, thread_id)
     contact_header = _latest_non_owner_header(messages, mailbox) or fallback_contact_header
     if not messages:
         messages = [{
@@ -336,12 +336,12 @@ def _thread_from_payload(
     )
 
 
-def _thread_messages(mailbox: str, thread_id: str) -> list[dict[str, Any]]:
+async def _thread_messages(mailbox: str, thread_id: str) -> list[dict[str, Any]]:
     if not thread_id:
         return []
     try:
-        from ..mail_providers.gmail.adapter import get_thread_context
-        thread = get_thread_context(mailbox, thread_id, max_messages=12)
+        from ..mail_providers.gmail.adapter import get_thread_context_async
+        thread = await get_thread_context_async(mailbox, thread_id, max_messages=12)
         return [
             {
                 "message_id": msg.message_id,

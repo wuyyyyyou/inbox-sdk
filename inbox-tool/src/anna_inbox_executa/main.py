@@ -50,6 +50,7 @@ def data_root() -> Path:
 
 from executa_sdk import PROTOCOL_VERSION_V2, SamplingClient, SamplingError
 from executa_sdk.storage import StorageClient, FilesClient, StorageError, make_response_router
+from mail_agent.storage.keys import app_key
 
 JSONRPC_VERSION = "2.0"
 DEFAULT_TOOL_ID = "inbox-tool"
@@ -116,102 +117,6 @@ DEFAULT_MANIFEST = {
             "name": "check_google_oauth",
             "description": "Check whether Anna injected a Google/Gmail OAuth credential for this invocation.",
             "parameters": [],
-        },
-        {
-            "name": "ask_anna_llm",
-            "description": "Deprecated compatibility alias for ask_dashscope_llm. This still uses DashScope, not Anna sampling.",
-            "parameters": [
-                {
-                    "name": "message",
-                    "type": "string",
-                    "description": "User message to send to DashScope.",
-                    "required": True,
-                }
-            ],
-        },
-        {
-            "name": "ask_dashscope_llm",
-            "description": "Ask the configured DashScope model. This is a direct DashScope wiring test.",
-            "parameters": [
-                {
-                    "name": "message",
-                    "type": "string",
-                    "description": "User message to send to DashScope.",
-                    "required": True,
-                }
-            ],
-        },
-        {
-            "name": "ask_anna_sampling",
-            "description": "Ask Anna LLM through sampling/createMessage and return the model response.",
-            "parameters": [
-                {
-                    "name": "message",
-                    "type": "string",
-                    "description": "User message to send through Anna sampling.",
-                    "required": True,
-                },
-                {
-                    "name": "system_prompt",
-                    "type": "string",
-                    "description": "Optional system prompt.",
-                    "required": False,
-                },
-                {
-                    "name": "max_tokens",
-                    "type": "integer",
-                    "description": "Maximum output tokens. Defaults to 512.",
-                    "required": False,
-                },
-                {
-                    "name": "temperature",
-                    "type": "number",
-                    "description": "Sampling temperature. Defaults to 0.2.",
-                    "required": False,
-                },
-                {
-                    "name": "model_preference",
-                    "type": "string",
-                    "description": "Optional model hint such as gpt or claude.",
-                    "required": False,
-                },
-            ],
-        },
-        {
-            "name": "test_anna_sampling",
-            "description": "Smoke-test Anna sampling/createMessage without touching Gmail or the mail-agent pipeline.",
-            "parameters": [
-                {
-                    "name": "prompt",
-                    "type": "string",
-                    "description": "User message to send through Anna sampling.",
-                    "required": True,
-                },
-                {
-                    "name": "system_prompt",
-                    "type": "string",
-                    "description": "Optional system prompt.",
-                    "required": False,
-                },
-                {
-                    "name": "max_tokens",
-                    "type": "integer",
-                    "description": "Maximum output tokens. Defaults to 64.",
-                    "required": False,
-                },
-                {
-                    "name": "temperature",
-                    "type": "number",
-                    "description": "Sampling temperature. Defaults to 0.2.",
-                    "required": False,
-                },
-                {
-                    "name": "model_preference",
-                    "type": "string",
-                    "description": "Optional model hint such as gpt or claude.",
-                    "required": False,
-                },
-            ],
         },
         {
             "name": "test_aps_storage",
@@ -691,10 +596,10 @@ def _set_storage_backend(provider: Any = "") -> str:
     global _active_storage_provider, _route_storage_response
     selected = _normalize_storage_provider(provider)
     if selected == "aps":
-        init_storage_singleton(_aps_storage, _aps_files, scope="user")
+        init_storage_singleton(_aps_storage, _aps_files, scope="user", backend="aps")
         _route_storage_response = _aps_route_storage_response
     else:
-        init_storage_singleton(_local_storage, _local_files, scope="user")
+        init_storage_singleton(_local_storage, _local_files, scope="user", backend="local")
         _route_storage_response = lambda msg: False
     if selected != _active_storage_provider:
         # 中文注释：调试开关允许前端按工具调用切换 APS 或本地 JSON 存储。
@@ -718,6 +623,8 @@ _set_storage_backend(os.environ.get("ANNA_STORAGE_BACKEND", "local"))
 loop = asyncio.new_event_loop()
 loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
 loop_thread.start()
+from mail_agent.storage.sync_bridge import bind as bind_storage_sync_bridge
+bind_storage_sync_bridge(loop, loop_thread)
 MAIL_AGENT_RUNS: dict[str, dict[str, Any]] = {}
 RUN_STATE_LOCK = threading.RLock()
 RUN_CHECKPOINT_DIR = data_root() / "runs" / "background"
@@ -926,102 +833,6 @@ def token_dir() -> Path:
     return repo_root() / "scripts" / "google_token" / ".secrets" / "gmail_tokens"
 
 
-def cache_dir() -> Path:
-    override = os.environ.get("ZHAOPY_MAIL_AGENT_DATA_DIR")
-    base = Path(override).expanduser().resolve() if override else data_root() / "gmail_cache"
-    path = base / "mailboxes"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def mailbox_cache_dir(mailbox: str) -> Path:
-    path = cache_dir() / sanitize_mailbox_id(mailbox)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def index_path(mailbox: str) -> Path:
-    return mailbox_cache_dir(mailbox) / "index.json"
-
-
-def message_path(mailbox: str, message_id: str) -> Path:
-    return mailbox_cache_dir(mailbox) / f"{sanitize_mailbox_id(message_id)}.json"
-
-
-def read_cache(mailbox: str) -> dict[str, Any]:
-    path = index_path(mailbox)
-    if not path.exists():
-        return {"mailbox": mailbox, "messages": [], "updated_at": None}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {"mailbox": mailbox, "messages": [], "updated_at": None}
-    if not isinstance(payload, dict):
-        return {"mailbox": mailbox, "messages": [], "updated_at": None}
-    messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
-    return {"mailbox": mailbox, "messages": messages, "updated_at": payload.get("updated_at")}
-
-
-def write_index(mailbox: str, messages: list[dict[str, Any]]) -> None:
-    payload = {
-        "mailbox": mailbox,
-        "updated_at": beijing_now(),
-        "message_count": len(messages),
-        "messages": messages,
-    }
-    index_path(mailbox).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def write_message(mailbox: str, message: dict[str, Any]) -> None:
-    message_id = str(message.get("id") or "")
-    if not message_id:
-        raise ValueError("Cannot cache Gmail message without id")
-    message_path(mailbox, message_id).write_text(json.dumps(message, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def read_message(mailbox: str, message_id: str) -> dict[str, Any]:
-    path = message_path(mailbox, message_id)
-    if not path.exists():
-        raise ValueError(f"Cached message not found: {message_id}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError(f"Cached message is invalid: {message_id}")
-    return payload
-
-
-def message_summary(message: dict[str, Any]) -> dict[str, Any]:
-    body_text = str(message.get("body_text") or "")
-    headers = message.get("raw_headers") if isinstance(message.get("raw_headers"), dict) else {}
-    summary_keys = [
-        "id",
-        "thread_id",
-        "mailbox",
-        "history_id",
-        "internal_date",
-        "date",
-        "from",
-        "to",
-        "cc",
-        "bcc",
-        "subject",
-        "message_id",
-        "in_reply_to",
-        "references",
-        "label_ids",
-        "snippet",
-        "size_estimate",
-        "mime_type",
-        "attachments",
-        "fetched_at",
-    ]
-    summary = {key: message.get(key) for key in summary_keys}
-    summary["body_preview"] = body_text[:500]
-    summary["body_length"] = len(body_text)
-    summary["raw_header_count"] = len(headers)
-    summary["json_file"] = str(message_path(str(message.get("mailbox") or ""), str(message.get("id") or "")))
-    return summary
-
-
 def load_local_token_record(mailbox: str) -> dict[str, Any]:
     candidates = [
         token_dir() / f"{sanitize_mailbox_id(mailbox)}.json",
@@ -1187,54 +998,34 @@ def normalize_message(mailbox: str, message: dict[str, Any]) -> dict[str, Any]:
 
 
 def read_primary_emails(mailbox_arg: str, limit_arg: Any) -> dict[str, Any]:
-    mailbox = normalize_mailbox(mailbox_arg)
-    limit = max(1, min(int(limit_arg or 5), 20))
-    refs_payload = gmail_request(mailbox, "/users/me/messages", {"q": "category:primary", "maxResults": limit})
-    refs = refs_payload.get("messages") or []
-    existing = read_cache(mailbox)
-    by_id = {str(item.get("id")): item for item in existing["messages"] if item.get("id")}
-    fetched_summaries: list[dict[str, Any]] = []
-    added_count = 0
-    updated_count = 0
-    for ref in refs:
-        message_id = ref.get("id") if isinstance(ref, dict) else None
-        if not message_id:
-            continue
-        full = gmail_request(mailbox, f"/users/me/messages/{urllib.parse.quote(str(message_id), safe='')}", {"format": "full"})
-        normalized = normalize_message(mailbox, full)
-        write_message(mailbox, normalized)
-        summary = message_summary(normalized)
-        if str(message_id) in by_id:
-            updated_count += 1
-        else:
-            added_count += 1
-        by_id[str(message_id)] = summary
-        fetched_summaries.append(summary)
+    from mail_agent.mail_providers.gmail.adapter import cache_debug_info, live_search_and_cache, list_messages, normalize_mailbox as adapter_normalize_mailbox
 
-    merged = sorted(by_id.values(), key=lambda item: int(item.get("internal_date") or 0), reverse=True)
-    write_index(mailbox, merged)
+    mailbox = adapter_normalize_mailbox(mailbox_arg)
+    limit = max(1, min(int(limit_arg or 5), 20))
+    matched_ids = live_search_and_cache(mailbox, "category:primary", limit)
+    merged = sorted(list_messages(mailbox), key=lambda item: int(item.get("internal_date") or 0), reverse=True)
+    fetched_summaries = [item for item in merged if str(item.get("id") or "") in set(matched_ids)]
     return {
         "mailbox": mailbox,
         "requested": limit,
         "fetched_count": len(fetched_summaries),
-        "added_count": added_count,
-        "updated_count": updated_count,
+        "matched_ids": len(matched_ids),
         "cached_count": len(merged),
-        "cache_dir": str(mailbox_cache_dir(mailbox)),
-        "index_file": str(index_path(mailbox)),
+        "cache": cache_debug_info(mailbox),
         "messages": fetched_summaries,
         "updated_at": beijing_now(),
     }
 
 
 def list_cached_emails(mailbox_arg: str) -> dict[str, Any]:
-    mailbox = normalize_mailbox(mailbox_arg)
-    cached = read_cache(mailbox)
-    messages = sorted(cached["messages"], key=lambda item: int(item.get("internal_date") or 0), reverse=True)
+    from mail_agent.mail_providers.gmail.adapter import cache_debug_info, list_messages, read_cache as adapter_read_cache, normalize_mailbox as adapter_normalize_mailbox
+
+    mailbox = adapter_normalize_mailbox(mailbox_arg)
+    cached = adapter_read_cache(mailbox)
+    messages = sorted(list_messages(mailbox), key=lambda item: int(item.get("internal_date") or 0), reverse=True)
     return {
         "mailbox": mailbox,
-        "cache_dir": str(mailbox_cache_dir(mailbox)),
-        "index_file": str(index_path(mailbox)),
+        "cache": cache_debug_info(mailbox),
         "updated_at": cached.get("updated_at"),
         "count": len(messages),
         "messages": messages,
@@ -1242,37 +1033,17 @@ def list_cached_emails(mailbox_arg: str) -> dict[str, Any]:
 
 
 def get_cached_email(mailbox_arg: str, message_id: str) -> dict[str, Any]:
-    mailbox = normalize_mailbox(mailbox_arg)
-    message = read_message(mailbox, str(message_id or ""))
+    from mail_agent.mail_providers.gmail.adapter import cache_debug_info, read_message as adapter_read_message, normalize_mailbox as adapter_normalize_mailbox
+
+    mailbox = adapter_normalize_mailbox(mailbox_arg)
+    msg_id = str(message_id or "")
+    message = adapter_read_message(mailbox, msg_id)
     return {
         "mailbox": mailbox,
-        "json_file": str(message_path(mailbox, str(message_id or ""))),
+        "cache": cache_debug_info(mailbox),
         "message": message,
     }
 
-
-async def run_dashscope_llm(message: str, invoke_id: str) -> dict[str, Any]:
-    """调用 DashScope 文本模型，用于保留旧调试入口。"""
-    clean_message = str(message or "").strip()
-    if not clean_message:
-        return {"text": "", "note": "empty message"}
-
-    from mail_agent.llm_runtime.service import call_dashscope_text
-
-    result = await asyncio.to_thread(
-        call_dashscope_text,
-        system_prompt="You are a concise assistant inside a minimal mail-agent wiring test.",
-        user_message=clean_message,
-        max_tokens=512,
-        timeout=90.0,
-    )
-    return {
-        "text": result.get("text", ""),
-        "model": result.get("model"),
-        "usage": result.get("usage"),
-        "provider": result.get("provider"),
-        "answered_at": beijing_now(),
-    }
 
 
 def _check_gmail_auth(mailbox: str) -> dict[str, Any]:
@@ -1373,71 +1144,6 @@ async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]
     }
 
 
-async def run_anna_sampling_text(arguments: dict[str, Any], invoke_id: str, *, tool_name: str, default_max_tokens: int) -> dict[str, Any]:
-    """调用 Anna sampling/createMessage，并返回文本结果。"""
-    from mail_agent.llm_runtime.service import extract_sampling_text
-
-    prompt = str(arguments.get("message") or arguments.get("prompt") or "").strip()
-    if not prompt:
-        return {"success": False, "error": "message is required"}
-
-    max_tokens = int(arguments.get("max_tokens") or default_max_tokens)
-    temperature = float(arguments.get("temperature") if arguments.get("temperature") is not None else 0.2)
-    metadata = {
-        "executa_invoke_id": invoke_id or f"local_{uuid.uuid4().hex}",
-        "tool": tool_name,
-    }
-    model_preference = str(arguments.get("model_preference") or "").strip()
-    model_preferences = {"hints": [{"name": model_preference}]} if model_preference else None
-    started = time.time()
-    started_at = beijing_now()
-
-    try:
-        result = await sampling.create_message(
-            messages=[
-                {
-                    "role": "user",
-                    "content": {"type": "text", "text": prompt},
-                }
-            ],
-            max_tokens=max_tokens,
-            system_prompt=str(arguments.get("system_prompt") or "") or None,
-            temperature=temperature,
-            include_context="none",
-            model_preferences=model_preferences,
-            metadata=metadata,
-            timeout=90.0,
-        )
-    except SamplingError as exc:
-        return {
-            "success": False,
-            "provider": "anna-sampling",
-            "error": exc.message,
-            "error_code": exc.code,
-            "error_data": exc.data,
-            "started_at": started_at,
-            "finished_at": beijing_now(),
-            "elapsed_ms": int((time.time() - started) * 1000),
-        }
-
-    text = extract_sampling_text(result)
-    return {
-        "success": True,
-        "provider": "anna-sampling",
-        "text": text,
-        "model": result.get("model") if isinstance(result, dict) else None,
-        "usage": result.get("usage") if isinstance(result, dict) else None,
-        "stop_reason": result.get("stopReason") if isinstance(result, dict) else None,
-        "started_at": started_at,
-        "finished_at": beijing_now(),
-        "elapsed_ms": int((time.time() - started) * 1000),
-    }
-
-
-async def run_anna_sampling_smoke(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
-    """只验证 Anna sampling/createMessage 的最小链路。"""
-    return await run_anna_sampling_text(arguments, invoke_id, tool_name="test_anna_sampling", default_max_tokens=64)
-
 
 async def run_aps_storage_smoke(arguments: dict[str, Any]) -> dict[str, Any]:
     """只验证 APS KV 的最小读写链路，不触碰业务邮箱数据。"""
@@ -1445,7 +1151,7 @@ async def run_aps_storage_smoke(arguments: dict[str, Any]) -> dict[str, Any]:
 
     storage = get_storage()
     suffix = str(arguments.get("key_suffix") or uuid.uuid4().hex[:8]).strip()
-    key = f"debug/aps_smoke/{suffix}"
+    key = app_key(f"debug/aps_smoke/{suffix}")
     value = {
         "value": str(arguments.get("value") or "hello aps"),
         "ts": beijing_now(),
@@ -1454,7 +1160,7 @@ async def run_aps_storage_smoke(arguments: dict[str, Any]) -> dict[str, Any]:
 
     set_result = await storage.set(key, value, scope=storage_scope)
     get_result = await storage.get(key, scope=storage_scope)
-    list_result = await storage.list(prefix="debug/aps_smoke/", limit=20, scope=storage_scope)
+    list_result = await storage.list(prefix=app_key("debug/aps_smoke/"), limit=20, scope=storage_scope)
     list_all_result = await storage.list(limit=20, scope=storage_scope)
     delete_result = await storage.delete(key, scope=storage_scope)
     after_delete = await storage.get(key, scope=storage_scope)
@@ -1585,6 +1291,15 @@ async def run_mail_agent_pipeline(
     }
 
 
+def _merge_partial(run_id: str, partial_update: dict[str, Any]) -> None:
+    target = MAIL_AGENT_RUNS[run_id].setdefault("partial", {})
+    for key, value in partial_update.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            target[key].update(value)
+        else:
+            target[key] = value
+
+
 async def run_mail_agent_background(run_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
     MAIL_AGENT_RUNS[run_id]["status"] = "running"
     MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
@@ -1593,7 +1308,7 @@ async def run_mail_agent_background(run_id: str, arguments: dict[str, Any], invo
     def _update_progress(stage: str, progress: dict[str, Any]) -> None:
         partial_update = progress.pop("partial", None)
         if isinstance(partial_update, dict):
-            MAIL_AGENT_RUNS[run_id].setdefault("partial", {}).update(partial_update)
+            _merge_partial(run_id, partial_update)
         MAIL_AGENT_RUNS[run_id]["stage"] = stage
         MAIL_AGENT_RUNS[run_id]["progress"] = progress
         MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
@@ -1646,7 +1361,7 @@ async def run_custom_scan_background(run_id: str, plan: Any, arguments: dict[str
     def _update_progress(stage: str, progress: dict[str, Any]) -> None:
         partial_update = progress.pop("partial", None)
         if isinstance(partial_update, dict):
-            MAIL_AGENT_RUNS[run_id].setdefault("partial", {}).update(partial_update)
+            _merge_partial(run_id, partial_update)
         MAIL_AGENT_RUNS[run_id]["stage"] = stage
         MAIL_AGENT_RUNS[run_id]["progress"] = progress
         MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
@@ -2381,7 +2096,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         card = next((c for c in cards.cards if c.card_id == card_id), None)
         if not card:
             return {"error": f"Card {card_id} not found"}
-        thread_ctx = _fetch_thread_context_sync(mailbox, card)
+        thread_ctx = await asyncio.to_thread(_fetch_thread_context_sync, mailbox, card)
         contact_ctx = {}
         try:
             from mail_agent.contact_memory.retriever import contact_email_from_header, retrieve_contact_context
@@ -2763,32 +2478,11 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     arguments = params.get("arguments") or {}
     context = params.get("context") or {}
     invoke_id = str(params.get("invoke_id") or "")
-    apply_runtime_credentials(context)
     _apply_storage_provider(arguments)
+    apply_runtime_credentials(context)
 
     if tool == "check_google_oauth":
         return {"success": True, "tool": tool, "data": check_google_oauth(context)}
-    if tool in ("ask_anna_llm", "ask_dashscope_llm"):
-        future = asyncio.run_coroutine_threadsafe(run_dashscope_llm(arguments.get("message", ""), invoke_id), loop)
-        try:
-            return {"success": True, "tool": tool, "data": future.result(timeout=180.0)}
-        except SamplingError as exc:
-            raise RuntimeError(json.dumps({"code": exc.code, "message": exc.message, "data": exc.data}, ensure_ascii=False)) from exc
-    if tool == "ask_anna_sampling":
-        future = asyncio.run_coroutine_threadsafe(
-            run_anna_sampling_text(arguments, invoke_id, tool_name="ask_anna_sampling", default_max_tokens=512),
-            loop,
-        )
-        try:
-            return {"success": True, "tool": tool, "data": future.result(timeout=180.0)}
-        except SamplingError as exc:
-            raise RuntimeError(json.dumps({"code": exc.code, "message": exc.message, "data": exc.data}, ensure_ascii=False)) from exc
-    if tool == "test_anna_sampling":
-        future = asyncio.run_coroutine_threadsafe(run_anna_sampling_smoke(arguments, invoke_id), loop)
-        try:
-            return {"success": True, "tool": tool, "data": future.result(timeout=180.0)}
-        except SamplingError as exc:
-            raise RuntimeError(json.dumps({"code": exc.code, "message": exc.message, "data": exc.data}, ensure_ascii=False)) from exc
     if tool == "test_aps_storage":
         future = asyncio.run_coroutine_threadsafe(run_aps_storage_smoke(arguments), loop)
         return {"success": True, "tool": tool, "data": future.result(timeout=60.0)}

@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from ..mail_providers.gmail.adapter import get_message_detail, get_thread_context
+from ..mail_providers.gmail.adapter import get_message_detail_async, get_thread_context_async
 from ..domain.types import CandidateContext, CandidateItem
 
 
@@ -41,12 +41,12 @@ async def read_candidate_context(
         msg_id = candidate.message_ids[0] if candidate.message_ids else ""
         if not msg_id:
             return CandidateContext(type="header_only", candidate=candidate)
-        detail = get_message_detail(mailbox, msg_id)
+        detail = await get_message_detail_async(mailbox, msg_id)
         return CandidateContext(type="message_detail", candidate=candidate, message=detail)
 
     # thread_context: 从本地缓存读取完整线程消息历史
     if depth == "thread_context" and candidate.thread_id:
-        thread = get_thread_context(mailbox, candidate.thread_id, max_messages=10)
+        thread = await get_thread_context_async(mailbox, candidate.thread_id, max_messages=10)
         return CandidateContext(type="thread_context", candidate=candidate, thread=thread)
 
     # Fallback: batch_summary 或 缺少 thread_id 时降级为 header_only

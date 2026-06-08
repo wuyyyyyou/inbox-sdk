@@ -7,6 +7,7 @@ draft reply (LLM-generated, user-editable).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -297,7 +298,7 @@ async def summarize_thread(
     from ..contact_memory.retriever import contact_email_from_header, format_contact_context_for_prompt, retrieve_contact_context
     from ..contact_memory.types import ContactMemoryQuery
 
-    thread_ctx = _fetch_thread_context_sync(mailbox, card)
+    thread_ctx = await asyncio.to_thread(_fetch_thread_context_sync, mailbox, card)
     contact_email = contact_email_from_header(card.original.from_addr)
     contact_context = await retrieve_contact_context(ContactMemoryQuery(
         mailbox=mailbox,
@@ -396,7 +397,7 @@ async def generate_draft_reply(
     from ..contact_memory.retriever import contact_email_from_header, format_contact_context_for_prompt, retrieve_contact_context
     from ..contact_memory.types import ContactMemoryQuery
 
-    thread_ctx = _fetch_thread_context_sync(mailbox, card)
+    thread_ctx = await asyncio.to_thread(_fetch_thread_context_sync, mailbox, card)
     contact_email = contact_email_from_header(card.original.from_addr)
     contact_context = await retrieve_contact_context(ContactMemoryQuery(
         mailbox=mailbox,
@@ -422,7 +423,7 @@ async def generate_draft_reply(
         user_message=prompt,
         fallback={"subject": "", "body": current_draft or "", "tone": "", "note": "Draft generation failed"},
         temperature=0.3,
-        max_tokens=20480,
+        max_tokens=8192,
         timeout=150.0,
         metadata={"tool": "generate_draft", "card_id": card.card_id, "reply_mode": reply_mode},
     )
@@ -474,7 +475,8 @@ async def reply_now(
         }
 
     try:
-        result = send_reply(
+        result = await asyncio.to_thread(
+            send_reply,
             mailbox=mailbox,
             thread_id=card.thread_id,
             to_addr=card.original.from_addr,

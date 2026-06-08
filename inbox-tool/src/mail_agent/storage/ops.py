@@ -29,22 +29,23 @@ from .types import (
     UserPreferences,
     _now,
 )
+from .keys import app_key, sanitize_key_part
 
 
 # ── Key builders ────────────────────────────────────────────────────
 
 def _sanitize(email: str) -> str:
     """Sanitize email address for use in storage keys."""
-    return "".join(c if c.isalnum() or c in "._-" else "_" for c in email.strip()).strip("._") or "default"
+    return sanitize_key_part(email.strip())
 
 
 def _mailbox_prefix(mailbox: str) -> str:
-    return f"mailbox/{_sanitize(mailbox)}"
+    return app_key(f"mailbox/{_sanitize(mailbox)}")
 
 
 # ── 邮箱注册表 ────────────────────────────────────────────────
 
-MAILBOX_REGISTRY_KEY = "mailboxes/registry"
+MAILBOX_REGISTRY_KEY = app_key("mailboxes/registry")
 
 
 def _normalize_email(email: str) -> str:
@@ -160,7 +161,7 @@ async def remove_mailbox_from_registry(mailbox: str) -> MailboxRegistry:
 
 # ── 多邮箱 token 持久化 ──────────────────────────────────────────
 
-MULTI_TOKENS_KEY = "mailboxes/multi_tokens"
+MULTI_TOKENS_KEY = app_key("mailboxes/multi_tokens")
 
 
 async def get_multi_tokens() -> list[dict[str, Any]]:
@@ -261,7 +262,7 @@ async def set_scan_plan(mailbox: str, plan: ScanPlan) -> dict:
 # ── Processed message index ─────────────────────────────────────────
 
 def _msg_key(mailbox: str, message_id: str) -> str:
-    return f"{_mailbox_prefix(mailbox)}/msg/{message_id}"
+    return f"{_mailbox_prefix(mailbox)}/processed/{message_id}"
 
 
 async def get_processed_message_ids(mailbox: str) -> set[str]:
@@ -269,7 +270,7 @@ async def get_processed_message_ids(mailbox: str) -> set[str]:
 
     Uses storage.list with prefix so we avoid N individual GET calls.
     """
-    prefix = f"{_mailbox_prefix(mailbox)}/msg/"
+    prefix = f"{_mailbox_prefix(mailbox)}/processed/"
     processed: set[str] = set()
     cursor: str | None = None
     while True:
@@ -369,7 +370,7 @@ async def get_run_record(mailbox: str, run_id: str) -> RunRecord | None:
 
 # ── Run history (cross-mailbox) ─────────────────────────────────────
 
-RUN_HISTORY_KEY = "runs/history"
+RUN_HISTORY_KEY = app_key("runs/history")
 
 
 async def get_run_history(limit: int = 20) -> list[RunHistoryEntry]:
@@ -432,8 +433,8 @@ async def append_card_action(
 
 # ── User preferences ────────────────────────────────────────────────
 
-SNOOZE_KEY = "prefs/snooze"
-LEARNING_KEY = "prefs/learning"
+SNOOZE_KEY = app_key("prefs/snooze")
+LEARNING_KEY = app_key("prefs/learning")
 
 
 async def get_user_prefs() -> UserPreferences:
@@ -558,7 +559,7 @@ def _dict_to_run_history_entry(d: dict) -> RunHistoryEntry:
 
 # ── Custom scan plans ──────────────────────────────────────────────
 
-_CUSTOM_PLANS_KEY = "custom/scan_plans"
+_CUSTOM_PLANS_KEY = app_key("custom/scan_plans")
 _MAX_CUSTOM_PLANS = 20
 
 

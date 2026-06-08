@@ -1,13 +1,13 @@
 """Persistent data types for the mail agent's local JSON store.
 
 Key naming convention (user scope):
-    mailbox/{sanitized_email}/scan_state
-    mailbox/{sanitized_email}/msg/{gmail_message_id}
-    mailbox/{sanitized_email}/run/{run_id}
-    mailbox/{sanitized_email}/cards/active
-    prefs/snooze
-    prefs/learning
-    runs/history
+    anna-inbox/mailbox/{sanitized_email}/scan_state
+    anna-inbox/mailbox/{sanitized_email}/processed/{gmail_message_id}
+    anna-inbox/mailbox/{sanitized_email}/run/{run_id}
+    anna-inbox/mailbox/{sanitized_email}/cards/active
+    anna-inbox/prefs/snooze
+    anna-inbox/prefs/learning
+    anna-inbox/runs/history
 """
 
 from __future__ import annotations
@@ -168,7 +168,7 @@ class PersistentCard:
 
 @dataclass
 class ActiveCards:
-    """Wraps the active cards list stored under mailbox/{id}/cards/active."""
+    """Wraps the active cards list stored under anna-inbox/mailbox/{id}/cards/active."""
     cards: list[PersistentCard] = field(default_factory=list)
     updated_at: str = field(default_factory=_now)
 
@@ -218,7 +218,7 @@ class UserPreferences:
     learning: list[LearningRecord] = field(default_factory=list)
 
 
-# ── Run history entry (lightweight, stored in runs/history list) ────
+# ── Run history entry (lightweight, stored in anna-inbox/runs/history list) ────
 
 
 @dataclass

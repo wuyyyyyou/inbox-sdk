@@ -38,26 +38,6 @@ export interface ToolInvokeArgs {
   timeoutMs: number;
 }
 
-export interface SamplingTestResult {
-  success?: boolean;
-  provider?: string;
-  text?: string;
-  model?: string | null;
-  usage?: Record<string, unknown> | null;
-  stop_reason?: string | null;
-  error?: string;
-  error_code?: number;
-  error_data?: Record<string, unknown>;
-  diagnostics?: {
-    context_has_invoke_id?: boolean;
-    context_has_sampling_token?: boolean;
-    manifest_has_llm_sample?: boolean;
-    metadata_invoke_id?: string;
-  };
-  started_at?: string;
-  finished_at?: string;
-  elapsed_ms?: number;
-}
 
 export interface FrontendCardAction {
   id: string;
@@ -382,8 +362,6 @@ export interface AppState {
   resultFilter: ResultFilter;
   llmProvider: LlmProvider;
   storageProvider: StorageProvider;
-  samplingTestRunning: boolean;
-  samplingTestResult: SamplingTestResult | null;
   generatingDraft: boolean;
   draftDots: string;
   summarizingThread: boolean;

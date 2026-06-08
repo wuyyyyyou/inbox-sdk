@@ -419,7 +419,7 @@ async def _run_phase1_single_batch(
         user_message=user_prompt,
         fallback={"classifications": []},
         temperature=0.1,
-        max_tokens=20480,
+        max_tokens=8192,
         timeout=240.0,
         metadata=metadata,
         allow_fallback=not strict_anna_sampling,

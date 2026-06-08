@@ -17,7 +17,15 @@
       "Bash(PYTHONPATH=src python -c ' *)",
       "Bash(PYTHONPATH=src python -m pytest src/tests/test_storage_integration.py -v --tb=short)",
       "Bash(PYTHONPATH=src python -m pytest src/tests/test_gmail_query_normalize.py src/tests/test_llm_json_repair.py -v --tb=short)",
-      "Bash(PYTHONPATH=src python src/tests/test_multi_token_integration.py)"
+      "Bash(PYTHONPATH=src python src/tests/test_multi_token_integration.py)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" --connect-timeout 5 https://gmail.googleapis.com/gmail/v1/users/me/profile)",
+      "Bash(nslookup gmail.googleapis.com)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" --connect-timeout 5 https://oauth2.googleapis.com/token)",
+      "Bash(wsl.exe --version)",
+      "Read(//etc/**)",
+      "Bash(ip route *)",
+      "Bash(route -n)",
+      "Bash(powershell.exe *)"
     ]
   }
 }

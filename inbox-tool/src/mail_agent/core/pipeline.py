@@ -246,7 +246,20 @@ async def run_mail_task(
         from ..storage.ops import filter_unprocessed
         new_message_ids = await filter_unprocessed(input_.mailbox_id, all_message_ids)
         skipped = len(all_message_ids) - len(new_message_ids)
-        _report_progress(progress_callback, "storage_filter", total=len(all_message_ids), new=len(new_message_ids), skipped=skipped)
+        _report_progress(
+            progress_callback,
+            "storage_filter",
+            total=len(all_message_ids),
+            new=len(new_message_ids),
+            skipped=skipped,
+            partial={
+                "brief_debug": {
+                    "total_scanned_ids": len(all_message_ids),
+                    "skipped_processed": skipped,
+                    "new_after_processed": len(new_message_ids),
+                }
+            },
+        )
         _logger.info("storage_filter: %d total, %d new, %d skipped", len(all_message_ids), len(new_message_ids), skipped)
     new_id_set = set(new_message_ids)
     new_messages = [m for m in messages if m.message_id in new_id_set]
@@ -303,7 +316,19 @@ async def run_mail_task(
     phase1_result = await run_phase1_batch_classify(new_messages, strategy, mailbox_profile, sampling_create_message)
     candidates = phase1_result["candidates"]
     low_value_items = phase1_result["low_value_items"]
-    _report_progress(progress_callback, "phase1_done", scanned=len(messages), candidates=len(candidates), low_value=len(low_value_items))
+    _report_progress(
+        progress_callback,
+        "phase1_done",
+        scanned=len(messages),
+        candidates=len(candidates),
+        low_value=len(low_value_items),
+        partial={
+            "brief_debug": {
+                "candidates": len(candidates),
+                "low_value": len(low_value_items),
+            }
+        },
+    )
     _logger.info("phase1 done: %d candidates, %d low_value", len(candidates), len(low_value_items))
 
     contexts = []
@@ -520,7 +545,7 @@ async def run_custom_scan(
     与 Brief 管线完全解耦。不走 phase1/judgment/guards/cards。
     执行 LLM 根据 plan.task_prompt 直接完成分析和输出。
     """
-    from mail_agent.mail_providers.gmail.adapter import normalize_mailbox, get_message_detail
+    from mail_agent.mail_providers.gmail.adapter import normalize_mailbox, get_message_detail_async
     from mail_agent.llm_runtime.service import call_llm_json_safe
 
     query_count = len(plan.gmail_queries or [])
@@ -592,7 +617,7 @@ async def run_custom_scan(
 
         if read_depth == "message_detail" or read_depth == "thread_context":
             try:
-                detail = get_message_detail(normalized_mailbox, msg.message_id)
+                detail = await get_message_detail_async(normalized_mailbox, msg.message_id)
                 if detail:
                     entry["body"] = (getattr(detail, "body_text", "") or "")[:4000]
             except Exception:
@@ -600,8 +625,8 @@ async def run_custom_scan(
 
         if read_depth == "thread_context":
             try:
-                from mail_agent.mail_providers.gmail.adapter import get_thread_context
-                thread_ctx = get_thread_context(normalized_mailbox, msg.thread_id or msg.message_id)
+                from mail_agent.mail_providers.gmail.adapter import get_thread_context_async
+                thread_ctx = await get_thread_context_async(normalized_mailbox, msg.thread_id or msg.message_id)
                 if thread_ctx and thread_ctx.messages:
                     entry["thread"] = []
                     for tm in thread_ctx.messages:
@@ -686,7 +711,7 @@ Match by EMAIL ADDRESS (between < >), not by display name.
                 user_message=_build_user_prompt(rendered_emails),
                 fallback={"title": "Scan failed", "summary": "Unable to analyze emails.", "sections": []},
                 temperature=0.2,
-                max_tokens=20480,
+                max_tokens=8192,
                 timeout=180.0,
                 metadata={
                     "tool": "run_custom_scan_agent",

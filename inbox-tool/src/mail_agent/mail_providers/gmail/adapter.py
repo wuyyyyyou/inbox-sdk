@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ...domain.types import MessageDetail, MessageLite, ThreadContext
+from ...storage.keys import app_key
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
@@ -151,9 +152,69 @@ def _message_path(mailbox: str, message_id: str) -> Path:
     return _mailbox_cache_dir(mailbox) / f"{sanitize_mailbox_id(message_id)}.json"
 
 
+def _storage_cache_enabled() -> bool:
+    try:
+        from ...storage.client import backend, is_ready
+        return is_ready() and backend() == "aps"
+    except Exception:
+        return False
+
+
+def _storage_cache_prefix(mailbox: str) -> str:
+    return app_key(f"gmail_cache/mailboxes/{sanitize_mailbox_id(mailbox)}")
+
+
+def _storage_index_key(mailbox: str) -> str:
+    return f"{_storage_cache_prefix(mailbox)}/index"
+
+
+def _storage_message_key(mailbox: str, message_id: str) -> str:
+    return f"{_storage_cache_prefix(mailbox)}/messages/{sanitize_mailbox_id(message_id)}"
+
+
+def _storage_get_value_sync(key: str, *, timeout: float = 30.0) -> Any:
+    from ...storage.client import get_storage, scope as default_scope
+    from ...storage.sync_bridge import run as run_storage_sync
+    result = run_storage_sync(get_storage().get(key, scope=default_scope()), timeout=timeout)
+    return result.get("value") if result.get("exists") else None
+
+
+def _storage_set_value_sync(key: str, value: Any, *, timeout: float = 30.0) -> None:
+    from ...storage.client import get_storage, scope as default_scope
+    from ...storage.sync_bridge import run as run_storage_sync
+    run_storage_sync(get_storage().set(key, value, scope=default_scope()), timeout=timeout)
+
+
+async def _storage_get_value_async(key: str, *, timeout: float = 30.0) -> Any:
+    from ...storage.client import get_storage, scope as default_scope
+    result = await get_storage().get(key, scope=default_scope(), timeout=timeout)
+    return result.get("value") if result.get("exists") else None
+
+
+def cache_debug_info(mailbox: str) -> dict[str, Any]:
+    if _storage_cache_enabled():
+        return {
+            "backend": "aps",
+            "prefix": _storage_cache_prefix(mailbox),
+            "index_key": _storage_index_key(mailbox),
+        }
+    return {
+        "backend": "local",
+        "cache_dir": str(_mailbox_cache_dir(mailbox)),
+        "index_file": str(_index_path(mailbox)),
+    }
+
+
 # ── Cache read / write ────────────────────────────────────────────
 
 def list_messages(mailbox: str) -> list[dict[str, Any]]:
+    if _storage_cache_enabled():
+        payload = _storage_get_value_sync(_storage_index_key(mailbox))
+        if not isinstance(payload, dict):
+            return []
+        messages = payload.get("messages")
+        return messages if isinstance(messages, list) else []
+
     path = _index_path(mailbox)
     if not path.exists():
         return []
@@ -165,6 +226,13 @@ def list_messages(mailbox: str) -> list[dict[str, Any]]:
 
 
 def read_cache(mailbox: str) -> dict[str, Any]:
+    if _storage_cache_enabled():
+        payload = _storage_get_value_sync(_storage_index_key(mailbox))
+        if not isinstance(payload, dict):
+            return {"mailbox": mailbox, "messages": [], "updated_at": None}
+        messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+        return {"mailbox": mailbox, "messages": messages, "updated_at": payload.get("updated_at")}
+
     path = _index_path(mailbox)
     if not path.exists():
         return {"mailbox": mailbox, "messages": [], "updated_at": None}
@@ -185,6 +253,9 @@ def write_index(mailbox: str, messages: list[dict[str, Any]]) -> None:
         "message_count": len(messages),
         "messages": messages,
     }
+    if _storage_cache_enabled():
+        _storage_set_value_sync(_storage_index_key(mailbox), payload)
+        return
     _index_path(mailbox).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -192,18 +263,36 @@ def write_message(mailbox: str, message: dict[str, Any]) -> None:
     message_id = str(message.get("id") or "")
     if not message_id:
         raise ValueError("Cannot cache Gmail message without id")
+    if _storage_cache_enabled():
+        _storage_set_value_sync(_storage_message_key(mailbox, message_id), message)
+        return
     _message_path(mailbox, message_id).write_text(
         json.dumps(message, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
 
 
 def read_message(mailbox: str, message_id: str) -> dict[str, Any]:
+    if _storage_cache_enabled():
+        payload = _storage_get_value_sync(_storage_message_key(mailbox, message_id))
+        if isinstance(payload, dict):
+            return payload
+        raise ValueError(f"Cached message not found: {message_id}")
+
     path = _message_path(mailbox, message_id)
     if not path.exists():
         raise ValueError(f"Cached message not found: {message_id}")
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Cached message is invalid: {message_id}")
+    return payload
+
+
+async def read_message_async(mailbox: str, message_id: str) -> dict[str, Any]:
+    if not _storage_cache_enabled():
+        return read_message(mailbox, message_id)
+    payload = await _storage_get_value_async(_storage_message_key(mailbox, message_id))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Cached message not found: {message_id}")
     return payload
 
 
@@ -220,7 +309,12 @@ def message_summary(message: dict[str, Any]) -> dict[str, Any]:
     summary["body_preview"] = body_text[:500]
     summary["body_length"] = len(body_text)
     summary["raw_header_count"] = len(headers)
-    summary["json_file"] = str(_message_path(str(message.get("mailbox") or ""), str(message.get("id") or "")))
+    mailbox = str(message.get("mailbox") or "")
+    message_id = str(message.get("id") or "")
+    if _storage_cache_enabled():
+        summary["cache_key"] = _storage_message_key(mailbox, message_id)
+    else:
+        summary["json_file"] = str(_message_path(mailbox, message_id))
     return summary
 
 
@@ -636,30 +730,44 @@ def _to_message_lite(msg: dict[str, Any]) -> MessageLite:
 def get_messages_lite(mailbox: str, message_ids: list[str]) -> list[MessageLite]:
     results: list[MessageLite] = []
     for msg_id in message_ids:
-        path = _message_path(mailbox, msg_id)
-        if not path.exists():
-            continue
         try:
-            msg = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+            msg = read_message(mailbox, msg_id)
+        except (ValueError, RuntimeError, TimeoutError, json.JSONDecodeError):
             continue
         if isinstance(msg, dict):
             results.append(_to_message_lite(msg))
     return results
 
 
+async def get_messages_lite_async(mailbox: str, message_ids: list[str]) -> list[MessageLite]:
+    if not _storage_cache_enabled():
+        return get_messages_lite(mailbox, message_ids)
+
+    results: list[MessageLite] = []
+    for msg_id in message_ids:
+        try:
+            msg = await _storage_get_value_async(_storage_message_key(mailbox, msg_id))
+        except Exception:
+            msg = None
+        if isinstance(msg, dict):
+            results.append(_to_message_lite(msg))
+    return results
+
+
 def get_message_detail(mailbox: str, message_id: str) -> MessageDetail | None:
-    path = _message_path(mailbox, message_id)
-    if not path.exists():
-        return None
     try:
-        msg = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        msg = read_message(mailbox, message_id)
+    except (ValueError, RuntimeError, TimeoutError, json.JSONDecodeError):
         return None
     if not isinstance(msg, dict):
         return None
 
     body_text = str(msg.get("body_text") or "")
+    return _to_message_detail(msg, body_text)
+
+
+def _to_message_detail(msg: dict[str, Any], body_text: str | None = None) -> MessageDetail:
+    body_text = str(msg.get("body_text") or "") if body_text is None else body_text
     return MessageDetail(
         message_id=str(msg.get("id") or ""),
         thread_id=str(msg.get("thread_id") or ""),
@@ -684,12 +792,41 @@ def get_message_detail(mailbox: str, message_id: str) -> MessageDetail | None:
     )
 
 
+async def get_message_detail_async(mailbox: str, message_id: str) -> MessageDetail | None:
+    try:
+        msg = await read_message_async(mailbox, message_id)
+    except (ValueError, RuntimeError, TimeoutError, json.JSONDecodeError):
+        return None
+    if not isinstance(msg, dict):
+        return None
+    return _to_message_detail(msg)
+
+
 def get_thread_context(mailbox: str, thread_id: str, max_messages: int = 10) -> ThreadContext:
     all_msgs = list_messages(mailbox)
     thread_msgs: list[MessageDetail] = []
     for summary in all_msgs:
         if str(summary.get("thread_id") or "") == thread_id:
             detail = get_message_detail(mailbox, str(summary.get("id") or ""))
+            if detail:
+                thread_msgs.append(detail)
+        if len(thread_msgs) >= max_messages:
+            break
+
+    thread_msgs.sort(key=lambda m: m.internal_date)
+    return ThreadContext(thread_id=thread_id, messages=thread_msgs)
+
+
+async def get_thread_context_async(mailbox: str, thread_id: str, max_messages: int = 10) -> ThreadContext:
+    if not _storage_cache_enabled():
+        return get_thread_context(mailbox, thread_id, max_messages=max_messages)
+
+    index = await _storage_get_value_async(_storage_index_key(mailbox))
+    all_msgs = index.get("messages") if isinstance(index, dict) and isinstance(index.get("messages"), list) else []
+    thread_msgs: list[MessageDetail] = []
+    for summary in all_msgs:
+        if str(summary.get("thread_id") or "") == thread_id:
+            detail = await get_message_detail_async(mailbox, str(summary.get("id") or ""))
             if detail:
                 thread_msgs.append(detail)
         if len(thread_msgs) >= max_messages:

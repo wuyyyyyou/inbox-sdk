@@ -6,6 +6,7 @@ from dataclasses import asdict
 from typing import Any
 
 from ..storage.client import get_storage, scope as default_scope
+from ..storage.keys import app_key, sanitize_key_part as sanitize_storage_key_part
 from ..storage.types import _now
 from .types import (
     ContactMemoryEvidence,
@@ -23,15 +24,15 @@ def normalize_email(value: str) -> str:
 
 def sanitize_key_part(value: str) -> str:
     text = normalize_email(value)
-    return "".join(c if c.isalnum() or c in "._-" else "_" for c in text).strip("._") or "default"
+    return sanitize_storage_key_part(text)
 
 
 def contact_memory_key(mailbox: str, contact_email: str) -> str:
-    return f"mailbox/{sanitize_key_part(mailbox)}/contacts/{sanitize_key_part(contact_email)}/memory"
+    return app_key(f"mailbox/{sanitize_key_part(mailbox)}/contacts/{sanitize_key_part(contact_email)}/memory")
 
 
 def contact_memory_prefix(mailbox: str) -> str:
-    return f"mailbox/{sanitize_key_part(mailbox)}/contacts/"
+    return app_key(f"mailbox/{sanitize_key_part(mailbox)}/contacts/")
 
 
 async def get_contact_memory(mailbox: str, contact_email: str) -> ContactMemoryFile | None:

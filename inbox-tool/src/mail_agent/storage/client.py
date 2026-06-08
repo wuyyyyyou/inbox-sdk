@@ -19,14 +19,16 @@ except ImportError:  # pragma: no cover — executa_sdk not available outside An
 _storage: Any = None
 _files: Any = None
 _scope: str = "user"
+_backend: str = ""
 
 
-def init(storage: StorageClient, files: FilesClient, *, scope: str = "user") -> None:
+def init(storage: StorageClient, files: FilesClient, *, scope: str = "user", backend: str = "") -> None:
     """Called once by main.py after creating the clients."""
-    global _storage, _files, _scope
+    global _storage, _files, _scope, _backend
     _storage = storage
     _files = files
     _scope = scope
+    _backend = str(backend or "")
 
 
 def get_storage() -> StorageClient:
@@ -46,6 +48,10 @@ def get_files() -> FilesClient:
 def scope() -> str:
     """Return the default storage scope."""
     return _scope
+
+
+def backend() -> str:
+    return _backend
 
 
 def is_ready() -> bool:
