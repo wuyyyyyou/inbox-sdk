@@ -83,6 +83,7 @@ export function HandleView() {
   const detail = state.selectedCardDetail || {};
   const context = detail.thread_context || {};
   const contactContext = detail.contact_context || {};
+  const latestBody = detail.latest_body || original.body || "";
   const summary = state.threadSummaryById[key];
   const draft = state.draftById[key] || "";
   const replyGaps = card.replyGaps;
@@ -91,6 +92,7 @@ export function HandleView() {
   const replyMode = state.replyModeById[key] || "reply_to_sender";
   const cc = asString(context.cc || original.cc || "None");
   const contextExpanded = Boolean(state.threadContextExpanded[key]);
+  const bodyExpanded = Boolean(state.threadContextExpanded[`${key}_body`]);
   const senderName = asString(context.from || original.from || "").split("<")[0].trim().replace(/"/g, "") || "Unknown";
   const threadSubject = asString(context.subject || original.thread || card.title || "").slice(0, 80);
   const hasDraft = Boolean(draft);
@@ -99,6 +101,8 @@ export function HandleView() {
   const messageCount = Number(context.message_count || 1);
   const isSingleShort = messageCount <= 1 && asString(original.body || "").trim().length <= 280;
   const relatedContext = contactContextLines(contactContext);
+  const BODY_PREVIEW = 500;
+  const bodyTruncated = latestBody.length > BODY_PREVIEW;
 
   const summaryBlock = () => {
     if (state.summarizingThread) {
@@ -159,6 +163,18 @@ export function HandleView() {
           </div>
           <span className={`category-tag ${hasDraft ? "is-ready-state" : ""}`}>{hasDraft ? "Reply ready" : "Needs review"}</span>
         </div>
+        {latestBody ? (
+          <section className="review-block">
+            <div className="original-body" style={{ whiteSpace: "pre-wrap" }}>
+              {bodyTruncated && !bodyExpanded ? latestBody.slice(0, BODY_PREVIEW) + "…" : latestBody}
+            </div>
+            {bodyTruncated ? (
+              <button className="soft-btn compact" style={{ marginTop: 6 }} onClick={() => actions.toggleThreadContext(`${key}_body`)}>
+                {bodyExpanded ? "Show less" : "Show full email"}
+              </button>
+            ) : null}
+          </section>
+        ) : null}
         {summaryBlock()}
         <section className={`review-block is-composer ${state.generatingDraft ? "is-loading" : ""}`}>
           <h3 className="review-block-title">Draft reply</h3>
@@ -207,7 +223,6 @@ export function HandleView() {
                 <div className="thread-context-row"><span>Thread</span><strong>{threadSubject}</strong></div>
                 <div className="thread-context-row"><span>Latest</span><strong>{formatBeijingTimestamp(context.latest_time || original.time)}</strong></div>
               </div>
-              <div className="original-body" style={{ marginTop: 8 }}>{original.body || "Latest email body is not available."}</div>
             </>
           ) : null}
         </section>

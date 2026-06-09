@@ -128,28 +128,54 @@ def _render_body_and_thread(ctx: CandidateContext, owner_email: str = "") -> str
     return "\n".join(parts)
 
 
+_REASON_LABELS: dict[str, str] = {
+    "automated": "Automated / no-reply emails",
+    "promotional": "Promotional or marketing content",
+    "newsletter": "Newsletter or digest",
+    "calendar": "Calendar / system notification",
+    "not_my_area": "Not my area of responsibility",
+    "cc_only": "CC'd, not primary recipient",
+}
+
+
 def _render_snooze_prefs_context(prefs: SnoozePrefs | None) -> str:
     """Render snooze preferences as prompt context for deprioritization."""
     if not prefs:
         return ""
     has_senders = bool(prefs.senders)
     has_threads = bool(prefs.threads)
+    has_reasons = bool(prefs.reasons)
     if not has_senders and not has_threads:
         return ""
 
     parts = [
         "",
         "## User Attention Preferences",
-        "The user has indicated they want to deprioritize attention from these sources.",
-        "These are NOT blocks — emails from these sources CAN still surface if they genuinely require user action.",
-        "However, apply a stricter standard: only surface items where the user MUST personally act",
-        "(reply, approve, review a security issue). Routine updates, newsletters, automated",
-        "notifications, and informational emails from these sources should be classified as low/ignore.",
+        "The user has marked these senders/threads as lower-priority. These are NOT blocks.",
     ]
     if has_senders:
-        parts.append(f"Deprioritized senders: {', '.join(prefs.senders)}")
+        parts.append(f"Deprioritized senders: {', '.join(prefs.senders[:10])}")
     if has_threads:
-        parts.append(f"Deprioritized threads: {', '.join(prefs.threads)}")
+        parts.append(f"Deprioritized threads: {', '.join(prefs.threads[:5])}")
+    if has_reasons:
+        labels = [_REASON_LABELS.get(r, r) for r in prefs.reasons if r in _REASON_LABELS]
+        if labels:
+            parts.append(f"User's stated reasons: {', '.join(labels)}.")
+            parts.append("Apply these stricter rules based on the stated reasons:")
+            if "automated" in prefs.reasons:
+                parts.append("  - automated/no-reply: surface ONLY for security alerts or anomalies; all others → low/ignore")
+            if "promotional" in prefs.reasons:
+                parts.append("  - promotional/marketing: surface ONLY if clearly personal (not mass template); all others → low/ignore")
+            if "newsletter" in prefs.reasons:
+                parts.append("  - newsletter/digest: classify as low/ignore")
+            if "calendar" in prefs.reasons:
+                parts.append("  - calendar/system: surface ONLY if time/location change needs user confirmation")
+            if "not_my_area" in prefs.reasons:
+                parts.append("  - not my area: surface ONLY if email mentions user's specific project/client")
+            if "cc_only" in prefs.reasons:
+                parts.append("  - CC only: surface ONLY if body explicitly asks the user to act")
+    else:
+        parts.append("Apply stricter standard: only surface if user MUST personally act.")
     return "\n".join(parts)
 
 
@@ -278,8 +304,8 @@ First, answer THIS question about the email:
 
   If YES → user_action = "reply"
     Then pick the BEST action_reason:
-    - question_asked: the sender explicitly asked a question or made a request that needs an answer
-    - waiting_for_you: the sender is clearly waiting for the user's input, approval, or decision
+    - question_asked: the sender explicitly asked a question or made a request that needs an answer. EXCLUDE automated notifications from noreply/notification addresses and social media alerts.
+    - waiting_for_you: the sender is clearly waiting for the user's input, approval, or decision. EXCLUDE automated reminders and system-generated messages.
     - unsent_draft: this is a draft the user wrote but never sent
     - courtesy_due: sender invested real effort (wrote 3+ substantive sentences, shared a document, or explicitly asked for the user's thoughts). Do NOT flag automated notifications, newsletters, receipts, or one-line status updates.
 
@@ -291,14 +317,16 @@ First, answer THIS question about the email:
     - receipt_or_notice: receipt, subscription confirmation, normal account notice — record only
     - cleanup: newsletter, promotion, automated digest — safe to archive
 
+  CRITICAL: If the sender address looks automated (contains "noreply", "no-reply", "notification", "@linkedin.com" alerts, social media notification bots), set user_action="review" regardless of the email body content.
+
   Priority & action_reason mapping (you MUST follow):
-    question_asked → priority≥medium, should_show_in_main_result=true
-    waiting_for_you → priority≥medium, should_show_in_main_result=true
-    unsent_draft → priority≥medium, should_show_in_main_result=true
-    courtesy_due → priority≥medium, should_show_in_main_result=true
-    security_or_billing → priority≥high, should_show_in_main_result=true
-    upcoming_event → priority≥medium
-    deal_or_pipeline → priority≥medium
+    question_asked → priority=high when: explicit deadline ("by Friday", "before EOD"), involves money/pricing/contract, or key contact (see contact memory). priority=medium otherwise. surface=true.
+    waiting_for_you → priority=high when: sender says "let me know" / "please confirm" / "I need your" AND topic is time-sensitive. priority=medium otherwise. surface=true.
+    unsent_draft → priority=medium, surface=true
+    courtesy_due → priority=medium, surface=true
+    security_or_billing → priority=critical when: unauthorized access, payment failed, service interruption imminent. priority=high otherwise. surface=true.
+    upcoming_event → priority=high when within 48 hours. priority=medium otherwise.
+    deal_or_pipeline → priority=medium
     receipt_or_notice → priority=low
     cleanup → priority=low, should_show_in_lower_priority=true
 
@@ -429,9 +457,11 @@ def build_batch_judgment_prompt(
         f"## Strategy\n{strategy.name}: {strategy.description}\n\n"
         "## Judgment Rubric — Binary Decision\n"
         "For each candidate, first decide: Does the user need to send a reply?\n"
-        "  YES (user_action=\"reply\"): question_asked | waiting_for_you | unsent_draft | courtesy_due → priority≥medium, surface=true\n"
+        "  YES (user_action=\"reply\"): question_asked | waiting_for_you | unsent_draft | courtesy_due\n"
+        "    question_asked→high if deadline/pricing/contract/key contact, else medium. waiting_for_you→high if time-sensitive with explicit ask, else medium. unsent_draft/courtesy_due→medium. surface=true.\n"
+        "    EXCLUDE: automated senders (noreply/notification/@linkedin.com alerts/social media bots).\n"
         "  NO  (user_action=\"review\"): upcoming_event | deal_or_pipeline | security_or_billing | receipt_or_notice | cleanup\n"
-        "    security_or_billing → priority≥high; upcoming_event/deal_or_pipeline → priority≥medium; receipt_or_notice/cleanup → priority=low\n"
+        "    security_or_billing→critical/high; upcoming_event→high if within 48h else medium; deal_or_pipeline→medium; receipt_or_notice/cleanup→low\n"
         f"## Mailbox Owner\n{mailbox_profile.mailbox_id} — match by EMAIL ADDRESS (between < >), not by display name.\n"
         "- Sender IS mailbox owner → OUTGOING. SENT: surface=false, priority=low, user_action=review, action_reason=cleanup.\n"
         "  DRAFT: surface=true, priority=medium, user_action=reply, action_reason=unsent_draft.\n\n"
@@ -492,8 +522,8 @@ First, answer THIS question about the email:
 
   If YES → user_action = "reply"
     Then pick the BEST action_reason:
-    - question_asked: the sender explicitly asked a question or made a request that needs an answer
-    - waiting_for_you: the sender is clearly waiting for the user's input, approval, or decision
+    - question_asked: the sender explicitly asked a question or made a request that needs an answer. EXCLUDE automated notifications from noreply/notification addresses and social media alerts.
+    - waiting_for_you: the sender is clearly waiting for the user's input, approval, or decision. EXCLUDE automated reminders and system-generated messages.
     - unsent_draft: this is a draft the user wrote but never sent
     - courtesy_due: sender invested real effort (wrote 3+ substantive sentences, shared a document, or explicitly asked for the user's thoughts). Do NOT flag automated notifications, newsletters, receipts, or one-line status updates.
 
@@ -505,14 +535,16 @@ First, answer THIS question about the email:
     - receipt_or_notice: receipt, subscription confirmation, normal account notice — record only
     - cleanup: newsletter, promotion, automated digest — safe to archive
 
+  CRITICAL: If the sender address looks automated (contains "noreply", "no-reply", "notification", "@linkedin.com" alerts, social media notification bots), set user_action="review" regardless of the email body content.
+
   Priority & action_reason mapping (you MUST follow):
-    question_asked → priority≥medium, surface=true
-    waiting_for_you → priority≥medium, surface=true
-    unsent_draft → priority≥medium, surface=true
-    courtesy_due → priority≥medium, surface=true
-    security_or_billing → priority≥high, surface=true
-    upcoming_event → priority≥medium
-    deal_or_pipeline → priority≥medium
+    question_asked → priority=high when explicit deadline, money/pricing/contract, or key contact. priority=medium otherwise. surface=true.
+    waiting_for_you → priority=high when time-sensitive AND sender says "let me know"/"please confirm". priority=medium otherwise. surface=true.
+    unsent_draft → priority=medium, surface=true
+    courtesy_due → priority=medium, surface=true
+    security_or_billing → priority=critical when unauthorized/payment failed/imminent interruption. priority=high otherwise. surface=true.
+    upcoming_event → priority=high when within 48h. priority=medium otherwise.
+    deal_or_pipeline → priority=medium
     receipt_or_notice → priority=low
     cleanup → priority=low
 

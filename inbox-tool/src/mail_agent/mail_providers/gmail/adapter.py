@@ -509,7 +509,8 @@ def _header_map(message: dict[str, Any]) -> dict[str, str]:
 
 
 def _decode_body(message: dict[str, Any]) -> str:
-    parts: list[str] = []
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
 
     def walk(part: dict[str, Any]) -> None:
         mime_type = str(part.get("mimeType") or "")
@@ -520,7 +521,10 @@ def _decode_body(message: dict[str, Any]) -> str:
                 decoded = base64.urlsafe_b64decode(
                     str(data) + "=" * (-len(str(data)) % 4)
                 ).decode("utf-8", errors="replace")
-                parts.append(decoded)
+                if mime_type == "text/plain":
+                    plain_parts.append(decoded)
+                else:
+                    html_parts.append(decoded)
             except Exception:
                 return
         for child in part.get("parts") or []:
@@ -529,6 +533,10 @@ def _decode_body(message: dict[str, Any]) -> str:
 
     payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
     walk(payload)
+
+    # Prefer text/html — modern email uses it as the canonical format.
+    # Callers are responsible for stripping HTML tags as needed.
+    parts = html_parts or plain_parts
     return "\n\n".join(part.strip() for part in parts if part.strip())[:30000]
 
 
@@ -578,6 +586,7 @@ def _normalize_message(mailbox: str, message: dict[str, Any]) -> dict[str, Any]:
         "attachments": _extract_attachments(payload),
         "body_text": _decode_body(message),
         "raw_headers": headers,
+        "payload": payload,
         "fetched_at": beijing_now(),
     }
 

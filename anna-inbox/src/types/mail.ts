@@ -230,6 +230,7 @@ export interface CardDetailPayload {
   card?: FrontendCard;
   thread_context?: Record<string, unknown>;
   contact_context?: Record<string, unknown>;
+  latest_body?: string;
 }
 
 export interface ContactMemorySummary {
@@ -356,6 +357,8 @@ export interface AppState {
   threadContextExpanded: Record<string, boolean>;
   expandedDetails: Record<string, boolean>;
   snoozeMenuCardId: string;
+  snoozeReasonsKey: string;
+  expandAllConfigs: boolean;
   statusByCardId: Record<string, string>;
   lowerPriorityOpen: boolean;
   minimized: boolean;

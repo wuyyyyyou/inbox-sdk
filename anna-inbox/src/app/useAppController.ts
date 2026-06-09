@@ -62,7 +62,7 @@ function filterCardsByMailboxes(cards: FrontendCard[], selected: string[]): Fron
 }
 
 function actionCount(cards: FrontendCard[]): number {
-  return cards.filter((card) => card.status !== "resolved" && card.status !== "dismissed" && (card.userAction === "reply" || card.userAction === "review")).length;
+  return cards.filter((card) => card.status !== "dismissed" && (card.priority || "" as string) !== "low" && card.priority !== "ignore").length;
 }
 
 function selectableMailboxes(selected: string[], fallback: string): string[] {
@@ -126,7 +126,10 @@ export interface AppActions {
   clearAllCards(): Promise<void>;
   markCleanupAsRead(cardId: string): Promise<void>;
   restoreCard(cardId: string, mailbox?: string): Promise<void>;
-  snoozeCard(cardId: string, option: string): Promise<void>;
+  snoozeCard(cardId: string, option: string, reasons?: string[]): Promise<void>;
+  openSnoozeReasons(cardId: string): void;
+  closeSnoozeReasons(): void;
+  openSourcesWithConfig(): void;
   startCustomScan(): Promise<void>;
   reRunCustomPlan(planId: string): Promise<void>;
   deleteCustomPlan(planId: string): Promise<void>;
@@ -398,7 +401,7 @@ export function useAppController() {
   const actions: AppActions = {
     showToast,
     closeDrawers() {
-      setState((s) => ({ ...s, sourcesOpen: false, historyOpen: false, memoryOpen: false, originalOpen: false, scanPlanOpen: false, selectedCard: null }));
+      setState((s) => ({ ...s, sourcesOpen: false, historyOpen: false, memoryOpen: false, originalOpen: false, scanPlanOpen: false, selectedCard: null, expandAllConfigs: false }));
     },
     setView(view) {
       setState((s) => ({ ...s, view, sourcesOpen: false, historyOpen: false, memoryOpen: false, originalOpen: false, scanPlanOpen: false, lowerPriorityOpen: view === "start" ? false : s.lowerPriorityOpen }));
@@ -737,19 +740,31 @@ export function useAppController() {
         showToast(error instanceof Error ? error.message : String(error));
       }
     },
-    async snoozeCard(cardId, option) {
+    async snoozeCard(cardId, option, reasons?: string[]) {
       const optionMap: Record<string, string> = { tomorrow: "tomorrow", "next-week": "next_week", "dont-prioritize": "dont_prioritize" };
       const card = findCard(state.cards, cardId);
       if (!card) return;
       try {
-        await client.recordSnooze({ mailbox: cardMailbox(card, state.mailbox), card_id: card.id, snooze_option: optionMap[option] || option, storage_provider: state.storageProvider });
-        setState((s) => ({ ...s, snoozeMenuCardId: "" }));
+        await client.recordSnooze({ mailbox: cardMailbox(card, state.mailbox), card_id: card.id, snooze_option: optionMap[option] || option, reasons, storage_provider: state.storageProvider });
+        setState((s) => ({ ...s, snoozeMenuCardId: "", snoozeReasonsKey: "" }));
         await loadActiveCards();
         await loadRunHistory();
         showToast(option === "dont-prioritize" ? "Preference saved." : "Card snoozed.");
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       }
+    },
+    openSnoozeReasons(cardId: string) {
+      setState((s) => ({ ...s, snoozeReasonsKey: cardId, snoozeMenuCardId: "" }));
+    },
+    closeSnoozeReasons() {
+      setState((s) => ({ ...s, snoozeReasonsKey: "" }));
+    },
+    openSourcesWithConfig() {
+      const mailboxes = state.mailboxes.length ? state.mailboxes : (state.mailbox ? [{ email: state.mailbox }] : []);
+      const first = mailboxes[0]?.email || state.mailbox || "";
+      setState((s) => ({ ...s, sourcesOpen: true }));
+      if (first) void actions.setConfigMailbox(first);
     },
     async startCustomScan() {
       const userRequest = state.customScanInput.trim();

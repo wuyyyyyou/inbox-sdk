@@ -6,9 +6,20 @@ merges new cards with existing active cards, and handles snooze expiry.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from typing import Any
+
+
+def _decode_snippet(text: str) -> str:
+    """Strip HTML entities from Gmail snippet text."""
+    if not text:
+        return ""
+    text = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))) if int(m.group(1)) < 0x110000 else "?", text)
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    text = text.replace("&quot;", '"').replace("&#39;", "'")
+    return text
 
 from ..domain.types import CandidateItem, JudgmentResult, MessageLite, ReadDepth
 from ..storage.types import (
@@ -60,6 +71,10 @@ def build_card(
     )
 
     # Build original
+    import re as _re
+    _snippet = (message.snippet or "")[:500]
+    _snippet = _re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))) if int(m.group(1)) < 0x110000 else "?", _snippet)
+    _snippet = _snippet.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
     original = OriginalEmail(
         source="Gmail",
         thread=message.subject or "",
@@ -67,7 +82,7 @@ def build_card(
         to_addr=message.to_addr or "",
         time=message.internal_date or "",
         status="Connected Gmail source",
-        body=(message.snippet or "")[:500],
+        body=_snippet,
     )
 
     # Build actions
@@ -470,7 +485,10 @@ def merge_cards(existing: ActiveCards, new_cards: list[PersistentCard]) -> Activ
 
     # Process existing cards
     for card in existing.cards:
-        if card.status == "resolved" or card.status == "dismissed":
+        if card.status == "resolved":
+            merged[card.thread_id or card.card_id] = card
+            continue
+        if card.status == "dismissed":
             continue
         if card.card_type == "cleanup_bundle":
             old_cleanup = card
@@ -532,7 +550,7 @@ def cards_to_frontend(cards: ActiveCards) -> list[dict[str, Any]]:
                 "to": card.original.to_addr,
                 "time": card.original.time,
                 "status": card.original.status,
-                "body": card.original.body,
+                "body": _decode_snippet(card.original.body),
             },
             "actions": [
                 {

@@ -404,6 +404,26 @@ function HistoryDrawer() {
 
   const entryKey = (run: RunHistoryEntry) => run.run_id || `${run.ts}-${run.request}`;
 
+  // Persisted restore check: find card_ids that have a "restore" entry AFTER
+  // a restorable entry → that older entry is consumed (persists across refresh)
+  const consumedEntryIds = new Set<string>();
+  const lastRestoreTs: Record<string, string> = {};
+  for (const r of state.history) {
+    if (r.entry_type === "card_action" && r.action === "restore" && r.card_id && r.ts) {
+      if (!lastRestoreTs[r.card_id] || r.ts > lastRestoreTs[r.card_id]) {
+        lastRestoreTs[r.card_id] = r.ts;
+      }
+    }
+  }
+  for (const r of state.history) {
+    if (r.entry_type === "card_action" && RESTORABLE_ACTIONS.has(r.action || "") && r.card_id && r.ts) {
+      const lastR = lastRestoreTs[r.card_id];
+      if (lastR && r.ts < lastR) {
+        consumedEntryIds.add(entryKey(r));
+      }
+    }
+  }
+
   const toggleExpand = (run: RunHistoryEntry) => {
     const key = entryKey(run);
     setExpanded((c) => ({ ...c, [key]: !c[key] }));
@@ -437,7 +457,7 @@ function HistoryDrawer() {
     const isCard = run.entry_type === "card_action";
     const isExpanded = expanded[entryKey(run)] || false;
     const hasCardContext = !!(run.card_from || run.card_subject || run.card_summary || run.card_body);
-    const canRestore = isCard && RESTORABLE_ACTIONS.has(run.action || "") && !!run.card_id && !restoredCardIds.has(run.card_id);
+    const canRestore = isCard && RESTORABLE_ACTIONS.has(run.action || "") && !!run.card_id && !restoredCardIds.has(run.card_id) && !consumedEntryIds.has(entryKey(run));
 
     const title = isCard
       ? (run.card_title || run.card_id || "")
@@ -496,7 +516,7 @@ function HistoryDrawer() {
       <div className="drawer-body">
         {!hasAny ? <p className="assistant-copy">No history yet.</p> : null}
         {visibleGroups.map((g) => {
-          const allEntries = (grouped[g.key] || []).filter((e) => !restoredCardIds.has(e.card_id || ""));
+          const allEntries = (grouped[g.key] || []).filter((e) => !restoredCardIds.has(e.card_id || "") && !consumedEntryIds.has(entryKey(e)));
           const isCollapsed = collapsed[g.key] || false;
           const isSnooze = g.key === "snooze";
           const { byFilter, selected } = isSnooze ? _filterVisible(allEntries) : { byFilter: new Map(), selected: allEntries };

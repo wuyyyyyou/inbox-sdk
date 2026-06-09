@@ -202,6 +202,7 @@ class SnoozePrefs:
     threads: list[str] = field(default_factory=list)      # thread subjects/IDs to deprioritize
     senders: list[str] = field(default_factory=list)      # sender addresses to deprioritize
     categories: list[str] = field(default_factory=list)   # categories to deprioritize
+    reasons: list[str] = field(default_factory=list)      # "automated","promotional","newsletter","calendar","not_my_area","cc_only"
     updated_at: str = field(default_factory=_now)
 
 

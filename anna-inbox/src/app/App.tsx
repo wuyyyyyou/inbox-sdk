@@ -19,14 +19,10 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const planLabel = state.scanPlan
-    ? `${state.scanPlan.scan_window_days || 7}d · max ${state.scanPlan.max_messages || 100}`
-    : "7d · max 100";
-  const nextInfo = "";
   const mailboxLabel = state.selectedMailboxes.length > 1 ? `${state.selectedMailboxes.length} mailboxes` : state.selectedMailboxes[0] || state.mailbox;
   const subtitle = state.isScanning
     ? `Scanning ${mailboxLabel}`
-    : `${visibleCards(state.cards).length} active · ${planLabel} · ${mailboxLabel}`;
+    : `${visibleCards(state.cards).length} active · ${mailboxLabel}`;
 
   return (
     <AppContext.Provider value={{ state, actions }}>
@@ -59,7 +55,7 @@ export function App() {
             </div>
           </header>
 
-          <section className="app-content" id="appContent">
+          <section className="app-content" id="appContent" style={state.snoozeReasonsKey ? { overflow: "hidden" } : undefined}>
             {state.view === "start" && state.originalOpen ? <HandleView /> : null}
             {state.view === "start" && !state.originalOpen && (state.cards.length > 0 || !state.isScanning) ? <BriefView /> : null}
             {state.view === "start" && state.isScanning && state.cards.length === 0 ? <ScanningView /> : null}

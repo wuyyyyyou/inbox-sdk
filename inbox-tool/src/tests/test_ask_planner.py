@@ -1,0 +1,146 @@
+"""Test the Ask planner: dataclass structure + real Anna LLM sampling.
+
+Run unit test (no sampling needed):
+  cd inbox-tool/src && py -3 tests/test_ask_planner.py
+
+Run with real Anna sampling:
+  cd inbox-tool/src && py -3 tests/test_ask_planner.py --real-sampling
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+from typing import Any
+
+SRC = Path(__file__).resolve().parents[1]
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+
+def test_askplan_dataclass():
+    """AskPlan dataclass defaults and field assignment."""
+    from mail_agent.ask.planner import AskPlan
+
+    plan = AskPlan(
+        plan_id="test_1",
+        user_request="find candidates",
+        title="Test",
+        topics=[{"concept": "test", "search_terms": ["a", "b"], "relevance_hint": "hint"}],
+    )
+    assert plan.plan_id == "test_1"
+    assert plan.timeframe == "30d"
+    assert plan.confidence == 0.8
+    assert plan.direction == "inbox"
+    assert plan.people == []
+    assert plan.goal == "general_qa"
+    assert plan.task_prompt == ""
+    assert plan.gmail_flags == []
+    print("[PASS] test_askplan_dataclass")
+
+
+# ── Real sampling integration tests ────────────────────────────────────
+
+async def run_real_sampling_tests(sampling_create_message: Any):
+    """Test the Planner LLM with real Anna sampling."""
+    from mail_agent.ask.planner import plan_ask_request, AskPlan
+
+    test_cases = [
+        {
+            "name": "候选人未回复",
+            "request": "找找候选人的未回复邮件",
+        },
+        {
+            "name": "合作邮件",
+            "request": "帮我看看最近有没有合作相关的邮件",
+        },
+        {
+            "name": "等我回复",
+            "request": "有哪些邮件在等我回复",
+        },
+        {
+            "name": "发票统计",
+            "request": "本月有多少发票",
+        },
+    ]
+
+    mailbox = "test@gmail.com"
+    results: list[tuple[str, AskPlan]] = []
+
+    for tc in test_cases:
+        print(f"\n{'='*60}")
+        print(f"Test: {tc['name']}")
+        print(f"Request: {tc['request']}")
+        print(f"{'='*60}")
+
+        plan = await plan_ask_request(tc["request"], mailbox, sampling_create_message=sampling_create_message)
+
+        print(f"\n--- AskPlan ---")
+        print(f"title: {plan.title}")
+        print(f"direction: {plan.direction}")
+        print(f"timeframe: {plan.timeframe}")
+        print(f"goal: {plan.goal}")
+        print(f"confidence: {plan.confidence}")
+        print(f"fallback_used: {plan.llm_meta.get('fallback_used', False)}")
+
+        print(f"people ({len(plan.people)}):")
+        for p in plan.people:
+            print(f"  - name_hint={p['name_hint']}, role={p['role']}")
+
+        print(f"topics ({len(plan.topics)}):")
+        for t in plan.topics:
+            print(f"  - concept: {t.get('concept', '')}")
+            print(f"    search_terms ({len(t.get('search_terms', []))}): {t.get('search_terms', [])}")
+            rh = t.get('relevance_hint', '')
+            print(f"    relevance_hint: {rh[:200]}")
+
+        print(f"task_prompt: {plan.task_prompt[:250]}")
+        results.append((tc["name"], plan))
+
+    print(f"\n{'='*60}")
+    print("SUMMARY")
+    print(f"{'='*60}")
+    for name, plan in results:
+        terms_count = sum(len(t.get("search_terms", [])) for t in plan.topics)
+        print(f"  {name:20s} | goal={plan.goal:20s} | dir={plan.direction:5s} | {terms_count} terms")
+
+    return results
+
+
+# ── Main ────────────────────────────────────────────────────────────────
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Test Ask Planner")
+    parser.add_argument("--real-sampling", action="store_true", help="Run with real Anna LLM sampling")
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("Ask Planner Tests")
+    print("=" * 60)
+
+    print("\n--- Unit test ---\n")
+    test_askplan_dataclass()
+    print("\n[ALL UNIT TESTS PASSED]\n")
+
+    if args.real_sampling:
+        print("\n--- Integration tests (real Anna LLM sampling) ---\n")
+        try:
+            from anna_inbox_executa.main import _build_sampling_for_run
+            sampling = _build_sampling_for_run(
+                {"ai_provider": "anna-llm"},
+                "test_ask_planner_" + str(__import__("uuid").uuid4().hex[:8]),
+            )
+            asyncio.run(run_real_sampling_tests(sampling))
+        except Exception as exc:
+            print(f"[ERROR] {exc}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("Skipping real sampling tests. Use --real-sampling to run them.")
+        print("(Requires running inside Anna Executa environment)")
+
+
+if __name__ == "__main__":
+    main()

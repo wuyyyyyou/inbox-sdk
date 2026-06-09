@@ -54,21 +54,24 @@ Brief 链路查联系人记忆（VIP、上次沟通、风格偏好），Ask 完�
 
 1. **LLM 不写 Gmail 语法**——输出结构化参数 + 语义展开（用户概念→可搜索词），代码构建 query
 2. **两阶段 LLM**——专用 filter（相关/不相关）+ Answer LLM（深度分析），各司其职
-3. **自适应搜索**——0 结果自动放宽 query
-4. **Contact memory 接入**——人员搜索用精确邮箱地址；回答阶段注入联系人上下文
-5. **安全 guard**——输出前校验
-6. **分阶段降级**——各阶段独立失败处理
+3. **多邮箱支持**——前端多选邮箱，Planner 共享一份 AskPlan，search + filter 按邮箱并发，Candidate 汇合标注来源，Answer LLM 一次跨邮箱分析
+4. **自适应搜索**——0 结果自动放宽 query
+5. **Contact memory 接入**——人员搜索用精确邮箱地址；回答阶段注入联系人上下文
+6. **安全 guard**——输出前校验
+7. **分阶段降级**——各阶段独立失败处理
 
 ---
 
 ## 三、新架构
 
 ```
-用户请求
+用户请求 + 选中的邮箱列表 [a@x.com, b@x.com, ...]
   │
   ▼
 ┌──────────────────────────────────────────┐
 │  planner.py · Planner LLM                 │
+│                                           │
+│  只调一次——同一份 AskPlan 适用所有邮箱      │
 │                                           │
 │  "找找候选人的未回复邮件"                   │
 │    ↓ LLM 语义展开                         │
@@ -86,37 +89,29 @@ Brief 链路查联系人记忆（VIP、上次沟通、风格偏好），Ask 完�
 │  输出：AskPlan（零 Gmail 语法）             │
 └──────────────────┬───────────────────────┘
                    │
-  ▼
+    ┌──────────────┼──────────────┐
+    ▼              ▼              ▼
+  a@x.com       b@x.com       c@x.com    ← 每个邮箱并发执行 search + filter
+    │              │              │
+  search.py     search.py     search.py
+    │              │              │
+  filter        filter        filter
+    │              │              │
+    ▼              ▼              ▼
+  candidates_a  candidates_b  candidates_c
+    │              │              │
+    └──────────────┼──────────────┘
+                   │  汇合 + 标注来源邮箱
+                   ▼
 ┌──────────────────────────────────────────┐
-│  search.py · Query Builder + Searcher     │
-│  （纯代码，零 LLM）                        │
+│  answer.py · Context → Answer → Guard     │
 │                                           │
-│  1. 人员 → contact memory → 精确邮箱       │
-│  2. search_terms → Gmail OR 组            │
-│  3. + direction + timeframe → query       │
-│  4. _normalize_gmail_query() 语法修正      │
-│  5. run_mail_scan() 执行                  │
-│  6. 0 结果 → 自动放宽 × 2                  │
+│  a. 对所有候选读正文/线程 + contact memory  │
 │                                           │
-│  输出：MessageLite 列表                    │
-└──────────────────┬───────────────────────┘
-                   │
-  ▼
-┌──────────────────────────────────────────┐
-│  answer.py · Filter → Context → Answer →  │
-│             Guard                         │
+│  b. Answer LLM（一次，看全部）              │
+│     候选渲染时标注来源邮箱，LLM 有跨邮箱视野  │
 │                                           │
-│  a. 专用 Ask filter（非 Phase 1！）        │
-│     问题："这封邮件和用户请求相关吗？"       │
-│     输出：relevant / not_relevant          │
-│     ≤10 封搜索结果 → 跳过过滤              │
-│                                           │
-│  b. 读正文/线程 + contact memory 上下文    │
-│                                           │
-│  c. Answer LLM：复用 _EXECUTION_          │
-│     SYSTEM_PROMPT，只看已过滤候选          │
-│                                           │
-│  d. Guard：禁止操作 + ID 校验               │
+│  c. Guard：禁止操作 + ID 校验               │
 │                                           │
 │  输出：{title, summary, sections} → 前端   │
 └──────────────────────────────────────────┘
@@ -364,12 +359,14 @@ inbox-tool/src/mail_agent/ask/
                    # 含 Ask filter 的专用 prompt（非 Phase 1）
 ```
 
-### 修改（2 个）
+### 修改（4 个）
 
 | 文件 | 改动 |
 |------|------|
 | `core/pipeline.py` | 删除 `run_custom_scan()` 中旧逻辑，改为调用 `run_ask_pipeline()` |
-| `anna_inbox_executa/main.py` | `_start_custom_scan_async()` 中旧 Planner 替换为 `plan_ask_request()` |
+| `anna_inbox_executa/main.py` | `_start_custom_scan_async()` 中旧 Planner 替换为 `plan_ask_request()`；接受 `mailboxes` 数组参数 |
+| `features/ask/AskView.tsx` | `ask-composer-footer` 左侧 "Custom mailbox scan" 替换为多选邮箱下拉（复用 Brief `MailboxFilter` 交互模式） |
+| `app/state.ts` + `useAppController.ts` | 新增 `customScanMailboxes: string[]` 状态字段，`startCustomScan()` 传递 `mailboxes` 数组 |
 
 ### 复用基础设施（不改动）
 
@@ -400,6 +397,47 @@ inbox-tool/src/mail_agent/ask/
 | 人员 | 无特殊处理 | Contact memory 解析名字→精确邮箱 |
 | 联系人 | 判断阶段检索 | 过滤后、回答前检索 |
 | 防线 | apply_rule_guards() | 内联 guard：禁止操作 + ID 校验 |
+| 邮箱 | 遍历选中的邮箱各自跑 | Planner 共享 + search/filter 并发 + 候选汇合标注→一次 Answer |
 | 输出 | ActionPlan + Cards | {title, summary, sections} |
 
 核心差异就一个：**Brief 的 filter 问"需要回复吗"，Ask 的 filter 问"相关吗"。**
+
+---
+
+### 4.4 多邮箱编排
+
+**前端：** AskView 的 `ask-composer-footer` 中，左侧 "Custom mailbox scan" 替换为多选邮箱下拉。
+
+```
+当前：  [ Custom mailbox scan ]              [ Run ]
+改为：  [ 📧 a@x.com, b@x.com... ▾ ]         [ Run ]
+```
+
+复用 Brief `MailboxFilter` 的交互模式——紧凑 dropdown，列出所有已启用邮箱，多选 checkbox。默认选中 `state.selectedMailboxes`。用户改选后更新 `state.customScanMailboxes`。
+
+**后端：** Planner 共享一份 AskPlan，search + filter 按邮箱并发，汇合后一次 Answer LLM。
+
+```
+run_ask_pipeline(question, mailboxes=[a@x.com, b@x.com, c@x.com]):
+
+  1. Planner LLM 调一次 → AskPlan
+     同一份 plan 适用所有邮箱，因为用户的问题（"找找候选人的未回复邮件"）
+     和邮箱无关——不管搜哪个邮箱，搜索策略是一样的。
+
+  2. 对每个邮箱并发执行 search + filter：
+     a@x.com: build_queries(plan, a@x.com) → execute_search → filter → candidates_a
+     b@x.com: build_queries(plan, b@x.com) → execute_search → filter → candidates_b
+     c@x.com: build_queries(plan, c@x.com) → execute_search → filter → candidates_c
+
+  3. 汇合：
+     - 每封 candidate 标注 source_mailbox
+     - 按 internalDate 统一排序
+     - 去重：同一 thread_id 出现在多个邮箱时保留一份，标记 "出现在多个邮箱"
+
+  4. Context Reader + Answer LLM + Guard：
+     - 候选渲染时标注 [mailbox: a@x.com]
+     - Answer LLM 一次调用，有跨邮箱全局视野
+     - 输出不强制按邮箱分组——LLM 自然地提到"你的 a@x.com 邮箱里有..."
+```
+
+**降级：** 单个邮箱搜索失败→该邮箱返回空候选，不阻断其他邮箱。所有邮箱都失败→阻断返回错误。

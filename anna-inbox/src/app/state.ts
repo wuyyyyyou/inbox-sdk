@@ -52,6 +52,8 @@ export function createInitialState(): AppState {
     threadContextExpanded: {},
     expandedDetails: {},
     snoozeMenuCardId: "",
+    snoozeReasonsKey: "",
+    expandAllConfigs: false,
     statusByCardId: {},
     lowerPriorityOpen: false,
     minimized: false,

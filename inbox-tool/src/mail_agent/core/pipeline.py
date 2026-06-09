@@ -396,7 +396,7 @@ async def run_mail_task(
                 await _persist_run_results(
                     run_id=run_id,
                     mailbox=input_.mailbox_id,
-                    messages=new_messages,
+                    messages=messages,
                     candidates=candidates,
                     judgments=judgments,
                     strategy_mode=task_plan.strategy_mode,
@@ -504,7 +504,8 @@ _EXECUTION_SYSTEM_PROMPT = """You are Anna, an executive email assistant. The ma
           "suggestion": "What to do (optional)",
           "draft": "Draft reply text — REQUIRED when the user asked for reply drafts. Every item with a message_id must include a draft in that case. Otherwise omit.",
           "message_id": "Gmail message ID copied from email data (e.g. 19e62c874f8b17df)",
-          "thread_id": "Gmail thread ID copied from email data"
+          "thread_id": "Gmail thread ID copied from email data",
+          "reply_gaps": {"needs_user_input": false, "summary": "", "questions": []}
         }
       ]
     }
@@ -519,6 +520,7 @@ _EXECUTION_SYSTEM_PROMPT = """You are Anna, an executive email assistant. The ma
   - body: optional narrative (timeline, explanation). Omit if items communicate enough.
   - items: specific emails, people, or actions. Use context for verifiable facts, suggestion for next steps.
   - draft: ONLY include when the user explicitly asked for reply drafts.
+  - reply_gaps: ONLY include for items that need a reply. When the email requires a response but you lack key information that only the user knows (e.g. their availability, opinions, preferences, specific dates, budget), ask clarifying questions instead of guessing. Set needs_user_input=true and provide 1-4 specific, answerable questions. Each question should be a single sentence. If you have enough information to draft a reply confidently, set needs_user_input=false and omit questions.
 - message_id: copy from the "Message ID:" field in the email data. REQUIRED when draft is present — the user needs this to send or act on the email. Only omit for pure informational items without a draft.
 - thread_id: copy from the "Thread:" field in the email data. REQUIRED when draft is present.
 - from: copy from the "From:" field in the email data. REQUIRED when draft is present — this is the reply recipient.
@@ -530,6 +532,7 @@ _EXECUTION_SYSTEM_PROMPT = """You are Anna, an executive email assistant. The ma
 - Base your answer ONLY on the emails provided. If nothing matches, say so in summary.
 - Use verifiable facts from the emails — no speculation, no AI reasoning.
 - Be specific in suggestions. Avoid generic 'evaluate and respond.'
+- NEVER fill in reply_gaps.questions with information you can verify from the emails — only ask about what you genuinely cannot know.
 - CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM". If no date is available, say "recently"."""
 
 

@@ -212,12 +212,12 @@ async def aggregate_active_cards(mailboxes: list[str] | None = None) -> ActiveCa
             if not card.details.mailbox:
                 card.details.mailbox = mailbox
             cards.append(card)
-    cards.sort(key=lambda card: (card.status in ("pending", "resolved", "snoozed"), _priority_rank(card.priority), card.updated_at or card.created_at or ""), reverse=True)
+    cards.sort(key=lambda card: (_priority_rank(card.priority), card.created_at or ""), reverse=True)
     return ActiveCards(cards=cards, updated_at=latest_updated or _now())
 
 
 def _priority_rank(priority: str) -> int:
-    return {"high": 3, "medium": 2, "low": 1}.get(str(priority or "").lower(), 0)
+    return {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(str(priority or "").lower(), 0)
 
 
 # ── Scan state ──────────────────────────────────────────────────────
@@ -323,6 +323,7 @@ async def \
     if result.get("exists") and result.get("value"):
         raw = result["value"]
         cards = [_dict_to_persistent_card(c) for c in raw.get("cards", [])]
+        cards.sort(key=lambda c: (_priority_rank(c.priority), c.created_at or ""), reverse=True)
         return ActiveCards(cards=cards, updated_at=raw.get("updated_at", ""))
     return ActiveCards()
 
@@ -469,6 +470,18 @@ async def add_snooze_thread(thread: str) -> dict:
     return await set_snooze_prefs(prefs.snooze)
 
 
+async def remove_snooze_sender(sender: str) -> dict:
+    prefs = await get_user_prefs()
+    prefs.snooze.senders = [s for s in prefs.snooze.senders if s != sender]
+    return await set_snooze_prefs(prefs.snooze)
+
+
+async def remove_snooze_thread(thread: str) -> dict:
+    prefs = await get_user_prefs()
+    prefs.snooze.threads = [t for t in prefs.snooze.threads if t != thread]
+    return await set_snooze_prefs(prefs.snooze)
+
+
 async def append_learning(pattern: str, action: str) -> dict:
     result = await get_storage().get(LEARNING_KEY, scope=default_scope())
     raw = result.get("value") if result.get("exists") else {"records": []}
@@ -574,19 +587,30 @@ async def save_custom_plan(plan: Any) -> None:
     if not isinstance(plans, list):
         plans = []
 
-    plan_dict = {
-        "plan_id": plan.plan_id,
-        "user_request": plan.user_request,
-        "title": plan.title,
-        "description": plan.description,
-        "gmail_queries": plan.gmail_queries,
-        "scan_budget": plan.scan_budget,
-        "read_depth": plan.read_depth,
-        "task_prompt": plan.task_prompt,
-        "created_at": plan.created_at,
-        "last_used_at": plan.last_used_at,
-        "use_count": plan.use_count,
-        "last_result_summary": plan.last_result_summary,
+    # Support both old CustomScanPlan and new AskPlan
+    plan_dict: dict[str, Any] = {
+        "plan_id": getattr(plan, "plan_id", ""),
+        "user_request": getattr(plan, "user_request", ""),
+        "title": getattr(plan, "title", ""),
+        "description": getattr(plan, "description", ""),
+        "task_prompt": getattr(plan, "task_prompt", ""),
+        "created_at": getattr(plan, "created_at", ""),
+        "last_used_at": getattr(plan, "last_used_at", ""),
+        "use_count": getattr(plan, "use_count", 0),
+        "last_result_summary": getattr(plan, "last_result_summary", ""),
+        # Old CustomScanPlan fields (default for AskPlan)
+        "gmail_queries": getattr(plan, "gmail_queries", []),
+        "scan_budget": getattr(plan, "scan_budget", {}),
+        "read_depth": getattr(plan, "read_depth", ""),
+        # New AskPlan fields (default for old CustomScanPlan)
+        "people": getattr(plan, "people", []),
+        "topics": getattr(plan, "topics", []),
+        "timeframe": getattr(plan, "timeframe", ""),
+        "direction": getattr(plan, "direction", ""),
+        "goal": getattr(plan, "goal", ""),
+        "gmail_flags": getattr(plan, "gmail_flags", []),
+        "confidence": getattr(plan, "confidence", 0.0),
+        "_plan_type": "ask" if hasattr(plan, "direction") and not hasattr(plan, "scan_budget") else "custom",
     }
 
     # Replace existing or prepend

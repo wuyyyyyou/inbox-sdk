@@ -180,17 +180,81 @@ function CustomRunResultCard({ result }: { result: CustomRunResult }) {
   );
 }
 
-function HistoryEntry({ entry, index }: { entry: AskHistoryEntry; index: number }) {
+function runMeta(result: CustomRunResult) {
+  const trace = result.trace || {};
+  const plan = (trace.plan as Record<string, unknown>) || {
+    gmail_queries: result.plan_gmail_queries || [],
+    read_depth: result.plan_read_depth || "",
+  };
+  const queries = asQueries(plan.gmail_queries);
+  const sources = Array.isArray(trace.sources) ? trace.sources : [];
+  const progress = (trace.progress || {}) as Record<string, unknown>;
+  const found = Number(progress.scanned || sources.length || 0);
+  const readTotal = Number(progress.total || progress.emails || sources.length || 0);
+  const readCurrent = Number(progress.current || readTotal || 0);
+  const readDepth = String(plan.read_depth || result.plan_read_depth || "message_detail");
+  return { queries, found, readCurrent, readTotal, readDepth };
+}
+
+function CustomRunPreview({ result }: { result: CustomRunResult }) {
+  const sections = Array.isArray(result.sections) ? result.sections : [];
+  const previewSections = sections.slice(0, 2);
+  return (
+    <div className="ask-history-preview">
+      {result.summary ? <p className="ask-history-preview-summary">{result.summary}</p> : null}
+      {previewSections.length ? (
+        <div className="ask-history-preview-grid">
+          {previewSections.map((sec, i) => {
+            const items = Array.isArray(sec.items) ? sec.items.slice(0, 2) : [];
+            return (
+              <div className="ask-history-preview-block" key={i}>
+                <strong>{sec.heading || "Result"}</strong>
+                {sec.body ? <p>{sec.body}</p> : null}
+                {items.length ? (
+                  <ul>
+                    {items.map((item, j) => (
+                      <li key={j}>
+                        <span>{item.subject || "Email"}</span>
+                        {item.context ? <em>{item.context}</em> : null}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+      <CustomTrace result={result} />
+    </div>
+  );
+}
+
+function AskHistoryEntryRow({ entry, index }: { entry: AskHistoryEntry; index: number }) {
   const { state, actions } = useApp();
   const expanded = state.askHistoryExpanded[index] || false;
+  const meta = runMeta(entry.result);
+  const title = entry.result.plan_title || entry.result.title || entry.query || "Custom scan";
+  const summary = entry.result.summary || entry.result.plan_description || "";
+  const readLabel = meta.readTotal ? `${meta.readCurrent}/${meta.readTotal} read` : "read depth";
   return (
-    <div className="history-list-item" onClick={() => actions.toggleAskHistory(index)} style={{ cursor: "pointer" }}>
-      <p className="history-item-head">
-        <span className="history-arrow">{expanded ? "▾" : "▸"}</span>
-        <strong>{entry.query.slice(0, 60)}{entry.query.length > 60 ? "…" : ""}</strong>
-        <span className="history-item-time">{formatBeijingTimestamp(entry.timestamp)}</span>
-      </p>
-      {expanded ? <CustomRunResultCard result={entry.result} /> : null}
+    <div className={`ask-history-entry ${expanded ? "is-expanded" : ""}`}>
+      <button className="ask-history-row" onClick={() => actions.toggleAskHistory(index)} aria-expanded={expanded}>
+        <span className="ask-history-index">{String(index + 1).padStart(2, "0")}</span>
+        <span className="ask-history-main">
+          <strong>{title}</strong>
+          <span className="ask-history-query">{entry.query}</span>
+          {summary ? <span className="ask-history-summary">{summary}</span> : null}
+          <span className="ask-history-meta">
+            {meta.queries.length || "-"} queries · {meta.found || "-"} found · {readLabel} · {meta.readDepth}
+          </span>
+        </span>
+        <span className="ask-history-side">
+          <time>{formatBeijingTimestamp(entry.timestamp)}</time>
+          <span className="ask-history-toggle">{expanded ? "Hide" : "Open"}</span>
+        </span>
+      </button>
+      {expanded ? <CustomRunPreview result={entry.result} /> : null}
     </div>
   );
 }
@@ -230,26 +294,43 @@ export function AskView() {
       {latest ? <CustomRunResultCard result={latest.result} /> : null}
 
       {older.length ? (
-        <section className="noticed-section">
-          {older.map((entry, idx) => <HistoryEntry key={idx} entry={entry} index={idx + 1} />)}
+        <section className="ask-history-section">
+          <div className="ask-section-head">
+            <div>
+              <h2>Past runs</h2>
+              <p>Recent custom scans, kept compact so the latest answer stays in focus.</p>
+            </div>
+            <span>{older.length} saved</span>
+          </div>
+          {older.map((entry, idx) => <AskHistoryEntryRow key={idx} entry={entry} index={idx + 1} />)}
         </section>
       ) : null}
 
       {state.customPlans.length ? (
-        <section className="noticed-section">
-          <h2 className="noticed-title">Saved scan plans</h2>
-          <p className="noticed-subtitle">Click Re-run to execute a saved plan again without re-planning.</p>
+        <section className="ask-plans-section">
+          <div className="ask-section-head">
+            <div>
+              <h2>Saved scan plans</h2>
+              <p>Reusable scans for the currently selected mailboxes.</p>
+            </div>
+            <span>{state.customPlans.length} plan{state.customPlans.length === 1 ? "" : "s"}</span>
+          </div>
           <div className="history-list">
             {state.customPlans.map((plan) => {
               const timestampLabel = plan.last_used_at ? `Last run ${formatBeijingTimestamp(plan.last_used_at)}` : `Created ${formatBeijingTimestamp(plan.created_at || "")}`;
               return (
                 <div className="custom-plan-row" key={plan.plan_id}>
-                  <button className="history-row" disabled={state.isCustomScanning} onClick={() => void actions.reRunCustomPlan(plan.plan_id)}>
-                    <strong>{plan.title || plan.user_request?.slice(0, 60) || "Custom scan"}</strong>
+                  <div className="history-row">
+                    <div className="custom-plan-head">
+                      <strong>{plan.title || plan.user_request?.slice(0, 60) || "Custom scan"}</strong>
+                      <span className="custom-plan-delete" role="button" aria-label="Delete plan" onClick={() => void actions.deleteCustomPlan(plan.plan_id)}>Delete</span>
+                    </div>
                     <span className="custom-plan-meta">{plan.user_request?.slice(0, 100) || ""}{plan.use_count ? ` · Used ${plan.use_count} time${plan.use_count === 1 ? "" : "s"}` : ""}{timestampLabel ? ` · ${timestampLabel}` : ""}</span>
                     {plan.last_result_summary ? <span className="custom-plan-result">{plan.last_result_summary}</span> : null}
-                    <span className="custom-plan-delete" role="button" aria-label="Delete plan" onClick={(e) => { e.stopPropagation(); void actions.deleteCustomPlan(plan.plan_id); }}>Delete</span>
-                  </button>
+                    <span className="custom-plan-actions">
+                      <button className="custom-plan-run" disabled={state.isCustomScanning} onClick={() => void actions.reRunCustomPlan(plan.plan_id)}>Run</button>
+                    </span>
+                  </div>
                 </div>
               );
             })}

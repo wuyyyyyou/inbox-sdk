@@ -277,6 +277,18 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "generate_ask_draft",
+            "description": "Generate a draft reply for an Ask scan result item, incorporating user answers to clarifying questions.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "message_id", "type": "string", "description": "Gmail message ID of the email to reply to.", "required": True},
+                {"name": "thread_id", "type": "string", "description": "Gmail thread ID.", "required": False},
+                {"name": "from_addr", "type": "string", "description": "Sender email address.", "required": False},
+                {"name": "subject", "type": "string", "description": "Email subject.", "required": False},
+                {"name": "user_answers", "type": "object", "description": "Map of question text to user's answer.", "required": True},
+            ],
+        },
+        {
             "name": "start_summarize_thread",
             "description": "Start a background thread summarization. Returns run_id immediately. Poll with get_mail_agent_run.",
             "parameters": [
@@ -1555,9 +1567,10 @@ def start_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, An
 
 
 async def _start_custom_scan_async(run_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
-    """Async portion: generate plan (LLM), save it, then execute."""
-    from mail_agent.planning.custom import generate_custom_plan
-    from mail_agent.storage.ops import save_custom_plan
+    """Async portion: run the new Ask pipeline (plan → search → filter → answer → guard)."""
+    from mail_agent.ask.answer import run_ask_pipeline
+    from mail_agent.storage.ops import append_run_history, save_custom_plan, update_plan_result
+    from mail_agent.storage.types import RunHistoryEntry, _now
 
     try:
         MAIL_AGENT_RUNS[run_id]["status"] = "running"
@@ -1566,27 +1579,115 @@ async def _start_custom_scan_async(run_id: str, arguments: dict[str, Any], invok
         _save_run_checkpoint(run_id)
 
         sampling = _build_sampling_for_run(arguments, invoke_id)
-        mailbox = str(arguments.get("mailbox", "")).strip()
         user_request = str(arguments.get("user_request", "")).strip()
+        mailboxes = _memory_mailboxes(arguments)
 
-        # Step 1: Generate plan
-        plan = await generate_custom_plan(user_request, mailbox, sampling)
-        MAIL_AGENT_RUNS[run_id]["stage"] = "planning_done"
-        MAIL_AGENT_RUNS[run_id].setdefault("partial", {})["plan"] = {
-            "plan_id": plan.plan_id,
-            "title": plan.title,
-            "description": plan.description,
-            "gmail_queries": plan.gmail_queries,
-            "read_depth": plan.read_depth or "message_detail",
+        def _update_progress(stage: str, progress: dict[str, Any]) -> None:
+            partial_update = progress.pop("partial", None)
+            if isinstance(partial_update, dict):
+                _merge_partial(run_id, partial_update)
+            MAIL_AGENT_RUNS[run_id]["stage"] = stage
+            MAIL_AGENT_RUNS[run_id]["progress"] = progress
+            MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
+            if _is_warning_stage(stage):
+                warnings = MAIL_AGENT_RUNS[run_id].setdefault("warnings", [])
+                entry = {"stage": stage, "at": beijing_now(), "detail": progress}
+                existing = [w for w in warnings if w.get("stage") != stage]
+                existing.append(entry)
+                MAIL_AGENT_RUNS[run_id]["warnings"] = existing[-10:]
+            _save_run_checkpoint(run_id)
+
+        result = await run_ask_pipeline(
+            user_request=user_request,
+            mailboxes=mailboxes,
+            sampling_create_message=sampling,
+            progress_callback=_update_progress,
+        )
+
+        plan_id = result.get("plan_id", "")
+        plan_title = result.get("plan_title", "")
+        plan_queries = result.get("plan_queries", [])
+        plan_topics = result.get("plan_topics", [])
+
+        result_data: dict[str, Any] = {
+            "success": True,
+            "run_id": run_id,
+            "plan_id": plan_id,
+            "plan_title": plan_title,
+            "plan_description": result.get("plan_description", ""),
+            "plan_gmail_queries": plan_queries,
+            "plan_read_depth": "per_candidate",
+            "title": result.get("title", ""),
+            "summary": result.get("summary", ""),
+            "sections": result.get("sections", []),
+            "ai_provider": str(arguments.get("ai_provider", "anna-llm") or "anna-llm"),
+            "planner_llm": result.get("planner_llm", {}),
+            "executor_llm": result.get("llm_meta", {}),
+            "trace": {
+                "plan": {
+                    "plan_id": plan_id,
+                    "title": plan_title,
+                    "topics": plan_topics,
+                    "timeframe": result.get("plan_timeframe", ""),
+                    "direction": result.get("plan_direction", ""),
+                    "goal": result.get("plan_goal", ""),
+                    "queries": plan_queries,
+                },
+                "mailboxes": mailboxes,
+                "messages_scanned": result.get("messages_scanned", 0),
+                "candidates_found": result.get("candidates_found", 0),
+                "sources": MAIL_AGENT_RUNS[run_id].get("partial", {}).get("sources", []),
+                "progress": MAIL_AGENT_RUNS[run_id].get("progress", {}),
+                "started_at": MAIL_AGENT_RUNS[run_id].get("started_at"),
+                "updated_at": beijing_now(),
+            },
         }
-        MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
+        MAIL_AGENT_RUNS[run_id].update({
+            "status": "done",
+            "stage": "done",
+            "updated_at": beijing_now(),
+            "result": result_data,
+        })
         _save_run_checkpoint(run_id)
 
-        # Step 2: Save plan
-        await save_custom_plan(plan)
+        # Persist plan and update result
+        from types import SimpleNamespace
+        plan_obj = SimpleNamespace(
+            plan_id=plan_id,
+            user_request=user_request,
+            title=plan_title,
+            description=result.get("plan_description", ""),
+            task_prompt="",
+            created_at=beijing_now(),
+            last_used_at=beijing_now(),
+            use_count=1,
+            last_result_summary="",
+            people=result.get("plan_topics", []),  # topics stored as people-ish for compat
+            topics=result.get("plan_topics", []),
+            timeframe=result.get("plan_timeframe", "30d"),
+            direction=result.get("plan_direction", "inbox"),
+            goal=result.get("plan_goal", "general_qa"),
+            gmail_flags=result.get("plan_gmail_flags", []),
+            confidence=0.8,
+        )
+        await save_custom_plan(plan_obj)
+        section_count = len(result.get("sections", []))
+        item_count = sum(len(s.get("items", [])) for s in result.get("sections", []))
+        await update_plan_result(plan_id, f"{section_count} sections, {item_count} items")
 
-        # Step 3: Execute
-        await run_custom_scan_background(run_id, plan, arguments, invoke_id)
+        # Write run history
+        history_entry = RunHistoryEntry(
+            run_id=run_id,
+            mailbox=mailboxes[0] if mailboxes else "",
+            ts=_now(),
+            entry_type="scan",
+            request=user_request[:100],
+            plan_id=plan_id,
+            result=f"{section_count} sections, {item_count} items",
+            summary=result.get("summary", "")[:200],
+        )
+        await append_run_history(history_entry)
+
     except Exception as exc:
         MAIL_AGENT_RUNS[run_id].update({
             "status": "failed",
@@ -1632,9 +1733,12 @@ def re_run_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, A
 
 
 async def _re_run_custom_scan_async(run_id: str, plan_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
-    """Async portion: load plan and execute."""
+    """Async portion: load plan and execute.
+
+    Routes to the new Ask pipeline for plans saved by the new planner,
+    or the old run_custom_scan path for legacy CustomScanPlan plans.
+    """
     from mail_agent.storage.ops import get_custom_plan
-    from mail_agent.domain.types import CustomScanPlan
 
     try:
         MAIL_AGENT_RUNS[run_id]["status"] = "running"
@@ -1645,9 +1749,108 @@ async def _re_run_custom_scan_async(run_id: str, plan_id: str, arguments: dict[s
         if not plan_dict:
             raise ValueError(f"Custom plan not found: {plan_id}")
 
+        user_request = str(plan_dict.get("user_request", "")).strip()
+
+        # New Ask plans have _plan_type == "ask" — reconstruct AskPlan, skip Planner
+        if plan_dict.get("_plan_type") == "ask":
+            from mail_agent.ask.answer import run_ask_pipeline
+            from mail_agent.ask.planner import AskPlan
+            from mail_agent.storage.ops import append_run_history, update_plan_result
+            from mail_agent.storage.types import RunHistoryEntry, _now
+
+            sampling = _build_sampling_for_run(arguments, invoke_id)
+            mailboxes = _memory_mailboxes(arguments)
+
+            ask_plan = AskPlan(
+                plan_id=plan_id,
+                user_request=user_request,
+                title=str(plan_dict.get("title", "")),
+                description=str(plan_dict.get("description", "")),
+                people=list(plan_dict.get("people", [])),
+                topics=list(plan_dict.get("topics", [])),
+                timeframe=str(plan_dict.get("timeframe", "30d")),
+                direction=str(plan_dict.get("direction", "inbox")),
+                goal=str(plan_dict.get("goal", "general_qa")),
+                task_prompt=str(plan_dict.get("task_prompt", "")),
+                gmail_flags=list(plan_dict.get("gmail_flags", [])),
+            )
+
+            def _update_progress(stage: str, progress: dict[str, Any]) -> None:
+                partial_update = progress.pop("partial", None)
+                if isinstance(partial_update, dict):
+                    _merge_partial(run_id, partial_update)
+                MAIL_AGENT_RUNS[run_id]["stage"] = stage
+                MAIL_AGENT_RUNS[run_id]["progress"] = progress
+                MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
+                if _is_warning_stage(stage):
+                    warnings = MAIL_AGENT_RUNS[run_id].setdefault("warnings", [])
+                    entry = {"stage": stage, "at": beijing_now(), "detail": progress}
+                    existing = [w for w in warnings if w.get("stage") != stage]
+                    existing.append(entry)
+                    MAIL_AGENT_RUNS[run_id]["warnings"] = existing[-10:]
+                _save_run_checkpoint(run_id)
+
+            result = await run_ask_pipeline(
+                mailboxes=mailboxes,
+                plan=ask_plan,
+                sampling_create_message=sampling,
+                progress_callback=_update_progress,
+            )
+
+            section_count = len(result.get("sections", []))
+            item_count = sum(len(s.get("items", [])) for s in result.get("sections", []))
+            await update_plan_result(plan_id, f"{section_count} sections, {item_count} items")
+
+            result_data: dict[str, Any] = {
+                "success": True,
+                "run_id": run_id,
+                "plan_id": plan_id,
+                "plan_title": result.get("plan_title", ""),
+                "plan_description": result.get("plan_description", ""),
+                "plan_gmail_queries": result.get("plan_queries", []),
+                "plan_read_depth": "per_candidate",
+                "title": result.get("title", ""),
+                "summary": result.get("summary", ""),
+                "sections": result.get("sections", []),
+                "ai_provider": str(arguments.get("ai_provider", "anna-llm") or "anna-llm"),
+                "planner_llm": result.get("planner_llm", {}),
+                "executor_llm": result.get("llm_meta", {}),
+                "trace": {
+                    "plan": {"plan_id": plan_id, "title": result.get("plan_title", ""),
+                             "topics": result.get("plan_topics", []),
+                             "queries": result.get("plan_queries", []),
+                    },
+                    "mailboxes": mailboxes,
+                    "messages_scanned": result.get("messages_scanned", 0),
+                    "candidates_found": result.get("candidates_found", 0),
+                },
+            }
+            MAIL_AGENT_RUNS[run_id].update({
+                "status": "done",
+                "stage": "done",
+                "updated_at": beijing_now(),
+                "result": result_data,
+            })
+            _save_run_checkpoint(run_id)
+
+            history_entry = RunHistoryEntry(
+                run_id=run_id,
+                mailbox=mailboxes[0] if mailboxes else "",
+                ts=_now(),
+                entry_type="scan",
+                request=user_request[:100],
+                plan_id=plan_id,
+                result=f"{section_count} sections, {item_count} items",
+                summary=result.get("summary", "")[:200],
+            )
+            await append_run_history(history_entry)
+            return
+
+        # Old CustomScanPlan path
+        from mail_agent.domain.types import CustomScanPlan
         plan = CustomScanPlan(
             plan_id=plan_dict.get("plan_id", plan_id),
-            user_request=plan_dict.get("user_request", ""),
+            user_request=user_request,
             title=plan_dict.get("title", ""),
             description=plan_dict.get("description", ""),
             gmail_queries=plan_dict.get("gmail_queries", []),
@@ -2097,6 +2300,35 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if not card:
             return {"error": f"Card {card_id} not found"}
         thread_ctx = await asyncio.to_thread(_fetch_thread_context_sync, mailbox, card)
+
+        # Read full body from cache, re-decode to pick up _decode_body fix.
+        # New cache entries include raw payload for re-decoding; old ones
+        # fall back to cached body_text with light dedup.
+        latest_body = card.original.body or ""
+        try:
+            from mail_agent.mail_providers.gmail.adapter import normalize_mailbox, _decode_body, read_message
+            msg = read_message(normalize_mailbox(mailbox), card.message_id)
+            if isinstance(msg, dict):
+                raw = _decode_body(msg)
+                if not raw.strip():
+                    raw = str(msg.get("body_text") or "")
+                raw = raw[:8000]
+                import re
+                raw = re.sub(r"<style[^>]*>.*?</style>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+                raw = re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+                raw = re.sub(r"<[^>]+>", "", raw)
+                raw = re.sub(r"&nbsp;", " ", raw)
+                raw = re.sub(r"&amp;", "&", raw)
+                raw = re.sub(r"&lt;", "<", raw)
+                raw = re.sub(r"&gt;", ">", raw)
+                raw = re.sub(r"&quot;", '"', raw)
+                raw = re.sub(r"&#\d+;", "", raw)
+                raw = re.sub(r"\n{3,}", "\n\n", raw)
+                raw = raw.strip()
+                latest_body = raw
+        except Exception:
+            pass
+
         contact_ctx = {}
         try:
             from mail_agent.contact_memory.retriever import contact_email_from_header, retrieve_contact_context
@@ -2107,7 +2339,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 mailbox=mailbox,
                 contact_email=contact_email,
                 current_subject=card.original.thread or card.title,
-                current_body=card.original.body,
+                current_body=latest_body,
                 current_thread_id=card.thread_id,
                 purpose="thread_summary",
             ), sampling_create_message=_detail_sampling)
@@ -2119,6 +2351,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             "card": _serialize_card_for_frontend(card),
             "thread_context": thread_ctx,
             "contact_context": contact_ctx,
+            "latest_body": latest_body,
         }
 
     # Build sampling for Anna LLM path (same logic as _build_sampling_for_run)
@@ -2175,6 +2408,27 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             from mail_agent.storage.ops import set_active_cards
             await set_active_cards(mailbox, cards)
         return result
+
+    if tool == "generate_ask_draft":
+        message_id = str(arguments.get("message_id", "")).strip()
+        thread_id = str(arguments.get("thread_id", "")).strip()
+        from_addr = str(arguments.get("from_addr", "")).strip()
+        subject = str(arguments.get("subject", "")).strip()
+        user_answers = arguments.get("user_answers") if isinstance(arguments.get("user_answers"), dict) else {}
+        if not mailbox or not message_id:
+            return {"error": "mailbox and message_id are required"}
+        if not user_answers:
+            return {"error": "user_answers is required"}
+        from mail_agent.ask.answer import generate_ask_item_draft
+        return await generate_ask_item_draft(
+            message_id=message_id,
+            thread_id=thread_id,
+            mailbox=mailbox,
+            from_addr=from_addr,
+            subject=subject,
+            user_answers=user_answers,
+            sampling_create_message=_sampling,
+        )
 
     if tool == "revise_draft":
         if not mailbox or not card_id:
@@ -2259,6 +2513,14 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             if card:
                 await add_snooze_sender(card.original.from_addr)
                 await add_snooze_thread(card.original.thread)
+                reasons = arguments.get("reasons") if isinstance(arguments.get("reasons"), list) else []
+                if reasons:
+                    from mail_agent.storage.ops import get_user_prefs, set_snooze_prefs
+                    prefs = await get_user_prefs()
+                    for r in reasons:
+                        if str(r) not in prefs.snooze.reasons:
+                            prefs.snooze.reasons.append(str(r))
+                    await set_snooze_prefs(prefs.snooze)
                 await update_card_status(mailbox, card_id, "resolved", "dont_prioritize")
             from mail_agent.storage.ops import append_card_action
             await append_card_action(mailbox, card_id, card_title, "snooze", "dont_prioritize", **_card_context(card) if card else {})
@@ -2289,9 +2551,17 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if not mailbox or not card_id:
             return {"error": "mailbox and card_id are required"}
         await update_card_status(mailbox, card_id, "pending")
-        # If it's a cleanup bundle card, mark messages as UNREAD in Gmail
+        # Remove from snooze prefs (don't-prioritize)
         cards = await storage_get_cards(mailbox)
         card = next((c for c in cards.cards if c.card_id == card_id), None)
+        if card:
+            try:
+                from mail_agent.storage.ops import remove_snooze_sender, remove_snooze_thread
+                await remove_snooze_sender(card.original.from_addr)
+                await remove_snooze_thread(card.original.thread)
+            except Exception:
+                pass
+        # If it's a cleanup bundle card, mark messages as UNREAD in Gmail
         if card and card.card_type == "cleanup_bundle" and card.bundled_messages:
             try:
                 import json as _json3
@@ -2444,6 +2714,16 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
 
 
 def _serialize_card_for_frontend(card: Any) -> dict[str, Any]:
+    import re as _re
+
+    def _dc(text: str) -> str:
+        if not text:
+            return ""
+        text = _re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))) if int(m.group(1)) < 0x110000 else "?", text)
+        text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        text = text.replace("&quot;", '"').replace("&#39;", "'")
+        return text
+
     return {
         "id": card.card_id,
         "title": card.title,
@@ -2463,7 +2743,7 @@ def _serialize_card_for_frontend(card: Any) -> dict[str, Any]:
             "to": card.original.to_addr,
             "time": card.original.time,
             "status": card.original.status,
-            "body": card.original.body,
+            "body": _dc(card.original.body),
         },
         "actions": [
             {"id": a.id, "label": a.label, "primary": a.primary, "statusTitle": a.status_title, "status": a.status}
@@ -2541,7 +2821,7 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     # ── V2 interaction tools (async → dispatch to event loop) ──
     if tool in (
         "get_card_detail", "summarize_thread",
-        "generate_draft_reply", "revise_draft", "record_card_decision",
+        "generate_draft_reply", "generate_ask_draft", "revise_draft", "record_card_decision",
         "clear_active_cards", "mark_cleanup_read", "record_snooze", "restore_card", "record_learning",
         "start_summarize_thread", "start_generate_draft",
         "delete_custom_plan",
