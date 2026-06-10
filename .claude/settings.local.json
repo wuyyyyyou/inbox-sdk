@@ -62,7 +62,16 @@
       "Bash(node *)",
       "Bash(npx vitest *)",
       "Bash(npm install *)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "WebSearch",
+      "WebFetch(domain:www.npmjs.com)",
+      "Bash(npm view *)",
+      "Bash(anna --version)",
+      "Bash(npx @anna-ai/cli --version)",
+      "Bash(cmd.exe /c \"npm list -g @anna-ai/cli 2>&1\")",
+      "Bash(cmd.exe /c \"npm view @anna-ai/cli version 2>&1\")",
+      "Read(//c/Users/24848/AppData/Roaming/npm/**)",
+      "Bash(uv run *)"
     ]
   }
 }

@@ -10,6 +10,7 @@ import type {
   RuntimeState,
   SamplingDebugInfo,
   ScanPlan,
+  TestSamplingBriefResult,
   TestSamplingResult,
 
 } from "../types/mail";
@@ -130,6 +131,10 @@ export class MailAgentClient {
 
   testSampling() {
     return this.invoke<TestSamplingResult>("test_sampling");
+  }
+
+  testSamplingBrief() {
+    return this.invoke<TestSamplingBriefResult>("test_sampling_brief");
   }
 
   getCardDetail(mailbox: string, cardId: string, storageProvider: string) {

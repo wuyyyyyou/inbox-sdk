@@ -544,13 +544,21 @@ export function BriefView() {
       <SamplingDebugPanel info={state.samplingDebug as Record<string, unknown> | null} />
       <div className="sampling-debug-fetch">
         <button className="soft-btn compact" onClick={() => { void actions.testSampling(); }}>Test sampling</button>
+        <button className="soft-btn compact" onClick={() => { void actions.testSamplingBrief(); }}>Test brief-style sampling</button>
         <button className="soft-btn compact" onClick={() => { void actions.loadSamplingDebug(); }}>Refresh debug info</button>
       </div>
       {state.samplingTestResult ? (
         <div className={`sampling-test-result ${state.samplingTestResult.ok ? "is-ok" : "is-err"}`}>
           {state.samplingTestResult.ok
-            ? `OK · ${v(state.samplingTestResult.elapsed_ms)}ms · model=${v(state.samplingTestResult.model)} · ${v(state.samplingTestResult.text)}`
-            : `FAILED · ${v(state.samplingTestResult.elapsed_ms)}ms · [${v(state.samplingTestResult.error_code)}] ${v(state.samplingTestResult.error_message)}`}
+            ? `Simple OK · ${v(state.samplingTestResult.elapsed_ms)}ms · model=${v(state.samplingTestResult.model)} · ${v(state.samplingTestResult.text)}`
+            : `Simple FAILED · ${v(state.samplingTestResult.elapsed_ms)}ms · [${v(state.samplingTestResult.error_code)}] ${v(state.samplingTestResult.error_message)}`}
+        </div>
+      ) : null}
+      {state.samplingBriefResult ? (
+        <div className={`sampling-test-result ${state.samplingBriefResult.ok ? "is-ok" : "is-err"}`}>
+          {state.samplingBriefResult.ok
+            ? `Brief OK · ${v(state.samplingBriefResult.elapsed_ms)}ms · model=${v(state.samplingBriefResult.model)} · tokens=${v(state.samplingBriefResult.output_tokens)} · json=${state.samplingBriefResult.json_ok ? "valid" : "invalid"} · ${v(state.samplingBriefResult.parse_preview)}`
+            : `Brief FAILED · ${v(state.samplingBriefResult.elapsed_ms)}ms · [${v(state.samplingBriefResult.error_code)}] ${v(state.samplingBriefResult.error_message)}`}
         </div>
       ) : null}
       {totalScans > 0 ? (

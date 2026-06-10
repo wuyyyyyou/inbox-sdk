@@ -13,7 +13,7 @@ const STAGE_STEP_MAP: Record<string, number> = {
   storage_filter: 1, thread_dedup: 1, check_replied: 1, already_replied_filter: 1, phase1: 1, phase1_done: 1,
   read_context: 2, read_context_done: 2,
   evaluate: 3, evaluate_done: 3,
-  plan: 4, storage_saved: 4, done: 4,
+  plan: 4, storage_saved: 4, reading_cards: 4, read_cards_error: 4, storage_error: 4, done: 4,
   planning: 0, planning_done: 0,
 };
 
@@ -44,6 +44,9 @@ export function scanStageLabel(stage: string | undefined, progress: Record<strin
     evaluate_done: "Evaluation complete.",
     plan: "Building action plan.",
     storage_saved: "Persisting cards locally.",
+    storage_error: "Failed to persist cards.",
+    reading_cards: "Reading cards from storage.",
+    read_cards_error: "Failed to read cards.",
     done: "Scan complete.",
   };
   const count = progress.current && progress.total ? ` (${progress.current}/${progress.total})` : "";
@@ -82,6 +85,18 @@ export function scanProgressLabel(stage: string | undefined, progress: Record<st
     return n ? `Building action plan from ${n} evaluations...` : "Building action plan...";
   }
   if (stage === "storage_saved") return "Cards saved.";
+  if (stage === "storage_error") {
+    const reason = p.reason ? `: ${p.reason}` : "";
+    return `Storage write failed${reason}`;
+  }
+  if (stage === "reading_cards") {
+    const n = Number(p.main_items || 0);
+    return n ? `Reading ${n} cards from storage...` : "Reading cards from storage...";
+  }
+  if (stage === "read_cards_error") {
+    const reason = p.reason ? `: ${p.reason}` : "";
+    return `Failed to read cards${reason}`;
+  }
   if (stage === "done") return "Scan complete.";
   return "";
 }

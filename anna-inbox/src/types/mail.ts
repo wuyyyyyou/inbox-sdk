@@ -374,6 +374,7 @@ export interface AppState {
   gmailAuthStatus: GmailAuthStatus;
   samplingDebug: SamplingDebugInfo | null;
   samplingTestResult: TestSamplingResult | null;
+  samplingBriefResult: TestSamplingBriefResult | null;
   askItemActions: Record<string, { read?: boolean; trashed?: boolean; replied?: boolean; sending?: boolean }>;
   askEditDraft: Record<string, string>;
   askHistory: AskHistoryEntry[];
@@ -395,6 +396,23 @@ export interface TestSamplingResult {
   stop_reason?: string;
   content_type?: string;
   text?: string;
+  usage?: Record<string, unknown>;
+  error_code?: number | string;
+  error_message?: string;
+  error_data?: Record<string, unknown>;
+}
+
+export interface TestSamplingBriefResult {
+  ok: boolean;
+  elapsed_ms?: number;
+  test_req_id?: string;
+  invoke_id?: string;
+  model?: string;
+  stop_reason?: string;
+  output_tokens?: number | string;
+  json_ok?: boolean;
+  json_error?: string;
+  parse_preview?: string;
   usage?: Record<string, unknown>;
   error_code?: number | string;
   error_message?: string;

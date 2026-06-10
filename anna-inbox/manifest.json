@@ -15,7 +15,7 @@
   "required_executas": [
     {
       "tool_id": "tool-zhaopy-inbox-executa-8jj3cw76",
-      "min_version": "0.4.2",
+      "min_version": "0.4.3",
       "version": "latest"
     }
   ],

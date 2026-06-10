@@ -1014,11 +1014,29 @@ def _dedup_body(text: str) -> str:
     return "\n\n".join(result)
 
 
+def _inject_link_attrs(tag_str: str) -> str:
+    """Add target='_blank' rel='noopener noreferrer' to <a> if missing."""
+    result = tag_str
+    if 'target=' not in result:
+        result = result[:-1] + ' target="_blank">' if result.endswith('>') else result + ' target="_blank">'
+    if 'rel=' not in result:
+        result = result[:-1] + ' rel="noopener noreferrer">' if result.endswith('>') else result + ' rel="noopener noreferrer">'
+    return result
+
+
+def _inject_img_attrs(tag_str: str) -> str:
+    """Add loading='lazy' referrerpolicy='no-referrer' to <img> if missing."""
+    result = tag_str
+    if 'loading=' not in result:
+        result = result + ' loading="lazy"'
+    if 'referrerpolicy=' not in result:
+        result = result + ' referrerpolicy="no-referrer"'
+    return result
+
+
 def _sanitize_email_html(html_text: str) -> str:
     """Strip XSS vectors from email HTML. Keeps images, links, formatting."""
     import re
-
-    # Remove <script> and <style> blocks with all their content
     html_text = re.sub(
         r"<script[^>]*>.*?</script>",
         "", html_text, flags=re.DOTALL | re.IGNORECASE,
@@ -1064,6 +1082,22 @@ def _sanitize_email_html(html_text: str) -> str:
     html_text = re.sub(
         r"<embed[^>]*>.*?</embed>",
         "", html_text, flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    # Add target="_blank" rel="noopener noreferrer" to <a> tags that have href
+    html_text = re.sub(
+        r'(<a\b[^>]*href\s*=\s*["\'][^"\']+["\'][^>]*)>',
+        lambda m: _inject_link_attrs(m.group(1)),
+        html_text, flags=re.IGNORECASE,
+    )
+
+    # Add loading="lazy" referrerpolicy="no-referrer" to <img> tags.
+    # Lazy match stops before the optional self-closing slash so we
+    # don't inject attributes after it.
+    html_text = re.sub(
+        r'(<img\b[^>]*?)\s*/?\s*>',
+        lambda m: _inject_img_attrs(m.group(1)) + '>',
+        html_text, flags=re.IGNORECASE,
     )
 
     return html_text
@@ -1188,11 +1222,9 @@ def _check_gmail_auth(mailbox: str) -> dict[str, Any]:
             try:
                 authorized_email = get_authorized_email().strip().lower()
             except Exception:
-                # Gmail API unreachable — token exists, assume authorized
-                return {"authorized": True, "source": "platform", "warning": "Gmail API unreachable; token assumed valid", "mode": "any"}
-            if not authorized_email:
-                return {"authorized": True, "source": "platform", "warning": "Token present but email lookup failed", "mode": "any"}
-            return {"authorized": True, "source": "platform", "authorized_email": authorized_email, "mode": "any"}
+                authorized_email = ""
+            if authorized_email:
+                return {"authorized": True, "source": "platform", "authorized_email": authorized_email, "mode": "any"}
         multi = get_multi_token_map()
         if multi:
             return {"authorized": True, "source": "platform_multi", "authorized_email": list(multi.keys())[0] if multi else "", "mode": "any"}
@@ -1408,6 +1440,8 @@ async def run_mail_agent_pipeline(
 
     # Read active cards from storage for V2 frontend
     active_cards: list[dict[str, Any]] = []
+    if progress_callback:
+        progress_callback("reading_cards", {"mailbox": input_.mailbox_id, "main_items": len(action_plan.main_items)})
     try:
         from mail_agent.storage.client import is_ready
         if is_ready():
@@ -1415,8 +1449,10 @@ async def run_mail_agent_pipeline(
             from mail_agent.cards.service import cards_to_frontend
             stored = await get_active_cards(input_.mailbox_id)
             active_cards = cards_to_frontend(stored)
-    except Exception:
-        pass
+    except Exception as exc:
+        log(f"pipeline get_active_cards failed: {type(exc).__name__}: {exc}")
+        if progress_callback:
+            progress_callback("read_cards_error", {"reason": f"{type(exc).__name__}: {exc}"[:200]})
 
     return {
         "success": True,
@@ -1623,7 +1659,7 @@ async def _test_sampling(arguments: dict[str, Any], invoke_id: str) -> dict[str,
 
         req_id = uuid.uuid4().hex[:12]
         result = await sampling_fn(
-            messages=[{"role": "user", "content": "Say 'hello' in exactly one word. Reply with only that word."}],
+            messages=[{"role": "user", "content": {"type": "text", "text": "Say 'hello' in exactly one word. Reply with only that word."}}],
             max_tokens=16,
             system_prompt="You are a test probe. Reply concisely.",
             temperature=0.0,
@@ -1642,6 +1678,186 @@ async def _test_sampling(arguments: dict[str, Any], invoke_id: str) -> dict[str,
             "content_type": result.get("content", {}).get("type") if isinstance(result.get("content"), dict) else "unknown",
             "text": str(result.get("content", {}).get("text", ""))[:200] if isinstance(result.get("content"), dict) else "",
             "usage": result.get("usage"),
+        }
+    except SamplingError as exc:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return {
+            "ok": False,
+            "elapsed_ms": elapsed_ms,
+            "test_req_id": req_id,
+            "invoke_id": invoke_id,
+            "error_code": exc.code,
+            "error_message": exc.message,
+            "error_data": exc.data,
+        }
+    except Exception as exc:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return {
+            "ok": False,
+            "elapsed_ms": elapsed_ms,
+            "test_req_id": req_id,
+            "invoke_id": invoke_id,
+            "error_code": "client_exception",
+            "error_message": str(exc),
+        }
+
+
+# Mirrors the real pipeline's wire format:
+#   system_prompt  = short JSON-only instruction
+#   user_message   = rubric + email + output format + JSON instruction
+# See call_llm_json() in llm_runtime/service.py:494 and
+# build_anna_single_judgment_prompt() in judgment_engine/service.py:495.
+
+_BRIEF_TEST_SYSTEM_PROMPT = "You are a strict JSON generator. Output ONLY valid JSON — no explanation, no markdown, no code fences."
+
+_BRIEF_TEST_USER_MESSAGE = """\
+You are Anna, an executive email assistant. Evaluate exactly ONE email candidate against the strategy below.
+Output ONLY a single JSON object. Do NOT wrap in markdown. Do NOT explain. The very first character you write MUST be `{`.
+
+## Strategy
+Default 秘书模式: 找出真正需要用户注意的邮件事项。
+
+## Judgment Rubric — Binary Decision
+
+First, answer THIS question about the email:
+
+  **"Does this email require the user to send a reply message?"**
+
+  If YES → user_action = "reply"
+    Then pick the BEST action_reason:
+    - question_asked: the sender explicitly asked a question or made a request that needs an answer. EXCLUDE automated notifications from noreply/notification addresses and social media alerts.
+    - waiting_for_you: the sender is clearly waiting for the user's input, approval, or decision. EXCLUDE automated reminders and system-generated messages.
+    - unsent_draft: this is a draft the user wrote but never sent
+    - courtesy_due: sender invested real effort (wrote 3+ substantive sentences, shared a document, or explicitly asked for the user's thoughts). Do NOT flag automated notifications, newsletters, receipts, or one-line status updates.
+
+  If NO → user_action = "review"
+    Then pick the BEST action_reason:
+    - upcoming_event: interview/meeting/deadline reminder — worth noting the time
+    - deal_or_pipeline: project/partnership/deal status update worth tracking
+    - security_or_billing: security alert, billing issue, subscription — needs checking
+    - receipt_or_notice: receipt, subscription confirmation, normal account notice — record only
+    - cleanup: newsletter, promotion, automated digest — safe to archive
+
+  CRITICAL: If the sender address looks automated (contains "noreply", "no-reply", "notification", "@linkedin.com" alerts, social media notification bots), set user_action="review" regardless of the email body content.
+
+  Priority & action_reason mapping (you MUST follow):
+    question_asked → priority=high when explicit deadline, money/pricing/contract, or key contact. priority=medium otherwise. surface=true.
+    waiting_for_you → priority=high when time-sensitive AND sender says "let me know"/"please confirm". priority=medium otherwise. surface=true.
+    unsent_draft → priority=medium, surface=true
+    courtesy_due → priority=medium, surface=true
+    security_or_billing → priority=critical when unauthorized/payment failed/imminent interruption. priority=high otherwise. surface=true.
+    upcoming_event → priority=high when within 48h. priority=medium otherwise.
+    deal_or_pipeline → priority=medium
+    receipt_or_notice → priority=low
+    cleanup → priority=low
+
+## Mailbox Owner
+You are evaluating mail for: test@example.com
+Match by EMAIL ADDRESS (between < >), not by display name.
+- If the sender's email IS the mailbox owner → OUTGOING mail.
+  SENT: user already sent it → surface=false, priority=low, user_action=review, action_reason=cleanup.
+  DRAFT: user hasn't sent it yet → user_action=reply, action_reason=unsent_draft, priority=medium.
+
+## Email
+candidate_id: test_cand_001
+kind: reply_required_possible
+priority_hint: high
+from: "Alice Zhang" <alice@acmecorp.com>
+subject: Q3 proposal review — need your sign-off by Friday
+snippet: Hi, I've attached the updated Q3 proposal incorporating feedback from the leadership review. Could you take a look and provide sign-off by Friday EOD? The procurement team is waiting on this to finalize the vendor contract. Let me know if you need any clarifications.
+date: 2026-06-09
+context_type: message_detail
+body_text: > Hi,\n> I've attached the updated Q3 proposal v3 incorporating the feedback from the leadership review last Thursday.\n> \n> Key changes:\n> - Budget adjusted from $180k to $210k to cover the expanded scope\n> - Timeline shifted: kickoff moved to July 15\n> - Vendor selection narrowed to two finalists (AcmeTech and BuildRight)\n> \n> Could you review and provide sign-off by Friday EOD? The procurement team is blocked on the vendor contract until they have your approval.\n> \n> Let me know if you need a call to walk through the changes.\n> \n> Thanks,\n> Alice
+
+## User request
+Find emails that need my attention.
+
+## Output format
+Return exactly this JSON shape:
+
+{
+  "candidate_id": "test_cand_001",
+  "priority": "medium",
+  "surface": true,
+  "user_action": "reply",
+  "action_reason": "question_asked",
+  "title": "Short card title (English ≤12 words)",
+  "context": "WHAT happened: who did what, when, and current status. Verifiable facts only. English ≤30 words.",
+  "suggestion": "Specific next action. Be concrete, not generic. English ≤15 words.",
+  "action": "create_draft",
+  "needs": "English ≤4 words label for what the user needs to decide or do.",
+  "latest_action": "English ≤8 words. What recently happened — the latest action by a person or service.",
+  "latest_actor": "English name or service. Who performed the latest_action.",
+  "reply_gaps": {"needs_user_input":true, "summary":"one-sentence summary", "questions":[{"id":"q1", "question":"What do you want to reply?", "hint":"short hint", "required":true}]},
+  "confidence": 0.85
+}
+
+Allowed user_action: reply, review.
+Allowed action_reason: question_asked, waiting_for_you, unsent_draft, courtesy_due, upcoming_event, deal_or_pipeline, security_or_billing, receipt_or_notice, cleanup.
+Allowed priority: critical, high, medium, low, ignore.
+Allowed action: create_draft, create_reminder, save_note, do_nothing.
+
+## Rules
+- user_action + action_reason MUST be consistent: question_asked/waiting_for_you/unsent_draft/courtesy_due → reply. upcoming_event/deal_or_pipeline/security_or_billing/receipt_or_notice/cleanup → review.
+- priority: reply reasons → medium or high. security_or_billing → critical or high. schedule/logistics → medium. receipt/cleanup → low.
+
+Return ONLY one valid JSON object. Do not include markdown fences, prose, analysis, or code comments.
+"""
+
+
+async def _test_sampling_brief(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
+    """Test Anna sampling with a realistic brief-style judgment call.
+
+    Uses the same message shape, system prompt complexity, and parameters
+    (max_tokens=8192, temperature=0.1, timeout=120s) as the real brief pipeline.
+    """
+    import json as _json
+    started = time.time()
+    req_id = ""
+    try:
+        sampling_fn = _build_sampling_for_run({"ai_provider": "anna-llm"}, invoke_id)
+        if sampling_fn is None:
+            return {"ok": False, "error": "sampling_fn is None", "invoke_id": invoke_id}
+
+        req_id = uuid.uuid4().hex[:12]
+        result = await sampling_fn(
+            messages=[{"role": "user", "content": {"type": "text", "text": _BRIEF_TEST_USER_MESSAGE}}],
+            max_tokens=8192,
+            system_prompt=_BRIEF_TEST_SYSTEM_PROMPT,
+            temperature=0.1,
+            include_context="none",
+            metadata={"tool": "test_sampling_brief", "executa_invoke_id": invoke_id, "test_req_id": req_id},
+            timeout=120.0,
+        )
+        elapsed_ms = int((time.time() - started) * 1000)
+        text = str(result.get("content", {}).get("text", "")) if isinstance(result.get("content"), dict) else ""
+        usage = result.get("usage", {})
+        output_tokens = usage.get("outputTokens") if isinstance(usage, dict) else "unknown"
+
+        json_ok = False
+        json_error = ""
+        parse_preview = ""
+        if text:
+            try:
+                parsed = _json.loads(text.strip())
+                json_ok = isinstance(parsed, dict) and "priority" in parsed
+                parse_preview = _json.dumps({k: v for k, v in parsed.items() if k in ("priority", "user_action", "action_reason", "title")})[:300]
+            except Exception as exc:
+                json_error = str(exc)[:200]
+                parse_preview = text.strip()[:300]
+
+        return {
+            "ok": True,
+            "elapsed_ms": elapsed_ms,
+            "test_req_id": req_id,
+            "invoke_id": invoke_id,
+            "model": result.get("model"),
+            "stop_reason": result.get("stopReason"),
+            "output_tokens": output_tokens,
+            "json_ok": json_ok,
+            "json_error": json_error,
+            "parse_preview": parse_preview,
+            "usage": usage,
         }
     except SamplingError as exc:
         elapsed_ms = int((time.time() - started) * 1000)
@@ -2275,43 +2491,53 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
     from mail_agent.cards.service import cards_to_frontend
     from mail_agent.storage.ops import aggregate_active_cards, get_active_cards, get_scan_state
 
-    if mailbox.lower() == "all":
-        active = _run_storage_query(aggregate_active_cards())
-        # Aggregate scan state across all registered mailboxes
-        try:
-            from mail_agent.storage.ops import get_mailbox_registry
-            reg = _run_storage_query(get_mailbox_registry())
-            all_mboxes = [e.email for e in (reg.mailboxes if reg else [])]
-            all_states = [_run_storage_query(get_scan_state(m)) for m in all_mboxes]
-            total_scans = max((getattr(s, 'total_scans', 0) for s in all_states), default=0)
-            total_processed = max((getattr(s, 'total_processed', 0) for s in all_states), default=0)
-            last_scan_ts = max((getattr(s, 'last_scan_ts', '') for s in all_states), default='')
+    try:
+        if mailbox.lower() == "all":
+            active = _run_storage_query(aggregate_active_cards())
+            # Aggregate scan state across all registered mailboxes
+            try:
+                from mail_agent.storage.ops import get_mailbox_registry
+                reg = _run_storage_query(get_mailbox_registry())
+                all_mboxes = [e.email for e in (reg.mailboxes if reg else [])]
+                all_states = [_run_storage_query(get_scan_state(m)) for m in all_mboxes]
+                total_scans = max((getattr(s, 'total_scans', 0) for s in all_states), default=0)
+                total_processed = max((getattr(s, 'total_processed', 0) for s in all_states), default=0)
+                last_scan_ts = max((getattr(s, 'last_scan_ts', '') for s in all_states), default='')
+                scan_state = {
+                    "last_scan_ts": last_scan_ts,
+                    "last_message_internal_date": "",
+                    "total_scans": total_scans,
+                    "total_processed": total_processed,
+                }
+            except Exception:
+                scan_state = {"total_scans": 0, "total_processed": 0, "last_scan_ts": "", "last_message_internal_date": ""}
+        else:
+            active = _run_storage_query(get_active_cards(mailbox))
+            state = _run_storage_query(get_scan_state(mailbox))
             scan_state = {
-                "last_scan_ts": last_scan_ts,
-                "last_message_internal_date": "",
-                "total_scans": total_scans,
-                "total_processed": total_processed,
+                "last_scan_ts": getattr(state, "last_scan_ts", ""),
+                "last_message_internal_date": getattr(state, "last_message_internal_date", ""),
+                "total_scans": getattr(state, "total_scans", 0),
+                "total_processed": getattr(state, "total_processed", 0),
             }
-        except Exception:
-            scan_state = {"total_scans": 0, "total_processed": 0, "last_scan_ts": "", "last_message_internal_date": ""}
-    else:
-        active = _run_storage_query(get_active_cards(mailbox))
-        state = _run_storage_query(get_scan_state(mailbox))
-        scan_state = {
-            "last_scan_ts": getattr(state, "last_scan_ts", ""),
-            "last_message_internal_date": getattr(state, "last_message_internal_date", ""),
-            "total_scans": getattr(state, "total_scans", 0),
-            "total_processed": getattr(state, "total_processed", 0),
+
+        action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
+
+        return {
+            "cards": cards_to_frontend(active),
+            "count": len(active.cards),
+            "action_count": action_count,
+            "scan_state": scan_state,
         }
-
-    action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
-
-    return {
-        "cards": cards_to_frontend(active),
-        "count": len(active.cards),
-        "action_count": action_count,
-        "scan_state": scan_state,
-    }
+    except Exception as exc:
+        log(f"get_active_cards sync entry failed: {type(exc).__name__}: {exc}")
+        return {
+            "cards": [],
+            "count": 0,
+            "action_count": 0,
+            "scan_state": {"total_scans": 0, "total_processed": 0, "last_scan_ts": "", "last_message_internal_date": ""},
+            "error": f"{type(exc).__name__}: {exc}"[:200],
+        }
 
 def _sync_get_run_history() -> dict[str, Any]:
     from mail_agent.storage.ops import get_run_history
@@ -3025,6 +3251,9 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     if tool == "test_sampling":
         future = asyncio.run_coroutine_threadsafe(_test_sampling(arguments, invoke_id), loop)
         return {"success": True, "tool": tool, "data": future.result(timeout=120.0)}
+    if tool == "test_sampling_brief":
+        future = asyncio.run_coroutine_threadsafe(_test_sampling_brief(arguments, invoke_id), loop)
+        return {"success": True, "tool": tool, "data": future.result(timeout=180.0)}
     if tool == "start_mail_agent_run":
         return {"success": True, "tool": tool, "data": start_mail_agent_run(arguments, invoke_id)}
     if tool == "get_mail_agent_run":

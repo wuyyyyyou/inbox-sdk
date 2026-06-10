@@ -69,6 +69,7 @@ export function createInitialState(): AppState {
     gmailAuthStatus: { checked: false, authorized: true },
     samplingDebug: null,
     samplingTestResult: null,
+    samplingBriefResult: null,
     askItemActions: {},
     askEditDraft: {},
     askHistory: [],

@@ -2,7 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { AppState, FrontendCard, MailboxInfo, RunStatus, TestSamplingResult } from "../types/mail";
+import type { AppState, FrontendCard, MailboxInfo, RunStatus, TestSamplingBriefResult, TestSamplingResult } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -106,6 +106,7 @@ export interface AppActions {
   checkAnyGmailAuth(): Promise<{ authorized: boolean; source: string }>;
   loadSamplingDebug(): Promise<void>;
   testSampling(): Promise<TestSamplingResult>;
+  testSamplingBrief(): Promise<TestSamplingBriefResult>;
   loadMailboxes(): Promise<void>;
   setMailboxSelected(mailbox: string, selected: boolean): Promise<void>;
   setBriefMailboxFilter(mailboxes: string[]): void;
@@ -214,7 +215,9 @@ export function useAppController() {
         };
       });
     } catch (error) {
-      setState((s) => ({ ...s, scanError: error instanceof Error ? error.message : String(error), cards: [], allCards: [], actionCount: 0, scanState: null, loading: false }));
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error("[loadActiveCards] failed:", detail, error);
+      setState((s) => ({ ...s, scanError: detail, cards: [], allCards: [], actionCount: 0, scanState: null, loading: false }));
     }
   }, [client, refreshStoredCardFields, state.mailbox, state.storageProvider]);
 
@@ -562,6 +565,20 @@ export function useAppController() {
         return fallback;
       }
     },
+    async testSamplingBrief() {
+      setState((s) => ({ ...s, samplingBriefResult: null }));
+      try {
+        const result = await client.testSamplingBrief();
+        setState((s) => ({ ...s, samplingBriefResult: result }));
+        await loadSamplingDebug();
+        return result;
+      } catch {
+        const fallback = { ok: false, error_message: "test_sampling_brief tool call failed" };
+        setState((s) => ({ ...s, samplingBriefResult: fallback }));
+        await loadSamplingDebug();
+        return fallback;
+      }
+    },
     saveScanPlanField(field, value) {
       setState((s) => ({ ...s, scanPlan: { ...(s.scanPlan || {}), [field]: value, updated_at: new Date().toISOString() } }));
       const targetMailbox = state.configMailbox || "";
@@ -634,7 +651,7 @@ export function useAppController() {
         const statusText = failures.length
           ? `Scan complete with ${failures.length} issue${failures.length === 1 ? "" : "s"}.`
           : "Scan complete. Showing persisted attention cards.";
-        setState((s) => ({ ...s, scanStatus: statusText, scanError: failures.join("\n") }));
+        setState((s) => ({ ...s, scanStatus: statusText, scanError: s.scanError || failures.join("\n") }));
         showToast(failures.length ? statusText : "Scan complete.");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
