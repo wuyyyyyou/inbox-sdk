@@ -31,6 +31,95 @@ function ScanErrorBlock({ error }: { error: string }) {
   );
 }
 
+function v(obj: unknown, fallback: string | number = "-"): string | number { return obj != null ? String(obj) : String(fallback); }
+
+function SamplingDebugPanel({ info }: { info: Record<string, unknown> | null }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!info) return null;
+  const enabled = Boolean(info.sampling_enabled);
+  const callCount = Number(info.call_count) || 0;
+  const errCount = Number(info.error_count) || 0;
+  const succCount = Number(info.success_count) || 0;
+  const pendCount = Number(info.pending_count) || 0;
+  const errorLog = Array.isArray(info.error_log) ? info.error_log as Record<string, unknown>[] : [];
+  const lastError = info.last_error as Record<string, unknown> | null;
+  const lastReq = info.last_request as Record<string, unknown> | undefined;
+  const lastResp = info.last_response as Record<string, unknown> | undefined;
+  const initialized = Boolean(info.initialized);
+  const hostCaps = Array.isArray(info.host_capabilities) ? (info.host_capabilities as string[]).join(", ") || "(none)" : "-";
+  const executaCaps = Array.isArray(info.executa_manifest_host_capabilities) ? (info.executa_manifest_host_capabilities as string[]).join(", ") || "(none)" : "-";
+  const toolId = String(info.executa_tool_id || "-");
+  const executaVersion = String(info.executa_version || "-");
+  const initKeys = Array.isArray(info.init_raw_params_keys) ? (info.init_raw_params_keys as string[]).join(", ") || "(none)" : "-";
+  const pendIds = Array.isArray(info.pending_req_ids) ? (info.pending_req_ids as string[]).join(", ") || "(none)" : "-";
+  const disabledReason = String(info.sampling_disabled_reason || "");
+  return (
+    <section className="sampling-debug-panel">
+      <div className="sampling-debug-head" onClick={() => setExpanded((v) => !v)}>
+        <span className={`sampling-debug-dot ${enabled ? "is-on" : "is-off"}`} />
+        <span>Anna Sampling · {initialized ? "init ok" : "NOT INIT"} · {enabled ? "enabled" : "disabled"} · {callCount} calls · {errCount} errors</span>
+        <span className="sampling-debug-arrow">{expanded ? "▲" : "▼"}</span>
+      </div>
+      {expanded ? (
+        <div className="sampling-debug-body">
+          <table className="sampling-debug-table">
+            <tbody>
+              <tr><td>init</td><td className={initialized ? "sampling-debug-ok" : "sampling-debug-err"}>{initialized ? `ok · protocol ${v(info.protocol_version)}` : "NOT INITIALIZED — host did not call initialize, or params were empty"}</td></tr>
+              <tr><td>executa</td><td>{toolId} v{executaVersion}</td></tr>
+              <tr><td>executa caps</td><td>{executaCaps}</td></tr>
+              <tr><td>sampling</td><td className={enabled ? "sampling-debug-ok" : "sampling-debug-err"}>{enabled ? "enabled" : `disabled — ${disabledReason || "unknown reason"}`}</td></tr>
+              <tr><td>host caps</td><td>{hostCaps}</td></tr>
+              <tr><td>init keys</td><td>{initKeys}</td></tr>
+              <tr><td>calls</td><td>total {callCount} · ok {succCount} · err {errCount} · pending {pendCount}</td></tr>
+              {lastReq ? (
+                <>
+                  <tr><td colSpan={2} className="sampling-debug-section">last request</td></tr>
+                  <tr><td>at</td><td>{v(lastReq.at)}</td></tr>
+                  <tr><td>seq</td><td>#{v(lastReq.call_seq)}</td></tr>
+                  <tr><td>max_tokens</td><td>{v(lastReq.max_tokens)}</td></tr>
+                  <tr><td>msgs</td><td>{v(lastReq.message_count)}</td></tr>
+                  <tr><td>temp</td><td>{v(lastReq.temperature, "default")}</td></tr>
+                  <tr><td>timeout</td><td>{v(lastReq.timeout_s)}s</td></tr>
+                  <tr><td>invoke_id</td><td className="sampling-debug-mono">{v(lastReq.invoke_id, "(none)")}</td></tr>
+                  {lastReq.model_preferences ? <tr><td>model prefs</td><td className="sampling-debug-mono">{JSON.stringify(lastReq.model_preferences)}</td></tr> : null}
+                </>
+              ) : null}
+              {lastResp && lastResp.at ? (
+                <>
+                  <tr><td colSpan={2} className="sampling-debug-section">last response</td></tr>
+                  <tr><td>at</td><td>{v(lastResp.at)}</td></tr>
+                  <tr><td>ok</td><td>{lastResp.success ? "yes" : `no — code=${v(lastResp.code)} ${v(lastResp.message, "")}`}</td></tr>
+                  {lastResp.model ? <tr><td>model</td><td>{v(lastResp.model)}</td></tr> : null}
+                  {lastResp.input_tokens != null ? <tr><td>tokens in/out</td><td>{v(lastResp.input_tokens)} / {v(lastResp.output_tokens)}</td></tr> : null}
+                </>
+              ) : null}
+              {lastError ? (
+                <>
+                  <tr><td colSpan={2} className="sampling-debug-section">last error</td></tr>
+                  <tr><td>req_id</td><td className="sampling-debug-mono">{v(lastError.req_id)}</td></tr>
+                  <tr><td>code</td><td className="sampling-debug-err">{v(lastError.code)}</td></tr>
+                  <tr><td>message</td><td className="sampling-debug-err">{v(lastError.message)}</td></tr>
+                  {lastError.data && Object.keys(lastError.data as object).length ? <tr><td>data</td><td className="sampling-debug-mono">{JSON.stringify(lastError.data)}</td></tr> : null}
+                </>
+              ) : null}
+              {errorLog.length ? (
+                <>
+                  <tr><td colSpan={2} className="sampling-debug-section">error log ({errorLog.length})</td></tr>
+                  {errorLog.slice(-5).reverse().map((e, i) => (
+                    <tr key={i}><td>{v(e.at)}</td><td className="sampling-debug-err">[{v(e.code)}] {v(e.message)}</td></tr>
+                  ))}
+                </>
+              ) : null}
+              <tr><td colSpan={2} className="sampling-debug-section">pending req ids</td></tr>
+              <tr><td colSpan={2} className="sampling-debug-mono">{pendIds}</td></tr>
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function CardDetails({ card }: { card: FrontendCard }) {
   const details = card.details || {};
   const original = card.original || {};
@@ -452,6 +541,18 @@ export function BriefView() {
           )}
         </div>
       </section>
+      <SamplingDebugPanel info={state.samplingDebug as Record<string, unknown> | null} />
+      <div className="sampling-debug-fetch">
+        <button className="soft-btn compact" onClick={() => { void actions.testSampling(); }}>Test sampling</button>
+        <button className="soft-btn compact" onClick={() => { void actions.loadSamplingDebug(); }}>Refresh debug info</button>
+      </div>
+      {state.samplingTestResult ? (
+        <div className={`sampling-test-result ${state.samplingTestResult.ok ? "is-ok" : "is-err"}`}>
+          {state.samplingTestResult.ok
+            ? `OK · ${v(state.samplingTestResult.elapsed_ms)}ms · model=${v(state.samplingTestResult.model)} · ${v(state.samplingTestResult.text)}`
+            : `FAILED · ${v(state.samplingTestResult.elapsed_ms)}ms · [${v(state.samplingTestResult.error_code)}] ${v(state.samplingTestResult.error_message)}`}
+        </div>
+      ) : null}
       {totalScans > 0 ? (
         <>
           <div className="result-filter-row">

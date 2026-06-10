@@ -1,4 +1,5 @@
 import { useState } from "react";
+import DOMPurify from "dompurify";
 import { useApp } from "../../app/AppContext";
 import { formatBeijingTimestamp } from "../../shared/format";
 import { nextCardId } from "../brief/cardHelpers";
@@ -84,6 +85,7 @@ export function HandleView() {
   const context = detail.thread_context || {};
   const contactContext = detail.contact_context || {};
   const latestBody = detail.latest_body || original.body || "";
+  const latestBodyHtml = detail.latest_body_html || "";
   const summary = state.threadSummaryById[key];
   const draft = state.draftById[key] || "";
   const replyGaps = card.replyGaps;
@@ -102,7 +104,9 @@ export function HandleView() {
   const isSingleShort = messageCount <= 1 && asString(original.body || "").trim().length <= 280;
   const relatedContext = contactContextLines(contactContext);
   const BODY_PREVIEW = 500;
-  const bodyTruncated = latestBody.length > BODY_PREVIEW;
+  const bodyTruncated = latestBodyHtml
+    ? latestBodyHtml.length > BODY_PREVIEW
+    : latestBody.length > BODY_PREVIEW;
 
   const summaryBlock = () => {
     if (state.summarizingThread) {
@@ -163,7 +167,37 @@ export function HandleView() {
           </div>
           <span className={`category-tag ${hasDraft ? "is-ready-state" : ""}`}>{hasDraft ? "Reply ready" : "Needs review"}</span>
         </div>
-        {latestBody ? (
+        {latestBodyHtml ? (
+          <section className="review-block">
+            <div
+              className={`original-body original-body-html${bodyTruncated && !bodyExpanded ? " is-clamped" : ""}`}
+              dangerouslySetInnerHTML={{
+                __html: DOMPurify.sanitize(latestBodyHtml, {
+                  ALLOWED_TAGS: [
+                    "a", "abbr", "b", "blockquote", "br", "caption", "code", "col",
+                    "colgroup", "dd", "del", "details", "div", "dl", "dt", "em",
+                    "figcaption", "figure", "h1", "h2", "h3", "h4", "h5", "h6",
+                    "hr", "i", "img", "ins", "kbd", "li", "mark", "ol", "p", "pre",
+                    "q", "s", "small", "span", "strong", "sub", "summary", "sup",
+                    "table", "tbody", "td", "tfoot", "th", "thead", "time", "tr",
+                    "u", "ul", "var",
+                  ],
+                  ALLOWED_ATTR: [
+                    "alt", "align", "border", "cellpadding", "cellspacing",
+                    "class", "colspan", "height", "href", "id", "rowspan",
+                    "src", "style", "target", "title", "valign", "width",
+                  ],
+                  ALLOW_DATA_ATTR: false,
+                }),
+              }}
+            />
+            {bodyTruncated ? (
+              <button className="soft-btn compact" style={{ marginTop: 6 }} onClick={() => actions.toggleThreadContext(`${key}_body`)}>
+                {bodyExpanded ? "Show less" : "Show full email"}
+              </button>
+            ) : null}
+          </section>
+        ) : latestBody ? (
           <section className="review-block">
             <div className="original-body" style={{ whiteSpace: "pre-wrap" }}>
               {bodyTruncated && !bodyExpanded ? latestBody.slice(0, BODY_PREVIEW) + "…" : latestBody}

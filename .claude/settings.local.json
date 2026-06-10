@@ -60,7 +60,9 @@
       "Bash(grep -v \"//\")",
       "Bash(node -e \"const fs=require\\('fs'\\); const c=fs.readFileSync\\('app.js','utf8'\\); const idx=c.indexOf\\('timeoutMs'\\); console.log\\(c.substring\\(Math.max\\(0,idx-400\\), idx+600\\)\\);\")",
       "Bash(node *)",
-      "Bash(npx vitest *)"
+      "Bash(npx vitest *)",
+      "Bash(npm install *)",
+      "Bash(git *)"
     ]
   }
 }

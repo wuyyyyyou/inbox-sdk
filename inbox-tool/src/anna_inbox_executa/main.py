@@ -763,6 +763,9 @@ def _compact_run_result(result: Any) -> Any:
 def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
     protocol_version = str((params or {}).get("protocolVersion") or "1.1")
     v2 = protocol_version == PROTOCOL_VERSION_V2
+    host_caps = (params or {}).get("capabilities") or (params or {}).get("client_capabilities") or {}
+    host_cap_list = sorted(host_caps.keys()) if isinstance(host_caps, dict) else []
+    sampling.record_init(protocol_version, host_cap_list, params or {})
     if not v2:
         manifest_has_llm = "llm.sample" in MANIFEST.get("host_capabilities", [])
         lines = [
@@ -953,7 +956,8 @@ def header_map(message: dict[str, Any]) -> dict[str, str]:
 
 
 def decode_gmail_body(message: dict[str, Any]) -> str:
-    parts: list[str] = []
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
 
     def walk(part: dict[str, Any]) -> None:
         mime_type = str(part.get("mimeType") or "")
@@ -962,7 +966,10 @@ def decode_gmail_body(message: dict[str, Any]) -> str:
         if data and mime_type in {"text/plain", "text/html"}:
             try:
                 decoded = base64.urlsafe_b64decode(str(data) + "=" * (-len(str(data)) % 4)).decode("utf-8", errors="replace")
-                parts.append(decoded)
+                if mime_type == "text/plain":
+                    plain_parts.append(decoded)
+                else:
+                    html_parts.append(decoded)
             except Exception:
                 return
         for child in part.get("parts") or []:
@@ -971,8 +978,95 @@ def decode_gmail_body(message: dict[str, Any]) -> str:
 
     payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
     walk(payload)
-    text = "\n\n".join(part.strip() for part in parts if part.strip())
-    return text[:30000]
+
+    # Prefer text/html — modern email uses it as the canonical format.
+    # Callers are responsible for stripping HTML tags as needed.
+    parts = html_parts or plain_parts
+    return "\n\n".join(part.strip() for part in parts if part.strip())[:30000]
+
+
+def _dedup_body(text: str) -> str:
+    """Remove duplicated adjacent segments in body text.
+
+    The old decode_gmail_body joined both text/plain and text/html parts
+    with ``\\n\\n``, so multipart/alternative emails contain the same
+    content twice — once as plain text, once as HTML.  This compares
+    segments after stripping HTML tags and collapsing whitespace.
+    """
+    if not text or "\n\n" not in text:
+        return text
+    import re
+    parts = text.split("\n\n")
+
+    def _normalize(s: str) -> str:
+        stripped = re.sub(r"<[^>]+>", "", s)
+        stripped = re.sub(r"&nbsp;", " ", stripped)
+        stripped = re.sub(r"&amp;", "&", stripped)
+        stripped = re.sub(r"&lt;", "<", stripped)
+        stripped = re.sub(r"&gt;", ">", stripped)
+        stripped = re.sub(r"&quot;", '"', stripped)
+        return " ".join(stripped.split())
+
+    result = [parts[0]]
+    for i in range(1, len(parts)):
+        if _normalize(result[-1]) != _normalize(parts[i]):
+            result.append(parts[i])
+    return "\n\n".join(result)
+
+
+def _sanitize_email_html(html_text: str) -> str:
+    """Strip XSS vectors from email HTML. Keeps images, links, formatting."""
+    import re
+
+    # Remove <script> and <style> blocks with all their content
+    html_text = re.sub(
+        r"<script[^>]*>.*?</script>",
+        "", html_text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    html_text = re.sub(
+        r"<style[^>]*>.*?</style>",
+        "", html_text, flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    # Strip event-handler attributes (onclick, onerror, onload, etc.)
+    html_text = re.sub(
+        r'\s+on\w+\s*=\s*"[^"]*"',
+        "", html_text, flags=re.IGNORECASE,
+    )
+    html_text = re.sub(
+        r"\s+on\w+\s*=\s*'[^']*'",
+        "", html_text, flags=re.IGNORECASE,
+    )
+    html_text = re.sub(
+        r'\s+on\w+\s*=\s*\S+',
+        "", html_text, flags=re.IGNORECASE,
+    )
+
+    # Remove javascript: / vbscript: URL schemes — delete the entire attribute
+    html_text = re.sub(
+        r'\s*(?:href|src|action|formaction)\s*=\s*["\'][^"\']*javascript\s*:[^"\']*["\']',
+        "", html_text, flags=re.IGNORECASE,
+    )
+    html_text = re.sub(
+        r'\s*(?:href|src|action|formaction)\s*=\s*["\'][^"\']*vbscript\s*:[^"\']*["\']',
+        "", html_text, flags=re.IGNORECASE,
+    )
+
+    # Remove <iframe>, <object>, <embed> tags
+    html_text = re.sub(
+        r"<iframe[^>]*>.*?</iframe>",
+        "", html_text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    html_text = re.sub(
+        r"<object[^>]*>.*?</object>",
+        "", html_text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    html_text = re.sub(
+        r"<embed[^>]*>.*?</embed>",
+        "", html_text, flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    return html_text
 
 
 def extract_attachments(part: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1516,6 +1610,60 @@ def _build_sampling_for_run(arguments: dict[str, Any], invoke_id: str) -> Any:
             return result
         return _sampling
     return None
+
+
+async def _test_sampling(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
+    """Test Anna sampling with a minimal one-shot call. Returns detailed diagnostics."""
+    started = time.time()
+    req_id = ""
+    try:
+        sampling_fn = _build_sampling_for_run({"ai_provider": "anna-llm"}, invoke_id)
+        if sampling_fn is None:
+            return {"ok": False, "error": "sampling_fn is None — ai_provider must be 'anna-llm'", "invoke_id": invoke_id}
+
+        req_id = uuid.uuid4().hex[:12]
+        result = await sampling_fn(
+            messages=[{"role": "user", "content": "Say 'hello' in exactly one word. Reply with only that word."}],
+            max_tokens=16,
+            system_prompt="You are a test probe. Reply concisely.",
+            temperature=0.0,
+            include_context="none",
+            metadata={"tool": "test_sampling", "executa_invoke_id": invoke_id, "test_req_id": req_id},
+            timeout=30.0,
+        )
+        elapsed_ms = int((time.time() - started) * 1000)
+        return {
+            "ok": True,
+            "elapsed_ms": elapsed_ms,
+            "test_req_id": req_id,
+            "invoke_id": invoke_id,
+            "model": result.get("model"),
+            "stop_reason": result.get("stopReason"),
+            "content_type": result.get("content", {}).get("type") if isinstance(result.get("content"), dict) else "unknown",
+            "text": str(result.get("content", {}).get("text", ""))[:200] if isinstance(result.get("content"), dict) else "",
+            "usage": result.get("usage"),
+        }
+    except SamplingError as exc:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return {
+            "ok": False,
+            "elapsed_ms": elapsed_ms,
+            "test_req_id": req_id,
+            "invoke_id": invoke_id,
+            "error_code": exc.code,
+            "error_message": exc.message,
+            "error_data": exc.data,
+        }
+    except Exception as exc:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return {
+            "ok": False,
+            "elapsed_ms": elapsed_ms,
+            "test_req_id": req_id,
+            "invoke_id": invoke_id,
+            "error_code": "client_exception",
+            "error_message": str(exc),
+        }
 
 
 def start_mail_agent_run(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
@@ -2359,6 +2507,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         # New cache entries include raw payload for re-decoding; old ones
         # fall back to cached body_text with light dedup.
         latest_body = card.original.body or ""
+        latest_body_html = ""
         try:
             from mail_agent.mail_providers.gmail.adapter import normalize_mailbox, _decode_body, read_message
             msg = read_message(normalize_mailbox(mailbox), card.message_id)
@@ -2366,7 +2515,13 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 raw = _decode_body(msg)
                 if not raw.strip():
                     raw = str(msg.get("body_text") or "")
+                    raw = _dedup_body(raw)  # old body_text may have duplicated parts
                 raw = raw[:8000]
+
+                # Build sanitized HTML for frontend display (before tag stripping)
+                if raw.strip():
+                    latest_body_html = _sanitize_email_html(raw)
+
                 import re
                 raw = re.sub(r"<style[^>]*>.*?</style>", "", raw, flags=re.DOTALL | re.IGNORECASE)
                 raw = re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL | re.IGNORECASE)
@@ -2379,9 +2534,17 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 raw = re.sub(r"&#\d+;", "", raw)
                 raw = re.sub(r"\n{3,}", "\n\n", raw)
                 raw = raw.strip()
-                latest_body = raw
+                if raw:
+                    latest_body = raw
         except Exception:
             pass
+
+        # When re-decode couldn't produce a body (failed, or the message
+        # has no text parts), card.original.body still holds the old
+        # value set by decode_gmail_body which joined text/plain and
+        # text/html parts — dedup adjacent identical segments.
+        if not latest_body_html and latest_body:
+            latest_body = _dedup_body(latest_body)
 
         contact_ctx = {}
         try:
@@ -2406,6 +2569,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             "thread_context": thread_ctx,
             "contact_context": contact_ctx,
             "latest_body": latest_body,
+            "latest_body_html": latest_body_html,
         }
 
     # Build sampling for Anna LLM path (same logic as _build_sampling_for_run)
@@ -2852,6 +3016,15 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "tool": tool, "data": get_cached_email(arguments.get("mailbox", ""), arguments.get("message_id", ""))}
     if tool == "check_gmail_auth":
         return {"success": True, "tool": tool, "data": _check_gmail_auth(arguments.get("mailbox", ""))}
+    if tool == "get_sampling_debug":
+        info = sampling.get_debug_info()
+        info["executa_manifest_host_capabilities"] = MANIFEST.get("host_capabilities", [])
+        info["executa_tool_id"] = TOOL_ID
+        info["executa_version"] = VERSION
+        return {"success": True, "tool": tool, "data": info}
+    if tool == "test_sampling":
+        future = asyncio.run_coroutine_threadsafe(_test_sampling(arguments, invoke_id), loop)
+        return {"success": True, "tool": tool, "data": future.result(timeout=120.0)}
     if tool == "start_mail_agent_run":
         return {"success": True, "tool": tool, "data": start_mail_agent_run(arguments, invoke_id)}
     if tool == "get_mail_agent_run":

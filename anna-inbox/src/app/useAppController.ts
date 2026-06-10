@@ -2,7 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { AppState, FrontendCard, MailboxInfo, RunStatus } from "../types/mail";
+import type { AppState, FrontendCard, MailboxInfo, RunStatus, TestSamplingResult } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -104,6 +104,8 @@ export interface AppActions {
   minimize(value: boolean): void;
   checkGmailAuth(mailboxOverride?: string): Promise<{ authorized: boolean; source: string }>;
   checkAnyGmailAuth(): Promise<{ authorized: boolean; source: string }>;
+  loadSamplingDebug(): Promise<void>;
+  testSampling(): Promise<TestSamplingResult>;
   loadMailboxes(): Promise<void>;
   setMailboxSelected(mailbox: string, selected: boolean): Promise<void>;
   setBriefMailboxFilter(mailboxes: string[]): void;
@@ -312,6 +314,15 @@ export function useAppController() {
       setState((s) => ({ ...s, scanPlan: { scan_window_days: 7, max_messages: 100, scan_categories: [] } }));
     }
   }, [client, state.mailbox, state.storageProvider]);
+
+  const loadSamplingDebug = useCallback(async () => {
+    try {
+      const info = await client.getSamplingDebug();
+      setState((s) => ({ ...s, samplingDebug: info }));
+    } catch {
+      setState((s) => ({ ...s, samplingDebug: null }));
+    }
+  }, [client]);
 
   const checkGmailAuth = useCallback(async (mailboxOverride?: string): Promise<{ authorized: boolean; source: string }> => {
     const mailbox = mailboxOverride ?? state.mailbox;
@@ -536,6 +547,21 @@ export function useAppController() {
     clearContactMemories,
     loadCustomPlans,
     loadScanPlan,
+    loadSamplingDebug,
+    async testSampling() {
+      setState((s) => ({ ...s, samplingTestResult: null }));
+      try {
+        const result = await client.testSampling();
+        setState((s) => ({ ...s, samplingTestResult: result }));
+        await loadSamplingDebug();
+        return result;
+      } catch {
+        const fallback = { ok: false, error_message: "test_sampling tool call failed" };
+        setState((s) => ({ ...s, samplingTestResult: fallback }));
+        await loadSamplingDebug();
+        return fallback;
+      }
+    },
     saveScanPlanField(field, value) {
       setState((s) => ({ ...s, scanPlan: { ...(s.scanPlan || {}), [field]: value, updated_at: new Date().toISOString() } }));
       const targetMailbox = state.configMailbox || "";

@@ -8,7 +8,9 @@ import type {
   RunHistoryEntry,
   RunStatus,
   RuntimeState,
+  SamplingDebugInfo,
   ScanPlan,
+  TestSamplingResult,
 
 } from "../types/mail";
 import appManifest from "../../manifest.json";
@@ -120,6 +122,14 @@ export class MailAgentClient {
 
   getRun(runId: string) {
     return this.invoke<RunStatus>("get_mail_agent_run", { run_id: runId });
+  }
+
+  getSamplingDebug() {
+    return this.invoke<SamplingDebugInfo>("get_sampling_debug");
+  }
+
+  testSampling() {
+    return this.invoke<TestSamplingResult>("test_sampling");
   }
 
   getCardDetail(mailbox: string, cardId: string, storageProvider: string) {

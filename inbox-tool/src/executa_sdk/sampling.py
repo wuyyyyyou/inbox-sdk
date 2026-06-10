@@ -36,6 +36,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -127,9 +128,21 @@ class SamplingClient:
         self._pending: Dict[str, _Pending] = {}
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        # Will be set lazily when the first request is awaited so we can
-        # resolve futures from threads (e.g. stdin reader thread).
         self._sampling_disabled_reason: Optional[str] = None
+
+        # ── Debug state ──
+        self._init_protocol_version: str = ""
+        self._init_host_capabilities: list[str] = []
+        self._last_request_at: str = ""
+        self._last_request_summary: dict[str, Any] = {}
+        self._last_response_at: str = ""
+        self._last_response_summary: dict[str, Any] = {}
+        self._last_error: dict[str, Any] | None = None
+        self._error_log: list[dict[str, Any]] = []  # ring buffer, max 20
+        self._call_count: int = 0
+        self._success_count: int = 0
+        self._error_count: int = 0
+        self._init_raw_params: dict[str, Any] = {}
 
     # — public API —
 
@@ -223,20 +236,119 @@ class SamplingClient:
         }
         try:
             self._write_frame(envelope)
+            # Record request in debug state
+            self._record_request(req_id, params, metadata)
         except Exception:
             with self._lock:
                 self._pending.pop(req_id, None)
+            self._record_error(req_id, "write_frame_failed", str(sys.exc_info()[1]))
             raise
 
         try:
-            return await asyncio.wait_for(future, timeout=timeout)
+            result = await asyncio.wait_for(future, timeout=timeout)
+            return result
         except asyncio.TimeoutError:
             with self._lock:
                 self._pending.pop(req_id, None)
-            raise SamplingError(
+            exc = SamplingError(
                 SAMPLING_ERR_TIMEOUT,
                 f"sampling/createMessage timed out after {timeout}s",
             )
+            self._record_error(req_id, SAMPLING_ERR_TIMEOUT, str(exc))
+            raise exc
+
+    # — debug tracking —
+
+    def _now_iso(self) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def _record_request(self, req_id: str, params: dict, metadata: dict | None) -> None:
+        now = self._now_iso()
+        self._call_count += 1
+        self._last_request_at = now
+        invoke_id = (metadata or {}).get("executa_invoke_id", "")
+        messages_raw = params.get("messages", [])
+        msg_count = len(messages_raw) if isinstance(messages_raw, list) else 0
+        self._last_request_summary = {
+            "req_id": req_id,
+            "at": now,
+            "call_seq": self._call_count,
+            "max_tokens": params.get("maxTokens"),
+            "message_count": msg_count,
+            "temperature": params.get("temperature"),
+            "system_prompt_len": len(str(params.get("systemPrompt") or "")),
+            "timeout_s": params.get("_clientTimeoutS"),
+            "invoke_id": invoke_id,
+            "model_preferences": params.get("modelPreferences"),
+        }
+
+    def _record_success(self, req_id: str, result: dict) -> None:
+        self._success_count += 1
+        now = self._now_iso()
+        self._last_response_at = now
+        model = result.get("model", "")
+        usage = result.get("usage", {})
+        content = result.get("content", {})
+        text_preview = ""
+        if isinstance(content, dict):
+            text_preview = str(content.get("text", ""))[:200]
+        self._last_response_summary = {
+            "req_id": req_id,
+            "at": now,
+            "success": True,
+            "model": model,
+            "input_tokens": usage.get("inputTokens"),
+            "output_tokens": usage.get("outputTokens"),
+            "stop_reason": result.get("stopReason"),
+            "text_preview": text_preview,
+        }
+        self._last_error = None
+
+    def _record_error(self, req_id: str, code: int | str, message: str, data: dict | None = None) -> None:
+        self._error_count += 1
+        now = self._now_iso()
+        self._last_response_at = now
+        err_entry = {
+            "req_id": req_id,
+            "at": now,
+            "code": code,
+            "message": str(message)[:500],
+            "data": data or {},
+        }
+        self._last_error = err_entry
+        self._last_response_summary = {"req_id": req_id, "at": now, "success": False, "code": code, "message": str(message)[:200]}
+        self._error_log.append(err_entry)
+        if len(self._error_log) > 20:
+            self._error_log = self._error_log[-20:]
+
+    def record_init(self, protocol_version: str, host_capabilities: list[str] | None = None, raw_params: dict | None = None) -> None:
+        """Record initialization context (called once after handle_initialize)."""
+        self._init_protocol_version = protocol_version
+        self._init_host_capabilities = list(host_capabilities or [])
+        self._init_raw_params = dict(raw_params or {})
+
+    def get_debug_info(self) -> dict[str, Any]:
+        """Return a snapshot of all sampling debug state for diagnostics."""
+        initialized = bool(self._init_protocol_version)
+        return {
+            "initialized": initialized,
+            "protocol_version": self._init_protocol_version or "unknown",
+            "sampling_enabled": self._sampling_disabled_reason is None,
+            "sampling_disabled_reason": self._sampling_disabled_reason or "",
+            "host_capabilities": list(self._init_host_capabilities),
+            "init_raw_params_keys": sorted(self._init_raw_params.keys()) if isinstance(self._init_raw_params, dict) else [],
+            "call_count": self._call_count,
+            "success_count": self._success_count,
+            "error_count": self._error_count,
+            "pending_count": len(self._pending),
+            "last_request_at": self._last_request_at,
+            "last_request": self._last_request_summary,
+            "last_response_at": self._last_response_at,
+            "last_response": self._last_response_summary,
+            "last_error": self._last_error,
+            "error_log": list(self._error_log),
+            "pending_req_ids": sorted(self._pending.keys()),
+        }
 
     # — wiring —
 
@@ -272,15 +384,17 @@ class SamplingClient:
                 return
             err = msg.get("error")
             if err:
+                code = int(err.get("code", -32603))
+                message = str(err.get("message", "unknown error"))
+                data = err.get("data")
+                self._record_error(req_id, code, message, data)
                 pending.future.set_exception(
-                    SamplingError(
-                        code=int(err.get("code", -32603)),
-                        message=str(err.get("message", "unknown error")),
-                        data=err.get("data"),
-                    )
+                    SamplingError(code=code, message=message, data=data)
                 )
             else:
-                pending.future.set_result(msg.get("result") or {})
+                result = msg.get("result") or {}
+                self._record_success(req_id, result)
+                pending.future.set_result(result)
 
         try:
             loop.call_soon_threadsafe(_resolve)

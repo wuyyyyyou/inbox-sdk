@@ -8,10 +8,12 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "dompurify": "^3.4.9",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },
   "devDependencies": {
+    "@types/dompurify": "^3.0.5",
     "@types/react": "^19.2.16",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.2",

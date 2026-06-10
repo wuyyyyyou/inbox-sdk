@@ -231,6 +231,7 @@ export interface CardDetailPayload {
   thread_context?: Record<string, unknown>;
   contact_context?: Record<string, unknown>;
   latest_body?: string;
+  latest_body_html?: string;
 }
 
 export interface ContactMemorySummary {
@@ -371,6 +372,8 @@ export interface AppState {
   cleanupReadState: Record<string, { read: boolean; readMsgIndices: number[] }>;
   markingReadIds: Record<string, boolean>;
   gmailAuthStatus: GmailAuthStatus;
+  samplingDebug: SamplingDebugInfo | null;
+  samplingTestResult: TestSamplingResult | null;
   askItemActions: Record<string, { read?: boolean; trashed?: boolean; replied?: boolean; sending?: boolean }>;
   askEditDraft: Record<string, string>;
   askHistory: AskHistoryEntry[];
@@ -381,4 +384,42 @@ export interface AskHistoryEntry {
   query: string;
   result: CustomRunResult;
   timestamp: string;
+}
+
+export interface TestSamplingResult {
+  ok: boolean;
+  elapsed_ms?: number;
+  test_req_id?: string;
+  invoke_id?: string;
+  model?: string;
+  stop_reason?: string;
+  content_type?: string;
+  text?: string;
+  usage?: Record<string, unknown>;
+  error_code?: number | string;
+  error_message?: string;
+  error_data?: Record<string, unknown>;
+}
+
+export interface SamplingDebugInfo {
+  initialized: boolean;
+  protocol_version: string;
+  sampling_enabled: boolean;
+  sampling_disabled_reason: string;
+  host_capabilities: string[];
+  executa_manifest_host_capabilities: string[];
+  executa_tool_id: string;
+  executa_version: string;
+  init_raw_params_keys: string[];
+  call_count: number;
+  success_count: number;
+  error_count: number;
+  pending_count: number;
+  last_request_at: string;
+  last_request: Record<string, unknown>;
+  last_response_at: string;
+  last_response: Record<string, unknown>;
+  last_error: Record<string, unknown> | null;
+  error_log: Record<string, unknown>[];
+  pending_req_ids: string[];
 }
