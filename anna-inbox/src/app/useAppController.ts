@@ -217,7 +217,9 @@ export function useAppController() {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.error("[loadActiveCards] failed:", detail, error);
-      setState((s) => ({ ...s, scanError: detail, cards: [], allCards: [], actionCount: 0, scanState: null, loading: false }));
+      setState((s) => ({ ...s, scanError: detail, loading: false }));
+      // Preserve existing cards — they may have come from the run result
+      // when the Executa process is no longer reachable.
     }
   }, [client, refreshStoredCardFields, state.mailbox, state.storageProvider]);
 
@@ -624,6 +626,26 @@ export function useAppController() {
                 scanStatus: mailboxesToScan.length > 1 ? `${status.stage || "Scanning"} · ${mailbox} · ${index + 1}/${mailboxesToScan.length}` : s.scanStatus,
               }));
               if (status.status === "done") {
+                // Use cards from run result directly (process may die before loadActiveCards)
+                if (Array.isArray(status.cards) && status.cards.length > 0) {
+                  const runCards = status.cards as FrontendCard[];
+                  const keyedCards = withCardKeys(runCards, mailbox);
+                  refreshStoredCardFields(keyedCards);
+                  setState((s) => {
+                    const selected = activeBriefMailboxes(s.selectedMailboxes, s.briefMailboxFilter, s.mailbox);
+                    const visible = filterCardsByMailboxes(keyedCards, selected);
+                    return {
+                      ...s,
+                      allCards: keyedCards,
+                      cards: visible,
+                      briefMailboxFilter: selected,
+                      actionCount: actionCount(visible),
+                      scanState: s.scanState,
+                      scanError: "",
+                      loading: false,
+                    };
+                  });
+                }
                 // Collect scan-level warnings (APS cache errors, Gmail API fallback)
                 const ws = status.warnings;
                 if (ws && ws.length) {

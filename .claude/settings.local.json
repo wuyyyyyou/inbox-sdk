@@ -71,7 +71,8 @@
       "Bash(cmd.exe /c \"npm list -g @anna-ai/cli 2>&1\")",
       "Bash(cmd.exe /c \"npm view @anna-ai/cli version 2>&1\")",
       "Read(//c/Users/24848/AppData/Roaming/npm/**)",
-      "Bash(uv run *)"
+      "Bash(uv run *)",
+      "Bash(dir *)"
     ]
   }
 }

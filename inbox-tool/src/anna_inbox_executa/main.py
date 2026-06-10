@@ -2551,10 +2551,17 @@ def get_mail_agent_run(run_id_arg: str) -> dict[str, Any]:
     state = _get_run_state(run_id)
     if not state:
         return {"success": False, "error": "run not found", "run_id": run_id}
+    status = state.get("status")
+    result = _compact_run_result(state.get("result"))
+    cards = None
+    if status == "done":
+        full_result = state.get("result")
+        if isinstance(full_result, dict):
+            cards = full_result.get("cards")
     return {
         "success": True,
         "run_id": run_id,
-        "status": state.get("status"),
+        "status": status,
         "stage": state.get("stage") or "",
         "progress": state.get("progress") or {},
         "partial": state.get("partial") or {},
@@ -2562,7 +2569,8 @@ def get_mail_agent_run(run_id_arg: str) -> dict[str, Any]:
         "started_at": state.get("started_at"),
         "updated_at": state.get("updated_at"),
         "error": state.get("error") or "",
-        "result": _compact_run_result(state.get("result")),
+        "result": result,
+        "cards": cards,
     }
 
 

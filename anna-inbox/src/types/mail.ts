@@ -135,6 +135,7 @@ export interface RunStatus {
   partial?: Record<string, unknown>;
   warnings?: RunWarning[];
   result?: Record<string, unknown>;
+  cards?: FrontendCard[] | null;
   started_at?: string;
   updated_at?: string;
   error?: string;
