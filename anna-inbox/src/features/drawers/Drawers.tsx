@@ -111,7 +111,7 @@ function SourcesDrawer() {
                       <span className="mailbox-source-main">
                         <span className="source-name">{email}</span>
                         <span className="source-meta">
-                          {(mailbox.provider || "gmail").toUpperCase()} · {mailbox.authorized === false ? "Re-auth needed" : "Connected"} · {modeLabel(state.strategyMode)}
+                          {(mailbox.provider || "gmail").toUpperCase()} · <span className={mailbox.authorized === false ? "auth-status is-off" : "auth-status is-on"}>{mailbox.authorized === false ? "Re-auth needed" : "Connected"}</span> · {modeLabel(state.strategyMode)}
                         </span>
                         <span className="source-meta">
                           {mailbox.last_scan_at ? `Last scan ${formatBeijingTimestamp(mailbox.last_scan_at)}` : "No scan yet"}

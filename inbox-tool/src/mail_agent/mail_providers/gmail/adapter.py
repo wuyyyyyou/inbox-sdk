@@ -227,7 +227,11 @@ def list_messages(mailbox: str) -> list[dict[str, Any]]:
 
 def read_cache(mailbox: str) -> dict[str, Any]:
     if _storage_cache_enabled():
-        payload = _storage_get_value_sync(_storage_index_key(mailbox))
+        try:
+            payload = _storage_get_value_sync(_storage_index_key(mailbox))
+        except Exception as exc:
+            _aps_cache_errors.append(f"read_cache({mailbox}): {exc}")
+            return {"mailbox": mailbox, "messages": [], "updated_at": None}
         if not isinstance(payload, dict):
             return {"mailbox": mailbox, "messages": [], "updated_at": None}
         messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
@@ -246,6 +250,17 @@ def read_cache(mailbox: str) -> dict[str, Any]:
     return {"mailbox": mailbox, "messages": messages, "updated_at": payload.get("updated_at")}
 
 
+_aps_cache_errors: list[str] = []
+
+
+def get_aps_cache_errors() -> list[str]:
+    return list(_aps_cache_errors)
+
+
+def _clear_aps_cache_errors() -> None:
+    _aps_cache_errors.clear()
+
+
 def write_index(mailbox: str, messages: list[dict[str, Any]]) -> None:
     payload = {
         "mailbox": mailbox,
@@ -254,7 +269,10 @@ def write_index(mailbox: str, messages: list[dict[str, Any]]) -> None:
         "messages": messages,
     }
     if _storage_cache_enabled():
-        _storage_set_value_sync(_storage_index_key(mailbox), payload)
+        try:
+            _storage_set_value_sync(_storage_index_key(mailbox), payload)
+        except Exception as exc:
+            _aps_cache_errors.append(f"write_index({mailbox}): {exc}")
         return
     _index_path(mailbox).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -264,7 +282,10 @@ def write_message(mailbox: str, message: dict[str, Any]) -> None:
     if not message_id:
         raise ValueError("Cannot cache Gmail message without id")
     if _storage_cache_enabled():
-        _storage_set_value_sync(_storage_message_key(mailbox, message_id), message)
+        try:
+            _storage_set_value_sync(_storage_message_key(mailbox, message_id), message)
+        except Exception as exc:
+            _aps_cache_errors.append(f"write_message({mailbox}, {message_id[:20]}): {exc}")
         return
     _message_path(mailbox, message_id).write_text(
         json.dumps(message, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

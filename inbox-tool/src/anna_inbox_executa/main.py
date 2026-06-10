@@ -1091,7 +1091,13 @@ def _check_gmail_auth(mailbox: str) -> dict[str, Any]:
     if not requested:
         platform_token = _os.environ.get("GMAIL_ACCESS_TOKEN") or _os.environ.get("GOOGLE_ACCESS_TOKEN")
         if platform_token and platform_token.strip():
-            authorized_email = get_authorized_email().strip().lower()
+            try:
+                authorized_email = get_authorized_email().strip().lower()
+            except Exception:
+                # Gmail API unreachable — token exists, assume authorized
+                return {"authorized": True, "source": "platform", "warning": "Gmail API unreachable; token assumed valid", "mode": "any"}
+            if not authorized_email:
+                return {"authorized": True, "source": "platform", "warning": "Token present but email lookup failed", "mode": "any"}
             return {"authorized": True, "source": "platform", "authorized_email": authorized_email, "mode": "any"}
         multi = get_multi_token_map()
         if multi:

@@ -321,8 +321,8 @@ export function useAppController() {
       setState((s) => ({ ...s, gmailAuthStatus: { checked: true, ...status } }));
       return status;
     } catch {
-      setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: true, source: "unknown" } }));
-      return { authorized: true, source: "unknown" };
+      setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: false, source: "error" } }));
+      return { authorized: false, source: "error" };
     }
   }, [client, state.mailbox]);
 
@@ -392,7 +392,9 @@ export function useAppController() {
     // 系统级鉴权：只看平台 token / multi-token 有没有至少一个可用，不针对具体邮箱
     const authResult = await client.checkAnyGmailAuth();
     const systemAuthorized = Boolean(authResult?.authorized);
+    const authWarning = (authResult as Record<string, unknown> | null | undefined)?.warning as string | undefined;
     setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: systemAuthorized, source: authResult?.source || "none" } }));
+    if (authWarning) showToast(`Auth notice: ${authWarning}`);
     if (runtime.connected) {
       if (!systemAuthorized) {
         setState((s) => ({ ...s, loading: false }));
@@ -484,8 +486,8 @@ export function useAppController() {
         setState((s) => ({ ...s, gmailAuthStatus: { checked: true, ...status } }));
         return status;
       } catch {
-        setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: true, source: "unknown" } }));
-        return { authorized: true, source: "unknown" };
+        setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: false, source: "error" } }));
+        return { authorized: false, source: "error" };
       }
     },
     async loadMailboxes() {
@@ -578,7 +580,21 @@ export function useAppController() {
                 scanProgress: status.progress || {},
                 scanStatus: mailboxesToScan.length > 1 ? `${status.stage || "Scanning"} · ${mailbox} · ${index + 1}/${mailboxesToScan.length}` : s.scanStatus,
               }));
-              if (status.status === "done") break;
+              if (status.status === "done") {
+                // Collect scan-level warnings (APS cache errors, Gmail API fallback)
+                const ws = status.warnings;
+                if (ws && ws.length) {
+                  for (const w of ws) {
+                    const detail = w.detail || {};
+                    const errs = Array.isArray(detail.errors) ? detail.errors : [];
+                    const apsErrs = Array.isArray(detail.aps_cache_errors) ? detail.aps_cache_errors : [];
+                    for (const e of [...errs, ...apsErrs.map((e: string) => `[APS cache] ${e}`)]) {
+                      if (e && !failures.includes(e)) failures.push(`${mailbox}: ${e}`);
+                    }
+                  }
+                }
+                break;
+              }
               if (status.status === "failed") throw new Error(status.error || "Mail agent scan failed");
               if (poll === POLL_LIMIT - 1) throw new Error("Mail agent scan timed out");
             }
@@ -590,7 +606,7 @@ export function useAppController() {
         await loadActiveCards();
         await loadRunHistory();
         const statusText = failures.length
-          ? `Scan complete with ${failures.length} mailbox error${failures.length === 1 ? "" : "s"}.`
+          ? `Scan complete with ${failures.length} issue${failures.length === 1 ? "" : "s"}.`
           : "Scan complete. Showing persisted attention cards.";
         setState((s) => ({ ...s, scanStatus: statusText, scanError: failures.join("\n") }));
         showToast(failures.length ? statusText : "Scan complete.");

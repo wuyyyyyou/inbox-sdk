@@ -232,8 +232,7 @@ async def run_mail_task(
             q["query"] = q_str
 
     budget = dict(scan_plan.get("budget", {}))
-    requested_max = max(1, input_.max_messages or configured_max)
-    budget["max_messages"] = min(budget.get("max_messages", requested_max), requested_max, configured_max)
+    budget["max_messages"] = min(budget.get("max_messages", configured_max), configured_max)
     scan_plan["budget"] = budget
 
     _report_progress(progress_callback, "scan", max_messages=budget["max_messages"], window_days=window_days)

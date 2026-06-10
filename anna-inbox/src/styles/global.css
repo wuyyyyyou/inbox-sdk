@@ -4395,7 +4395,11 @@
       }
     }
     .preset-row-sm { display:flex; flex-wrap:wrap; gap:6px; align-items: center; }
-    .mailbox-config-arrow {
+    .auth-status { font-weight: 500; }
+.auth-status.is-on { color: var(--green); }
+.auth-status.is-off { color: var(--rose); }
+
+.mailbox-config-arrow {
       font-size: 10px;
       color: var(--text-muted);
       flex-shrink: 0;
@@ -4665,6 +4669,15 @@
 .auth-orb svg {
   width: 22px;
   height: 22px;
+}
+
+.auth-orb.is-pulse {
+  animation: auth-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes auth-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.08); opacity: 0.75; }
 }
 
 .auth-guide-card {

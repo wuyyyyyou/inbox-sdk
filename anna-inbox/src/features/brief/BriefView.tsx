@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CATEGORY_NOTE, CATEGORY_TABS } from "../../app/constants";
 import { useApp } from "../../app/AppContext";
 import { scanProgressLabel, SCAN_STEPS } from "./runHelpers";
@@ -289,25 +289,71 @@ function SnoozeReasonsDialog({ cardKey, onConfirm, onClose }: { cardKey: string;
 export function BriefView() {
   const { state, actions } = useApp();
   const [confirmClear, setConfirmClear] = useState<string | null>(null);
-  if (state.gmailAuthStatus.checked && !state.gmailAuthStatus.authorized) {
+  const [authChecking, setAuthChecking] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const autoRetryRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Auto-retry Gmail auth check every 10s while on the auth guide page
+  const isAuthPage = state.gmailAuthStatus.checked && !state.gmailAuthStatus.authorized;
+  const checkingRef = useRef(false);
+  useEffect(() => {
+    if (!isAuthPage) return;
+    const doCheck = async () => {
+      if (checkingRef.current) return;
+      checkingRef.current = true;
+      setAuthChecking(true);
+      try {
+        const r = await actions.checkAnyGmailAuth();
+        if (!r.authorized) setAuthError(r.source === "error" ? "No Gmail token found — open More → Authorizations in the Anna app menu to connect a Google account." : `No authorized mailbox detected (source: ${r.source}).`);
+        else setAuthError("");
+      } catch {
+        setAuthError("Auth check failed. Make sure the Anna app has internet access and Gmail permissions.");
+      } finally {
+        checkingRef.current = false;
+        setAuthChecking(false);
+      }
+    };
+    doCheck();
+    autoRetryRef.current = setInterval(doCheck, 10000);
+    return () => { if (autoRetryRef.current) clearInterval(autoRetryRef.current); };
+  }, [isAuthPage]);
+
+  const handleManualCheck = async () => {
+    if (checkingRef.current) return;
+    checkingRef.current = true;
+    setAuthChecking(true);
+    setAuthError("");
+    try {
+      const r = await actions.checkAnyGmailAuth();
+      if (!r.authorized) setAuthError("No Gmail token found — open More → Authorizations in the Anna app menu to connect a Google account.");
+    } catch {
+      setAuthError("Auth check failed. Make sure the Anna app has internet access and Gmail permissions.");
+    } finally {
+      checkingRef.current = false;
+      setAuthChecking(false);
+    }
+  };
+
+  if (isAuthPage) {
     return (
       <div className="first-run-layout">
         <section className="first-run-center" aria-label="Gmail authorization required">
-          <div className="auth-orb" aria-hidden="true">A</div>
+          <div className={`auth-orb ${authChecking ? "is-pulse" : ""}`} aria-hidden="true">A</div>
           <h1 className="first-run-title">Connect your Gmail account</h1>
           <p className="first-run-copy">Authorize Anna to read and manage your inbox.</p>
           <div className="auth-guide-card">
             <div className="auth-guide-steps">
               <div className="auth-step"><span className="auth-step-num">1</span><span>Open <strong>More → Authorizations</strong></span></div>
               <div className="auth-step"><span className="auth-step-num">2</span><span>Select <strong>Google</strong> → <strong>Connect with OAuth</strong></span></div>
-              <div className="auth-step"><span className="auth-step-num">3</span><span>Tick Gmail and Calendar permissions</span></div>
+              <div className="auth-step"><span className="auth-step-num">3</span><span>Tick Gmail Read/Modify/Compose/Send</span></div>
               <div className="auth-step"><span className="auth-step-num">4</span><span>Click <strong>Authorize</strong> and return here</span></div>
             </div>
           </div>
           <div className="first-run-actions">
-            <button className="primary-btn" onClick={() => void actions.checkAnyGmailAuth()}>Check again</button>
+            <button className="primary-btn" disabled={authChecking} onClick={handleManualCheck}>{authChecking ? "Checking..." : "Check again"}</button>
             <button className="soft-btn" onClick={() => actions.openSourcesWithConfig?.()}>Scan setting</button>
           </div>
+          {authError ? <p className="assistant-copy is-error" style={{ marginTop: 12, textAlign: "center" }}>{authError}</p> : null}
         </section>
       </div>
     );

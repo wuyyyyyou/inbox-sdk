@@ -132,12 +132,15 @@ async def run_mail_scan(
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from ..mail_providers.gmail.adapter import (
+        _clear_aps_cache_errors,
         cache_debug_info,
+        get_aps_cache_errors,
         get_messages_lite_async,
         live_search_and_cache,
         list_messages,
         normalize_mailbox,
     )
+    _clear_aps_cache_errors()
 
     normalized_mailbox = normalize_mailbox(mailbox)
     budget = scan_plan.get("budget", {})
@@ -200,13 +203,26 @@ async def run_mail_scan(
             },
         })
 
-    if fallback_used:
-        _logger.warning("Gmail API 不可用，回退到本地缓存：%d 封缓存邮件", len(messages))
+    # Collect APS cache sync bridge errors
+    aps_errors = get_aps_cache_errors()
+    if aps_errors:
+        _logger.warning("APS cache sync errors: %s", aps_errors[:5])
+        gmail_errors.extend(f"[APS cache] {e}" for e in aps_errors[:5])
+
+    if fallback_used or aps_errors:
+        _logger.warning("Gmail API/cache 不可用：Gmail errors=%d APS cache errors=%d", len(gmail_errors), len(aps_errors))
         if progress_callback:
             progress_callback("scan_fallback", {
-                "gmail_api_failed": True,
+                "gmail_api_failed": bool(gmail_errors),
+                "aps_cache_errors": aps_errors[:5],
                 "cached_count": len(messages),
-                "errors": gmail_errors[-3:],  # 最多返回最后3条错误
+                "errors": gmail_errors[-5:],
+                "partial": {
+                    "scan_warnings": {
+                        "gmail_errors": gmail_errors[-5:],
+                        "aps_cache_errors": aps_errors[:5],
+                    }
+                },
             })
 
     if fallback_used and not messages:
