@@ -352,6 +352,22 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "clear_cards",
+            "description": "Clear brief cards by category for a mailbox. Category: all, reply, review, or cleanup.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "category", "type": "string", "description": "all | reply | review | cleanup", "required": True},
+            ],
+        },
+        {
+            "name": "clear_history",
+            "description": "Delete all run history records.",
+        },
+        {
+            "name": "reset_all_data",
+            "description": "Reset all persistent data — cards, history, cache, scan state, contacts. Returns app to first-run state.",
+        },
+        {
             "name": "record_learning",
             "description": "Record a learning feedback from the user about email patterns.",
             "parameters": [
@@ -639,7 +655,7 @@ from mail_agent.storage.sync_bridge import bind as bind_storage_sync_bridge
 bind_storage_sync_bridge(loop, loop_thread)
 MAIL_AGENT_RUNS: dict[str, dict[str, Any]] = {}
 RUN_STATE_LOCK = threading.RLock()
-RUN_CHECKPOINT_DIR = data_root() / "runs" / "background"
+RUN_CHECKPOINT_DIR = data_root() / "anna-inbox" / "runs" / "background"
 
 
 def _run_checkpoint_path(run_id: str) -> Path:
@@ -1070,6 +1086,22 @@ def _check_gmail_auth(mailbox: str) -> dict[str, Any]:
     from pathlib import Path as _Path
 
     requested = str(mailbox or "").strip().lower()
+
+    # 系统级判断：mailbox 为空时，只看 token 有没有，不关心具体邮箱
+    if not requested:
+        platform_token = _os.environ.get("GMAIL_ACCESS_TOKEN") or _os.environ.get("GOOGLE_ACCESS_TOKEN")
+        if platform_token and platform_token.strip():
+            authorized_email = get_authorized_email().strip().lower()
+            return {"authorized": True, "source": "platform", "authorized_email": authorized_email, "mode": "any"}
+        multi = get_multi_token_map()
+        if multi:
+            return {"authorized": True, "source": "platform_multi", "authorized_email": list(multi.keys())[0] if multi else "", "mode": "any"}
+        token_dir = _token_dir()
+        if token_dir.exists():
+            for p in token_dir.glob("*.json"):
+                if p.name != "default.json":
+                    return {"authorized": True, "source": "local_file", "mode": "any"}
+        return {"authorized": False, "source": "none", "mode": "any"}
 
     # Platform path — check for injected OAuth credential
     platform_token = _os.environ.get("GMAIL_ACCESS_TOKEN") or _os.environ.get("GOOGLE_ACCESS_TOKEN")
@@ -2091,7 +2123,23 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
 
     if mailbox.lower() == "all":
         active = _run_storage_query(aggregate_active_cards())
-        scan_state = None
+        # Aggregate scan state across all registered mailboxes
+        try:
+            from mail_agent.storage.ops import get_mailbox_registry
+            reg = _run_storage_query(get_mailbox_registry())
+            all_mboxes = [e.email for e in (reg.mailboxes if reg else [])]
+            all_states = [_run_storage_query(get_scan_state(m)) for m in all_mboxes]
+            total_scans = max((getattr(s, 'total_scans', 0) for s in all_states), default=0)
+            total_processed = max((getattr(s, 'total_processed', 0) for s in all_states), default=0)
+            last_scan_ts = max((getattr(s, 'last_scan_ts', '') for s in all_states), default='')
+            scan_state = {
+                "last_scan_ts": last_scan_ts,
+                "last_message_internal_date": "",
+                "total_scans": total_scans,
+                "total_processed": total_processed,
+            }
+        except Exception:
+            scan_state = {"total_scans": 0, "total_processed": 0, "last_scan_ts": "", "last_message_internal_date": ""}
     else:
         active = _run_storage_query(get_active_cards(mailbox))
         state = _run_storage_query(get_scan_state(mailbox))
@@ -2595,6 +2643,30 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         await delete_custom_plan(plan_id)
         return {"ok": True, "plan_id": plan_id}
 
+    if tool == "clear_cards":
+        category = str(arguments.get("category", "")).strip()
+        if not mailbox or not category:
+            return {"error": "mailbox and category are required"}
+        from mail_agent.storage.ops import clear_cards_by_category
+        removed = await clear_cards_by_category(mailbox, category)
+        return {"ok": True, "removed": removed, "category": category, "mailbox": mailbox}
+
+    if tool == "clear_history":
+        from mail_agent.storage.ops import clear_run_history
+        await clear_run_history()
+        return {"ok": True}
+
+    if tool == "reset_all_data":
+        from mail_agent.storage.ops import reset_all_data
+        import shutil
+        await reset_all_data()
+        # Local file-system cleanup: remove the entire data directory.
+        # APS stores data remotely so this is a no-op there.
+        root = data_root()
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+        return {"ok": True}
+
     if tool == "reply_now":
         log(f"[reply_now] mailbox={mailbox} card_id={card_id} dry_run={arguments.get('dry_run', True)} reply_mode={arguments.get('reply_mode', 'reply_to_sender')} draft_len={len(str(arguments.get('draft_body', '')))}")
         if not mailbox or not card_id:
@@ -2825,6 +2897,7 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         "clear_active_cards", "mark_cleanup_read", "record_snooze", "restore_card", "record_learning",
         "start_summarize_thread", "start_generate_draft",
         "delete_custom_plan",
+        "clear_cards", "clear_history", "reset_all_data",
         "get_scan_plan", "set_scan_plan",
         "reply_now", "reply_from_ask", "mark_read_from_ask", "trash_from_ask",
     ):
@@ -2941,7 +3014,7 @@ def handle_line(line: str) -> None:
 
 def main() -> None:
     # Write startup log so we can diagnose harness crashes even without stderr.
-    _diag_dir = data_root() / "diagnostics"
+    _diag_dir = data_root() / "anna-inbox" / "diagnostics"
     _diag_dir.mkdir(parents=True, exist_ok=True)
     _diag_path = _diag_dir / "agent_startup.log"
     with open(_diag_path, "a", encoding="utf-8") as _df:

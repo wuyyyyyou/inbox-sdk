@@ -76,6 +76,7 @@ function PerMailboxConfig() {
 
 function SourcesDrawer() {
   const { state, actions } = useApp();
+  const [confirmReset, setConfirmReset] = useState(false);
   const storageLabel = state.storageProvider === "aps" ? "APS (Anna Persistent Storage)" : "local JSON files";
   const plan = state.scanPlan || {};
   const expanded = state.configMailbox;
@@ -133,7 +134,22 @@ function SourcesDrawer() {
           <ul className="config-list">
             <li>{storageLabel}</li>
           </ul>
+          <div style={{ marginTop: 12 }}>
+            <button className="danger-btn" style={{ fontSize: 12, padding: "6px 14px", borderRadius: 8 }} onClick={() => setConfirmReset(true)}>Reset all data</button>
+            <p className="drawer-copy" style={{ marginTop: 4 }}>Clears all cards, history, cache, and scan state.</p>
+          </div>
         </section>
+        {confirmReset ? (
+          <div className="confirm-overlay" onClick={() => setConfirmReset(false)}>
+            <div className="confirm-dialog" onClick={(e) => e.stopPropagation()}>
+              <p>This will delete all persistent data including cards, history, Gmail cache, and scan state. The app will reload. <strong>This cannot be undone.</strong></p>
+              <div className="confirm-actions">
+                <button className="soft-btn" onClick={() => setConfirmReset(false)}>Cancel</button>
+                <button className="primary-btn danger-btn" onClick={() => { void actions.resetAllData(); }}>Reset everything</button>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
     </aside>
   );
@@ -453,6 +469,25 @@ function HistoryDrawer() {
     void actions.restoreCard(run.card_id, run.mailbox);
   };
 
+  const scanTags = (run: RunHistoryEntry) => {
+    if (!run.result || run.entry_type === "card_action") return null;
+    const parts = run.result.split(", ");
+    const tags: { label: string; color: string }[] = [];
+    for (const p of parts) {
+      if (p.includes("needs reply")) tags.push({ label: p.trim(), color: "reply" });
+      else if (p.includes("needs review")) tags.push({ label: p.trim(), color: "review" });
+      else if (p.includes("cleanup")) tags.push({ label: p.trim(), color: "cleanup" });
+      else if (p.includes("important")) tags.push({ label: p.trim(), color: "important" });
+      else if (p.toLowerCase().startsWith("scanned")) tags.push({ label: p.trim(), color: "scanned" });
+    }
+    if (!tags.length) return null;
+    return (
+      <div className="history-entry-tags">
+        {tags.map((t, i) => <span key={i} className={`history-tag history-tag-${t.color}`}>{t.label}</span>)}
+      </div>
+    );
+  };
+
   const renderEntry = (run: RunHistoryEntry, hideDetail?: boolean) => {
     const isCard = run.entry_type === "card_action";
     const isExpanded = expanded[entryKey(run)] || false;
@@ -462,17 +497,16 @@ function HistoryDrawer() {
     const title = isCard
       ? (run.card_title || run.card_id || "")
       : (run.request || run.strategy || "Mailbox scan");
+    const tags = !isCard ? scanTags(run) : null;
 
     return (
       <div className="history-entry" key={entryKey(run)}>
         <div
-          className={`history-entry-row ${isCard ? "is-expandable" : ""}`}
+          className={`history-entry-row ${isCard ? "is-expandable" : ""} ${tags ? "has-tags" : ""}`}
           onClick={isCard ? () => toggleExpand(run) : undefined}
         >
           <span className="history-entry-time">{formatBeijingTimestamp(run.ts)}</span>
           <span className="history-entry-text">{title}</span>
-          {run.detail && !hideDetail ? <span className="history-entry-detail">{run.detail}</span> : null}
-          {run.result && !isCard ? <span className="history-entry-detail">{run.result}</span> : null}
           {canRestore ? (
             <button
               className="history-restore-btn"
@@ -486,6 +520,7 @@ function HistoryDrawer() {
           ) : null}
           {isCard ? <span className="history-entry-arrow">{isExpanded ? "▾" : "▸"}</span> : null}
         </div>
+        {tags}
         {isExpanded ? (
           <div className="history-entry-body">
             {hasCardContext ? (
@@ -516,7 +551,7 @@ function HistoryDrawer() {
       <div className="drawer-body">
         {!hasAny ? <p className="assistant-copy">No history yet.</p> : null}
         {visibleGroups.map((g) => {
-          const allEntries = (grouped[g.key] || []).filter((e) => !restoredCardIds.has(e.card_id || "") && !consumedEntryIds.has(entryKey(e)));
+          const allEntries = (grouped[g.key] || []).filter((e) => e.action === "restore" || (!restoredCardIds.has(e.card_id || "") && !consumedEntryIds.has(entryKey(e))));
           const isCollapsed = collapsed[g.key] || false;
           const isSnooze = g.key === "snooze";
           const { byFilter, selected } = isSnooze ? _filterVisible(allEntries) : { byFilter: new Map(), selected: allEntries };

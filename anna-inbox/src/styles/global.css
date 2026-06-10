@@ -5061,6 +5061,12 @@
   margin: 8px 0;
 }
 
+.result-filter-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .category-segment {
   display: inline-flex;
   align-items: center;
@@ -5082,6 +5088,72 @@
   cursor: pointer;
   transition: background 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
   white-space: nowrap;
+}
+
+.category-clear-btn,
+.history-clear-btn {
+  height: 32px;
+  padding: 0 14px;
+  border: 1px solid rgba(217,48,37,0.18);
+  background: rgba(255,255,255,0.44);
+  color: #d93025;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: background 0.15s, border-color 0.15s;
+  flex-shrink: 0;
+}
+
+.category-clear-btn:hover,
+.history-clear-btn:hover {
+  background: rgba(217,48,37,0.06);
+  border-color: rgba(217,48,37,0.35);
+}
+
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.35);
+  backdrop-filter: blur(4px);
+}
+
+.confirm-dialog {
+  background: #fff;
+  border-radius: 16px;
+  padding: 24px;
+  max-width: 360px;
+  width: 90%;
+  box-shadow: 0 24px 64px rgba(0,0,0,0.18);
+}
+
+.confirm-dialog p {
+  margin: 0 0 16px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-main);
+}
+
+.confirm-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.danger-btn {
+  background: #d93025 !important;
+  color: #fff !important;
+}
+
+.danger-btn:hover {
+  background: #b71c1c !important;
 }
 
 .category-tab.is-active {
@@ -5382,6 +5454,29 @@
   margin-bottom: 3px;
   word-break: break-word;
 }
+
+.history-entry-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 3px 0 0 96px;
+}
+
+.history-tag {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 7px;
+  border-radius: 999px;
+  white-space: nowrap;
+  line-height: 1.6;
+}
+
+.history-tag-scanned { background: rgba(75,85,99,0.06); color: #4b5563; }
+.history-tag-reply { background: rgba(37,99,235,0.08); color: #2563eb; }
+.history-tag-review { background: rgba(139,92,246,0.08); color: #7c3aed; }
+.history-tag-cleanup { background: rgba(107,114,128,0.08); color: #6b7280; }
+.history-tag-important { background: rgba(217,119,6,0.08); color: #d97706; }
 
 .history-entry-label {
   font-size: 10px;

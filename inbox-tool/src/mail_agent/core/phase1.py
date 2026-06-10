@@ -229,8 +229,13 @@ def parse_phase1_response(
             user_action = "ignore"
 
         if user_action == "ignore":
-            low_value_items.append(_build_low_value_item(msg_id, item, "llm"))
-            continue
+            msg = msg_by_id.get(msg_id)
+            if msg and (getattr(msg, "starred", False) or getattr(msg, "important", False)):
+                user_action = "review"
+                item["reason"] = f"[code guard: starred={getattr(msg, 'starred', False)} important={getattr(msg, 'important', False)}] {item.get('reason', '')}"
+            else:
+                low_value_items.append(_build_low_value_item(msg_id, item, "llm"))
+                continue
 
         llm_kind = _user_action_to_kind(user_action)
 

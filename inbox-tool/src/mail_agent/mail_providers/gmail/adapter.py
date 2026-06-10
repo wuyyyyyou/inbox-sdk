@@ -132,7 +132,7 @@ def normalize_mailbox(mailbox: str) -> str:
 
 def cache_dir() -> Path:
     override = os.environ.get("ZHAOPY_MAIL_AGENT_DATA_DIR")
-    base = Path(override).expanduser().resolve() if override else _data_root() / "gmail_cache"
+    base = Path(override).expanduser().resolve() if override else _data_root() / "anna-inbox" / "gmail_cache"
     path = base / "mailboxes"
     path.mkdir(parents=True, exist_ok=True)
     return path

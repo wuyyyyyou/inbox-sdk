@@ -288,6 +288,7 @@ function SnoozeReasonsDialog({ cardKey, onConfirm, onClose }: { cardKey: string;
 
 export function BriefView() {
   const { state, actions } = useApp();
+  const [confirmClear, setConfirmClear] = useState<string | null>(null);
   if (state.gmailAuthStatus.checked && !state.gmailAuthStatus.authorized) {
     return (
       <div className="first-run-layout">
@@ -304,7 +305,7 @@ export function BriefView() {
             </div>
           </div>
           <div className="first-run-actions">
-            <button className="primary-btn" onClick={() => void actions.checkGmailAuth()}>Check again</button>
+            <button className="primary-btn" onClick={() => void actions.checkAnyGmailAuth()}>Check again</button>
             <button className="soft-btn" onClick={() => actions.openSourcesWithConfig?.()}>Scan setting</button>
           </div>
         </section>
@@ -388,24 +389,35 @@ export function BriefView() {
           )}
         </div>
       </section>
-      {totalVisible > 0 ? (
+      {totalScans > 0 ? (
         <>
           <div className="result-filter-row">
-            <div className="category-segment" role="tablist" aria-label="Card filters">
-              {CATEGORY_TABS.map((tab) => (
-                <button key={tab.id} className={`category-tab ${activeFilter === tab.id ? "is-active" : ""}`} role="tab" aria-selected={activeFilter === tab.id} onClick={() => actions.setResultFilter(tab.id)}>
-                  {tab.label}&nbsp;{tab.id === "all" ? (filteredCards(state.cards, "all").length - cleanupCards.length + cleanupCount) : tab.id === "cleanup" ? cleanupCount : filteredCards(state.cards, tab.id).length}
-                </button>
-              ))}
+            <div className="result-filter-left">
+              <div className="category-segment" role="tablist" aria-label="Card filters">
+                {CATEGORY_TABS.map((tab) => {
+                  const count = tab.id === "all" ? (filteredCards(state.cards, "all").length - cleanupCards.length + cleanupCount) : tab.id === "cleanup" ? cleanupCount : filteredCards(state.cards, tab.id).length;
+                  return (
+                    <button key={tab.id} className={`category-tab ${activeFilter === tab.id ? "is-active" : ""}`} role="tab" aria-selected={activeFilter === tab.id} onClick={() => actions.setResultFilter(tab.id)}>
+                      {tab.label}&nbsp;{count}
+                    </button>
+                  );
+                })}
+              </div>
+              <MailboxFilter allCards={cardsInEnabledMailboxes} />
             </div>
-            <MailboxFilter allCards={cardsInEnabledMailboxes} />
+            {(() => {
+              const activeCount = activeFilter === "all" ? (filteredCards(state.cards, "all").length - cleanupCards.length + cleanupCount) : activeFilter === "cleanup" ? cleanupCount : filteredCards(state.cards, activeFilter).length;
+              return activeCount > 0 ? (
+                <button className="category-clear-btn" title={`Clear ${activeFilter}`} onClick={() => setConfirmClear(activeFilter)}>🗑 Clear</button>
+              ) : null;
+            })()}
           </div>
           {!isAll && CATEGORY_NOTE[activeFilter] ? <p className="category-note">{CATEGORY_NOTE[activeFilter]}</p> : null}
         </>
       ) : null}
       {mainDisplayCards.length ? (
         <section className="noticed-section"><div className="attention-queue">{mainDisplayCards.map((card) => <AttentionCard key={card.uiKey || card.id} card={card} />)}</div></section>
-      ) : totalVisible > 0 && !cleanupCards.length ? <p className="assistant-copy" style={{ textAlign: "center", marginTop: 12 }}>No cards in this category.</p> : null}
+      ) : null}
       {state.snoozeReasonsKey ? (
         <SnoozeReasonsDialog
           cardKey={state.snoozeReasonsKey}
@@ -431,6 +443,17 @@ export function BriefView() {
           })}
           {cleanupMessages.map(({ msg, index, cardId }, i) => <CleanupIndividualCard key={msg.message_id || `${i}`} msg={msg} index={index} cardId={cardId} />)}
         </>
+      ) : null}
+      {confirmClear ? (
+        <div className="confirm-overlay" onClick={() => setConfirmClear(null)}>
+          <div className="confirm-dialog" onClick={(e) => e.stopPropagation()}>
+            <p>Delete all <strong>{confirmClear === "all" ? "" : confirmClear}</strong> cards? This cannot be undone.</p>
+            <div className="confirm-actions">
+              <button className="soft-btn" onClick={() => setConfirmClear(null)}>Cancel</button>
+              <button className="primary-btn danger-btn" onClick={() => { void actions.clearCards(confirmClear); setConfirmClear(null); }}>Delete</button>
+            </div>
+          </div>
+        </div>
       ) : null}
     </div>
   );

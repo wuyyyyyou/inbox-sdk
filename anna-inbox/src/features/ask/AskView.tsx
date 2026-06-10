@@ -300,7 +300,10 @@ export function AskView() {
               <h2>Past runs</h2>
               <p>Recent custom scans, kept compact so the latest answer stays in focus.</p>
             </div>
-            <span>{older.length} saved</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <button className="history-clear-btn" title="Clear history" onClick={() => void actions.clearHistory()}>🗑 Clear</button>
+              <span>{older.length} saved</span>
+            </div>
           </div>
           {older.map((entry, idx) => <AskHistoryEntryRow key={idx} entry={entry} index={idx + 1} />)}
         </section>

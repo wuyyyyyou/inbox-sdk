@@ -220,7 +220,10 @@ async def run_mail_task(
     for q in queries:
         if isinstance(q, dict):
             q_str = str(q.get("query") or "")
-            q_str = _re.sub(r"newer_than:\d+d", f"newer_than:{window_days}d", q_str)
+            if "newer_than:" in q_str:
+                q_str = _re.sub(r"newer_than:\d+d", f"newer_than:{window_days}d", q_str)
+            else:
+                q_str = f"{q_str} newer_than:{window_days}d".strip()
             # Inject extra scan categories (promotions, social, updates, forums)
             categories = scan_plan_config.scan_categories if scan_plan_config else []
             for cat in categories:
@@ -989,6 +992,11 @@ async def _persist_run_results_locked(
     candidate_count = len(candidates)
     main_count = sum(1 for j in judgments if j.final_decision.should_show_in_main_result)
     lower_count = sum(1 for j in judgments if j.final_decision.should_show_in_lower_priority)
+    # Per-category breakdown
+    reply_count = sum(1 for j in judgments if j.final_decision.user_action == "reply")
+    review_count = sum(1 for j in judgments if j.final_decision.user_action == "review")
+    cleanup_count = sum(1 for j in judgments if j.final_decision.priority in ("low", "ignore"))
+    important_count = sum(1 for j in judgments if j.final_decision.priority in ("critical", "high", "medium"))
 
     run = RunRecord(
         run_id=run_id,
@@ -1030,6 +1038,11 @@ async def _persist_run_results_locked(
     await set_scan_state(mailbox, scan_state)
 
     # 6. Append run history (cross-mailbox)
+    parts = [f"Scanned {scanned_count} emails"]
+    if reply_count: parts.append(f"{reply_count} needs reply")
+    if review_count: parts.append(f"{review_count} needs review")
+    if cleanup_count: parts.append(f"{cleanup_count} cleanup")
+    if important_count: parts.append(f"{important_count} important")
     history_entry = RunHistoryEntry(
         run_id=run_id,
         mailbox=mailbox,
@@ -1038,8 +1051,10 @@ async def _persist_run_results_locked(
         mode=mode,
         strategy=strategy_mode,
         plan_id=plan_id,
-        result=f"{main_count} main, {lower_count} lower, {len(cards_summary)} cards",
-        summary=f"Scanned {scanned_count}, candidates {candidate_count}, main {main_count}, lower {lower_count}",
+        result=", ".join(parts),
+        summary=f"Scanned {scanned_count} messages\n"
+                f"Needs reply: {reply_count} · Needs review: {review_count} · Cleanup: {cleanup_count}\n"
+                f"Important (medium+): {important_count}",
     )
     await append_run_history(history_entry)
 

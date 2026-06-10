@@ -103,6 +103,7 @@ export interface AppActions {
   setDrawer(drawer: "sources" | "history" | "memory" | "scanPlan", open: boolean): void;
   minimize(value: boolean): void;
   checkGmailAuth(mailboxOverride?: string): Promise<{ authorized: boolean; source: string }>;
+  checkAnyGmailAuth(): Promise<{ authorized: boolean; source: string }>;
   loadMailboxes(): Promise<void>;
   setMailboxSelected(mailbox: string, selected: boolean): Promise<void>;
   setBriefMailboxFilter(mailboxes: string[]): void;
@@ -133,6 +134,9 @@ export interface AppActions {
   startCustomScan(): Promise<void>;
   reRunCustomPlan(planId: string): Promise<void>;
   deleteCustomPlan(planId: string): Promise<void>;
+  clearCards(category: string): Promise<void>;
+  clearHistory(): Promise<void>;
+  resetAllData(): Promise<void>;
   handleAskMarkRead(actionKey: string, messageId: string, mailbox?: string): Promise<void>;
   handleAskTrash(actionKey: string, messageId: string, mailbox?: string): Promise<void>;
   enterAskDraftEdit(key: string, draft: string): void;
@@ -385,9 +389,12 @@ export function useAppController() {
       const mailbox = await discoverMailbox();
       currentMailbox = mailbox || state.mailbox;
     }
-    const auth = await checkGmailAuth(currentMailbox);
+    // 系统级鉴权：只看平台 token / multi-token 有没有至少一个可用，不针对具体邮箱
+    const authResult = await client.checkAnyGmailAuth();
+    const systemAuthorized = Boolean(authResult?.authorized);
+    setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: systemAuthorized, source: authResult?.source || "none" } }));
     if (runtime.connected) {
-      if (!auth.authorized) {
+      if (!systemAuthorized) {
         setState((s) => ({ ...s, loading: false }));
         return;
       }
@@ -396,7 +403,7 @@ export function useAppController() {
       await loadScanPlan(currentMailbox);
       await loadActiveCards(undefined, "all");
     }
-  }, [checkGmailAuth, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadMailboxes, loadRunHistory, loadScanPlan, state.mailbox]);
+  }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadMailboxes, loadRunHistory, loadScanPlan, state.mailbox]);
 
   const actions: AppActions = {
     showToast,
@@ -470,6 +477,17 @@ export function useAppController() {
       setState((s) => ({ ...s, minimized: value }));
     },
     checkGmailAuth,
+    async checkAnyGmailAuth() {
+      try {
+        const result = await client.checkAnyGmailAuth();
+        const status = { authorized: Boolean(result && result.authorized), source: (result && result.source) || "none" };
+        setState((s) => ({ ...s, gmailAuthStatus: { checked: true, ...status } }));
+        return status;
+      } catch {
+        setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: true, source: "unknown" } }));
+        return { authorized: true, source: "unknown" };
+      }
+    },
     async loadMailboxes() {
       await loadMailboxes();
     },
@@ -871,6 +889,42 @@ export function useAppController() {
         await client.deleteCustomPlan(planId, state.storageProvider);
         setState((s) => ({ ...s, customPlans: s.customPlans.filter((p) => p.plan_id !== planId) }));
         showToast("Plan deleted.");
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+      }
+    },
+    async clearCards(category: string) {
+      const mailbox = state.selectedMailboxes[0] || state.mailbox;
+      if (!mailbox) return;
+      try {
+        const result = await client.clearCards(mailbox, category);
+        if (result.ok) {
+          showToast(`${result.removed} card${result.removed !== 1 ? "s" : ""} cleared from ${category}.`);
+          await loadActiveCards();
+        }
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+      }
+    },
+    async clearHistory() {
+      try {
+        const result = await client.clearHistory();
+        if (result.ok) {
+          setState((s) => ({ ...s, askHistory: [] }));
+          showToast("History cleared.");
+        }
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+      }
+    },
+    async resetAllData() {
+      try {
+        const result = await client.resetAllData();
+        if (result.ok) {
+          setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, askItemActions: {}, askEditDraft: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
+          showToast("All data reset. Ready for a fresh start.");
+          window.location.reload();
+        }
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       }

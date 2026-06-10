@@ -52,7 +52,11 @@
       "Bash(npx vite *)",
       "Bash(py -3 -c \"from mail_agent.ask.planner import _PLANNER_SYSTEM_PROMPT; print\\('import OK, prompt length:', len\\(_PLANNER_SYSTEM_PROMPT\\)\\)\")",
       "Bash(py -3 -c ' *)",
-      "Bash(py -3)"
+      "Bash(py -3)",
+      "Bash(py -3 -c \"from mail_agent.storage.ops import clear_cards_by_category, clear_run_history; print\\('backend OK'\\)\")",
+      "Bash(py -3 -c \"from mail_agent.storage.ops import reset_all_data; print\\('OK'\\)\")",
+      "Bash(py -3 -c \"from anna_inbox_executa.main import _sync_get_active_cards; print\\('OK'\\)\")",
+      "Bash(py -3 -c \"from anna_inbox_executa.main import data_root; print\\('OK'\\)\")"
     ]
   }
 }

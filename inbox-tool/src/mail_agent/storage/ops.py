@@ -130,6 +130,17 @@ async def merge_discovered_mailboxes(discovered: list[dict[str, Any]]) -> Mailbo
                 last_auth_checked_at=str(raw.get("last_auth_checked_at") or ""),
             )
         changed = True
+
+    # 将不在当前 discovered 列表中的已有条目标记为 unauthorized。
+    # 平台 token 从邮箱 A 换到 B 时，A 仍在注册表中但 token 已消失；
+    # multi-token 被删除时同理。只有 discovered 中的邮箱才是"拿得到 token"的。
+    discovered_emails = {_normalize_email(str(r.get("email") or "")) for r in discovered}
+    for email, entry in list(by_email.items()):
+        if email not in discovered_emails and entry.authorized:
+            entry.authorized = False
+            entry.updated_at = _now()
+            changed = True
+
     if changed:
         registry.mailboxes = sorted(by_email.values(), key=lambda item: item.email)
         await set_mailbox_registry(registry)
@@ -397,6 +408,94 @@ async def append_run_history(entry: RunHistoryEntry) -> dict:
     return await get_storage().set(RUN_HISTORY_KEY, raw, scope=default_scope())
 
 
+async def clear_run_history() -> dict:
+    """Delete all run history entries."""
+    return await get_storage().set(RUN_HISTORY_KEY, {"entries": []}, scope=default_scope())
+
+
+async def clear_cards_by_category(mailbox: str, category: str) -> int:
+    """Remove cards matching a given category from active cards. Returns count removed.
+
+    category: "reply" | "review" | "cleanup" | "all"
+    """
+    active = await get_active_cards(mailbox)
+    original_count = len(active.cards)
+
+    if category == "all":
+        active.cards = []
+    elif category == "cleanup":
+        active.cards = [
+            c for c in active.cards
+            if not (c.user_action == "cleanup" or c.card_type == "cleanup_bundle")
+        ]
+    elif category == "reply":
+        active.cards = [c for c in active.cards if c.user_action != "reply"]
+    elif category == "review":
+        active.cards = [c for c in active.cards if c.user_action != "review"]
+    else:
+        return 0
+
+    removed = original_count - len(active.cards)
+    if removed > 0:
+        await set_active_cards(mailbox, active)
+        await update_mailbox_registry_fields(mailbox, card_count=len(active.cards))
+    return removed
+
+
+async def reset_all_data() -> dict:
+    """Reset all persistent data via storage API.
+
+    For local file storage the caller should also delete the data directory
+    after this returns (handled by main.py's data_root() cleanup).
+    """
+    storage = get_storage()
+    # 1. Clear mailbox-level data for all known mailboxes
+    registry = await get_mailbox_registry()
+    for entry in registry.mailboxes:
+        mbox = entry.email
+        prefix = _mailbox_prefix(mbox)
+        # Use correct key suffixes matching _cards_key, _scan_key etc
+        for sub in ("cards/active", "scan_state", "scan_plan", "processed"):
+            try:
+                await storage.delete(f"{prefix}/{sub}", scope=default_scope())
+            except Exception:
+                pass
+        # Contact memories
+        try:
+            from ..contact_memory.store import list_contact_memories, clear_contact_memories
+            await clear_contact_memories(mbox)
+        except Exception:
+            pass
+        # Run records
+        try:
+            result = await storage.list(f"{prefix}/run/", scope=default_scope())
+            for item in result.get("items", []):
+                try:
+                    await storage.delete(item.get("key", ""), scope=default_scope())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 2. Clear cross-mailbox data
+    for key in (RUN_HISTORY_KEY, _CUSTOM_PLANS_KEY, MAILBOX_REGISTRY_KEY):
+        try:
+            await storage.delete(key, scope=default_scope())
+        except Exception:
+            pass
+
+    # 3. Clear Gmail cache storage keys (APS)
+    try:
+        result = await storage.list(app_key("gmail_cache/mailboxes/"), scope=default_scope())
+        for item in result.get("items", []):
+            try:
+                await storage.delete(item.get("key", ""), scope=default_scope())
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return {"ok": True}
 async def append_card_action(
     mailbox: str,
     card_id: str,

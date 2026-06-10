@@ -81,6 +81,10 @@ export class MailAgentClient {
     return this.invoke<{ authorized?: boolean; source?: string }>("check_gmail_auth", { mailbox });
   }
 
+  checkAnyGmailAuth() {
+    return this.invoke<{ authorized?: boolean; source?: string; authorized_email?: string }>("check_gmail_auth", { mailbox: "" });
+  }
+
   listMailboxes(storageProvider: string) {
     return this.invoke<{ mailboxes: MailboxInfo[]; selected: string[]; discovered?: MailboxInfo[] }>("list_mailboxes", { storage_provider: storageProvider });
   }
@@ -184,6 +188,18 @@ export class MailAgentClient {
 
   reRunCustomScan(args: Record<string, unknown>) {
     return this.invoke<RunStatus>("re_run_custom_scan", args);
+  }
+
+  clearCards(mailbox: string, category: string) {
+    return this.invoke<{ ok: boolean; removed: number }>("clear_cards", { mailbox, category });
+  }
+
+  clearHistory() {
+    return this.invoke<{ ok: boolean }>("clear_history", {});
+  }
+
+  resetAllData() {
+    return this.invoke<{ ok: boolean }>("reset_all_data", {});
   }
 
   markReadFromAsk(mailbox: string, messageIds: string[]) {
