@@ -4088,6 +4088,8 @@
     .connection-status.is-live { color:#58b889; }
     .connection-status.is-offline { color:#d9748c; }
     .assistant-copy.is-error { color:var(--rose); }
+    .assistant-copy.is-error .inline-link { background:none; border:none; color:var(--rose); cursor:pointer; font-size:inherit; padding:0; text-decoration:underline; opacity:0.8; }
+    .assistant-copy.is-error .inline-link:hover { opacity:1; }
     .point-box-sm { margin-top:10px; }
     .simple-list-sm { margin-top:8px; }
     .text-muted-inline { color:var(--text-muted); }

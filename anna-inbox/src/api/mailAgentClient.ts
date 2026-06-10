@@ -51,16 +51,16 @@ export class MailAgentClient {
     if (!runtime.connected || !runtime.client) {
       throw new Error(runtime.error || "Anna runtime is not connected.");
     }
+    const timeoutMs = options.timeoutMs || INVOKE_TIMEOUT_MS;
     const invokeArgs = {
       tool_id: TOOL_ID,
       method,
       args,
-      timeoutMs: options.timeoutMs || INVOKE_TIMEOUT_MS,
     };
     try {
       const result = runtime.client.tools && typeof runtime.client.tools.invoke === "function"
-        ? await runtime.client.tools.invoke(invokeArgs)
-        : await runtime.client.call?.("tools", "invoke", invokeArgs, { timeout: INVOKE_TIMEOUT_MS, ...options });
+        ? await runtime.client.tools.invoke(invokeArgs, { timeoutMs })
+        : await runtime.client.call?.("tools", "invoke", invokeArgs, { timeout: timeoutMs, timeoutMs });
       return unwrapToolResult(result) as T;
     } catch (error) {
       const err = error as { details?: Record<string, unknown>; data?: Record<string, unknown>; code?: string | number; message?: string };

@@ -66,9 +66,21 @@ export function scanProgressLabel(stage: string | undefined, progress: Record<st
   if (stage === "phase1_done") return `${p.candidates || 0} candidates, ${p.low_value || 0} low-priority`;
   if (stage === "read_context") return `Reading context ${p.current || 0}/${p.total || 0}`;
   if (stage === "read_context_done") return `${p.total || 0} contexts loaded`;
-  if (stage === "evaluate") return `Evaluating ${p.evaluated || 0}/${p.total || 0}`;
-  if (stage === "evaluate_done") return `${p.evaluated || p.total || 0} evaluated`;
-  if (stage === "plan") return "Building action plan...";
+  if (stage === "evaluate") {
+    const detail = `Evaluating ${p.evaluated || 0}/${p.total || 0}`;
+    const fb = Number(p.fallback || 0);
+    return fb > 0 ? `${detail} · ${fb} fallback` : detail;
+  }
+  if (stage === "evaluate_done") {
+    const fb = Number(p.fallback || 0);
+    const total = Number(p.evaluated || p.total || 0);
+    if (fb > 0) return `${total} evaluated · ${fb} fallback`;
+    return `${total} evaluated`;
+  }
+  if (stage === "plan") {
+    const n = Number(p.judgments || 0);
+    return n ? `Building action plan from ${n} evaluations...` : "Building action plan...";
+  }
   if (stage === "storage_saved") return "Cards saved.";
   if (stage === "done") return "Scan complete.";
   return "";

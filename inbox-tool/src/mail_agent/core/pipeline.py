@@ -416,9 +416,16 @@ async def run_mail_task(
     semaphore = asyncio.Semaphore(EVALUATE_CONCURRENCY)
     progress_lock = asyncio.Lock()
     evaluated_count = 0
+    succeeded_count = 0
+    fallback_count = 0
+
+    def _is_fallback(judgment: Any) -> bool:
+        """Detect fallback judgments created by create_fallback_judgment."""
+        mode = getattr(judgment, "mode_judgment", None)
+        return isinstance(mode, dict) and "fallback_reason" in mode
 
     async def _evaluate_one(index: int, ctx: Any) -> Any:
-        nonlocal evaluated_count
+        nonlocal evaluated_count, succeeded_count, fallback_count
         async with semaphore:
             _report_progress(
                 progress_callback,
@@ -426,6 +433,8 @@ async def run_mail_task(
                 current=index,
                 total=len(contexts),
                 evaluated=evaluated_count,
+                succeeded=succeeded_count,
+                fallback=fallback_count,
                 concurrency=EVALUATE_CONCURRENCY,
             )
             try:
@@ -447,12 +456,18 @@ async def run_mail_task(
                 )
             async with progress_lock:
                 evaluated_count += 1
+                if _is_fallback(judgment):
+                    fallback_count += 1
+                else:
+                    succeeded_count += 1
                 _report_progress(
                     progress_callback,
                     "evaluate",
                     current=index,
                     total=len(contexts),
                     evaluated=evaluated_count,
+                    succeeded=succeeded_count,
+                    fallback=fallback_count,
                     concurrency=EVALUATE_CONCURRENCY,
                 )
             return judgment
@@ -461,7 +476,7 @@ async def run_mail_task(
         judgments = await asyncio.gather(*(_evaluate_one(index, ctx) for index, ctx in enumerate(contexts, start=1)))
     else:
         judgments = []
-    _report_progress(progress_callback, "evaluate_done", total=len(judgments), evaluated=len(judgments))
+    _report_progress(progress_callback, "evaluate_done", total=len(judgments), evaluated=len(judgments), succeeded=succeeded_count, fallback=fallback_count)
 
     _report_progress(progress_callback, "plan", judgments=len(judgments))
     action_plan = generate_action_plan(run_id, task_plan, judgments)

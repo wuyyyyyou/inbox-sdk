@@ -14,6 +14,23 @@ import {
   visibleCards,
 } from "./cardHelpers";
 
+function ScanErrorBlock({ error }: { error: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const lines = error.split("\n").filter((line) => line.trim());
+  if (!lines.length) return null;
+  const hasMore = lines.length > 1;
+  return (
+    <p className="assistant-copy is-error">
+      {expanded ? lines.map((line, i) => <span key={i}>{line}{i < lines.length - 1 ? <br /> : null}</span>) : lines[0]}
+      {hasMore ? (
+        <button className="inline-link" onClick={() => setExpanded((v) => !v)}>
+          {" | "}{expanded ? "Show less" : `Show all (${lines.length - 1} more)`}
+        </button>
+      ) : null}
+    </p>
+  );
+}
+
 function CardDetails({ card }: { card: FrontendCard }) {
   const details = card.details || {};
   const original = card.original || {};
@@ -383,7 +400,7 @@ export function BriefView() {
             <button className="primary-btn" disabled={!state.runtime.connected} onClick={() => void actions.startScan("first")}>Start scan</button>
             <button className="soft-btn" onClick={() => actions.openSourcesWithConfig?.()}>Scan setting</button>
           </div>
-          {state.scanError ? <p className="assistant-copy is-error">{state.scanError}</p> : null}
+          <ScanErrorBlock error={state.scanError} />
         </section>
       </div>
     );
@@ -430,7 +447,7 @@ export function BriefView() {
           ) : (
             <>
               {state.scanStatus ? <p className="assistant-copy">{state.scanStatus}</p> : null}
-              {state.scanError ? <p className="assistant-copy is-error">{state.scanError}</p> : null}
+              <ScanErrorBlock error={state.scanError} />
             </>
           )}
         </div>

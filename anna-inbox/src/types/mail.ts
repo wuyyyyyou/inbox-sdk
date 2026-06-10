@@ -26,7 +26,7 @@ export interface RuntimeState {
 }
 
 export interface AnnaRuntimeClient {
-  tools?: { invoke?: (args: ToolInvokeArgs) => Promise<unknown> };
+  tools?: { invoke?: (args: ToolInvokeArgs, options?: { timeoutMs?: number }) => Promise<unknown> };
   window?: { set_title?: (args: { title: string }) => Promise<unknown> };
   call?: (ns: string, method: string, args?: unknown, options?: { timeout?: number; timeoutMs?: number }) => Promise<unknown>;
 }
@@ -35,7 +35,7 @@ export interface ToolInvokeArgs {
   tool_id: string;
   method: string;
   args: Record<string, unknown>;
-  timeoutMs: number;
+  timeoutMs?: number;
 }
 
 

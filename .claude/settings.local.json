@@ -57,7 +57,10 @@
       "Bash(py -3 -c \"from mail_agent.storage.ops import reset_all_data; print\\('OK'\\)\")",
       "Bash(py -3 -c \"from anna_inbox_executa.main import _sync_get_active_cards; print\\('OK'\\)\")",
       "Bash(py -3 -c \"from anna_inbox_executa.main import data_root; print\\('OK'\\)\")",
-      "Bash(grep -v \"//\")"
+      "Bash(grep -v \"//\")",
+      "Bash(node -e \"const fs=require\\('fs'\\); const c=fs.readFileSync\\('app.js','utf8'\\); const idx=c.indexOf\\('timeoutMs'\\); console.log\\(c.substring\\(Math.max\\(0,idx-400\\), idx+600\\)\\);\")",
+      "Bash(node *)",
+      "Bash(npx vitest *)"
     ]
   }
 }

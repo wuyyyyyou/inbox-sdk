@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import sys
 import time
@@ -444,7 +445,7 @@ def get_access_token(mailbox: str) -> str:
     platform_token = os.environ.get("GMAIL_ACCESS_TOKEN") or os.environ.get("GOOGLE_ACCESS_TOKEN")
     if platform_token and platform_token.strip():
         global _discovered_email
-        if not _discovered_email:
+        if not _discovered_email or normalized != _discovered_email:
             _discovered_email = get_authorized_email().lower()
         if normalized == _discovered_email or not _discovered_email:
             return str(platform_token).strip()
@@ -622,7 +623,8 @@ def search_gmail(mailbox: str, query: str, max_results: int = 100) -> list[str]:
             "maxResults": min(max_results, 500),
             "fields": "messages/id,nextPageToken",
         })
-    except ValueError:
+    except ValueError as exc:
+        logging.getLogger("mail_agent.gmail").warning("search_gmail failed for %s: %s", mailbox, exc)
         return []
     refs = payload.get("messages") if isinstance(payload, dict) else []
     if not refs:

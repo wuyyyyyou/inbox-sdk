@@ -2081,10 +2081,10 @@ def _discover_mailboxes() -> list[dict[str, Any]]:
 
 
 def _sync_list_mailboxes() -> dict[str, Any]:
-    from mail_agent.storage.ops import get_mailbox_registry, merge_discovered_mailboxes
+    from mail_agent.storage.ops import merge_discovered_mailboxes
 
     discovered = _discover_mailboxes()
-    registry = _run_storage_query(merge_discovered_mailboxes(discovered)) if discovered else _run_storage_query(get_mailbox_registry())
+    registry = _run_storage_query(merge_discovered_mailboxes(discovered))
     mailboxes = _registry_to_frontend(registry)
     return {
         "mailboxes": mailboxes,
