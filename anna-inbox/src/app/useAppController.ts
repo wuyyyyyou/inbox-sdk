@@ -600,6 +600,7 @@ export function useAppController() {
       setState((s) => ({ ...s, isScanning: true, scanError: "", scanStepIndex: 0, scanStage: "", scanProgress: {}, resultFilter: "all" }));
       try {
         const failures: string[] = [];
+        let gotCardsFromRun = false;
         for (let index = 0; index < mailboxesToScan.length; index += 1) {
           const mailbox = mailboxesToScan[index];
           setState((s) => ({ ...s, scanStatus: mailboxesToScan.length > 1 ? `Scanning ${mailbox} (${index + 1}/${mailboxesToScan.length})` : s.scanStatus }));
@@ -628,6 +629,7 @@ export function useAppController() {
               if (status.status === "done") {
                 // Use cards from run result directly (process may die before loadActiveCards)
                 if (Array.isArray(status.cards) && status.cards.length > 0) {
+                  gotCardsFromRun = true;
                   const runCards = status.cards as FrontendCard[];
                   const keyedCards = withCardKeys(runCards, mailbox);
                   refreshStoredCardFields(keyedCards);
@@ -666,9 +668,9 @@ export function useAppController() {
           } catch (error) {
             failures.push(`${mailbox}: ${error instanceof Error ? error.message : String(error)}`);
           }
-          await loadActiveCards();
+          if (!gotCardsFromRun) await loadActiveCards();
         }
-        await loadActiveCards();
+        if (!gotCardsFromRun) await loadActiveCards();
         await loadRunHistory();
         const statusText = failures.length
           ? `Scan complete with ${failures.length} issue${failures.length === 1 ? "" : "s"}.`

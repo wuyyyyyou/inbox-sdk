@@ -2287,6 +2287,15 @@ async def _re_run_custom_scan_async(run_id: str, plan_id: str, arguments: dict[s
 
 
 def _run_storage_query(coro: Any, timeout: float = 60.0) -> Any:
+    if _active_storage_provider != "aps":
+        # Local storage: run directly on the calling thread to avoid
+        # depending on the main event loop (which may be dead on some
+        # Anna harness versions after a background coroutine completes).
+        new_loop = asyncio.new_event_loop()
+        try:
+            return new_loop.run_until_complete(coro)
+        finally:
+            new_loop.close()
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result(timeout=timeout)
 
