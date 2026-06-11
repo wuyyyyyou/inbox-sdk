@@ -1103,6 +1103,63 @@ def _sanitize_email_html(html_text: str) -> str:
     return html_text
 
 
+def _build_cid_map(payload: dict[str, Any]) -> dict[str, str]:
+    """Walk MIME parts for inline images with Content-ID, return {cid: data_uri}."""
+    cid_map: dict[str, str] = {}
+
+    def walk(part: dict[str, Any]) -> None:
+        headers = part.get("headers") or []
+        cid: str | None = None
+        for h in headers:
+            if isinstance(h, dict) and str(h.get("name") or "").lower() == "content-id":
+                cid = str(h.get("value") or "").strip().strip("<>")
+                break
+        if cid:
+            mime_type = str(part.get("mimeType") or "image/png")
+            if not mime_type.startswith("image/"):
+                return
+            body = part.get("body") if isinstance(part.get("body"), dict) else {}
+            data = body.get("data")
+            if data:
+                try:
+                    import base64
+                    raw_bytes = base64.urlsafe_b64decode(str(data) + "=" * (-len(str(data)) % 4))
+                    b64 = base64.b64encode(raw_bytes).decode("ascii")
+                    cid_map[cid] = f"data:{mime_type};base64,{b64}"
+                except Exception:
+                    pass
+        for child in part.get("parts") or []:
+            if isinstance(child, dict):
+                walk(child)
+
+    walk(payload)
+    return cid_map
+
+
+def _resolve_cid_images(html_text: str, payload: dict[str, Any]) -> str:
+    """Replace cid: references in <img src> with inline data URIs."""
+    cid_map = _build_cid_map(payload)
+    if not cid_map:
+        return html_text
+    import re
+
+    def _replace(m: re.Match[str]) -> str:
+        cid = m.group(1)
+        # Strip optional @host suffix (cid:xxx@host)
+        cid_key = cid.split("@")[0] if "@" in cid else cid
+        uri = cid_map.get(cid_key) or cid_map.get(cid)
+        if uri:
+            return f'src="{uri}"'
+        return m.group(0)
+
+    # Match src="cid:..." or src='cid:...'
+    html_text = re.sub(
+        r'''src\s*=\s*["']cid:([^"'\s]+)["']''',
+        _replace, html_text, flags=re.IGNORECASE,
+    )
+    return html_text
+
+
 def extract_attachments(part: dict[str, Any]) -> list[dict[str, Any]]:
     attachments: list[dict[str, Any]] = []
 
@@ -1882,6 +1939,58 @@ async def _test_sampling_brief(arguments: dict[str, Any], invoke_id: str) -> dic
         }
 
 
+def _start_test_sampling_async(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
+    """Like test_sampling_brief, but returns immediately and runs sampling in background.
+
+    This is the decisive experiment: if the background call fails with -32001
+    while the synchronous test_sampling_brief succeeds, the Anna platform binds
+    sampling authorization to the *active* invoke lifecycle.
+    """
+    run_id = f"tsa_{uuid.uuid4().hex[:12]}"
+    MAIL_AGENT_RUNS[run_id] = {
+        "run_id": run_id,
+        "status": "queued",
+        "stage": "queued",
+        "progress": {},
+        "warnings": [],
+        "started_at": beijing_now(),
+        "updated_at": beijing_now(),
+        "result": None,
+        "error": "",
+        "partial": {"invoke_id": invoke_id},
+    }
+    asyncio.run_coroutine_threadsafe(_run_test_sampling_async(run_id, arguments, invoke_id), loop)
+    return {
+        "run_id": run_id,
+        "status": "queued",
+        "started_at": beijing_now(),
+        "note": "Sampling scheduled in background — poll with get_mail_agent_run",
+    }
+
+
+async def _run_test_sampling_async(run_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
+    """Background sampling test — waits 2s then calls the brief-style sampling."""
+    try:
+        await asyncio.sleep(2.0)  # simulate real scan delay
+        MAIL_AGENT_RUNS[run_id]["status"] = "running"
+        MAIL_AGENT_RUNS[run_id]["stage"] = "sampling"
+        MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
+        result = await _test_sampling_brief(arguments, invoke_id)
+        MAIL_AGENT_RUNS[run_id].update({
+            "status": "done",
+            "stage": "done",
+            "updated_at": beijing_now(),
+            "result": result,
+        })
+    except Exception as exc:
+        MAIL_AGENT_RUNS[run_id].update({
+            "status": "failed",
+            "stage": "failed",
+            "updated_at": beijing_now(),
+            "error": str(exc),
+        })
+
+
 def start_mail_agent_run(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
     run_id = f"bg_{uuid.uuid4().hex[:12]}"
     MAIL_AGENT_RUNS[run_id] = {
@@ -2496,6 +2605,8 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
     mailbox = str(arguments.get("mailbox", "")).strip()
     if not mailbox:
         return {"error": "mailbox is required"}
+    offset = int(arguments.get("offset", 0))
+    limit = int(arguments.get("limit", 50))
 
     from mail_agent.cards.service import cards_to_frontend
     from mail_agent.storage.ops import aggregate_active_cards, get_active_cards, get_scan_state
@@ -2530,11 +2641,20 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
                 "total_processed": getattr(state, "total_processed", 0),
             }
 
+        total = len(active.cards)
+        page = active.cards[offset:offset + limit] if limit > 0 else active.cards
+        from mail_agent.storage.types import ActiveCards as ActiveCardsType
+        page_active = ActiveCardsType(cards=list(page), updated_at=active.updated_at)
+
         action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
 
         return {
-            "cards": cards_to_frontend(active),
-            "count": len(active.cards),
+            "cards": cards_to_frontend(page_active),
+            "total": total,
+            "count": len(page),
+            "has_more": (offset + limit) < total if limit > 0 else False,
+            "offset": offset,
+            "limit": limit,
             "action_count": action_count,
             "scan_state": scan_state,
         }
@@ -2542,7 +2662,9 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
         log(f"get_active_cards sync entry failed: {type(exc).__name__}: {exc}")
         return {
             "cards": [],
+            "total": 0,
             "count": 0,
+            "has_more": False,
             "action_count": 0,
             "scan_state": {"total_scans": 0, "total_processed": 0, "last_scan_ts": "", "last_message_internal_date": ""},
             "error": f"{type(exc).__name__}: {exc}"[:200],
@@ -2764,6 +2886,9 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 # Build sanitized HTML for frontend display (before tag stripping)
                 if raw.strip():
                     latest_body_html = _sanitize_email_html(raw)
+                    # Resolve cid: inline images to data URIs
+                    payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
+                    latest_body_html = _resolve_cid_images(latest_body_html, payload)
 
                 import re
                 raw = re.sub(r"<style[^>]*>.*?</style>", "", raw, flags=re.DOTALL | re.IGNORECASE)
@@ -3271,6 +3396,8 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     if tool == "test_sampling_brief":
         future = asyncio.run_coroutine_threadsafe(_test_sampling_brief(arguments, invoke_id), loop)
         return {"success": True, "tool": tool, "data": future.result(timeout=180.0)}
+    if tool == "test_sampling_async":
+        return {"success": True, "tool": tool, "data": _start_test_sampling_async(arguments, invoke_id)}
     if tool == "start_mail_agent_run":
         return {"success": True, "tool": tool, "data": start_mail_agent_run(arguments, invoke_id)}
     if tool == "get_mail_agent_run":

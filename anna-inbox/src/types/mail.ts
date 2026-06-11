@@ -122,6 +122,10 @@ export interface ScanState {
 export interface ActiveCardsPayload {
   cards: FrontendCard[];
   count?: number;
+  total?: number;
+  has_more?: boolean;
+  offset?: number;
+  limit?: number;
   action_count?: number;
   scan_state?: ScanState;
 }
@@ -376,6 +380,7 @@ export interface AppState {
   samplingDebug: SamplingDebugInfo | null;
   samplingTestResult: TestSamplingResult | null;
   samplingBriefResult: TestSamplingBriefResult | null;
+  samplingAsyncResult: TestSamplingBriefResult | null;
   askItemActions: Record<string, { read?: boolean; trashed?: boolean; replied?: boolean; sending?: boolean }>;
   askEditDraft: Record<string, string>;
   askHistory: AskHistoryEntry[];

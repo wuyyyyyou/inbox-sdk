@@ -545,6 +545,7 @@ export function BriefView() {
       <div className="sampling-debug-fetch">
         <button className="soft-btn compact" onClick={() => { void actions.testSampling(); }}>Test sampling</button>
         <button className="soft-btn compact" onClick={() => { void actions.testSamplingBrief(); }}>Test brief-style sampling</button>
+        <button className="soft-btn compact" onClick={() => { void actions.testSamplingAsync(); }}>Test async brief sampling</button>
         <button className="soft-btn compact" onClick={() => { void actions.loadSamplingDebug(); }}>Refresh debug info</button>
       </div>
       {state.samplingTestResult ? (
@@ -559,6 +560,13 @@ export function BriefView() {
           {state.samplingBriefResult.ok
             ? `Brief OK · ${v(state.samplingBriefResult.elapsed_ms)}ms · model=${v(state.samplingBriefResult.model)} · tokens=${v(state.samplingBriefResult.output_tokens)} · json=${state.samplingBriefResult.json_ok ? "valid" : "invalid"} · ${v(state.samplingBriefResult.parse_preview)}`
             : `Brief FAILED · ${v(state.samplingBriefResult.elapsed_ms)}ms · [${v(state.samplingBriefResult.error_code)}] ${v(state.samplingBriefResult.error_message)}`}
+        </div>
+      ) : null}
+      {state.samplingAsyncResult ? (
+        <div className={`sampling-test-result ${state.samplingAsyncResult.ok ? "is-ok" : "is-err"}`}>
+          {state.samplingAsyncResult.ok
+            ? `Async Brief OK · ${v(state.samplingAsyncResult.elapsed_ms)}ms · model=${v(state.samplingAsyncResult.model)} · tokens=${v(state.samplingAsyncResult.output_tokens)} · json=${state.samplingAsyncResult.json_ok ? "valid" : "invalid"} · ${v(state.samplingAsyncResult.parse_preview)}`
+            : `Async Brief FAILED · ${v(state.samplingAsyncResult.elapsed_ms)}ms · [${v(state.samplingAsyncResult.error_code)}] ${v(state.samplingAsyncResult.error_message)}`}
         </div>
       ) : null}
       {totalScans > 0 ? (

@@ -100,8 +100,8 @@ export class MailAgentClient {
     return this.invoke<{ ok?: boolean; mailboxes: MailboxInfo[]; selected: string[] }>("remove_mailbox", { mailbox, storage_provider: storageProvider });
   }
 
-  loadActiveCards(mailbox: string, storageProvider: string) {
-    return this.invoke<ActiveCardsPayload>("get_active_cards", { mailbox, storage_provider: storageProvider });
+  loadActiveCards(mailbox: string, storageProvider: string, offset = 0, limit = 50) {
+    return this.invoke<ActiveCardsPayload>("get_active_cards", { mailbox, storage_provider: storageProvider, offset, limit });
   }
 
   loadRunHistory() {
@@ -135,6 +135,10 @@ export class MailAgentClient {
 
   testSamplingBrief() {
     return this.invoke<TestSamplingBriefResult>("test_sampling_brief");
+  }
+
+  testSamplingAsync() {
+    return this.invoke<RunStatus>("test_sampling_async");
   }
 
   getCardDetail(mailbox: string, cardId: string, storageProvider: string) {

@@ -2,7 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { AppState, FrontendCard, MailboxInfo, RunStatus, TestSamplingBriefResult, TestSamplingResult } from "../types/mail";
+import type { ActiveCardsPayload, AppState, FrontendCard, MailboxInfo, RunStatus, TestSamplingBriefResult, TestSamplingResult } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -107,6 +107,7 @@ export interface AppActions {
   loadSamplingDebug(): Promise<void>;
   testSampling(): Promise<TestSamplingResult>;
   testSamplingBrief(): Promise<TestSamplingBriefResult>;
+  testSamplingAsync(): Promise<TestSamplingBriefResult>;
   loadMailboxes(): Promise<void>;
   setMailboxSelected(mailbox: string, selected: boolean): Promise<void>;
   setBriefMailboxFilter(mailboxes: string[]): void;
@@ -196,9 +197,21 @@ export function useAppController() {
   const loadActiveCards = useCallback(async (storageOverride?: string, mailboxOverride?: string) => {
     const provider = storageOverride ?? state.storageProvider;
     const mailbox = mailboxOverride ?? "all";
+    const PAGE_SIZE = 50;
     try {
-      const payload = await client.loadActiveCards(mailbox, provider);
-      const keyedCards = withCardKeys(payload.cards || [], mailbox === "all" ? state.mailbox : mailbox);
+      const allCards: FrontendCard[] = [];
+      let offset = 0;
+      let hasMore = true;
+      let scanState: ActiveCardsPayload["scan_state"];
+      const MAX_PAGES = 20;  // safety: 1000 cards at 50/page
+      while (hasMore && offset < MAX_PAGES * PAGE_SIZE) {
+        const payload = await client.loadActiveCards(mailbox, provider, offset, PAGE_SIZE);
+        allCards.push(...(payload.cards || []));
+        hasMore = Boolean(payload.has_more);
+        offset += PAGE_SIZE;
+        if (payload.scan_state) scanState = payload.scan_state;
+      }
+      const keyedCards = withCardKeys(allCards, mailbox === "all" ? state.mailbox : mailbox);
       refreshStoredCardFields(keyedCards);
       setState((s) => {
         const selected = activeBriefMailboxes(s.selectedMailboxes, s.briefMailboxFilter, s.mailbox);
@@ -209,7 +222,7 @@ export function useAppController() {
           cards: visible,
           briefMailboxFilter: selected,
           actionCount: actionCount(visible),
-          scanState: payload.scan_state || s.scanState,
+          scanState: scanState || s.scanState,
           scanError: "",
           loading: false,
         };
@@ -577,6 +590,36 @@ export function useAppController() {
       } catch {
         const fallback = { ok: false, error_message: "test_sampling_brief tool call failed" };
         setState((s) => ({ ...s, samplingBriefResult: fallback }));
+        await loadSamplingDebug();
+        return fallback;
+      }
+    },
+    async testSamplingAsync() {
+      setState((s) => ({ ...s, samplingAsyncResult: null }));
+      try {
+        const started = await client.testSamplingAsync();
+        if (!started.run_id) throw new Error("No run_id returned");
+        // Poll for result (same as getRun in startScan)
+        for (let poll = 0; poll < 60; poll += 1) {
+          await new Promise((r) => setTimeout(r, 1000));
+          const status = await client.getRun(started.run_id);
+          if (status.status === "done") {
+            const result = (status.result as unknown as TestSamplingBriefResult) || { ok: false, error_message: "no result" };
+            setState((s) => ({ ...s, samplingAsyncResult: result }));
+            await loadSamplingDebug();
+            return result;
+          }
+          if (status.status === "failed") {
+            const fallback: TestSamplingBriefResult = { ok: false, error_message: status.error || "background sampling failed" };
+            setState((s) => ({ ...s, samplingAsyncResult: fallback }));
+            await loadSamplingDebug();
+            return fallback;
+          }
+        }
+        throw new Error("Test sampling async timed out after 60s");
+      } catch (err) {
+        const fallback: TestSamplingBriefResult = { ok: false, error_message: err instanceof Error ? err.message : String(err) };
+        setState((s) => ({ ...s, samplingAsyncResult: fallback }));
         await loadSamplingDebug();
         return fallback;
       }

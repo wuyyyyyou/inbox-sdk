@@ -70,6 +70,7 @@ export function createInitialState(): AppState {
     samplingDebug: null,
     samplingTestResult: null,
     samplingBriefResult: null,
+    samplingAsyncResult: null,
     askItemActions: {},
     askEditDraft: {},
     askHistory: [],

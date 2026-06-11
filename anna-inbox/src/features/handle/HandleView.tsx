@@ -192,6 +192,7 @@ export function HandleView() {
                     "width",
                   ],
                   ALLOW_DATA_ATTR: false,
+                  ALLOWED_URI_REGEXP: /^(?:(?:https?|ftp|mailto|data|cid):|[^/]+\/[^/]+)/i,
                 }),
               }}
             />
