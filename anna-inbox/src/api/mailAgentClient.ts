@@ -97,8 +97,8 @@ export class MailAgentClient {
     return this.invoke<{ ok?: boolean; mailboxes: MailboxInfo[]; selected: string[] }>("remove_mailbox", { mailbox, storage_provider: storageProvider });
   }
 
-  loadActiveCards(mailbox: string, storageProvider: string, offset = 0, limit = 50, includeCleanup = false, cleanupOffset = 0, cleanupLimit = 100) {
-    return this.invoke<ActiveCardsPayload>("get_active_cards", { mailbox, storage_provider: storageProvider, offset, limit, include_cleanup: includeCleanup, cleanup_offset: cleanupOffset, cleanup_limit: cleanupLimit });
+  loadActiveCards(mailbox: string, storageProvider: string, offset = 0, limit = 50, includeCleanup = false, cleanupOffset = 0, cleanupLimit = 100, timeoutMs = 55_000) {
+    return this.invoke<ActiveCardsPayload>("get_active_cards", { mailbox, storage_provider: storageProvider, offset, limit, include_cleanup: includeCleanup, cleanup_offset: cleanupOffset, cleanup_limit: cleanupLimit }, { timeoutMs });
   }
 
   loadRunHistory() {

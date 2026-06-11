@@ -193,9 +193,11 @@ export function useAppController() {
     });
   }, []);
 
-  const loadActiveCards = useCallback(async (storageOverride?: string, mailboxOverride?: string) => {
+  const loadActiveCards = useCallback(async (storageOverride?: string, mailboxOverride?: string, options: { includeCleanup?: boolean; timeoutMs?: number } = {}) => {
     const provider = storageOverride ?? state.storageProvider;
     const mailbox = mailboxOverride ?? "all";
+    const includeCleanup = options.includeCleanup ?? true;
+    const timeoutMs = options.timeoutMs ?? 55_000;
     const PAGE_SIZE = 50;
     try {
       const allCards: FrontendCard[] = [];
@@ -211,7 +213,8 @@ export function useAppController() {
         const isFirstCardPage = offset === 0;
         const payload = await client.loadActiveCards(
           mailbox, provider, offset, PAGE_SIZE,
-          isFirstCardPage, cleanupOffset, isFirstCardPage ? CLEANUP_PAGE : 0,
+          includeCleanup && isFirstCardPage, cleanupOffset, includeCleanup && isFirstCardPage ? CLEANUP_PAGE : 0,
+          timeoutMs,
         );
         // Only first page includes cleanup; subsequent card pages skip it
         const gotCleanup = isFirstCardPage && payload.cleanup_bundle;
@@ -226,10 +229,11 @@ export function useAppController() {
         }
       }
       // Load remaining cleanup pages
-      while (cleanupHasMore && cleanupOffset < MAX_PAGES * CLEANUP_PAGE) {
+      while (includeCleanup && cleanupHasMore && cleanupOffset < MAX_PAGES * CLEANUP_PAGE) {
         const payload = await client.loadActiveCards(
           mailbox, provider, 0, 1,
           true, cleanupOffset, CLEANUP_PAGE,
+          timeoutMs,
         );
         if (payload.cleanup_bundle) {
           cleanupItems.push(...payload.cleanup_bundle);
@@ -252,7 +256,7 @@ export function useAppController() {
           briefMailboxFilter: selected,
           actionCount: actionCount(visible),
           scanState: scanState || s.scanState,
-          cleanupBundle: cleanupBundle ?? s.cleanupBundle,
+          cleanupBundle: includeCleanup ? cleanupBundle ?? s.cleanupBundle : s.cleanupBundle,
           scanError: "",
           loading: false,
         };
@@ -703,7 +707,7 @@ export function useAppController() {
               const nextCardsVersion = Number(result.cards_version || 0);
               if (Number(result.cards_added || 0) > 0 || nextCardsVersion > cardsVersion) {
                 cardsVersion = nextCardsVersion;
-                await loadActiveCards();
+                void loadActiveCards(undefined, "all", { includeCleanup: false, timeoutMs: 55_000 });
               }
               if (result.status === "done" || result.status === "failed" || result.needs_continue === false) {
                 break;
@@ -720,7 +724,7 @@ export function useAppController() {
           if (result.status !== "done") {
             failures.push(`${mailbox}: Scan paused before completion`);
           }
-          await loadActiveCards();
+          void loadActiveCards(undefined, "all", { includeCleanup: false, timeoutMs: 55_000 });
           // 卡片刷新到界面后，只记录联系人记忆补写任务；扫描主流程结束后再后台续跑。
           contactMemoryJobs.push({
             mailbox,
@@ -729,18 +733,18 @@ export function useAppController() {
             storage_provider: state.storageProvider,
           });
         }
-        await loadActiveCards();
-        await loadRunHistory();
         const statusText = failures.length
           ? `Scan complete with ${failures.length} issue${failures.length === 1 ? "" : "s"}.`
           : "Scan complete. Showing persisted attention cards.";
         setState((s) => ({ ...s, scanStatus: statusText, scanError: s.scanError || failures.join("\n") }));
         showToast(failures.length ? statusText : "Scan complete.");
-        if (contactMemoryJobs.length) {
-          window.setTimeout(() => {
+        window.setTimeout(() => {
+          void loadActiveCards(undefined, "all", { includeCleanup: true, timeoutMs: 55_000 });
+          void loadRunHistory();
+          if (contactMemoryJobs.length) {
             void runContactMemoryBackfill(contactMemoryJobs);
-          }, 0);
-        }
+          }
+        }, 0);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         setState((s) => ({ ...s, scanError: message, scanStatus: "" }));

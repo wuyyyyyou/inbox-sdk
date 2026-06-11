@@ -3442,44 +3442,68 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
     include_cleanup = bool(arguments.get("include_cleanup"))
 
     from mail_agent.cards.service import cards_to_frontend
-    from mail_agent.storage.ops import (
-        aggregate_active_cards,
-        get_active_cards,
-        get_active_cards_page,
-        get_scan_state,
-    )
+    from mail_agent.storage.ops import get_active_cards_page, get_scan_state
     from mail_agent.storage.types import ActiveCards as ActiveCardsType
 
     try:
         if mailbox.lower() == "all":
-            full_active = _run_storage_query(aggregate_active_cards())
-            total = len(full_active.cards)
-            action_count = sum(1 for c in full_active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
-            # Paginate in-memory for cross-mailbox aggregation
-            page = full_active.cards[offset:offset + limit] if limit > 0 else full_active.cards
-            active = ActiveCardsType(cards=list(page), updated_at=full_active.updated_at)
-            # Aggregate scan state across all registered mailboxes
-            try:
-                from mail_agent.storage.ops import get_mailbox_registry
-                reg = _run_storage_query(get_mailbox_registry())
-                all_mboxes = [e.email for e in (reg.mailboxes if reg else [])]
-                all_states = [_run_storage_query(get_scan_state(m)) for m in all_mboxes]
-                total_scans = max((getattr(s, 'total_scans', 0) for s in all_states), default=0)
-                total_processed = max((getattr(s, 'total_processed', 0) for s in all_states), default=0)
-                last_scan_ts = max((getattr(s, 'last_scan_ts', '') for s in all_states), default='')
-                scan_state = {
-                    "last_scan_ts": last_scan_ts,
-                    "last_message_internal_date": "",
-                    "total_scans": total_scans,
-                    "total_processed": total_processed,
+            from mail_agent.storage.ops import get_mailbox_registry
+
+            async def _load_all_page() -> dict[str, Any]:
+                registry = await get_mailbox_registry()
+                entries = list(getattr(registry, "mailboxes", []) or [])
+                selected_entries = [entry for entry in entries if getattr(entry, "selected", False)]
+                scoped_entries = selected_entries or entries
+                mailboxes = [
+                    str(getattr(entry, "email", "") or "").strip().lower()
+                    for entry in scoped_entries
+                ]
+                mailboxes = sorted(dict.fromkeys(item for item in mailboxes if item))
+                page_limit = max(offset + limit, limit, 50) if limit > 0 else 50
+                page_results = await asyncio.gather(
+                    *(get_active_cards_page(item, 0, page_limit) for item in mailboxes),
+                    return_exceptions=True,
+                )
+                all_cards: list[Any] = []
+                total_cards = 0
+                latest_updated = ""
+                for result in page_results:
+                    if isinstance(result, Exception) or not isinstance(result, dict):
+                        continue
+                    total_cards += int(result.get("total") or 0)
+                    active_page = result.get("active")
+                    latest_updated = max(latest_updated, getattr(active_page, "updated_at", "") or "")
+                    for card in getattr(active_page, "cards", []) or []:
+                        all_cards.append(card)
+                priority_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+                all_cards.sort(key=lambda c: (priority_rank.get(str(getattr(c, "priority", "") or "").lower(), 0), getattr(c, "created_at", "") or ""), reverse=True)
+                page_cards = all_cards[offset:offset + limit] if limit > 0 else all_cards
+                state_results = await asyncio.gather(
+                    *(get_scan_state(item) for item in mailboxes),
+                    return_exceptions=True,
+                )
+                valid_states = [item for item in state_results if not isinstance(item, Exception)]
+                return {
+                    "active": ActiveCardsType(cards=list(page_cards), updated_at=latest_updated),
+                    "total": total_cards,
+                    "scan_state": {
+                        "last_scan_ts": max((getattr(s, "last_scan_ts", "") for s in valid_states), default=""),
+                        "last_message_internal_date": "",
+                        "total_scans": max((getattr(s, "total_scans", 0) for s in valid_states), default=0),
+                        "total_processed": max((getattr(s, "total_processed", 0) for s in valid_states), default=0),
+                    },
                 }
-            except Exception:
-                scan_state = {"total_scans": 0, "total_processed": 0, "last_scan_ts": "", "last_message_internal_date": ""}
+
+            loaded = _run_storage_query(_load_all_page(), timeout=45.0)
+            active = loaded["active"]
+            total = int(loaded["total"])
+            scan_state = loaded["scan_state"]
+            action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
         else:
-            page_result = _run_storage_query(get_active_cards_page(mailbox, offset, limit))
+            page_result = _run_storage_query(get_active_cards_page(mailbox, offset, limit), timeout=45.0)
             active = page_result["active"]
             total = page_result["total"]
-            state = _run_storage_query(get_scan_state(mailbox))
+            state = _run_storage_query(get_scan_state(mailbox), timeout=45.0)
             scan_state = {
                 "last_scan_ts": getattr(state, "last_scan_ts", ""),
                 "last_message_internal_date": getattr(state, "last_message_internal_date", ""),
@@ -3498,16 +3522,32 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
             from mail_agent.storage.ops import get_cleanup_bundle_page, get_mailbox_registry
             if mailbox.lower() == "all":
                 try:
-                    reg = _run_storage_query(get_mailbox_registry())
-                    all_items: list[dict[str, Any]] = []
-                    total_all = 0
-                    for entry in reg.mailboxes:
-                        try:
-                            page_result = _run_storage_query(get_cleanup_bundle_page(entry.email, cleanup_offset, cleanup_limit))
-                            all_items.extend(page_result["items"])
-                            total_all += page_result["total"]
-                        except Exception:
-                            pass
+                    async def _load_cleanup_all() -> dict[str, Any]:
+                        registry = await get_mailbox_registry()
+                        entries = list(getattr(registry, "mailboxes", []) or [])
+                        selected_entries = [entry for entry in entries if getattr(entry, "selected", False)]
+                        scoped_entries = selected_entries or entries
+                        mailboxes = [
+                            str(getattr(entry, "email", "") or "").strip().lower()
+                            for entry in scoped_entries
+                        ]
+                        mailboxes = sorted(dict.fromkeys(item for item in mailboxes if item))
+                        results = await asyncio.gather(
+                            *(get_cleanup_bundle_page(item, cleanup_offset, cleanup_limit) for item in mailboxes),
+                            return_exceptions=True,
+                        )
+                        items: list[dict[str, Any]] = []
+                        total_items = 0
+                        for result in results:
+                            if isinstance(result, Exception) or not isinstance(result, dict):
+                                continue
+                            items.extend(result.get("items") or [])
+                            total_items += int(result.get("total") or 0)
+                        return {"items": items, "total": total_items}
+
+                    cleanup_result = _run_storage_query(_load_cleanup_all(), timeout=45.0)
+                    all_items = cleanup_result["items"]
+                    total_all = cleanup_result["total"]
                     cleanup_bundle = all_items if all_items else None
                     cleanup_total = total_all
                     cleanup_has_more = (cleanup_offset + cleanup_limit) < total_all if cleanup_limit > 0 else False
@@ -3516,7 +3556,7 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
                     cleanup_total = 0
                     cleanup_has_more = False
             else:
-                page_result = _run_storage_query(get_cleanup_bundle_page(mailbox, cleanup_offset, cleanup_limit))
+                page_result = _run_storage_query(get_cleanup_bundle_page(mailbox, cleanup_offset, cleanup_limit), timeout=45.0)
                 cleanup_bundle = page_result["items"] if page_result["items"] else None
                 cleanup_total = page_result["total"]
                 cleanup_has_more = page_result["has_more"]
