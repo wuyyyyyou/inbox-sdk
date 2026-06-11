@@ -681,10 +681,14 @@ export function useAppController() {
                   refreshStoredCardFields(keyedCards);
                   setState((s) => {
                     const selected = activeBriefMailboxes(s.selectedMailboxes, s.briefMailboxFilter, s.mailbox);
-                    const visible = filterCardsByMailboxes(keyedCards, selected);
+                    // Merge with existing cards across mailboxes: replace this
+                    // mailbox's cards, keep cards from other mailboxes.
+                    const otherCards = s.allCards.filter(c => cardMailbox(c) !== mailbox);
+                    const mergedAll = [...otherCards, ...keyedCards];
+                    const visible = filterCardsByMailboxes(mergedAll, selected);
                     return {
                       ...s,
-                      allCards: keyedCards,
+                      allCards: mergedAll,
                       cards: visible,
                       briefMailboxFilter: selected,
                       actionCount: actionCount(visible),
@@ -714,9 +718,20 @@ export function useAppController() {
           } catch (error) {
             failures.push(`${mailbox}: ${error instanceof Error ? error.message : String(error)}`);
           }
-          if (!gotCardsFromRun) await loadActiveCards();
+          if (!gotCardsFromRun) {
+            await loadActiveCards();
+          }
         }
-        if (!gotCardsFromRun) await loadActiveCards();
+        if (!gotCardsFromRun) {
+          await loadActiveCards();
+        }
+        // Load full cleanup bundle once after all mailboxes are scanned
+        try {
+          const cleanupPayload = await client.loadActiveCards("all", state.storageProvider, 0, 1, true);
+          if (cleanupPayload.cleanup_bundle) {
+            setState((s) => ({ ...s, cleanupBundle: cleanupPayload.cleanup_bundle! }));
+          }
+        } catch { /* cleanup is non-critical */ }
         await loadRunHistory();
         const statusText = failures.length
           ? `Scan complete with ${failures.length} issue${failures.length === 1 ? "" : "s"}.`
@@ -854,7 +869,9 @@ export function useAppController() {
     async markCleanupAsRead(cardId) {
       const card = findCard(state.cards, cardId);
       const key = card?.uiKey || (card ? cardUiKey(card, state.mailbox) : cardId);
-      const messages = (Array.isArray(state.cleanupBundle) && state.cleanupBundle.length > 0 ? state.cleanupBundle : (Array.isArray(card?.bundledMessages) ? card.bundledMessages : []));
+      const cardMbox = cardMailbox(card, state.mailbox);
+      const bundle = Array.isArray(state.cleanupBundle) && state.cleanupBundle.length > 0 ? state.cleanupBundle : (Array.isArray(card?.bundledMessages) ? card.bundledMessages : []);
+      const messages = cardMbox ? bundle.filter((m) => normalizedMailbox(m.mailbox ?? "") === normalizedMailbox(cardMbox)) : bundle;
       const messageIds = messages.map((m) => m.message_id || m.id).filter(Boolean) as string[];
       if (!card || !messageIds.length) return;
       setState((s) => ({ ...s, markingReadIds: { ...s.markingReadIds, [key]: true }, cleanupReadState: { ...s.cleanupReadState, [key]: { read: true, readMsgIndices: messages.map((_m, i) => i) } } }));

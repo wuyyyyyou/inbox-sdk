@@ -2658,9 +2658,22 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
             action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
 
         cleanup_bundle = None
-        if include_cleanup and mailbox.lower() != "all":
-            from mail_agent.storage.ops import get_cleanup_bundle
-            cleanup_bundle = _run_storage_query(get_cleanup_bundle(mailbox))
+        if include_cleanup:
+            from mail_agent.storage.ops import get_cleanup_bundle, get_mailbox_registry
+            if mailbox.lower() == "all":
+                try:
+                    reg = _run_storage_query(get_mailbox_registry())
+                    all_cleanup: list[dict[str, Any]] = []
+                    for entry in reg.mailboxes:
+                        try:
+                            all_cleanup.extend(_run_storage_query(get_cleanup_bundle(entry.email)))
+                        except Exception:
+                            pass
+                    cleanup_bundle = all_cleanup if all_cleanup else None
+                except Exception:
+                    cleanup_bundle = None
+            else:
+                cleanup_bundle = _run_storage_query(get_cleanup_bundle(mailbox))
 
         return {
             "cards": cards_to_frontend(active),

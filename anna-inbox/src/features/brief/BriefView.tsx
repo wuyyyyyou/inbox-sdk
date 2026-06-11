@@ -230,9 +230,20 @@ function CleanupBundleCard({ card }: { card: FrontendCard }) {
   const expanded = Boolean(state.expandedDetails[key]);
   const readState = state.cleanupReadState[key];
   const isAllRead = readState?.read;
+  const sourcesMailboxes = (state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox]).map(normalizeMailbox).filter(Boolean);
+  const sourcesSet = new Set(sourcesMailboxes);
+  const briefSet: Set<string> = (() => {
+    if (!state.briefMailboxFilter.length) return sourcesSet;
+    const filtered = state.briefMailboxFilter.map(normalizeMailbox).filter((m) => sourcesSet.has(m));
+    return filtered.length ? new Set(filtered) : sourcesSet;
+  })();
   const fullBundle = Array.isArray(state.cleanupBundle) && state.cleanupBundle.length > 0 ? state.cleanupBundle : null;
-  const messages = fullBundle ?? (Array.isArray(card.bundledMessages) ? card.bundledMessages : []);
-  const count = fullBundle ? fullBundle.length : (card.bundledCount || messages.length);
+  const rawMessages = fullBundle ?? (Array.isArray(card.bundledMessages) ? card.bundledMessages : []);
+  const messages = rawMessages.filter((m: CleanupMessage) => {
+    const mbox = normalizeMailbox(m.mailbox ?? "");
+    return mbox ? briefSet.has(mbox) : true;
+  });
+  const count = messages.length;
   const readCount = readState ? readState.readMsgIndices.length : 0;
   return (
     <article className={`cleanup-bundle-card ${expanded ? "is-expanded" : ""} ${isAllRead ? "is-all-read" : ""}`}>
@@ -468,7 +479,12 @@ export function BriefView() {
 
   const enabledMailboxes = (state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox]).map(normalizeMailbox).filter(Boolean);
   const enabledSet = new Set(enabledMailboxes);
-  const cardsInEnabledMailboxes = state.allCards.filter((card) => enabledSet.has(cardMailbox(card)));
+  const briefFilterSet: Set<string> = (() => {
+    if (!state.briefMailboxFilter.length) return enabledSet;
+    const filtered = state.briefMailboxFilter.map(normalizeMailbox).filter((m) => enabledSet.has(m));
+    return filtered.length ? new Set(filtered) : enabledSet;
+  })();
+  const cardsInEnabledMailboxes = state.allCards.filter((card) => briefFilterSet.has(cardMailbox(card)));
   const cards = mainCards(state.cards);
   const lower = lowerCards(state.cards);
   const hasCards = visibleCards(cardsInEnabledMailboxes).length > 0;
@@ -518,10 +534,14 @@ export function BriefView() {
   const cleanupCards = lowerCards(state.cards).filter((c) => c.cardType === "cleanup_bundle");
   const regularLower = lowerCards(state.cards).filter((c) => c.cardType !== "cleanup_bundle");
   const fullCleanupBundle = Array.isArray(state.cleanupBundle) && state.cleanupBundle.length > 0 ? state.cleanupBundle : null;
-  const cleanupMessages = fullCleanupBundle
+  const cleanupMessages = (fullCleanupBundle
     ? fullCleanupBundle.map((msg, index) => ({ msg, index, cardId: cleanupCards[0]?.uiKey || cleanupCards[0]?.id || "cleanup" }))
-    : cleanupCards.flatMap((c) => (Array.isArray(c.bundledMessages) ? c.bundledMessages : []).map((msg, i) => ({ msg, index: i, cardId: c.uiKey || c.id })));
-  const cleanupCount = fullCleanupBundle ? fullCleanupBundle.length : cleanupMessages.length;
+    : cleanupCards.flatMap((c) => (Array.isArray(c.bundledMessages) ? c.bundledMessages : []).map((msg, i) => ({ msg, index: i, cardId: c.uiKey || c.id })))
+  ).filter(({ msg }) => {
+    const mbox = normalizeMailbox(msg.mailbox ?? "");
+    return mbox ? briefFilterSet.has(mbox) : true;
+  });
+  const cleanupCount = cleanupMessages.length;
 
   return (
     <div className="start-grid">

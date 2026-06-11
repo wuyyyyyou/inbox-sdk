@@ -370,6 +370,7 @@ def build_cleanup_bundle(
         msg = msg_map.get(item["message_id"])
         full_bundled.append({
             "message_id": item["message_id"],
+            "mailbox": mailbox,
             "from_addr": (msg.from_addr or "")[:80] if msg else "",
             "subject": (msg.subject or "")[:120] if msg else "",
             "snippet": (msg.snippet or "")[:200] if msg else "",

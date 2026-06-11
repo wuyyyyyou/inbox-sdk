@@ -104,6 +104,7 @@ export interface FrontendCard {
 export interface CleanupMessage {
   id?: string;
   message_id?: string;
+  mailbox?: string;
   from_addr?: string;
   subject?: string;
   snippet?: string;

@@ -487,6 +487,7 @@ def _cleanup_legacy_key(mailbox: str) -> str:
 
 async def get_cleanup_bundle(mailbox: str) -> list[dict[str, Any]]:
     result = await get_storage().get(_cleanup_index_key(mailbox), scope=default_scope())
+    messages: list[dict[str, Any]] = []
     if not result.get("exists") or not isinstance(result.get("value"), dict):
         # Try legacy single-file migration
         legacy = await get_storage().get(_cleanup_legacy_key(mailbox), scope=default_scope())
@@ -494,16 +495,19 @@ async def get_cleanup_bundle(mailbox: str) -> list[dict[str, Any]]:
             messages = legacy["value"]
             await set_cleanup_bundle(mailbox, messages)
             await get_storage().delete(_cleanup_legacy_key(mailbox), scope=default_scope())
-            return messages
-        return []
-    idx = result["value"]
-    shard_count = int(idx.get("shards", 0))
-    all_msgs: list[dict[str, Any]] = []
-    for i in range(shard_count):
-        shard = await get_storage().get(_cleanup_shard_key(mailbox, i), scope=default_scope())
-        if shard.get("exists") and isinstance(shard.get("value"), list):
-            all_msgs.extend(shard["value"])
-    return all_msgs
+        else:
+            return []
+    else:
+        idx = result["value"]
+        for i in range(int(idx.get("shards", 0))):
+            shard = await get_storage().get(_cleanup_shard_key(mailbox, i), scope=default_scope())
+            if shard.get("exists") and isinstance(shard.get("value"), list):
+                messages.extend(shard["value"])
+    # Ensure every item has a mailbox field (backfill for old data)
+    for item in messages:
+        if "mailbox" not in item:
+            item["mailbox"] = mailbox
+    return messages
 
 
 async def set_cleanup_bundle(mailbox: str, messages: list[dict[str, Any]]) -> dict:
