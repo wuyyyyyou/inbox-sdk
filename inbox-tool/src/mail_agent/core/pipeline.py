@@ -297,37 +297,53 @@ async def run_mail_task(
     _logger.info("thread_dedup: %d messages → %d after dedup", len(new_id_set), len(new_messages))
 
     # 过滤已回复线程：最新一封来自用户本人 → 已处理过，跳过
+    # 使用 8 路并发 Gmail API 调用，200 线程从 ~100s 降到 ~12s
     already_replied_count = 0
     check_timeouts = 0
     filtered_messages: list[Any] = []
     total_after_dedup = len(new_messages)
-    for i, m in enumerate(new_messages):
-        tid = m.thread_id or m.message_id
-        _report_progress(progress_callback, "check_replied", current=i + 1, total=total_after_dedup)
-        try:
-            result = _thread_latest_is_from_owner(input_.mailbox_id, tid, input_.mailbox_id)
-            if result is None:
-                check_timeouts += 1
-            elif result:
-                already_replied_count += 1
+    if total_after_dedup > 0:
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+        # Collect all check results concurrently
+        _tid_to_msg: dict[str, Any] = {}
+        with ThreadPoolExecutor(max_workers=8, thread_name_prefix="check-replied") as _pool:
+            _futures: dict[Any, Any] = {}
+            for _m in new_messages:
+                _tid = _m.thread_id or _m.message_id
+                _tid_to_msg[_tid] = _m
+                _futures[_pool.submit(_thread_latest_is_from_owner, input_.mailbox_id, _tid, input_.mailbox_id)] = _tid
+            _done_count = 0
+            for _future in _as_completed(_futures):
+                _done_count += 1
+                _tid = _futures[_future]
+                _m = _tid_to_msg[_tid]
+                _report_progress(progress_callback, "check_replied", current=_done_count, total=total_after_dedup)
                 try:
-                    from ..contact_memory.indexer import ingest_thread_observation
-                    await ingest_thread_observation(
-                        input_.mailbox_id,
-                        tid,
-                        m.from_addr,
-                        m.subject,
-                        sampling_create_message=sampling_create_message,
-                        source="gmail_scan",
-                        user_action="owner_replied",
-                    )
+                    _result = _future.result()
                 except Exception:
-                    pass
-                continue
-        except Exception:
-            _logger.warning("check_replied error for thread %s, keeping message", tid)
-            check_timeouts += 1
-        filtered_messages.append(m)
+                    _logger.warning("check_replied error for thread %s, keeping message", _tid)
+                    check_timeouts += 1
+                    filtered_messages.append(_m)
+                    continue
+                if _result is None:
+                    check_timeouts += 1
+                    filtered_messages.append(_m)
+                elif _result:
+                    already_replied_count += 1
+                    try:
+                        from ..contact_memory.indexer import ingest_thread_observation
+                        await ingest_thread_observation(
+                            input_.mailbox_id, _tid, _m.from_addr, _m.subject,
+                            sampling_create_message=sampling_create_message,
+                            source="gmail_scan", user_action="owner_replied",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    filtered_messages.append(_m)
+        # Restore original order
+        _msg_order = {(_m.thread_id or _m.message_id): _m for _m in new_messages}
+        filtered_messages.sort(key=lambda _m: new_messages.index(_msg_order.get(_m.thread_id or _m.message_id, _m)))
     _tick(f"already_replied_filter filtered={already_replied_count} timeouts={check_timeouts}")
     _logger.info("already_replied_filter: %d filtered (already replied), %d timeouts, %d remaining",
                  already_replied_count, check_timeouts, len(filtered_messages))
