@@ -119,7 +119,7 @@ export class MailAgentClient {
   }
 
   continueBriefRun(args: Record<string, unknown>) {
-    return this.invoke<RunStatus>("continue_mail_agent_run", args, { timeoutMs: 70_000 });
+    return this.invoke<RunStatus>("continue_mail_agent_run", args, { timeoutMs: 55_000 });
   }
 
   getRun(runId: string) {
@@ -147,7 +147,15 @@ export class MailAgentClient {
   }
 
   generateContactMemories(args: Record<string, unknown>) {
-    return this.invoke<{ ok?: boolean; backfilled?: number; skipped_old?: number; error?: string }>("generate_contact_memories", args, { timeoutMs: 600_000 });
+    return this.startContactMemoryRun(args);
+  }
+
+  startContactMemoryRun(args: Record<string, unknown>) {
+    return this.invoke<RunStatus>("start_contact_memory_run", args);
+  }
+
+  continueContactMemoryRun(args: Record<string, unknown>) {
+    return this.invoke<RunStatus>("continue_contact_memory_run", args, { timeoutMs: 55_000 });
   }
 
   startSummarizeThread(args: Record<string, unknown>) {

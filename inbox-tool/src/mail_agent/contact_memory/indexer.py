@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import asdict
@@ -220,9 +221,10 @@ Input:
             "message_summaries": [asdict(item) for item in fallback.message_summaries],
         },
         temperature=0.0,
-        max_tokens=1200,
-        timeout=90.0,
+        max_tokens=900,
+        timeout=20.0,
         metadata={"tool": "contact_memory_update", "thread_id": thread_id},
+        max_attempts=1,
     )
     raw = result.get("payload") if isinstance(result.get("payload"), dict) else {}
     generated = _thread_from_payload(mailbox, thread_id, subject, raw, fallback)
@@ -341,7 +343,7 @@ async def _thread_messages(mailbox: str, thread_id: str) -> list[dict[str, Any]]
         return []
     try:
         from ..mail_providers.gmail.adapter import get_thread_context_async
-        thread = await get_thread_context_async(mailbox, thread_id, max_messages=12)
+        thread = await asyncio.wait_for(get_thread_context_async(mailbox, thread_id, max_messages=6), timeout=8.0)
         return [
             {
                 "message_id": msg.message_id,

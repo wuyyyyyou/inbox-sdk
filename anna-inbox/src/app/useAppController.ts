@@ -416,6 +416,28 @@ export function useAppController() {
     return {};
   }, [client]);
 
+  const runContactMemoryBackfill = useCallback(async (jobs: Array<Record<string, unknown>>) => {
+    for (const job of jobs) {
+      try {
+        const started = await client.startContactMemoryRun(job);
+        if (!started.run_id) continue;
+        let status: RunStatus = started;
+        for (let step = 0; step < 120; step += 1) {
+          if (status.status === "done" || status.status === "failed" || status.needs_continue === false) break;
+          status = await client.continueContactMemoryRun({ ...job, run_id: started.run_id, batch_limit: 1 });
+          if (status.status === "done" || status.status === "failed" || status.needs_continue === false) break;
+          await sleep(300);
+        }
+        if (status.status === "failed" && status.error) {
+          console.warn("[contactMemoryBackfill] failed:", status.error);
+        }
+      } catch (error) {
+        console.warn("[contactMemoryBackfill] failed:", error);
+      }
+    }
+    await loadContactMemories().catch(() => {});
+  }, [client, loadContactMemories]);
+
   const discoverMailbox = useCallback(async (): Promise<string> => {
     try {
       const result = await client.getAuthorizedMailbox();
@@ -611,6 +633,7 @@ export function useAppController() {
         return;
       }
       setState((s) => ({ ...s, isScanning: true, scanError: "", scanStatus: "", scanStepIndex: 0, scanStage: "scan", scanProgress: {}, resultFilter: "all" }));
+      const contactMemoryJobs: Array<Record<string, unknown>> = [];
       try {
         const failures: string[] = [];
         for (let index = 0; index < mailboxesToScan.length; index += 1) {
@@ -698,15 +721,13 @@ export function useAppController() {
             failures.push(`${mailbox}: Scan paused before completion`);
           }
           await loadActiveCards();
-          // 卡片已经持久化并刷新到界面后，再用独立 invoke 在后台补写联系人记忆。
-          window.setTimeout(() => {
-            void client.generateContactMemories({
-              mailbox,
-              since: started.started_at || result.started_at || "",
-              ai_provider: state.llmProvider,
-              storage_provider: state.storageProvider,
-            }).catch(() => {});
-          }, 0);
+          // 卡片刷新到界面后，只记录联系人记忆补写任务；扫描主流程结束后再后台续跑。
+          contactMemoryJobs.push({
+            mailbox,
+            since: started.started_at || result.started_at || "",
+            ai_provider: state.llmProvider,
+            storage_provider: state.storageProvider,
+          });
         }
         await loadActiveCards();
         await loadRunHistory();
@@ -715,6 +736,11 @@ export function useAppController() {
           : "Scan complete. Showing persisted attention cards.";
         setState((s) => ({ ...s, scanStatus: statusText, scanError: s.scanError || failures.join("\n") }));
         showToast(failures.length ? statusText : "Scan complete.");
+        if (contactMemoryJobs.length) {
+          window.setTimeout(() => {
+            void runContactMemoryBackfill(contactMemoryJobs);
+          }, 0);
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         setState((s) => ({ ...s, scanError: message, scanStatus: "" }));

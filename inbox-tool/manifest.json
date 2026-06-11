@@ -1,7 +1,7 @@
 {
   "name": "tool-zhaopy-inbox-executa-8jj3cw76",
   "display_name": "Zhaopy Mail Agent RD6B87R5",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Minimal Anna Executa skeleton for reading Gmail through local token files and DashScope or Anna sampling LLM.",
   "author": "Zhaopy",
   "host_capabilities": [
@@ -335,7 +335,7 @@
           "required": false
         }
       ],
-      "timeout": 120
+      "timeout": 60
     },
     {
       "name": "continue_mail_agent_run",
@@ -384,7 +384,7 @@
           "required": false
         }
       ],
-      "timeout": 120
+      "timeout": 60
     },
     {
       "name": "get_mail_agent_run",
@@ -1131,7 +1131,7 @@
     },
     {
       "name": "generate_contact_memories",
-      "description": "Generate contact memories for active brief cards without blocking card display.",
+      "description": "Start a contact-memory backfill run for active brief cards. Prefer start_contact_memory_run + continue_contact_memory_run.",
       "parameters": [
         {
           "name": "mailbox",
@@ -1164,7 +1164,75 @@
           "required": false
         }
       ],
-      "timeout": 120
+      "timeout": 60
+    },
+    {
+      "name": "start_contact_memory_run",
+      "description": "Create a pollable contact-memory backfill run. Follow with continue_contact_memory_run.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address, or all.",
+          "required": false
+        },
+        {
+          "name": "mailboxes",
+          "type": "array",
+          "description": "Mailbox email addresses.",
+          "required": false
+        },
+        {
+          "name": "since",
+          "type": "string",
+          "description": "Only process cards created at or after this ISO timestamp.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "continue_contact_memory_run",
+      "description": "Advance a contact-memory backfill run by a small bounded batch.",
+      "parameters": [
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "Run ID from start_contact_memory_run.",
+          "required": true
+        },
+        {
+          "name": "batch_limit",
+          "type": "integer",
+          "description": "Maximum contact cards to process in this invoke. Defaults to 1.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ],
+      "timeout": 60
     }
   ],
   "runtime": {
