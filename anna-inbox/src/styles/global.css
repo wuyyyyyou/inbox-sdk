@@ -4177,27 +4177,6 @@
     .assistant-copy.is-error .inline-link:hover { opacity:1; }
     .point-box-sm { margin-top:10px; }
     .simple-list-sm { margin-top:8px; }
-    /* sampling debug panel */
-    .sampling-debug-fetch { margin:6px 0 0; display:flex; gap:6px; }
-    .sampling-debug-fetch .soft-btn { font-size:12px; min-height:28px; }
-    .sampling-test-result { margin-top:6px; padding:6px 10px; border-radius:8px; font-size:12px; font-family:monospace; word-break:break-all; }
-    .sampling-test-result.is-ok { color:#58b889; background:rgba(88,184,137,0.08); }
-    .sampling-test-result.is-err { color:var(--rose); background:rgba(217,116,140,0.08); }
-    .sampling-debug-panel { margin:8px 0 0; border-radius:10px; border:1px solid rgba(40,40,70,0.1); background:rgba(255,255,255,0.5); font-size:12px; overflow:hidden; }
-    .sampling-debug-head { display:flex; align-items:center; gap:8px; padding:8px 12px; cursor:pointer; user-select:none; color:#6b677e; }
-    .sampling-debug-head:hover { background:rgba(40,40,70,0.03); }
-    .sampling-debug-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
-    .sampling-debug-dot.is-on { background:#58b889; }
-    .sampling-debug-dot.is-off { background:#d9748c; }
-    .sampling-debug-arrow { margin-left:auto; font-size:10px; opacity:0.6; }
-    .sampling-debug-body { padding:0 12px 10px; }
-    .sampling-debug-table { width:100%; border-collapse:collapse; }
-    .sampling-debug-table td { padding:3px 6px; vertical-align:top; border-bottom:1px solid rgba(40,40,70,0.04); }
-    .sampling-debug-table td:first-child { width:90px; color:var(--text-muted); white-space:nowrap; }
-    .sampling-debug-section { font-weight:600; color:#4d4964; padding-top:8px; }
-    .sampling-debug-ok { color:#58b889; }
-    .sampling-debug-err { color:var(--rose); }
-    .sampling-debug-mono { font-family:monospace; font-size:11px; word-break:break-all; }
     .text-muted-inline { color:var(--text-muted); }
     .text-accent-inline { color:var(--accent); font-weight:500; }
     /* ── Ask item action buttons ── */
@@ -4765,6 +4744,25 @@
 }
 .scan-bottom-label { font-size: 13px; color: #4d4964; font-weight: 500; }
 .scan-bottom-meta { font-size: 12px; color: var(--text-muted); margin-left: auto; }
+
+/* Gmail connection error popup */
+.gmail-error-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(15,15,35,0.45);
+  display: flex; align-items: center; justify-content: center;
+}
+.gmail-error-dialog {
+  background: #fff; border-radius: 14px; padding: 28px 28px 22px;
+  max-width: 400px; width: calc(100% - 40px);
+  box-shadow: 0 16px 48px rgba(0,0,0,0.18);
+}
+.gmail-error-title { font-size: 18px; font-weight: 600; color: #d94a5a; margin: 0 0 10px; }
+.gmail-error-body { font-size: 14px; color: #4d4964; margin: 0 0 14px; line-height: 1.5; }
+.gmail-error-steps { font-size: 13px; color: #6b677e; margin: 0 0 18px; line-height: 1.6; }
+.gmail-error-steps p { margin: 0 0 4px; }
+.gmail-error-steps ol { margin: 0; padding-left: 18px; }
+.gmail-error-steps li { margin-bottom: 6px; }
+.gmail-error-close { margin-top: 4px; }
 
 .first-run-title {
   margin: 0;
@@ -5355,49 +5353,6 @@
   color: #5348c8;
   background: rgba(255,255,255,0.9);
   box-shadow: 0 5px 14px rgba(43,35,86,0.07);
-}
-
-.sampling-test-btn {
-  border: 1px solid rgba(93,82,128,0.08);
-  background: rgba(255,255,255,0.55);
-}
-
-.sampling-test-btn.is-ok {
-  color: #2f7b57;
-  background: rgba(88,184,137,0.14);
-  border-color: rgba(88,184,137,0.22);
-}
-
-.sampling-test-btn.is-error {
-  color: #b43d56;
-  background: rgba(217,116,140,0.12);
-  border-color: rgba(217,116,140,0.2);
-}
-
-.sampling-test-pill {
-  display: inline-flex;
-  align-items: center;
-  min-height: 26px;
-  padding: 0 9px;
-  border-radius: 999px;
-  color: #717182;
-  background: rgba(255,255,255,0.5);
-  border: 1px solid rgba(93,82,128,0.07);
-  font-size: 11px;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.sampling-test-pill.is-ok {
-  color: #2f7b57;
-  background: rgba(88,184,137,0.12);
-  border-color: rgba(88,184,137,0.2);
-}
-
-.sampling-test-pill.is-error {
-  color: #b43d56;
-  background: rgba(217,116,140,0.1);
-  border-color: rgba(217,116,140,0.18);
 }
 
 .bar-actions .debug-provider-controls {

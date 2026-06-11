@@ -2,7 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { ActiveCardsPayload, AppState, CleanupMessage, CustomRunResultItem, FrontendCard, MailboxInfo, RunStatus, ScanState, TestSamplingBriefResult, TestSamplingResult } from "../types/mail";
+import type { ActiveCardsPayload, AppState, CleanupMessage, CustomRunResultItem, FrontendCard, GmailErrorPopup, MailboxInfo, RunStatus, ScanState } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -104,10 +104,7 @@ export interface AppActions {
   minimize(value: boolean): void;
   checkGmailAuth(mailboxOverride?: string): Promise<{ authorized: boolean; source: string }>;
   checkAnyGmailAuth(): Promise<{ authorized: boolean; source: string }>;
-  loadSamplingDebug(): Promise<void>;
-  testSampling(): Promise<TestSamplingResult>;
-  testSamplingBrief(): Promise<TestSamplingBriefResult>;
-  testSamplingAsync(): Promise<TestSamplingBriefResult>;
+  closeGmailErrorPopup(): void;
   loadMailboxes(): Promise<void>;
   setMailboxSelected(mailbox: string, selected: boolean): Promise<void>;
   setBriefMailboxFilter(mailboxes: string[]): void;
@@ -366,15 +363,6 @@ export function useAppController() {
     }
   }, [client, state.mailbox, state.storageProvider]);
 
-  const loadSamplingDebug = useCallback(async () => {
-    try {
-      const info = await client.getSamplingDebug();
-      setState((s) => ({ ...s, samplingDebug: info }));
-    } catch {
-      setState((s) => ({ ...s, samplingDebug: null }));
-    }
-  }, [client]);
-
   const checkGmailAuth = useCallback(async (mailboxOverride?: string): Promise<{ authorized: boolean; source: string }> => {
     const mailbox = mailboxOverride ?? state.mailbox;
     try {
@@ -443,31 +431,36 @@ export function useAppController() {
   }, [client]);
 
   const initialize = useCallback(async () => {
-    const runtime = await getRuntime();
-    setState((s) => ({ ...s, runtime, loading: runtime.connected ? s.loading : false }));
-    const mailboxState = await loadMailboxes();
-    let currentMailbox = mailboxState.primary;
-    if (!currentMailbox) {
-      const mailbox = await discoverMailbox();
-      currentMailbox = mailbox || state.mailbox;
-    }
-    // 系统级鉴权：只看平台 token / multi-token 有没有至少一个可用，不针对具体邮箱
-    const authResult = await client.checkAnyGmailAuth();
-    const systemAuthorized = Boolean(authResult?.authorized);
-    const authWarning = (authResult as Record<string, unknown> | null | undefined)?.warning as string | undefined;
-    setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: systemAuthorized, source: authResult?.source || "none" } }));
-    if (authWarning) showToast(`Auth notice: ${authWarning}`);
-    if (runtime.connected) {
-      if (!systemAuthorized) {
-        setState((s) => ({ ...s, loading: false }));
-        return;
+    try {
+      const runtime = await getRuntime();
+      setState((s) => ({ ...s, runtime, loading: runtime.connected ? s.loading : false }));
+      const mailboxState = await loadMailboxes();
+      let currentMailbox = mailboxState.primary;
+      if (!currentMailbox) {
+        const mailbox = await discoverMailbox();
+        currentMailbox = mailbox || state.mailbox;
       }
-      await loadRunHistory();
-      await loadCustomPlans();
-      await loadScanPlan(currentMailbox);
-      await loadActiveCards(undefined, "all");
+      const authResult = await client.checkAnyGmailAuth();
+      const systemAuthorized = Boolean(authResult?.authorized);
+      const authWarning = (authResult as Record<string, unknown> | null | undefined)?.warning as string | undefined;
+      setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: systemAuthorized, source: authResult?.source || "none" } }));
+      if (authWarning) showToast(`Auth notice: ${authWarning}`);
+      if (runtime.connected) {
+        if (!systemAuthorized) {
+          setState((s) => ({ ...s, loading: false }));
+          return;
+        }
+        await loadRunHistory();
+        await loadCustomPlans();
+        await loadScanPlan(currentMailbox);
+        await loadActiveCards(undefined, "all");
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      showToast(`Init failed: ${msg}`);
+      setState((s) => ({ ...s, loading: false }));
     }
-  }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadMailboxes, loadRunHistory, loadScanPlan, state.mailbox]);
+  }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadMailboxes, loadRunHistory, loadScanPlan, showToast, state.mailbox]);
 
   const actions: AppActions = {
     showToast,
@@ -598,64 +591,8 @@ export function useAppController() {
     clearContactMemories,
     loadCustomPlans,
     loadScanPlan,
-    loadSamplingDebug,
-    async testSampling() {
-      setState((s) => ({ ...s, samplingTestResult: null }));
-      try {
-        const result = await client.testSampling();
-        setState((s) => ({ ...s, samplingTestResult: result }));
-        await loadSamplingDebug();
-        return result;
-      } catch {
-        const fallback = { ok: false, error_message: "test_sampling tool call failed" };
-        setState((s) => ({ ...s, samplingTestResult: fallback }));
-        await loadSamplingDebug();
-        return fallback;
-      }
-    },
-    async testSamplingBrief() {
-      setState((s) => ({ ...s, samplingBriefResult: null }));
-      try {
-        const result = await client.testSamplingBrief();
-        setState((s) => ({ ...s, samplingBriefResult: result }));
-        await loadSamplingDebug();
-        return result;
-      } catch {
-        const fallback = { ok: false, error_message: "test_sampling_brief tool call failed" };
-        setState((s) => ({ ...s, samplingBriefResult: fallback }));
-        await loadSamplingDebug();
-        return fallback;
-      }
-    },
-    async testSamplingAsync() {
-      setState((s) => ({ ...s, samplingAsyncResult: null }));
-      try {
-        const started = await client.testSamplingAsync();
-        if (!started.run_id) throw new Error("No run_id returned");
-        // Poll for result (same as getRun in startScan)
-        for (let poll = 0; poll < 60; poll += 1) {
-          await new Promise((r) => setTimeout(r, 1000));
-          const status = await client.getRun(started.run_id);
-          if (status.status === "done") {
-            const result = (status.result as unknown as TestSamplingBriefResult) || { ok: false, error_message: "no result" };
-            setState((s) => ({ ...s, samplingAsyncResult: result }));
-            await loadSamplingDebug();
-            return result;
-          }
-          if (status.status === "failed") {
-            const fallback: TestSamplingBriefResult = { ok: false, error_message: status.error || "background sampling failed" };
-            setState((s) => ({ ...s, samplingAsyncResult: fallback }));
-            await loadSamplingDebug();
-            return fallback;
-          }
-        }
-        throw new Error("Test sampling async timed out after 60s");
-      } catch (err) {
-        const fallback: TestSamplingBriefResult = { ok: false, error_message: err instanceof Error ? err.message : String(err) };
-        setState((s) => ({ ...s, samplingAsyncResult: fallback }));
-        await loadSamplingDebug();
-        return fallback;
-      }
+    closeGmailErrorPopup() {
+      setState((s) => ({ ...s, gmailErrorPopup: null }));
     },
     saveScanPlanField(field, value) {
       setState((s) => ({ ...s, scanPlan: { ...(s.scanPlan || {}), [field]: value, updated_at: new Date().toISOString() } }));
@@ -781,6 +718,12 @@ export function useAppController() {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         setState((s) => ({ ...s, scanError: message, scanStatus: "" }));
+        // Show popup for Gmail connectivity errors so users know to re-authorize
+        if (message.toLowerCase().includes("gmail connection failed")) {
+          const lastMailbox = mailboxesToScan.length > 0 ? mailboxesToScan[mailboxesToScan.length - 1] : state.mailbox;
+          const popup: GmailErrorPopup = { mailbox: normalizedMailbox(lastMailbox) || state.mailbox, message };
+          setState((s) => ({ ...s, gmailErrorPopup: popup }));
+        }
         showToast(message);
       } finally {
         setState((s) => ({ ...s, isScanning: false }));

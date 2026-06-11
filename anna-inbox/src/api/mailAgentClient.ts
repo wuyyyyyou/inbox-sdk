@@ -8,10 +8,7 @@ import type {
   RunHistoryEntry,
   RunStatus,
   RuntimeState,
-  SamplingDebugInfo,
   ScanPlan,
-  TestSamplingBriefResult,
-  TestSamplingResult,
 
 } from "../types/mail";
 import appManifest from "../../manifest.json";
@@ -72,7 +69,7 @@ export class MailAgentClient {
       const traceback = String(details.traceback || data?.traceback || "");
       const code = err.code !== undefined ? `[${err.code}] ` : "";
       const message = err.message || String(error);
-      throw new Error(`${code}${message}${traceback ? `\n\n${traceback}` : ""}`);
+      throw new Error(`[tool:${method}] ${code}${message}${traceback ? `\n\n${traceback}` : ""}`);
     }
   }
 
@@ -127,22 +124,6 @@ export class MailAgentClient {
 
   getRun(runId: string) {
     return this.invoke<RunStatus>("get_mail_agent_run", { run_id: runId });
-  }
-
-  getSamplingDebug() {
-    return this.invoke<SamplingDebugInfo>("get_sampling_debug");
-  }
-
-  testSampling() {
-    return this.invoke<TestSamplingResult>("test_sampling");
-  }
-
-  testSamplingBrief() {
-    return this.invoke<TestSamplingBriefResult>("test_sampling_brief");
-  }
-
-  testSamplingAsync() {
-    return this.invoke<RunStatus>("test_sampling_async");
   }
 
   getCardDetail(mailbox: string, cardId: string, storageProvider: string) {

@@ -423,7 +423,7 @@ async def generate_draft_reply(
         user_message=prompt,
         fallback={"subject": "", "body": current_draft or "", "tone": "", "note": "Draft generation failed"},
         temperature=0.3,
-        max_tokens=8192,
+        max_tokens=8000,
         timeout=150.0,
         metadata={"tool": "generate_draft", "card_id": card.card_id, "reply_mode": reply_mode},
     )

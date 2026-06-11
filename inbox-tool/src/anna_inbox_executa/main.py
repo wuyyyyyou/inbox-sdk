@@ -1913,7 +1913,7 @@ async def _test_sampling_brief(arguments: dict[str, Any], invoke_id: str) -> dic
     """Test Anna sampling with a realistic brief-style judgment call.
 
     Uses the same message shape, system prompt complexity, and parameters
-    (max_tokens=8192, temperature=0.1, timeout=120s) as the real brief pipeline.
+    (max_tokens=8000, temperature=0.1, timeout=120s) as the real brief pipeline.
     """
     import json as _json
     started = time.time()
@@ -1926,7 +1926,7 @@ async def _test_sampling_brief(arguments: dict[str, Any], invoke_id: str) -> dic
         req_id = uuid.uuid4().hex[:12]
         result = await sampling_fn(
             messages=[{"role": "user", "content": {"type": "text", "text": _BRIEF_TEST_USER_MESSAGE}}],
-            max_tokens=8192,
+            max_tokens=8000,
             system_prompt=_BRIEF_TEST_SYSTEM_PROMPT,
             temperature=0.1,
             include_context="none",
@@ -2168,9 +2168,8 @@ def _brief_update_state(run_id: str, *, status: str = "running", stage: str, pro
 
 
 async def _brief_prepare_scan(run_id: str, arguments: dict[str, Any]) -> None:
-    import re as _re
-    from mail_agent.core.pipeline import _apply_incremental_window, _dedupe_by_thread, _get_scan_plan_config, _storage_ready
-    from mail_agent.core.scan import build_scan_plan, run_mail_scan
+    from mail_agent.core.pipeline import _dedupe_by_thread, _get_scan_plan_config, _storage_ready
+    from mail_agent.core.scan import run_mail_scan
     from mail_agent.domain.types import MailTaskInput
     from mail_agent.planning.intent import parse_intent
     from mail_agent.planning.strategies import get as get_strategy
@@ -2189,33 +2188,10 @@ async def _brief_prepare_scan(run_id: str, arguments: dict[str, Any]) -> None:
     if not strategy:
         raise ValueError(f"Unknown strategy mode: {task_plan.strategy_mode}")
 
-    scan_plan = build_scan_plan(task_plan, strategy)
-    last_message_internal_date = ""
-    if _storage_ready():
-        try:
-            from mail_agent.storage.ops import get_scan_state as _gss
-            last_message_internal_date = (await _gss(mailbox)).last_message_internal_date
-        except Exception:
-            pass
     scan_plan_config = await _get_scan_plan_config(mailbox)
-    window_days = scan_plan_config.scan_window_days if scan_plan_config else 7
     configured_max = scan_plan_config.max_messages if scan_plan_config else 100
-    _apply_incremental_window(scan_plan, last_message_internal_date)
-    queries = scan_plan.get("queries") if isinstance(scan_plan.get("queries"), list) else []
-    for q in queries:
-        if not isinstance(q, dict):
-            continue
-        q_str = str(q.get("query") or "")
-        q_str = _re.sub(r"newer_than:\d+d", f"newer_than:{window_days}d", q_str) if "newer_than:" in q_str else f"{q_str} newer_than:{window_days}d".strip()
-        for cat in (scan_plan_config.scan_categories if scan_plan_config else []):
-            if cat in ("promotions", "social", "updates", "forums"):
-                q_str += f" OR category:{cat} newer_than:{window_days}d"
-        q["query"] = q_str
-    budget = dict(scan_plan.get("budget", {}))
-    budget["max_messages"] = min(budget.get("max_messages", configured_max), configured_max)
-    scan_plan["budget"] = budget
 
-    messages = await run_mail_scan(mailbox, scan_plan, progress_callback=lambda stage, progress: _brief_update_state(run_id, stage=stage, progress=progress))
+    messages = await run_mail_scan(mailbox, configured_max, progress_callback=lambda stage, progress: _brief_update_state(run_id, stage=stage, progress=progress))
     all_message_ids = [m.message_id for m in messages if m.message_id]
     new_message_ids = all_message_ids
     if _storage_ready() and all_message_ids:
@@ -2430,7 +2406,7 @@ async def _brief_run_phase2_slice(run_id: str, sampling_create_message: Any) -> 
                 user_message=prompt,
                 fallback={},
                 temperature=0.1,
-                max_tokens=8192,
+                max_tokens=8000,
                 timeout=55.0,
                 metadata={"tool": "evaluate_item_single", "strategy_mode": strategy.id, "candidate_count": "1"},
                 allow_fallback=True,

@@ -641,6 +641,46 @@ def _is_at_or_before_stop_time(message: dict[str, Any], stop_internal_date: str)
         return False
 
 
+# ── Thread-based fetch (paginated, 50 threads per invoke) ────────────
+
+THREAD_PAGE_SIZE = 50
+
+
+def list_threads_page(
+    mailbox: str,
+    page_token: str | None = None,
+    max_results: int = THREAD_PAGE_SIZE,
+) -> dict[str, Any]:
+    """List one page of threads from Gmail, newest first. 50 threads per page."""
+    query_params: dict[str, Any] = {
+        "q": "-in:chats",
+        "maxResults": min(max_results, 100),
+        "fields": "threads(id,snippet,historyId),nextPageToken,resultSizeEstimate",
+    }
+    if page_token:
+        query_params["pageToken"] = page_token
+    return gmail_request(mailbox, "/users/me/threads", query_params)
+
+
+def fetch_thread_full(mailbox: str, thread_id: str) -> dict[str, Any]:
+    """Fetch the full Gmail thread with all messages."""
+    import urllib.parse as _up
+    return gmail_request(
+        mailbox,
+        f"/users/me/threads/{_up.quote(str(thread_id), safe='')}",
+        {"format": "full", "fields": "messages(id,threadId,labelIds,internalDate,payload(parts,headers,body,mimeType),snippet)"},
+    )
+
+
+def extract_messages_from_thread(thread: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract message dicts from a full Gmail thread response, newest first."""
+    msgs = thread.get("messages") if isinstance(thread, dict) else []
+    if not isinstance(msgs, list):
+        return []
+    # Sort newest first
+    return sorted(msgs, key=lambda m: int(m.get("internalDate") or 0), reverse=True)
+
+
 def fetch_and_cache_message(mailbox: str, message_id: str) -> dict[str, Any] | None:
     """Fetch a full Gmail message and cache it locally. Returns the normalized message dict."""
     try:

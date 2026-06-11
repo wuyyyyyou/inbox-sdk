@@ -201,7 +201,7 @@ async def generate_custom_plan(
         user_message=user_message,
         fallback=fallback_plan,
         temperature=0.1,
-        max_tokens=8192,
+        max_tokens=8000,
         timeout=90.0,
         metadata={
             "tool": "planner_generate_custom_plan",

@@ -271,7 +271,7 @@ async def plan_ask_request(
         user_message=user_message,
         fallback={},
         temperature=0.1,
-        max_tokens=8192,
+        max_tokens=8000,
         timeout=90.0,
         metadata={"tool": "ask_planner"},
         allow_fallback=False,

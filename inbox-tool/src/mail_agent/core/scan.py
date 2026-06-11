@@ -5,7 +5,7 @@
 
 主要流程：
   build_scan_plan() → 根据策略和用户请求构建扫描计划
-  run_mail_scan()  → 执行扫描计划，获取并缓存邮件，返回 MessageLite 列表
+  run_mail_scan()  → 分页拉取 Gmail threads，每页 50 个，返回 MessageLite 列表
 """
 
 from __future__ import annotations
@@ -108,134 +108,112 @@ def _apply_user_scope_to_queries(
     return result
 
 
-# ── 邮件扫描器（使用 Gmail API）───────────────────────────────────
+# ── 邮件扫描器（Thread-based, 50 threads per invoke）─────────────────
 
 async def run_mail_scan(
     mailbox: str,
-    scan_plan: dict[str, Any],
+    max_threads: int = 100,
     *,
     progress_callback: Any = None,
 ) -> list[MessageLite]:
-    """使用真实 Gmail API 执行邮件扫描。
+    """Paginate Gmail threads newest-first, 50 per page, until max_threads unique threads.
 
-    对扫描计划中的每条查询：
-    1. 调用 Gmail API users.messages.list 搜索邮件
-    2. 获取新邮件并缓存到本地
-    3. 返回去重后的 MessageLite 列表
-
-    参数：
-        mailbox: 邮箱地址
-        scan_plan: build_scan_plan 返回的扫描计划
-
-    返回：
-        MessageLite 列表，按 internalDate 排序
+    Each page of 50 threads = one Gmail API call = one invoke-safe unit.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from ..mail_providers.gmail.adapter import (
         _clear_aps_cache_errors,
-        cache_debug_info,
+        extract_messages_from_thread,
+        fetch_thread_full,
         get_aps_cache_errors,
-        get_messages_lite_async,
-        live_search_and_cache,
-        list_messages,
+        list_threads_page,
         normalize_mailbox,
+        _to_message_lite,
+        write_message,
     )
     _clear_aps_cache_errors()
 
-    normalized_mailbox = normalize_mailbox(mailbox)
-    budget = scan_plan.get("budget", {})
-    max_messages = int(budget.get("max_messages", 250))
-
-    queries = scan_plan.get("queries", [])
-
-    # Phase 1: concurrent Gmail search across all queries
+    normalized = normalize_mailbox(mailbox)
+    all_messages: list[MessageLite] = []
+    seen_threads: set[str] = set()
+    page_token: str | None = None
     gmail_errors: list[str] = []
-    fallback_used = False
     _errors_lock = threading.Lock()
 
-    def _run_one_query(q: dict[str, Any]) -> tuple[list[str], str]:
-        nonlocal fallback_used
-        query = _normalize_gmail_query(str(q.get("query", "")))
-        max_results = min(int(q.get("max_results", 100)), 500)
-        stop_at = str(q.get("stop_at_internal_date") or "")
+    while len(all_messages) < max_threads:
+        # 1. List one page of threads (50 per call = 1 invoke)
         try:
-            ids = live_search_and_cache(normalized_mailbox, query, max_results, stop_at_internal_date=stop_at)
-            return ids, ""
+            page = list_threads_page(normalized, page_token=page_token)
         except Exception as exc:
-            fallback_used = True
-            err_msg = f"Gmail API failed for query \"{query}\": {exc}"
-            _logger.warning("fallback to cache: %s", err_msg)
             with _errors_lock:
-                gmail_errors.append(err_msg)
-            all_cached = list_messages(normalized_mailbox)
-            ids = [str(m.get("id")) for m in all_cached if m.get("id")]
-            return ids[:max_results], str(exc)
+                gmail_errors.append(f"list_threads_page: {exc}")
+            break
 
-    matched_id_set: set[str] = set()
-    matched_ids: list[str] = []
-    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-        futures = {pool.submit(_run_one_query, q): q for q in queries}
-        for future in as_completed(futures):
-            if len(matched_ids) >= max_messages:
+        thread_refs = page.get("threads") if isinstance(page, dict) else []
+        if not thread_refs:
+            break
+
+        thread_ids: list[str] = []
+        for t in thread_refs:
+            if isinstance(t, dict) and t.get("id"):
+                tid = str(t["id"])
+                if tid not in seen_threads:
+                    thread_ids.append(tid)
+                    seen_threads.add(tid)
+
+        if not thread_ids:
+            page_token = page.get("nextPageToken")
+            if not page_token:
                 break
-            ids, _err = future.result()
-            for msg_id in ids:
-                if len(matched_ids) >= max_messages:
+            continue
+
+        # 2. Fetch full thread details concurrently within this page
+        def _fetch_one_thread(tid: str) -> list[dict[str, Any]]:
+            try:
+                full = fetch_thread_full(normalized, tid)
+                msgs = extract_messages_from_thread(full)
+                for msg in msgs:
+                    try:
+                        write_message(normalized, msg)
+                    except Exception:
+                        pass
+                return msgs
+            except Exception as exc:
+                with _errors_lock:
+                    gmail_errors.append(f"fetch_thread({tid}): {exc}")
+                return []
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {pool.submit(_fetch_one_thread, tid): tid for tid in thread_ids}
+            for future in as_completed(futures):
+                msgs = future.result()
+                for msg in msgs:
+                    try:
+                        all_messages.append(_to_message_lite(msg))
+                    except Exception:
+                        pass
+                if len(all_messages) >= max_threads:
                     break
-                if msg_id not in matched_id_set:
-                    matched_id_set.add(msg_id)
-                    matched_ids.append(msg_id)
 
-    # 从缓存中将消息 ID 转换为 MessageLite 对象
-    limited_ids = matched_ids[:max_messages]
-    messages = await get_messages_lite_async(normalized_mailbox, limited_ids)
-    if progress_callback:
-        progress_callback("scan_cache", {
-            "matched_ids": len(limited_ids),
-            "lite_count": len(messages),
-            "cache": cache_debug_info(normalized_mailbox),
-            "partial": {
-                "brief_debug": {
-                    "gmail_cache": cache_debug_info(normalized_mailbox),
-                    "matched_ids": len(limited_ids),
-                    "lite_count": len(messages),
-                }
-            },
-        })
-
-    # Collect APS cache sync bridge errors
-    aps_errors = get_aps_cache_errors()
-    if aps_errors:
-        _logger.warning("APS cache sync errors: %s", aps_errors[:5])
-        gmail_errors.extend(f"[APS cache] {e}" for e in aps_errors[:5])
-
-    if fallback_used or aps_errors:
-        _logger.warning("Gmail API/cache 不可用：Gmail errors=%d APS cache errors=%d", len(gmail_errors), len(aps_errors))
         if progress_callback:
-            progress_callback("scan_fallback", {
-                "gmail_api_failed": bool(gmail_errors),
-                "aps_cache_errors": aps_errors[:5],
-                "cached_count": len(messages),
-                "errors": gmail_errors[-5:],
-                "partial": {
-                    "scan_warnings": {
-                        "gmail_errors": gmail_errors[-5:],
-                        "aps_cache_errors": aps_errors[:5],
-                    }
-                },
+            progress_callback("scan", {
+                "threads_fetched": len(all_messages),
+                "max_threads": max_threads,
+                "page_size": len(thread_ids),
             })
 
-    if fallback_used and not messages:
-        _logger.error(
-            "Gmail API 不可用且本地缓存为空，无法获取任何邮件。请检查网络连接和 token 是否有效。\n错误详情: %s",
-            "\n".join(gmail_errors[-3:]),
-        )
+        page_token = page.get("nextPageToken")
+        if not page_token:
+            break
+
+    if not all_messages and gmail_errors:
+        _logger.error("Gmail API failed: %s", gmail_errors[:3])
         if progress_callback:
             progress_callback("scan_fallback_empty", {
                 "gmail_api_failed": True,
                 "cached_count": 0,
-                "errors": gmail_errors[-3:],
-                "hint": "请检查网络连接和 Gmail token 是否有效",
+                "errors": gmail_errors[:3],
+                "hint": "Check Gmail token and network",
             })
 
-    return messages
+    return all_messages[:max_threads]

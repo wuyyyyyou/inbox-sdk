@@ -927,7 +927,7 @@ async def evaluate_item(
         user_message=prompt,
         fallback={},
         temperature=0.1,
-        max_tokens=8192,
+        max_tokens=8000,
         timeout=240.0,
         metadata={
             "tool": "evaluate_item",
@@ -1007,7 +1007,7 @@ async def evaluate_items_batch(
             user_message=prompt,
             fallback={"judgments": []},
             temperature=0.1,
-            max_tokens=8192 if sampling_create_message is not None else min(4096, max(900, 450 * len(batch))),
+            max_tokens=8000 if sampling_create_message is not None else min(4096, max(900, 450 * len(batch))),
             timeout=120.0 if sampling_create_message is not None else 240.0,
             metadata={
                 "tool": "evaluate_item_single" if sampling_create_message is not None else "evaluate_items_batch",

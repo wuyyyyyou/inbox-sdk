@@ -211,7 +211,6 @@ async def run_mail_task(
         raise ValueError(f"Unknown strategy mode: {task_plan.strategy_mode}")
 
     mailbox_profile = MailboxProfile(mailbox_id=input_.mailbox_id, owner=input_.mailbox_id)
-    scan_plan = build_scan_plan(task_plan, strategy)
 
     import re as _re
 
@@ -229,42 +228,30 @@ async def run_mail_task(
 
     scan_plan_config = await _get_scan_plan_config(input_.mailbox_id)
 
-    if scan_plan_config:
-        window_days = scan_plan_config.scan_window_days
-        configured_max = scan_plan_config.max_messages
-    else:
-        window_days = 7
-        configured_max = 100
+    configured_max = scan_plan_config.max_messages if scan_plan_config else 100
 
-    # Stop at last processed message time (incremental scan)
-    _apply_incremental_window(scan_plan, last_message_internal_date)
+    # Quick Gmail connectivity check
+    _report_progress(progress_callback, "scan", stage="gmail_check")
+    try:
+        from ..mail_providers.gmail.adapter import get_access_token, GMAIL_API_BASE
+        import urllib.request as _ur
+        _token = get_access_token(input_.mailbox_id)
+        _req = _ur.Request(
+            f"{GMAIL_API_BASE}/users/me/profile",
+            headers={"Authorization": f"Bearer {_token}", "Accept": "application/json"},
+            method="GET",
+        )
+        with _ur.urlopen(_req, timeout=8) as _resp:
+            _profile = json.loads(_resp.read().decode("utf-8"))
+        _logger.info("gmail_check ok: %s", _profile.get("emailAddress"))
+    except Exception as _exc:
+        _logger.warning("gmail_check failed: %s", _exc)
+        raise RuntimeError(f"Gmail connection failed — check your token or network. ({_exc})") from _exc
 
-    # Apply scan window to Gmail queries
-    queries = scan_plan.get("queries") if isinstance(scan_plan.get("queries"), list) else []
-    for q in queries:
-        if isinstance(q, dict):
-            q_str = str(q.get("query") or "")
-            if "newer_than:" in q_str:
-                q_str = _re.sub(r"newer_than:\d+d", f"newer_than:{window_days}d", q_str)
-            else:
-                q_str = f"{q_str} newer_than:{window_days}d".strip()
-            # Inject extra scan categories (promotions, social, updates, forums)
-            categories = scan_plan_config.scan_categories if scan_plan_config else []
-            for cat in categories:
-                if cat in ("promotions", "social", "updates", "forums"):
-                    q_str += f" OR category:{cat} newer_than:{window_days}d"
-            q["query"] = q_str
-
-    budget = dict(scan_plan.get("budget", {}))
-    budget["max_messages"] = min(budget.get("max_messages", configured_max), configured_max)
-    scan_plan["budget"] = budget
-
-    _tick("scan_start")
-    _report_progress(progress_callback, "scan", max_messages=budget["max_messages"], window_days=window_days)
-    _logger.info("scan started: mailbox=%s max_messages=%s window_days=%s", input_.mailbox_id, budget["max_messages"], window_days)
-    messages = await run_mail_scan(input_.mailbox_id, scan_plan, progress_callback=progress_callback)
-    _tick("scan_done")
-    _report_progress(progress_callback, "scan_done", scanned=len(messages), max_messages=budget["max_messages"])
+    _report_progress(progress_callback, "scan", max_threads=configured_max)
+    _logger.info("scan started: mailbox=%s max_threads=%s", input_.mailbox_id, configured_max)
+    messages = await run_mail_scan(input_.mailbox_id, configured_max, progress_callback=progress_callback)
+    _report_progress(progress_callback, "scan_done", scanned=len(messages), max_threads=configured_max)
     _logger.info("scan done: %d messages fetched", len(messages))
 
     # ── Storage: filter already-processed messages ─────────────────
@@ -431,7 +418,7 @@ async def run_mail_task(
                         user_message=prompt,
                         fallback={},
                         temperature=0.1,
-                        max_tokens=8192,
+                        max_tokens=8000,
                         timeout=120.0,
                         metadata={"tool": "evaluate_item_single", "strategy_mode": strategy.id, "candidate_count": "1"},
                         allow_fallback=True,
@@ -683,11 +670,8 @@ async def run_custom_scan(
     normalized_mailbox = normalize_mailbox(mailbox)
 
     # 1. Search
-    scan_plan = {
-        "queries": list(plan.gmail_queries),
-        "budget": plan.scan_budget or {"max_messages": 200, "max_threads": 100},
-    }
-    messages = await run_mail_scan(mailbox, scan_plan, progress_callback=progress_callback)
+    max_threads = (plan.scan_budget or {}).get("max_messages", 200) if isinstance(plan.scan_budget, dict) else 200
+    messages = await run_mail_scan(mailbox, max_threads, progress_callback=progress_callback)
     sources = [
         {
             "subject": getattr(msg, "subject", "") or "",
@@ -827,7 +811,7 @@ Match by EMAIL ADDRESS (between < >), not by display name.
                 user_message=_build_user_prompt(rendered_emails),
                 fallback={"title": "Scan failed", "summary": "Unable to analyze emails.", "sections": []},
                 temperature=0.2,
-                max_tokens=8192,
+                max_tokens=8000,
                 timeout=180.0,
                 metadata={
                     "tool": "run_custom_scan_agent",
