@@ -1585,47 +1585,57 @@ def _merge_partial(run_id: str, partial_update: dict[str, Any]) -> None:
 
 
 async def run_mail_agent_background(run_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
+    """Warm Gmail cache only — do NOT run the full pipeline.
+
+    The real pipeline runs in continue_mail_agent_run (blocking invoke with
+    live sampling token). This background task just fetches messages into the
+    local cache so the blocking invoke's scan phase is fast.
+    """
     MAIL_AGENT_RUNS[run_id]["status"] = "running"
+    MAIL_AGENT_RUNS[run_id]["stage"] = "scan"
     MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
     _save_run_checkpoint(run_id)
 
-    def _update_progress(stage: str, progress: dict[str, Any]) -> None:
-        partial_update = progress.pop("partial", None)
-        if isinstance(partial_update, dict):
-            _merge_partial(run_id, partial_update)
-        MAIL_AGENT_RUNS[run_id]["stage"] = stage
-        MAIL_AGENT_RUNS[run_id]["progress"] = progress
-        MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
-        # 持久化警告/错误阶段，不被后续正常阶段覆盖
-        if _is_warning_stage(stage):
-            warnings = MAIL_AGENT_RUNS[run_id].setdefault("warnings", [])
-            entry = {"stage": stage, "at": beijing_now(), "detail": progress}
-            # 去重：同一个 stage 只保留最新一次
-            existing = [w for w in warnings if w.get("stage") != stage]
-            existing.append(entry)
-            MAIL_AGENT_RUNS[run_id]["warnings"] = existing[-10:]  # 最多保留 10 条
-        _save_run_checkpoint(run_id)
-
     try:
-        primary_count = arguments.get("primary_count", 20)
-        max_messages = arguments.get("max_messages", primary_count)
-        result = await run_mail_agent_pipeline(
-            user_request=arguments.get("user_request", ""),
-            mailbox=arguments.get("mailbox", ""),
-            mode=arguments.get("mode", "auto"),
-            max_messages=max_messages,
-            primary_count=primary_count,
-            ai_provider=arguments.get("ai_provider", "anna-llm"),
-            invoke_id=invoke_id,
-            progress_callback=_update_progress,
-        )
+        from mail_agent.core.scan import build_scan_plan, run_mail_scan
+        from mail_agent.planning.strategies import get as get_strategy
+        from mail_agent.planning.intent import parse_intent
+        from mail_agent.domain.types import MailTaskInput, MailTaskPlan
+
+        mode = arguments.get("mode", "auto")
+        mailbox = arguments.get("mailbox", "")
+        max_messages = arguments.get("max_messages", 50)
+        primary_count = arguments.get("primary_count", 30)
+
+        if mode and mode != "auto":
+            strategy = get_strategy(mode)
+        else:
+            strategy = get_strategy("default_secretary")
+        if strategy:
+            input_ = MailTaskInput(
+                user_request=arguments.get("user_request", ""),
+                mailbox_id=mailbox,
+                user_email=mailbox,
+                mode=mode,
+                max_messages=max_messages,
+                dry_run=True,
+            )
+            task_plan = MailTaskPlan(
+                strategy_mode=strategy.id,
+                user_request=input_.user_request,
+                scope={},
+            )
+            scan_plan = build_scan_plan(task_plan, strategy)
+            budget = scan_plan.get("budget", {})
+            budget["max_messages"] = min(budget.get("max_messages", 100), max_messages)
+            scan_plan["budget"] = budget
+            scanned = await run_mail_scan(mailbox, scan_plan)
+            MAIL_AGENT_RUNS[run_id]["progress"] = {"scanned": len(scanned)}
         MAIL_AGENT_RUNS[run_id].update({
             "status": "done",
             "stage": "done",
             "updated_at": beijing_now(),
-            "result": result,
         })
-        _save_run_checkpoint(run_id)
     except Exception as exc:
         MAIL_AGENT_RUNS[run_id].update({
             "status": "failed",
@@ -1633,7 +1643,8 @@ async def run_mail_agent_background(run_id: str, arguments: dict[str, Any], invo
             "updated_at": beijing_now(),
             "error": str(exc),
         })
-        _save_run_checkpoint(run_id)
+    _save_run_checkpoint(run_id)
+
 
 
 async def run_custom_scan_background(run_id: str, plan: Any, arguments: dict[str, Any], invoke_id: str) -> None:

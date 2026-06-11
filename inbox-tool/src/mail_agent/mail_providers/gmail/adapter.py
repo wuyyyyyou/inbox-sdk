@@ -217,13 +217,29 @@ def list_messages(mailbox: str) -> list[dict[str, Any]]:
         return messages if isinstance(messages, list) else []
 
     path = _index_path(mailbox)
-    if not path.exists():
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            payload = {}
+        if isinstance(payload, dict) and payload.get("messages"):
+            return payload["messages"]
+
+    # Fallback: rebuild from individual message files when index is missing
+    msg_dir = _mailbox_cache_dir(mailbox)
+    if not msg_dir.is_dir():
         return []
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return []
-    return payload.get("messages") if isinstance(payload, dict) else []
+    messages: list[dict[str, Any]] = []
+    for f in sorted(msg_dir.iterdir()):
+        if not f.name.endswith(".json"):
+            continue
+        try:
+            msg = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(msg, dict):
+                messages.append(msg)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return sorted(messages, key=lambda m: int(m.get("internal_date") or 0), reverse=True)
 
 
 def read_cache(mailbox: str) -> dict[str, Any]:

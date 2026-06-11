@@ -123,9 +123,11 @@ async def run_mail_scan(
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from ..mail_providers.gmail.adapter import (
         _clear_aps_cache_errors,
+        _normalize_message,
         extract_messages_from_thread,
         fetch_thread_full,
         get_aps_cache_errors,
+        list_messages,
         list_threads_page,
         normalize_mailbox,
         _to_message_lite,
@@ -138,6 +140,7 @@ async def run_mail_scan(
     seen_threads: set[str] = set()
     page_token: str | None = None
     gmail_errors: list[str] = []
+    fallback_used = False
     _errors_lock = threading.Lock()
 
     while len(all_messages) < max_threads:
@@ -145,8 +148,18 @@ async def run_mail_scan(
         try:
             page = list_threads_page(normalized, page_token=page_token)
         except Exception as exc:
-            with _errors_lock:
-                gmail_errors.append(f"list_threads_page: {exc}")
+            # Fall back to local cache if Gmail API is unreachable
+            fallback_used = True
+            _logger.warning("threads.list failed, falling back to cache: %s", exc)
+            cached = list_messages(normalized)
+            for m in cached:
+                if isinstance(m, dict) and m.get("id"):
+                    try:
+                        all_messages.append(_to_message_lite(m))
+                    except Exception:
+                        pass
+                if len(all_messages) >= max_threads:
+                    break
             break
 
         thread_refs = page.get("threads") if isinstance(page, dict) else []
@@ -171,13 +184,16 @@ async def run_mail_scan(
         def _fetch_one_thread(tid: str) -> list[dict[str, Any]]:
             try:
                 full = fetch_thread_full(normalized, tid)
-                msgs = extract_messages_from_thread(full)
-                for msg in msgs:
+                raw_msgs = extract_messages_from_thread(full)
+                normalized_msgs: list[dict[str, Any]] = []
+                for msg in raw_msgs:
                     try:
-                        write_message(normalized, msg)
+                        n = _normalize_message(normalized, msg)
+                        write_message(normalized, n)
+                        normalized_msgs.append(n)
                     except Exception:
                         pass
-                return msgs
+                return normalized_msgs
             except Exception as exc:
                 with _errors_lock:
                     gmail_errors.append(f"fetch_thread({tid}): {exc}")
@@ -206,7 +222,37 @@ async def run_mail_scan(
         if not page_token:
             break
 
-    if not all_messages and gmail_errors:
+    # Persist index for future cache fallback
+    if all_messages:
+        from ..mail_providers.gmail.adapter import write_index, read_message
+        try:
+            summaries: list[dict[str, Any]] = []
+            for lite in all_messages:
+                try:
+                    msg = read_message(normalized, lite.message_id)
+                    summaries.append({
+                        "id": msg.get("id", lite.message_id),
+                        "thread_id": msg.get("thread_id", lite.thread_id),
+                        "internal_date": str(msg.get("internal_date") or lite.internal_date or ""),
+                        "from_addr": msg.get("from", lite.from_addr) or "",
+                        "subject": msg.get("subject", lite.subject) or "",
+                        "snippet": msg.get("snippet", lite.snippet) or "",
+                    })
+                except Exception:
+                    pass
+            if summaries:
+                write_index(normalized, summaries)
+        except Exception:
+            pass
+
+    if fallback_used:
+        if progress_callback:
+            progress_callback("scan_fallback", {
+                "gmail_api_failed": bool(gmail_errors),
+                "cached_count": len(all_messages),
+                "errors": gmail_errors[-3:],
+            })
+    if not all_messages and gmail_errors and not fallback_used:
         _logger.error("Gmail API failed: %s", gmail_errors[:3])
         if progress_callback:
             progress_callback("scan_fallback_empty", {

@@ -230,23 +230,26 @@ async def run_mail_task(
 
     configured_max = scan_plan_config.max_messages if scan_plan_config else 100
 
-    # Quick Gmail connectivity check
-    _report_progress(progress_callback, "scan", stage="gmail_check")
-    try:
-        from ..mail_providers.gmail.adapter import get_access_token, GMAIL_API_BASE
-        import urllib.request as _ur
-        _token = get_access_token(input_.mailbox_id)
-        _req = _ur.Request(
-            f"{GMAIL_API_BASE}/users/me/profile",
-            headers={"Authorization": f"Bearer {_token}", "Accept": "application/json"},
-            method="GET",
-        )
-        with _ur.urlopen(_req, timeout=8) as _resp:
-            _profile = json.loads(_resp.read().decode("utf-8"))
-        _logger.info("gmail_check ok: %s", _profile.get("emailAddress"))
-    except Exception as _exc:
-        _logger.warning("gmail_check failed: %s", _exc)
-        raise RuntimeError(f"Gmail connection failed — check your token or network. ({_exc})") from _exc
+    # Quick Gmail connectivity check (platform only; skip in local dev)
+    import os as _os, sys as _sys
+    _on_platform = bool(getattr(_sys, "_MEIPASS", "") or _os.environ.get("GMAIL_ACCESS_TOKEN") or _os.environ.get("GOOGLE_ACCESS_TOKEN"))
+    if _on_platform:
+        _report_progress(progress_callback, "scan", stage="gmail_check")
+        try:
+            from ..mail_providers.gmail.adapter import get_access_token, GMAIL_API_BASE
+            import urllib.request as _ur
+            _token = get_access_token(input_.mailbox_id)
+            _req = _ur.Request(
+                f"{GMAIL_API_BASE}/users/me/profile",
+                headers={"Authorization": f"Bearer {_token}", "Accept": "application/json"},
+                method="GET",
+            )
+            with _ur.urlopen(_req, timeout=8) as _resp:
+                _profile = json.loads(_resp.read().decode("utf-8"))
+            _logger.info("gmail_check ok: %s", _profile.get("emailAddress"))
+        except Exception as _exc:
+            _logger.warning("gmail_check failed: %s", _exc)
+            raise RuntimeError(f"Gmail connection failed — check your token or network. ({_exc})") from _exc
 
     _report_progress(progress_callback, "scan", max_threads=configured_max)
     _logger.info("scan started: mailbox=%s max_threads=%s", input_.mailbox_id, configured_max)
