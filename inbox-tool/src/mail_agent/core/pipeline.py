@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import math
+import sys
+import time
 from collections.abc import Callable
 from dataclasses import asdict
 from datetime import datetime, timezone, timedelta
@@ -30,7 +32,13 @@ from .context import read_candidate_context
 from .phase1 import run_phase1_batch_classify
 from .guards import apply_rule_guards
 from ..planning.intent import parse_intent
-from ..judgment_engine.service import evaluate_item, evaluate_items_batch
+from ..judgment_engine.service import (
+    build_anna_single_judgment_prompt,
+    create_fallback_judgment,
+    evaluate_item,
+    evaluate_items_batch,
+)
+from ..llm_runtime.service import call_llm_json_safe as _call_llm_json_safe
 from .plan import create_run_id, generate_action_plan
 from .scan import build_scan_plan, run_mail_scan
 from ..planning.strategies import get as get_strategy
@@ -43,7 +51,7 @@ from ..domain.types import (
 )
 
 ProgressCallback = Callable[[str, dict[str, Any]], None]
-EVALUATE_CONCURRENCY = 2
+EVALUATE_CONCURRENCY = 3  # maxCalls=8 per invoke; 3 main + retries within limit
 _PERSIST_LOCKS: dict[str, asyncio.Lock] = {}
 
 # Storage integration (lazy import to avoid circular deps at module level)
@@ -175,12 +183,28 @@ async def run_mail_task(
     sampling_create_message: Any,
     primary_count: int = 20,
     progress_callback: ProgressCallback | None = None,
+    skip_contact_memory: bool = False,
 ) -> ActionPlan:
     """Run the full mail agent pipeline."""
     run_id = create_run_id()
 
+    _t_total = time.time()
+    _t = _t_total
+
+    def _tick(label: str) -> None:
+        nonlocal _t
+        now = time.time()
+        sys.stderr.write(f"[pipeline] ⏱ {label}: +{int((now - _t) * 1000)}ms (total {int((now - _t_total) * 1000)}ms)\n")
+        sys.stderr.flush()
+        _t = now
+
+    sys.stderr.write(f"[pipeline] ⏱ START mailbox={input_.mailbox_id} run_id={run_id}\n")
+    sys.stderr.flush()
+    _tick("begin")
+
     _report_progress(progress_callback, "parse_intent")
     task_plan = await parse_intent(input_, sampling_create_message)
+    _tick("parse_intent")
 
     strategy = get_strategy(task_plan.strategy_mode)
     if not strategy:
@@ -235,9 +259,11 @@ async def run_mail_task(
     budget["max_messages"] = min(budget.get("max_messages", configured_max), configured_max)
     scan_plan["budget"] = budget
 
+    _tick("scan_start")
     _report_progress(progress_callback, "scan", max_messages=budget["max_messages"], window_days=window_days)
     _logger.info("scan started: mailbox=%s max_messages=%s window_days=%s", input_.mailbox_id, budget["max_messages"], window_days)
     messages = await run_mail_scan(input_.mailbox_id, scan_plan, progress_callback=progress_callback)
+    _tick("scan_done")
     _report_progress(progress_callback, "scan_done", scanned=len(messages), max_messages=budget["max_messages"])
     _logger.info("scan done: %d messages fetched", len(messages))
 
@@ -302,6 +328,7 @@ async def run_mail_task(
             _logger.warning("check_replied error for thread %s, keeping message", tid)
             check_timeouts += 1
         filtered_messages.append(m)
+    _tick(f"already_replied_filter filtered={already_replied_count} timeouts={check_timeouts}")
     _logger.info("already_replied_filter: %d filtered (already replied), %d timeouts, %d remaining",
                  already_replied_count, check_timeouts, len(filtered_messages))
     _report_progress(
@@ -331,6 +358,7 @@ async def run_mail_task(
             }
         },
     )
+    _tick(f"phase1_done candidates={len(candidates)}")
     _logger.info("phase1 done: %d candidates, %d low_value", len(candidates), len(low_value_items))
 
     contexts = []
@@ -354,6 +382,7 @@ async def run_mail_task(
         except Exception:
             pass
         contexts.append(ctx)
+    _tick(f"read_context_done candidates={len(contexts)}")
     _report_progress(progress_callback, "read_context_done", total=len(contexts))
     _logger.info("read_context done: %d candidates", len(contexts))
 
@@ -367,34 +396,79 @@ async def run_mail_task(
         except Exception:
             snooze_prefs = None
 
-    if sampling_create_message is not None:
-        _report_progress(
-            progress_callback,
-            "evaluate",
-            current=0,
-            total=len(contexts),
-            evaluated=0,
-            mode="anna_batch",
-        )
-        judgments = await evaluate_items_batch(
-            task_plan=task_plan,
-            strategy=strategy,
-            mailbox_profile=mailbox_profile,
-            candidate_contexts=contexts,
-            sampling_create_message=sampling_create_message,
-            max_sampling_calls=max(1, math.ceil(len(contexts) / 3)),
-            snooze_prefs=snooze_prefs,
-            progress_callback=progress_callback,
-        )
-        _report_progress(progress_callback, "evaluate_done", total=len(judgments), evaluated=len(judgments), mode="anna_batch")
-        _report_progress(progress_callback, "plan", judgments=len(judgments))
+    _tick(f"eval_start calls={len(contexts)}")
+    if sampling_create_message is not None and contexts:
+        # Concurrent Anna evaluation — same semaphore pattern as DashScope path.
+        # Each evaluate_item_single call issues one sampling/createMessage RPC.
+        # 4 concurrent calls fit within the invoke's maxCalls=8 grant.
+        ann_sem = asyncio.Semaphore(EVALUATE_CONCURRENCY)
+        ann_progress_lock = asyncio.Lock()
+        ann_evaluated = 0
+        ann_succeeded = 0
+        ann_fallback = 0
 
-        # Apply rule guards — Anna batch path must match DashScope single-item path
-        for i, j in enumerate(judgments):
-            judgments[i] = apply_rule_guards(j, strategy)
+        async def _ann_evaluate_one(index: int, ctx: Any) -> Any:
+            nonlocal ann_evaluated, ann_succeeded, ann_fallback
+            _ev_start = time.time()
+            async with ann_sem:
+                sys.stderr.write(f"[pipeline] ⏱ eval #{index}/{len(contexts)} enter sem\n")
+                sys.stderr.flush()
+                _report_progress(
+                    progress_callback, "evaluate",
+                    current=index, total=len(contexts),
+                    evaluated=ann_evaluated, succeeded=ann_succeeded, fallback=ann_fallback,
+                    concurrency=EVALUATE_CONCURRENCY, mode="anna_concurrent",
+                )
+                try:
+                    prompt = build_anna_single_judgment_prompt(task_plan, strategy, mailbox_profile, ctx, snooze_prefs)
+                    result = await _call_llm_json_safe(
+                        sampling_create_message,
+                        system_prompt="You are a strict JSON generator. Output ONLY valid JSON — no explanation, no markdown, no code fences.",
+                        user_message=prompt,
+                        fallback={},
+                        temperature=0.1,
+                        max_tokens=8192,
+                        timeout=120.0,
+                        metadata={"tool": "evaluate_item_single", "strategy_mode": strategy.id, "candidate_count": "1"},
+                        allow_fallback=True,
+                        allow_sampling_provider_fallback=False,
+                        max_attempts=2,
+                    )
+                    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+                    if not payload or result.get("fallback_used"):
+                        raise ValueError(result.get("fallback_reason") or "empty or fallback Anna sampling response")
+                    from ..judgment_engine.service import _parse_compact_batch_item as _parse
+                    judgment = _parse(payload, strategy)
+                    judgment = apply_rule_guards(judgment, strategy)
+                except Exception as exc:
+                    judgment = create_fallback_judgment(
+                        ctx.candidate.candidate_id, strategy,
+                        f"evaluation failed: {type(exc).__name__}: {exc}",
+                    )
+                async with ann_progress_lock:
+                    ann_evaluated += 1
+                    if getattr(judgment, "mode_judgment", None) and isinstance(judgment.mode_judgment, dict) and "fallback_reason" in judgment.mode_judgment:
+                        ann_fallback += 1
+                    else:
+                        ann_succeeded += 1
+                    _report_progress(
+                        progress_callback, "evaluate",
+                        current=index, total=len(contexts),
+                        evaluated=ann_evaluated, succeeded=ann_succeeded, fallback=ann_fallback,
+                        concurrency=EVALUATE_CONCURRENCY, mode="anna_concurrent",
+                    )
+                sys.stderr.write(f"[pipeline] ⏱ eval #{index}/{len(contexts)} done: {int((time.time() - _ev_start) * 1000)}ms\n")
+                sys.stderr.flush()
+                return judgment
+
+        judgments = await asyncio.gather(*(_ann_evaluate_one(i, ctx) for i, ctx in enumerate(contexts, start=1)))
+        _tick("eval_all_done")
+        _report_progress(progress_callback, "evaluate_done", total=len(judgments), evaluated=len(judgments), mode="anna_concurrent")
+        _report_progress(progress_callback, "plan", judgments=len(judgments))
 
         if _storage_ready():
             try:
+                _tick("persist_start")
                 await _persist_run_results(
                     run_id=run_id,
                     mailbox=input_.mailbox_id,
@@ -406,12 +480,17 @@ async def run_mail_task(
                     mode=input_.mode if hasattr(input_, 'mode') else "auto",
                     low_value_items=low_value_items,
                     sampling_create_message=sampling_create_message,
+                    skip_contact_memory=skip_contact_memory,
                 )
+                _tick("persist_done")
                 _report_progress(progress_callback, "storage_saved")
             except Exception as exc:
                 _report_progress(progress_callback, "storage_error", reason=str(exc)[:200])
 
-        return generate_action_plan(run_id, task_plan, judgments)
+        _tick("plan_start")
+        result = generate_action_plan(run_id, task_plan, judgments)
+        _tick("all_done (anna path)")
+        return result
 
     semaphore = asyncio.Semaphore(EVALUATE_CONCURRENCY)
     progress_lock = asyncio.Lock()
@@ -495,11 +574,13 @@ async def run_mail_task(
                 mode=input_.mode if hasattr(input_, 'mode') else "auto",
                 low_value_items=low_value_items,
                 sampling_create_message=sampling_create_message,
+                skip_contact_memory=skip_contact_memory,
             )
             _report_progress(progress_callback, "storage_saved")
         except Exception as exc:
             _report_progress(progress_callback, "storage_error", reason=str(exc)[:200])
 
+    _tick("all_done (dashscope path)")
     return action_plan
 
 
@@ -519,10 +600,10 @@ _EXECUTION_SYSTEM_PROMPT = """You are Anna, an executive email assistant. The ma
           "from": "Sender email address copied from email data",
           "context": "What this is about (verifiable facts)",
           "suggestion": "What to do (optional)",
-          "draft": "Draft reply text — REQUIRED when the user asked for reply drafts. Every item with a message_id must include a draft in that case. Otherwise omit.",
+          "draft": "Draft reply text. Omit when reply_gaps.needs_user_input is true — use reply_gaps to ask the user first, then the draft will be generated later from their answers.",
           "message_id": "Gmail message ID copied from email data (e.g. 19e62c874f8b17df)",
           "thread_id": "Gmail thread ID copied from email data",
-          "reply_gaps": {"needs_user_input": false, "summary": "", "questions": []}
+          "reply_gaps": {"needs_user_input": false, "summary": "Brief summary of what info is needed", "questions": [{"id": "q1", "question": "What days work for you next week?", "hint": "e.g. Mon/Wed/Fri", "required": true}]}
         }
       ]
     }
@@ -536,8 +617,18 @@ _EXECUTION_SYSTEM_PROMPT = """You are Anna, an executive email assistant. The ma
   - heading: short label for this group
   - body: optional narrative (timeline, explanation). Omit if items communicate enough.
   - items: specific emails, people, or actions. Use context for verifiable facts, suggestion for next steps.
-  - draft: ONLY include when the user explicitly asked for reply drafts.
-  - reply_gaps: ONLY include for items that need a reply. When the email requires a response but you lack key information that only the user knows (e.g. their availability, opinions, preferences, specific dates, budget), ask clarifying questions instead of guessing. Set needs_user_input=true and provide 1-4 specific, answerable questions. Each question should be a single sentence. If you have enough information to draft a reply confidently, set needs_user_input=false and omit questions.
+  - draft ↔ reply_gaps (two-phase reply generation):
+    For EVERY item that needs a reply, decide between two paths:
+    PATH A — You have enough context to draft confidently:
+      → Set draft to a professional reply. Set reply_gaps.needs_user_input to false.
+    PATH B — You lack key info only the user knows (availability, budget, opinions, dates):
+      → Omit the draft field entirely. Set reply_gaps.needs_user_input=true, write a 1-sentence summary of what info is missing, and provide 1-4 specific, answerable questions. Each question must have:
+        - id: short slug ("q1", "q2")
+        - question: one clear sentence
+        - hint: an example answer to guide the user (optional)
+        - required: true if this question must be answered
+      The user will see these questions, answer them, and a draft will be generated from their answers.
+    CRITICAL: NEVER guess when you don't know. Path B is always better than a wrong draft.
 - message_id: copy from the "Message ID:" field in the email data. REQUIRED when draft is present — the user needs this to send or act on the email. Only omit for pure informational items without a draft.
 - thread_id: copy from the "Thread:" field in the email data. REQUIRED when draft is present.
 - from: copy from the "From:" field in the email data. REQUIRED when draft is present — this is the reply recipient.
@@ -549,6 +640,7 @@ _EXECUTION_SYSTEM_PROMPT = """You are Anna, an executive email assistant. The ma
 - Base your answer ONLY on the emails provided. If nothing matches, say so in summary.
 - Use verifiable facts from the emails — no speculation, no AI reasoning.
 - Be specific in suggestions. Avoid generic 'evaluate and respond.'
+- REPLY DRAFTS: For items needing a reply, choose Path A (draft directly) or Path B (reply_gaps to ask user). NEVER include both draft AND reply_gaps.needs_user_input=true on the same item — they are mutually exclusive.
 - NEVER fill in reply_gaps.questions with information you can verify from the emails — only ask about what you genuinely cannot know.
 - CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM". If no date is available, say "recently"."""
 
@@ -856,6 +948,7 @@ async def _persist_run_results(
     plan_id: str = "",
     low_value_items: list[dict[str, Any]] | None = None,
     sampling_create_message: Any = None,
+    skip_contact_memory: bool = False,
 ) -> None:
     lock = _PERSIST_LOCKS.setdefault(mailbox, asyncio.Lock())
     async with lock:
@@ -865,6 +958,7 @@ async def _persist_run_results(
             strategy_mode=strategy_mode, user_request=user_request, mode=mode,
             plan_id=plan_id, low_value_items=low_value_items,
             sampling_create_message=sampling_create_message,
+            skip_contact_memory=skip_contact_memory,
         )
 
 
@@ -881,6 +975,7 @@ async def _persist_run_results_locked(
     plan_id: str = "",
     low_value_items: list[dict[str, Any]] | None = None,
     sampling_create_message: Any = None,
+    skip_contact_memory: bool = False,
 ) -> None:
     from ..storage.ops import (
         mark_messages_processed_batch,
@@ -991,31 +1086,32 @@ async def _persist_run_results_locked(
     merged = merge_cards(existing, new_cards)
     await set_active_cards(mailbox, merged)
 
-    try:
-        from ..contact_memory.indexer import ingest_card_event, ingest_thread_observation
-        card_thread_ids = {card.thread_id for card in new_cards if getattr(card, "thread_id", "")}
-        for card in new_cards:
-            if getattr(card, "card_type", "") != "cleanup_bundle":
-                await ingest_card_event(
-                    mailbox,
-                    card,
-                    event_type="card_created",
-                    source="gmail_scan",
-                    sampling_create_message=sampling_create_message,
-                )
-        for candidate in candidates:
-            if candidate.thread_id and candidate.thread_id not in card_thread_ids:
-                await ingest_thread_observation(
-                    mailbox,
-                    candidate.thread_id,
-                    str(candidate.evidence.get("from", "")),
-                    str(candidate.evidence.get("subject", "")),
-                    sampling_create_message=sampling_create_message,
-                    source="gmail_scan",
-                    user_action="message_seen",
-                )
-    except Exception as exc:
-        _logger.warning("contact_memory_ingest_failed mailbox=%s error=%s", mailbox, exc)
+    if not skip_contact_memory:
+        try:
+            from ..contact_memory.indexer import ingest_card_event, ingest_thread_observation
+            card_thread_ids = {card.thread_id for card in new_cards if getattr(card, "thread_id", "")}
+            for card in new_cards:
+                if getattr(card, "card_type", "") != "cleanup_bundle":
+                    await ingest_card_event(
+                        mailbox,
+                        card,
+                        event_type="card_created",
+                        source="gmail_scan",
+                        sampling_create_message=sampling_create_message,
+                    )
+            for candidate in candidates:
+                if candidate.thread_id and candidate.thread_id not in card_thread_ids:
+                    await ingest_thread_observation(
+                        mailbox,
+                        candidate.thread_id,
+                        str(candidate.evidence.get("from", "")),
+                        str(candidate.evidence.get("subject", "")),
+                        sampling_create_message=sampling_create_message,
+                        source="gmail_scan",
+                        user_action="message_seen",
+                    )
+        except Exception as exc:
+            _logger.warning("contact_memory_ingest_failed mailbox=%s error=%s", mailbox, exc)
 
     # 4. Save run record
     cards_summary = cards_to_frontend(merged)

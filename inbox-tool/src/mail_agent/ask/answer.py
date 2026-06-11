@@ -90,7 +90,7 @@ async def _filter_candidates(
             timeout=120.0,
             metadata={"tool": "ask_filter"},
             allow_fallback=True,
-            allow_sampling_provider_fallback=sampling_create_message is None,
+            allow_sampling_provider_fallback=True,
             max_attempts=2 if sampling_create_message is not None else None,
         )
     except Exception:
@@ -295,11 +295,13 @@ async def _generate_answer(
             f"{plan.user_request}\n\n"
             f"## Task\n"
             f"{plan.task_prompt}\n\n"
-            f"## Important: reply_gaps\n"
-            f"If the user asked for draft replies and you lack key information that only "
-            f"the user knows (availability, preferences, budget, dates), set reply_gaps "
-            f"with needs_user_input=true and ask clarifying questions. "
-            f"Do NOT invent answers — ask instead.\n\n"
+            f"## Two-phase reply generation\n"
+            f"For EVERY item that needs a reply, decide between two paths:\n"
+            f"PATH A — You have enough context → write the draft in the 'draft' field.\n"
+            f"PATH B — You need user clarification → OMIT 'draft', set reply_gaps.needs_user_input=true "
+            f"with specific questions. The user will answer, and a draft will be generated later.\n"
+            f"CRITICAL: Never include both draft AND reply_gaps.needs_user_input on the same item.\n"
+            f"When in doubt, choose Path B. A bad guess is worse than asking.\n\n"
             f"## Relevant emails ({len(enriched)} total)\n"
             f"{rendered}\n\n"
             f"## Important\n"
@@ -338,7 +340,7 @@ async def _generate_answer(
                 timeout=180.0,
                 metadata={"tool": "ask_answer", "email_count": str(len(enriched)), "variant": variant["name"]},
                 allow_fallback=sampling_create_message is None,
-                allow_sampling_provider_fallback=sampling_create_message is None,
+                allow_sampling_provider_fallback=True,
                 max_attempts=1 if sampling_create_message is not None else None,
             )
             break
@@ -616,7 +618,7 @@ async def generate_ask_item_draft(
         timeout=120.0,
         metadata={"tool": "ask_draft", "message_id": message_id},
         allow_fallback=True,
-        allow_sampling_provider_fallback=sampling_create_message is None,
+        allow_sampling_provider_fallback=True,
     )
 
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}

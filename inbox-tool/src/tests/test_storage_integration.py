@@ -228,6 +228,18 @@ async def main():
     await append_run_history(entry)
     history = await get_run_history()
     check("append/get run history", len(history) >= 1 and history[0].run_id == "run_test_1")
+    updated_entry = RunHistoryEntry(
+        run_id="run_test_1", mailbox="test@example.com", ts="2026-05-21",
+        request="test request", mode="auto", strategy="default_secretary",
+        result="Scanned 100 emails, 3 needs reply, 2 needs review", summary="Updated",
+    )
+    await append_run_history(updated_entry)
+    history = await get_run_history()
+    same_run_entries = [h for h in history if h.run_id == "run_test_1"]
+    check(
+        "append run history updates same run",
+        len(same_run_entries) == 1 and history[0].result == "Scanned 100 emails, 3 needs reply, 2 needs review",
+    )
 
     # 8. Test user preferences
     print("\n── storage_ops: user preferences ──")

@@ -9,11 +9,12 @@ export const SCAN_STEPS = [
 ];
 
 const STAGE_STEP_MAP: Record<string, number> = {
-  queued: 0, parse_intent: 0, scan: 0, scan_cache: 0, scan_done: 0, scan_fallback: 0, scan_fallback_empty: 0,
+  queued: 0, parse_intent: 0, scan: 0, scanning: 0, scan_cache: 0, scan_done: 0, scan_fallback: 0, scan_fallback_empty: 0,
   storage_filter: 1, thread_dedup: 1, check_replied: 1, already_replied_filter: 1, phase1: 1, phase1_done: 1,
+  filtering: 1,
   read_context: 2, read_context_done: 2,
-  evaluate: 3, evaluate_done: 3,
-  plan: 4, storage_saved: 4, reading_cards: 4, read_cards_error: 4, storage_error: 4, done: 4,
+  evaluate: 3, evaluate_done: 3, phase2: 3,
+  plan: 4, finalizing: 4, storage_saved: 4, reading_cards: 4, read_cards_error: 4, storage_error: 4, done: 4,
   planning: 0, planning_done: 0,
 };
 
@@ -28,11 +29,13 @@ export function scanStageLabel(stage: string | undefined, progress: Record<strin
     planning_done: "Plan ready. Starting scan.",
     parse_intent: "Choosing scan strategy.",
     scan: "Reading Gmail source.",
+    scanning: "Reading Gmail source.",
     scan_cache: "Loading Gmail cache.",
     scan_done: "New messages loaded.",
     scan_fallback: "Gmail API unreachable — using cached emails.",
     scan_fallback_empty: "Gmail API unreachable and cache empty — no emails available.",
     storage_filter: "Skipping messages already processed.",
+    filtering: "Filtering messages.",
     thread_dedup: "Deduplicating threads.",
     check_replied: "Checking thread reply status.",
     already_replied_filter: "Filtering already-replied threads.",
@@ -42,7 +45,9 @@ export function scanStageLabel(stage: string | undefined, progress: Record<strin
     read_context_done: "Context loaded.",
     evaluate: "Evaluating cards.",
     evaluate_done: "Evaluation complete.",
+    phase2: "Evaluating cards.",
     plan: "Building action plan.",
+    finalizing: "Saving brief.",
     storage_saved: "Persisting cards locally.",
     storage_error: "Failed to persist cards.",
     reading_cards: "Reading cards from storage.",
@@ -56,7 +61,7 @@ export function scanStageLabel(stage: string | undefined, progress: Record<strin
 export function scanProgressLabel(stage: string | undefined, progress: Record<string, unknown> = {}): string {
   const p = progress;
   if (!stage || stage === "queued") return "";
-  if (stage === "scan" || stage === "parse_intent") return "Connecting to Gmail...";
+  if (stage === "scan" || stage === "scanning" || stage === "parse_intent") return "Connecting to Gmail...";
   if (stage === "scan_cache") return `${p.lite_count || 0}/${p.matched_ids || 0} cached emails ready`;
   if (stage === "scan_done") return `${p.scanned || 0} emails loaded`;
   if (stage === "scan_fallback") return `Gmail unreachable, using ${p.cached_count || 0} cached`;
@@ -65,11 +70,17 @@ export function scanProgressLabel(stage: string | undefined, progress: Record<st
   if (stage === "thread_dedup") return `${p.after || 0} after dedup`;
   if (stage === "check_replied") return `Checking reply status ${p.current || 0}/${p.total || 0}`;
   if (stage === "already_replied_filter") return `${p.filtered || 0} already replied`;
-  if (stage === "phase1") return `Classifying ${p.scanned || 0} emails...`;
+  if (stage === "filtering") return `${p.new || 0} new after filtering`;
+  if (stage === "phase1") {
+    const current = Number(p.current || 0);
+    const total = Number(p.total || p.scanned || 0);
+    if (total) return `Classifying headers ${current}/${total}`;
+    return `Classifying ${p.scanned || 0} emails...`;
+  }
   if (stage === "phase1_done") return `${p.candidates || 0} candidates, ${p.low_value || 0} low-priority`;
   if (stage === "read_context") return `Reading context ${p.current || 0}/${p.total || 0}`;
   if (stage === "read_context_done") return `${p.total || 0} contexts loaded`;
-  if (stage === "evaluate") {
+  if (stage === "phase2" || stage === "evaluate") {
     const detail = `Evaluating ${p.evaluated || 0}/${p.total || 0}`;
     const fb = Number(p.fallback || 0);
     return fb > 0 ? `${detail} · ${fb} fallback` : detail;
@@ -84,6 +95,7 @@ export function scanProgressLabel(stage: string | undefined, progress: Record<st
     const n = Number(p.judgments || 0);
     return n ? `Building action plan from ${n} evaluations...` : "Building action plan...";
   }
+  if (stage === "finalizing") return "Saving brief and scan state...";
   if (stage === "storage_saved") return "Cards saved.";
   if (stage === "storage_error") {
     const reason = p.reason ? `: ${p.reason}` : "";
@@ -112,17 +124,25 @@ export const CUSTOM_PROGRESS_STEPS = [
 export function customStageKey(stage: string | undefined, status: string | undefined): string {
   if (status === "done") return "done";
   if (status === "failed") return "failed";
+  // Legacy custom scan stages
   if (stage === "scan" || stage === "scan_done") return "searching";
   if (stage === "read_context" || stage === "read_context_done") return "reading";
   if (stage === "evaluate" || stage === "evaluate_done") return "answering";
+  // New ask pipeline stages (plan → search → filter → context → answer → guard)
+  if (stage === "plan" || stage === "plan_done") return "planning";
+  if (stage === "search" || stage === "search_done" || stage === "filter_done") return "searching";
+  if (stage === "answer") return "answering";
   if (stage === "done") return "done";
   return "planning";
 }
 
 export function customStageCopy(stageKey: string, progress: Record<string, unknown> = {}): string {
-  if (stageKey === "planning") return "Shaping the mailbox scan into a focused plan.";
+  if (stageKey === "planning") {
+    const title = String(progress.title || "");
+    return title ? `Plan ready: ${title}` : "Shaping the mailbox scan into a focused plan.";
+  }
   if (stageKey === "searching") {
-    const found = Number(progress.scanned || 0);
+    const found = Number(progress.scanned || progress.candidates || 0);
     return found ? `Found ${found} relevant message${found === 1 ? "" : "s"}.` : "Running the planned Gmail searches.";
   }
   if (stageKey === "reading") {
@@ -130,7 +150,10 @@ export function customStageCopy(stageKey: string, progress: Record<string, unkno
     const total = Number(progress.total || 0);
     return total ? `Reading context ${current}/${total}.` : "Opening the relevant email context.";
   }
-  if (stageKey === "answering") return "The mail evidence is ready. Anna is composing the answer.";
+  if (stageKey === "answering") {
+    const candidates = Number(progress.candidates || 0);
+    return candidates ? `Analyzing ${candidates} candidate${candidates === 1 ? "" : "s"} with Anna LLM.` : "The mail evidence is ready. Anna is composing the answer.";
+  }
   if (stageKey === "done") return "Answer ready.";
   return "The scan stopped before an answer was produced.";
 }

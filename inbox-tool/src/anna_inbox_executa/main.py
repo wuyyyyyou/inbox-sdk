@@ -180,11 +180,26 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "start_mail_agent_run",
-            "description": "Start the full mail-agent pipeline in the background and poll status separately.",
+            "description": "Prepare a pollable brief run. Follow with continue_mail_agent_run to execute scan and LLM phases.",
             "parameters": [
                 {"name": "user_request", "type": "string", "description": "Natural language request from user.", "required": True},
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
                 {"name": "mode", "type": "string", "description": "Strategy mode: auto, default_secretary, creator_opportunity, security_billing", "required": False},
+                {"name": "max_messages", "type": "integer", "description": "Maximum messages to scan.", "required": False},
+                {"name": "primary_count", "type": "integer", "description": "How many recent Primary emails to fetch first.", "required": False},
+                {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
+                {"name": "run_id", "type": "string", "description": "Client-generated run ID for polling progress.", "required": False},
+                {"name": "storage_provider", "type": "string", "description": "Storage provider: local or aps.", "required": False},
+            ],
+        },
+        {
+            "name": "continue_mail_agent_run",
+            "description": "Advance one short Brief state-machine slice with sampling bound to this invoke.",
+            "parameters": [
+                {"name": "run_id", "type": "string", "description": "Run ID from start_mail_agent_run.", "required": True},
+                {"name": "user_request", "type": "string", "description": "Natural language request from user.", "required": False},
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": False},
+                {"name": "mode", "type": "string", "description": "Strategy mode.", "required": False},
                 {"name": "max_messages", "type": "integer", "description": "Maximum messages to scan.", "required": False},
                 {"name": "primary_count", "type": "integer", "description": "How many recent Primary emails to fetch first.", "required": False},
                 {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
@@ -425,6 +440,7 @@ DEFAULT_MANIFEST = {
             "parameters": [
                 {"name": "user_request", "type": "string", "description": "Natural language request from user.", "required": True},
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "run_id", "type": "string", "description": "Client-generated run ID for polling progress before execution completes.", "required": False},
                 {"name": "max_messages", "type": "integer", "description": "Maximum messages to scan.", "required": False},
                 {"name": "primary_count", "type": "integer", "description": "How many recent Primary emails to fetch first.", "required": False},
                 {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
@@ -436,6 +452,7 @@ DEFAULT_MANIFEST = {
             "parameters": [
                 {"name": "plan_id", "type": "string", "description": "Plan ID from get_custom_plans.", "required": True},
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "run_id", "type": "string", "description": "Client-generated run ID for polling progress before execution completes.", "required": False},
                 {"name": "max_messages", "type": "integer", "description": "Maximum messages to scan.", "required": False},
                 {"name": "primary_count", "type": "integer", "description": "How many recent Primary emails to fetch first.", "required": False},
                 {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
@@ -491,6 +508,17 @@ DEFAULT_MANIFEST = {
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address, or all.", "required": False},
                 {"name": "mailboxes", "type": "array", "description": "Mailbox email addresses.", "required": False},
+                {"name": "storage_provider", "type": "string", "description": "Storage backend: local or aps.", "required": False},
+            ],
+        },
+        {
+            "name": "generate_contact_memories",
+            "description": "Generate contact memories for active brief cards without blocking card display.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address, or all.", "required": False},
+                {"name": "mailboxes", "type": "array", "description": "Mailbox email addresses.", "required": False},
+                {"name": "since", "type": "string", "description": "Only process cards created at or after this ISO timestamp.", "required": False},
+                {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
                 {"name": "storage_provider", "type": "string", "description": "Storage backend: local or aps.", "required": False},
             ],
         },
@@ -758,6 +786,25 @@ def _compact_run_result(result: Any) -> Any:
             "meta": _compact_run_payload(result.get("meta") or {}, text_limit=800),
         }
     return _compact_run_payload(result, text_limit=1200)
+
+
+def _public_run_view(state: dict[str, Any]) -> dict[str, Any]:
+    brief = state.get("brief") if isinstance(state.get("brief"), dict) else {}
+    return {
+        "success": state.get("status") != "failed",
+        "run_id": state.get("run_id", ""),
+        "status": state.get("status", ""),
+        "stage": state.get("stage", ""),
+        "progress": state.get("progress") or {},
+        "warnings": state.get("warnings") or [],
+        "started_at": state.get("started_at"),
+        "updated_at": state.get("updated_at"),
+        "error": state.get("error", ""),
+        "needs_continue": bool(state.get("needs_continue")),
+        "cards_added": int(state.get("cards_added") or 0),
+        "cards_version": int(brief.get("cards_version") or state.get("cards_version") or 0),
+        "result": _compact_run_result(state.get("result")),
+    }
 
 
 def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
@@ -1992,7 +2039,10 @@ async def _run_test_sampling_async(run_id: str, arguments: dict[str, Any], invok
 
 
 def start_mail_agent_run(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
-    run_id = f"bg_{uuid.uuid4().hex[:12]}"
+    # 接收前端预生成的 run_id，便于后续 continue 调用期间轮询同一个运行状态。
+    run_id = str(arguments.get("run_id") or "").strip()
+    if not run_id or len(run_id) < 8:
+        run_id = f"bg_{uuid.uuid4().hex[:12]}"
     MAIL_AGENT_RUNS[run_id] = {
         "run_id": run_id,
         "status": "queued",
@@ -2004,24 +2054,23 @@ def start_mail_agent_run(arguments: dict[str, Any], invoke_id: str) -> dict[str,
         "result": None,
         "error": "",
         "partial": {},
+        "needs_continue": True,
+        "cards_added": 0,
+        "brief": {
+            "stage": "queued",
+            "cards_version": 0,
+            "messages": [],
+            "phase1_cursor": 0,
+            "phase1_batch_size": 20,
+            "candidates": [],
+            "low_value_items": [],
+            "phase2_cursor": 0,
+            "judgments": [],
+        },
     }
     _save_run_checkpoint(run_id)
-    future = asyncio.run_coroutine_threadsafe(run_mail_agent_background(run_id, arguments, invoke_id), loop)
-    if arguments.get("wait") is True:
-        wait_timeout = int(arguments.get("wait_timeout_seconds", 300))
-        future.result(timeout=wait_timeout)
-        return {
-            "success": MAIL_AGENT_RUNS[run_id].get("status") == "done",
-            "run_id": run_id,
-            "status": MAIL_AGENT_RUNS[run_id]["status"],
-            "stage": MAIL_AGENT_RUNS[run_id]["stage"],
-            "progress": MAIL_AGENT_RUNS[run_id]["progress"],
-            "partial": MAIL_AGENT_RUNS[run_id].get("partial", {}),
-            "started_at": MAIL_AGENT_RUNS[run_id]["started_at"],
-            "updated_at": MAIL_AGENT_RUNS[run_id]["updated_at"],
-            "result": _compact_run_result(MAIL_AGENT_RUNS[run_id].get("result")),
-            "error": MAIL_AGENT_RUNS[run_id].get("error", ""),
-        }
+    # 保存参数给 continue_mail_agent_run 复用；不在这个 invoke 里启动 LLM。
+    MAIL_AGENT_RUNS[run_id]["partial"]["_args"] = dict(arguments)
     return {
         "success": True,
         "run_id": run_id,
@@ -2032,9 +2081,538 @@ def start_mail_agent_run(arguments: dict[str, Any], invoke_id: str) -> dict[str,
     }
 
 
+def _brief_messages_from_dict(items: list[dict[str, Any]]) -> list[Any]:
+    from mail_agent.domain.types import MessageLite
+
+    return [
+        MessageLite(
+            message_id=str(item.get("message_id") or ""),
+            thread_id=str(item.get("thread_id") or ""),
+            from_addr=str(item.get("from_addr") or ""),
+            to_addr=str(item.get("to_addr") or ""),
+            cc=str(item.get("cc") or ""),
+            subject=str(item.get("subject") or ""),
+            snippet=str(item.get("snippet") or ""),
+            internal_date=str(item.get("internal_date") or ""),
+            label_ids=list(item.get("label_ids") or []),
+            unread=bool(item.get("unread")),
+            starred=bool(item.get("starred")),
+            important=bool(item.get("important")),
+            has_attachment=bool(item.get("has_attachment")),
+            headers=dict(item.get("headers") or {}),
+        )
+        for item in items
+        if isinstance(item, dict)
+    ]
+
+
+def _brief_candidates_from_dict(items: list[dict[str, Any]]) -> list[Any]:
+    from mail_agent.domain.types import CandidateItem
+
+    return [
+        CandidateItem(
+            candidate_id=str(item.get("candidate_id") or ""),
+            kind=item.get("kind") or "unsure",
+            message_ids=list(item.get("message_ids") or []),
+            thread_id=str(item.get("thread_id") or ""),
+            evidence=dict(item.get("evidence") or {}),
+            priority_hint=item.get("priority_hint") or "unknown",
+            read_depth_required=item.get("read_depth_required") or "header_only",
+            source=item.get("source") or "rule",
+            confidence=float(item.get("confidence") or 0.5),
+        )
+        for item in items
+        if isinstance(item, dict)
+    ]
+
+
+def _brief_judgments_from_dict(items: list[dict[str, Any]]) -> list[Any]:
+    from mail_agent.domain.types import BaseJudgment, FinalDecision, JudgmentResult
+
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        result.append(JudgmentResult(
+            candidate_id=str(item.get("candidate_id") or ""),
+            strategy_mode=item.get("strategy_mode") or "default_secretary",
+            base_judgment=BaseJudgment(**dict(item.get("base_judgment") or {})),
+            mode_judgment=dict(item.get("mode_judgment") or {}),
+            final_decision=FinalDecision(**dict(item.get("final_decision") or {})),
+            confidence=float(item.get("confidence") or 0.5),
+        ))
+    return result
+
+
+def _brief_to_dict_list(items: list[Any]) -> list[dict[str, Any]]:
+    from dataclasses import asdict, is_dataclass
+
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if is_dataclass(item):
+            result.append(asdict(item))
+        elif isinstance(item, dict):
+            result.append(item)
+    return result
+
+
+def _brief_update_state(run_id: str, *, status: str = "running", stage: str, progress: dict[str, Any], cards_added: int = 0, needs_continue: bool = True) -> None:
+    state = MAIL_AGENT_RUNS[run_id]
+    state["status"] = status
+    state["stage"] = stage
+    state["progress"] = progress
+    state["cards_added"] = cards_added
+    state["needs_continue"] = needs_continue
+    state["updated_at"] = beijing_now()
+    _save_run_checkpoint(run_id)
+
+
+async def _brief_prepare_scan(run_id: str, arguments: dict[str, Any]) -> None:
+    import re as _re
+    from mail_agent.core.pipeline import _apply_incremental_window, _dedupe_by_thread, _get_scan_plan_config, _storage_ready, _thread_latest_is_from_owner
+    from mail_agent.core.scan import build_scan_plan, run_mail_scan
+    from mail_agent.domain.types import MailTaskInput
+    from mail_agent.planning.intent import parse_intent
+    from mail_agent.planning.strategies import get as get_strategy
+
+    state = MAIL_AGENT_RUNS[run_id]
+    brief = state.setdefault("brief", {})
+    user_request = str(arguments.get("user_request") or "")
+    mailbox = str(arguments.get("mailbox") or "")
+    mode = str(arguments.get("mode") or "auto")
+    max_messages = int(arguments.get("max_messages") or 50)
+
+    _brief_update_state(run_id, stage="scan", progress={"current": 0, "total": max_messages, "mailbox": mailbox})
+    input_ = MailTaskInput(user_request=user_request, mailbox_id=mailbox, user_email=mailbox, mode=mode, max_messages=max_messages, dry_run=True)
+    task_plan = await parse_intent(input_, None)
+    strategy = get_strategy(task_plan.strategy_mode)
+    if not strategy:
+        raise ValueError(f"Unknown strategy mode: {task_plan.strategy_mode}")
+
+    scan_plan = build_scan_plan(task_plan, strategy)
+    last_message_internal_date = ""
+    if _storage_ready():
+        try:
+            from mail_agent.storage.ops import get_scan_state as _gss
+            last_message_internal_date = (await _gss(mailbox)).last_message_internal_date
+        except Exception:
+            pass
+    scan_plan_config = await _get_scan_plan_config(mailbox)
+    window_days = scan_plan_config.scan_window_days if scan_plan_config else 7
+    configured_max = scan_plan_config.max_messages if scan_plan_config else 100
+    _apply_incremental_window(scan_plan, last_message_internal_date)
+    queries = scan_plan.get("queries") if isinstance(scan_plan.get("queries"), list) else []
+    for q in queries:
+        if not isinstance(q, dict):
+            continue
+        q_str = str(q.get("query") or "")
+        q_str = _re.sub(r"newer_than:\d+d", f"newer_than:{window_days}d", q_str) if "newer_than:" in q_str else f"{q_str} newer_than:{window_days}d".strip()
+        for cat in (scan_plan_config.scan_categories if scan_plan_config else []):
+            if cat in ("promotions", "social", "updates", "forums"):
+                q_str += f" OR category:{cat} newer_than:{window_days}d"
+        q["query"] = q_str
+    budget = dict(scan_plan.get("budget", {}))
+    budget["max_messages"] = min(budget.get("max_messages", configured_max), configured_max)
+    scan_plan["budget"] = budget
+
+    messages = await run_mail_scan(mailbox, scan_plan, progress_callback=lambda stage, progress: _brief_update_state(run_id, stage=stage, progress=progress))
+    all_message_ids = [m.message_id for m in messages if m.message_id]
+    new_message_ids = all_message_ids
+    if _storage_ready() and all_message_ids:
+        from mail_agent.storage.ops import filter_unprocessed
+        new_message_ids = await filter_unprocessed(mailbox, all_message_ids)
+    new_id_set = set(new_message_ids)
+    new_messages = _dedupe_by_thread([m for m in messages if m.message_id in new_id_set])
+
+    filtered_messages = []
+    already_replied_count = 0
+    total_after_dedup = len(new_messages)
+    for i, msg in enumerate(new_messages):
+        _brief_update_state(run_id, stage="check_replied", progress={"current": i + 1, "total": total_after_dedup})
+        tid = msg.thread_id or msg.message_id
+        try:
+            if _thread_latest_is_from_owner(mailbox, tid, mailbox):
+                already_replied_count += 1
+                continue
+        except Exception:
+            pass
+        filtered_messages.append(msg)
+
+    brief.update({
+        "stage": "phase1",
+        "strategy_mode": task_plan.strategy_mode,
+        "task_plan": _brief_to_dict_list([task_plan])[0],
+        "messages": _brief_to_dict_list(filtered_messages),
+        "phase1_cursor": 0,
+        "phase1_batch_size": 20,
+        "candidates": [],
+        "low_value_items": [],
+        "phase2_cursor": 0,
+        "judgments": [],
+    })
+    _brief_update_state(
+        run_id,
+        stage="phase1",
+        progress={
+            "current": 0,
+            "total": len(filtered_messages),
+            "scanned": len(messages),
+            "new": len(new_message_ids),
+            "deduped": len(new_messages),
+            "already_replied": already_replied_count,
+        },
+    )
+
+
+async def _brief_run_phase1_slice(run_id: str, sampling_create_message: Any) -> None:
+    from mail_agent.core.phase1 import _run_phase1_single_batch
+    from mail_agent.domain.types import MailboxProfile
+    from mail_agent.planning.strategies import get as get_strategy
+
+    state = MAIL_AGENT_RUNS[run_id]
+    brief = state.setdefault("brief", {})
+    messages = _brief_messages_from_dict(list(brief.get("messages") or []))
+    cursor = int(brief.get("phase1_cursor") or 0)
+    batch_size = int(brief.get("phase1_batch_size") or 20)
+    total = len(messages)
+    strategy = get_strategy(str(brief.get("strategy_mode") or "default_secretary"))
+    if not strategy:
+        raise ValueError(f"Unknown strategy mode: {brief.get('strategy_mode')}")
+    profile = MailboxProfile(mailbox_id=str((state.get("partial") or {}).get("_args", {}).get("mailbox") or ""), owner=str((state.get("partial") or {}).get("_args", {}).get("mailbox") or ""))
+
+    if cursor >= total:
+        brief["stage"] = "phase2"
+        _brief_update_state(run_id, stage="phase2", progress={"evaluated": int(brief.get("phase2_cursor") or 0), "total": len(brief.get("candidates") or [])})
+        return
+
+    batches = []
+    batch_total = max(1, (total + batch_size - 1) // batch_size)
+    for start in range(cursor, min(total, cursor + batch_size * 4), batch_size):
+        batches.append((start, messages[start:start + batch_size]))
+    _brief_update_state(run_id, stage="phase1", progress={"current": cursor, "total": total, "batch_count": len(batches), "batch_size": batch_size})
+    async def _run_one_phase1(start: int, batch: list[Any]) -> dict[str, Any]:
+        try:
+            return await _run_phase1_single_batch(batch, strategy, profile, sampling_create_message, batch_index=(start // batch_size) + 1, batch_total=batch_total)
+        except Exception:
+            from mail_agent.core.candidate import generate_candidates
+            return {"candidates": generate_candidates(batch, strategy, profile), "low_value_items": []}
+
+    results = await asyncio.gather(*[_run_one_phase1(start, batch) for start, batch in batches])
+
+    candidates = _brief_candidates_from_dict(list(brief.get("candidates") or []))
+    low_value_items = list(brief.get("low_value_items") or [])
+    for result in results:
+        candidates.extend(result.get("candidates") or [])
+        low_value_items.extend(result.get("low_value_items") or [])
+
+    deduped: dict[str, Any] = {}
+    for candidate in candidates:
+        key = candidate.thread_id or (candidate.message_ids[0] if candidate.message_ids else candidate.candidate_id)
+        deduped[key] = candidate
+    cursor = min(total, cursor + batch_size * len(batches))
+    brief["phase1_cursor"] = cursor
+    brief["candidates"] = _brief_to_dict_list(list(deduped.values()))
+    brief["low_value_items"] = low_value_items
+    if cursor >= total:
+        brief["stage"] = "phase2"
+        stage = "phase1_done"
+    else:
+        stage = "phase1"
+    _brief_update_state(
+        run_id,
+        stage=stage,
+        progress={"current": cursor, "total": total, "candidates": len(brief["candidates"]), "low_value": len(low_value_items), "sampling_calls_used": len(batches)},
+    )
+
+
+async def _brief_persist_cards(run_id: str, new_judgments: list[Any]) -> int:
+    from mail_agent.cards.service import build_card, cards_to_frontend, merge_cards
+    from mail_agent.storage.ops import get_active_cards, set_active_cards
+    from mail_agent.storage.types import ActiveCards
+
+    state = MAIL_AGENT_RUNS[run_id]
+    brief = state.setdefault("brief", {})
+    mailbox = str((state.get("partial") or {}).get("_args", {}).get("mailbox") or "")
+    messages = _brief_messages_from_dict(list(brief.get("messages") or []))
+    candidates = _brief_candidates_from_dict(list(brief.get("candidates") or []))
+    msg_map = {m.message_id: m for m in messages if m.message_id}
+    cand_map = {c.candidate_id: c for c in candidates}
+    new_cards = []
+    for judgment in new_judgments:
+        candidate = cand_map.get(judgment.candidate_id)
+        if not candidate or not candidate.message_ids:
+            continue
+        card = build_card(candidate, judgment, msg_map.get(candidate.message_ids[0]), mailbox)
+        new_cards.append(card)
+    if not new_cards:
+        return 0
+    active = await get_active_cards(mailbox)
+    merged = merge_cards(active, new_cards)
+    await set_active_cards(mailbox, merged)
+    brief["cards_version"] = int(brief.get("cards_version") or 0) + 1
+    brief["last_cards"] = [{"id": c.get("id"), "title": c.get("title")} for c in cards_to_frontend(ActiveCards(cards=new_cards))]
+    return len(new_cards)
+
+
+async def _brief_run_phase2_slice(run_id: str, sampling_create_message: Any) -> None:
+    from mail_agent.core.context import read_candidate_context
+    from mail_agent.core.guards import apply_rule_guards
+    from mail_agent.domain.types import MailTaskPlan, MailboxProfile
+    from mail_agent.judgment_engine.service import build_anna_single_judgment_prompt, create_fallback_judgment, _parse_compact_batch_item
+    from mail_agent.llm_runtime.service import call_llm_json_safe
+    from mail_agent.planning.strategies import get as get_strategy
+
+    state = MAIL_AGENT_RUNS[run_id]
+    brief = state.setdefault("brief", {})
+    args = (state.get("partial") or {}).get("_args", {})
+    mailbox = str(args.get("mailbox") or "")
+    task_plan_raw = dict(brief.get("task_plan") or {})
+    task_plan = MailTaskPlan(
+        raw_user_request=str(task_plan_raw.get("raw_user_request") or args.get("user_request") or ""),
+        mailbox_id=mailbox,
+        user_email=mailbox,
+        strategy_mode=task_plan_raw.get("strategy_mode") or brief.get("strategy_mode") or "default_secretary",
+        goals=list(task_plan_raw.get("goals") or []),
+        constraints=list(task_plan_raw.get("constraints") or []),
+        scope=dict(task_plan_raw.get("scope") or {}),
+    )
+    strategy = get_strategy(task_plan.strategy_mode)
+    if not strategy:
+        raise ValueError(f"Unknown strategy mode: {task_plan.strategy_mode}")
+    profile = MailboxProfile(mailbox_id=mailbox, owner=mailbox)
+    candidates = _brief_candidates_from_dict(list(brief.get("candidates") or []))
+    cursor = int(brief.get("phase2_cursor") or 0)
+    total = len(candidates)
+    if cursor >= total:
+        brief["stage"] = "finalizing"
+        _brief_update_state(run_id, stage="finalizing", progress={"evaluated": cursor, "total": total})
+        return
+    batch = candidates[cursor:cursor + 4]
+    _brief_update_state(run_id, stage="read_context", progress={"current": cursor, "total": total, "batch": len(batch)})
+    contexts = [await read_candidate_context(mailbox, candidate) for candidate in batch]
+
+    async def _evaluate_one(index: int, ctx: Any) -> Any:
+        try:
+            prompt = build_anna_single_judgment_prompt(task_plan, strategy, profile, ctx, None)
+            result = await call_llm_json_safe(
+                sampling_create_message,
+                system_prompt="You are a strict JSON generator. Output ONLY valid JSON — no explanation, no markdown, no code fences.",
+                user_message=prompt,
+                fallback={},
+                temperature=0.1,
+                max_tokens=8192,
+                timeout=55.0,
+                metadata={"tool": "evaluate_item_single", "strategy_mode": strategy.id, "candidate_count": "1"},
+                allow_fallback=True,
+                allow_sampling_provider_fallback=False,
+                max_attempts=1,
+            )
+            payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+            if not payload or result.get("fallback_used"):
+                raise ValueError(str(result.get("fallback_reason") or "empty Anna sampling response"))
+            payload.setdefault("candidate_id", ctx.candidate.candidate_id)
+            return apply_rule_guards(_parse_compact_batch_item(payload, strategy), strategy)
+        except Exception as exc:
+            return create_fallback_judgment(ctx.candidate.candidate_id, strategy, f"evaluation failed: {type(exc).__name__}: {exc}")
+
+    _brief_update_state(run_id, stage="evaluate", progress={"evaluated": cursor, "total": total, "batch": len(batch), "sampling_calls_used": len(batch)})
+    judgments = await asyncio.gather(*[_evaluate_one(cursor + offset + 1, ctx) for offset, ctx in enumerate(contexts)])
+    all_judgments = _brief_judgments_from_dict(list(brief.get("judgments") or []))
+    all_judgments.extend(judgments)
+    brief["judgments"] = _brief_to_dict_list(all_judgments)
+    brief["phase2_cursor"] = min(total, cursor + len(judgments))
+    cards_added = await _brief_persist_cards(run_id, judgments)
+    if brief["phase2_cursor"] >= total:
+        brief["stage"] = "finalizing"
+    _brief_update_state(
+        run_id,
+        stage="evaluate_done" if brief["stage"] != "finalizing" else "finalizing",
+        progress={"evaluated": brief["phase2_cursor"], "total": total, "cards_added": cards_added, "cards_version": int(brief.get("cards_version") or 0)},
+        cards_added=cards_added,
+    )
+
+
+async def _brief_finalize_run(run_id: str) -> None:
+    from mail_agent.cards.service import build_cleanup_bundle, cards_to_frontend, merge_cards
+    from mail_agent.storage.ops import append_run_history, get_active_cards, get_cleanup_bundle, get_scan_state, mark_messages_processed_batch, save_run_record, set_active_cards, set_cleanup_bundle, set_scan_state
+    from mail_agent.storage.types import ProcessedMessage, RunHistoryEntry, RunRecord, ScanState, _now
+
+    state = MAIL_AGENT_RUNS[run_id]
+    brief = state.setdefault("brief", {})
+    args = (state.get("partial") or {}).get("_args", {})
+    mailbox = str(args.get("mailbox") or "")
+    messages = _brief_messages_from_dict(list(brief.get("messages") or []))
+    candidates = _brief_candidates_from_dict(list(brief.get("candidates") or []))
+    judgments = _brief_judgments_from_dict(list(brief.get("judgments") or []))
+    candidate_msg_ids = {c.message_ids[0] for c in candidates if c.message_ids}
+    j_by_cand = {j.candidate_id: j for j in judgments}
+    c_by_msg = {c.message_ids[0]: c for c in candidates if c.message_ids}
+    processed_msgs = []
+    for msg in messages:
+        if not msg.message_id:
+            continue
+        candidate = c_by_msg.get(msg.message_id)
+        judgment = j_by_cand.get(candidate.candidate_id) if candidate else None
+        processed = ProcessedMessage(
+            message_id=msg.message_id,
+            thread_id=msg.thread_id or "",
+            from_addr=msg.from_addr or "",
+            subject=msg.subject or "",
+            snippet=msg.snippet or "",
+            internal_date=msg.internal_date or "",
+            processed_at=_now(),
+            run_id=run_id,
+            is_candidate=msg.message_id in candidate_msg_ids,
+            candidate_kind=(candidate.kind if candidate else ""),
+            priority=(judgment.final_decision.priority if judgment else (candidate.priority_hint if candidate else "low")),
+            read_depth=(candidate.read_depth_required if candidate else "header_only"),
+            confidence=(judgment.confidence if judgment else 0.0),
+        )
+        processed_msgs.append(processed)
+    if processed_msgs:
+        await mark_messages_processed_batch(mailbox, processed_msgs)
+
+    cleanup_full = []
+    cleanup_card = None
+    if brief.get("low_value_items"):
+        cleanup_card, cleanup_full = build_cleanup_bundle(run_id, mailbox, list(brief.get("low_value_items") or []), messages)
+    if cleanup_full:
+        existing_cleanup = await get_cleanup_bundle(mailbox)
+        seen_cleanup = {str(item.get("message_id") or "") for item in existing_cleanup if item.get("message_id")}
+        for item in cleanup_full:
+            if str(item.get("message_id") or "") not in seen_cleanup:
+                existing_cleanup.append(item)
+                seen_cleanup.add(str(item.get("message_id") or ""))
+        await set_cleanup_bundle(mailbox, existing_cleanup)
+        if cleanup_card is not None:
+            cleanup_card.bundled_count = len(existing_cleanup)
+            active = await get_active_cards(mailbox)
+            await set_active_cards(mailbox, merge_cards(active, [cleanup_card]))
+            brief["cards_version"] = int(brief.get("cards_version") or 0) + 1
+
+    previous_state = await get_scan_state(mailbox)
+    latest_internal_date = max((str(m.internal_date) for m in messages if m.internal_date), default=previous_state.last_message_internal_date, key=lambda value: int(value or 0))
+    await set_scan_state(mailbox, ScanState(
+        mailbox=mailbox,
+        last_scan_ts=_now(),
+        last_message_internal_date=latest_internal_date,
+        total_scans=previous_state.total_scans + 1,
+        total_processed=previous_state.total_processed + len(processed_msgs),
+    ))
+
+    cards_summary = cards_to_frontend(await get_active_cards(mailbox))
+    run_record = RunRecord(
+        run_id=run_id,
+        mailbox=mailbox,
+        strategy_mode=str(brief.get("strategy_mode") or ""),
+        user_request=str(args.get("user_request") or ""),
+        mode=str(args.get("mode") or "auto"),
+        scanned_count=len(messages),
+        candidate_count=len(candidates),
+        main_count=sum(1 for j in judgments if j.final_decision.should_show_in_main_result),
+        lower_count=sum(1 for j in judgments if j.final_decision.should_show_in_lower_priority),
+        summary=[f"Scanned {len(messages)} messages, found {len(candidates)} candidates."],
+        strategy=[f"Strategy: {brief.get('strategy_mode') or ''}"],
+        cards=[{"id": card.get("id"), "title": card.get("title")} for card in cards_summary],
+    )
+    await save_run_record(mailbox, run_record)
+    reply_count = sum(1 for j in judgments if j.final_decision.user_action == "reply")
+    review_count = sum(1 for j in judgments if j.final_decision.user_action == "review")
+    cleanup_count = sum(1 for j in judgments if j.final_decision.user_action == "cleanup")
+    if cleanup_card is not None:
+        cleanup_count += 1
+    important_count = sum(1 for j in judgments if j.final_decision.priority in ("critical", "high", "medium"))
+    history_parts = [f"Scanned {len(messages)} emails"]
+    if reply_count:
+        history_parts.append(f"{reply_count} needs reply")
+    if review_count:
+        history_parts.append(f"{review_count} needs review")
+    if cleanup_count:
+        history_parts.append(f"{cleanup_count} cleanup")
+    if important_count:
+        history_parts.append(f"{important_count} important")
+    await append_run_history(RunHistoryEntry(
+        run_id=run_id,
+        mailbox=mailbox,
+        ts=_now(),
+        entry_type="scan",
+        request=str(args.get("user_request") or "")[:100],
+        mode=str(args.get("mode") or "auto"),
+        strategy=str(brief.get("strategy_mode") or ""),
+        result=", ".join(history_parts),
+        summary=(
+            f"Scanned {len(messages)} messages, found {len(candidates)} candidates.\n"
+            f"Needs reply: {reply_count} · Needs review: {review_count} · Cleanup: {cleanup_count}"
+        ),
+    ))
+    state.update({
+        "status": "done",
+        "stage": "done",
+        "needs_continue": False,
+        "cards_added": 0,
+        "progress": {"evaluated": len(judgments), "total": len(candidates), "cards_version": int(brief.get("cards_version") or 0)},
+        "updated_at": beijing_now(),
+        "result": {"success": True, "run_id": run_id, "cards_version": int(brief.get("cards_version") or 0)},
+    })
+    _save_run_checkpoint(run_id)
+
+
+async def _continue_mail_agent_run_async(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
+    """推进 Brief 短 invoke 状态机，每次只处理一个有限阶段。"""
+    run_id = str(arguments.get("run_id") or "")
+    state = _get_run_state(run_id)
+    if not state:
+        return {"success": False, "run_id": run_id, "error": "run not found"}
+    saved_args = (state.get("partial") or {}).get("_args") or {}
+    saved_args.update({key: value for key, value in arguments.items() if key != "run_id" and value not in (None, "")})
+    state.setdefault("partial", {})["_args"] = saved_args
+    ai_provider = str(arguments.get("ai_provider") or saved_args.get("ai_provider", "anna-llm"))
+
+    if not str(saved_args.get("mailbox") or ""):
+        return {"success": False, "run_id": run_id, "error": "mailbox is required"}
+
+    sampling_fn = _build_sampling_for_run({"ai_provider": ai_provider}, invoke_id)
+    try:
+        state["status"] = "running"
+        state["needs_continue"] = True
+        state["cards_added"] = 0
+        brief = state.setdefault("brief", {})
+        stage = str(brief.get("stage") or state.get("stage") or "queued")
+        if stage in ("queued", "scan", "scanning", "filtering"):
+            await _brief_prepare_scan(run_id, saved_args)
+        elif stage == "phase1":
+            await _brief_run_phase1_slice(run_id, sampling_fn)
+        elif stage == "phase2":
+            await _brief_run_phase2_slice(run_id, sampling_fn)
+        elif stage == "finalizing":
+            await _brief_finalize_run(run_id)
+        elif stage == "done":
+            state["status"] = "done"
+            state["needs_continue"] = False
+        else:
+            brief["stage"] = "phase1"
+        return _public_run_view(state)
+    except Exception as exc:
+        MAIL_AGENT_RUNS[run_id].update({
+            "status": "failed",
+            "stage": "failed",
+            "updated_at": beijing_now(),
+            "error": str(exc),
+            "needs_continue": False,
+        })
+        _save_run_checkpoint(run_id)
+        return _public_run_view(MAIL_AGENT_RUNS[run_id])
+
+
 def start_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
-    """Start a custom scan: generate plan (LLM) then execute in background."""
-    run_id = f"bg_{uuid.uuid4().hex[:12]}"
+    """Start a custom scan: generate plan (LLM) then execute.
+
+    Blocks until the pipeline completes (keeps invoke alive for sampling token).
+    The frontend polls get_mail_agent_run for progress via a separate invoke.
+    """
+    run_id = str(arguments.get("run_id") or "").strip()
+    if not run_id or len(run_id) < 8:
+        run_id = f"bg_{uuid.uuid4().hex[:12]}"
     MAIL_AGENT_RUNS[run_id] = {
         "run_id": run_id,
         "status": "queued",
@@ -2052,28 +2630,19 @@ def start_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, An
         _start_custom_scan_async(run_id, arguments, invoke_id),
         loop,
     )
-    if arguments.get("wait") is True:
-        wait_timeout = int(arguments.get("wait_timeout_seconds", 180))
-        future.result(timeout=wait_timeout)
-        return {
-            "success": MAIL_AGENT_RUNS[run_id].get("status") == "done",
-            "run_id": run_id,
-            "status": MAIL_AGENT_RUNS[run_id]["status"],
-            "stage": MAIL_AGENT_RUNS[run_id]["stage"],
-            "progress": MAIL_AGENT_RUNS[run_id]["progress"],
-            "partial": MAIL_AGENT_RUNS[run_id].get("partial", {}),
-            "started_at": MAIL_AGENT_RUNS[run_id]["started_at"],
-            "updated_at": MAIL_AGENT_RUNS[run_id]["updated_at"],
-            "result": _compact_run_result(MAIL_AGENT_RUNS[run_id].get("result")),
-            "error": MAIL_AGENT_RUNS[run_id].get("error", ""),
-        }
+    wait_timeout = int(arguments.get("wait_timeout_seconds", 600))
+    future.result(timeout=wait_timeout)
     return {
-        "success": True,
+        "success": MAIL_AGENT_RUNS[run_id].get("status") == "done",
         "run_id": run_id,
-        "status": "queued",
-        "stage": "planning",
-        "progress": {},
+        "status": MAIL_AGENT_RUNS[run_id]["status"],
+        "stage": MAIL_AGENT_RUNS[run_id]["stage"],
+        "progress": MAIL_AGENT_RUNS[run_id]["progress"],
+        "partial": MAIL_AGENT_RUNS[run_id].get("partial", {}),
         "started_at": MAIL_AGENT_RUNS[run_id]["started_at"],
+        "updated_at": MAIL_AGENT_RUNS[run_id]["updated_at"],
+        "result": _compact_run_result(MAIL_AGENT_RUNS[run_id].get("result")),
+        "error": MAIL_AGENT_RUNS[run_id].get("error", ""),
     }
 
 
@@ -2210,12 +2779,18 @@ async def _start_custom_scan_async(run_id: str, arguments: dict[str, Any], invok
 
 
 def re_run_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
-    """Re-run a previously saved custom scan plan (skip LLM planning)."""
+    """Re-run a previously saved custom scan plan (skip LLM planning).
+
+    Blocks until execution completes (keeps invoke alive for sampling token).
+    The frontend polls get_mail_agent_run for progress via a separate invoke.
+    """
     plan_id = str(arguments.get("plan_id", "")).strip()
     if not plan_id:
         return {"success": False, "error": "plan_id is required"}
 
-    run_id = f"bg_{uuid.uuid4().hex[:12]}"
+    run_id = str(arguments.get("run_id") or "").strip()
+    if not run_id or len(run_id) < 8:
+        run_id = f"bg_{uuid.uuid4().hex[:12]}"
     MAIL_AGENT_RUNS[run_id] = {
         "run_id": run_id,
         "status": "queued",
@@ -2229,17 +2804,23 @@ def re_run_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, A
         "partial": {},
     }
     _save_run_checkpoint(run_id)
-    asyncio.run_coroutine_threadsafe(
+    future = asyncio.run_coroutine_threadsafe(
         _re_run_custom_scan_async(run_id, plan_id, arguments, invoke_id),
         loop,
     )
+    wait_timeout = int(arguments.get("wait_timeout_seconds", 600))
+    future.result(timeout=wait_timeout)
     return {
-        "success": True,
+        "success": MAIL_AGENT_RUNS[run_id].get("status") == "done",
         "run_id": run_id,
-        "status": "queued",
-        "stage": "planning_done",
-        "progress": {},
+        "status": MAIL_AGENT_RUNS[run_id]["status"],
+        "stage": MAIL_AGENT_RUNS[run_id]["stage"],
+        "progress": MAIL_AGENT_RUNS[run_id]["progress"],
+        "partial": MAIL_AGENT_RUNS[run_id].get("partial", {}),
         "started_at": MAIL_AGENT_RUNS[run_id]["started_at"],
+        "updated_at": MAIL_AGENT_RUNS[run_id]["updated_at"],
+        "result": _compact_run_result(MAIL_AGENT_RUNS[run_id].get("result")),
+        "error": MAIL_AGENT_RUNS[run_id].get("error", ""),
     }
 
 
@@ -2479,6 +3060,18 @@ def _sync_clear_contact_memories(arguments: dict[str, Any]) -> dict[str, Any]:
     return _run_storage_query(clear_memory(_memory_mailboxes(arguments)))
 
 
+async def _generate_contact_memories_async(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
+    from mail_agent.contact_memory.manager import backfill_active_card_memories
+
+    sampling_fn = _build_sampling_for_run(arguments, invoke_id)
+    return await backfill_active_card_memories(
+        _memory_mailboxes(arguments),
+        sampling_create_message=sampling_fn,
+        source="brief_card_background",
+        since=str(arguments.get("since") or ""),
+    )
+
+
 def _registry_to_frontend(registry: Any) -> list[dict[str, Any]]:
     return [
         {
@@ -2658,22 +3251,36 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
             action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
 
         cleanup_bundle = None
+        cleanup_total = 0
+        cleanup_has_more = False
         if include_cleanup:
-            from mail_agent.storage.ops import get_cleanup_bundle, get_mailbox_registry
+            cleanup_offset = int(arguments.get("cleanup_offset", 0))
+            cleanup_limit = int(arguments.get("cleanup_limit", 100))
+            from mail_agent.storage.ops import get_cleanup_bundle_page, get_mailbox_registry
             if mailbox.lower() == "all":
                 try:
                     reg = _run_storage_query(get_mailbox_registry())
-                    all_cleanup: list[dict[str, Any]] = []
+                    all_items: list[dict[str, Any]] = []
+                    total_all = 0
                     for entry in reg.mailboxes:
                         try:
-                            all_cleanup.extend(_run_storage_query(get_cleanup_bundle(entry.email)))
+                            page_result = _run_storage_query(get_cleanup_bundle_page(entry.email, cleanup_offset, cleanup_limit))
+                            all_items.extend(page_result["items"])
+                            total_all += page_result["total"]
                         except Exception:
                             pass
-                    cleanup_bundle = all_cleanup if all_cleanup else None
+                    cleanup_bundle = all_items if all_items else None
+                    cleanup_total = total_all
+                    cleanup_has_more = (cleanup_offset + cleanup_limit) < total_all if cleanup_limit > 0 else False
                 except Exception:
                     cleanup_bundle = None
+                    cleanup_total = 0
+                    cleanup_has_more = False
             else:
-                cleanup_bundle = _run_storage_query(get_cleanup_bundle(mailbox))
+                page_result = _run_storage_query(get_cleanup_bundle_page(mailbox, cleanup_offset, cleanup_limit))
+                cleanup_bundle = page_result["items"] if page_result["items"] else None
+                cleanup_total = page_result["total"]
+                cleanup_has_more = page_result["has_more"]
 
         return {
             "cards": cards_to_frontend(active),
@@ -2685,6 +3292,8 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
             "action_count": action_count,
             "scan_state": scan_state,
             "cleanup_bundle": cleanup_bundle,
+            "cleanup_total": cleanup_total,
+            "cleanup_has_more": cleanup_has_more,
         }
     except Exception as exc:
         log(f"get_active_cards sync entry failed: {type(exc).__name__}: {exc}")
@@ -2694,6 +3303,8 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
             "count": 0,
             "has_more": False,
             "cleanup_bundle": None,
+            "cleanup_total": 0,
+            "cleanup_has_more": False,
             "action_count": 0,
             "scan_state": {"total_scans": 0, "total_processed": 0, "last_scan_ts": "", "last_message_internal_date": ""},
             "error": f"{type(exc).__name__}: {exc}"[:200],
@@ -2735,6 +3346,9 @@ def get_mail_agent_run(run_id_arg: str) -> dict[str, Any]:
         "started_at": state.get("started_at"),
         "updated_at": state.get("updated_at"),
         "error": state.get("error") or "",
+        "needs_continue": bool(state.get("needs_continue")),
+        "cards_added": int(state.get("cards_added") or 0),
+        "cards_version": int((state.get("brief") or {}).get("cards_version") or state.get("cards_version") or 0),
         "result": result,
         "cards": cards,
         "scan_state": scan_state,
@@ -3448,6 +4062,9 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "tool": tool, "data": _start_test_sampling_async(arguments, invoke_id)}
     if tool == "start_mail_agent_run":
         return {"success": True, "tool": tool, "data": start_mail_agent_run(arguments, invoke_id)}
+    if tool == "continue_mail_agent_run":
+        future = asyncio.run_coroutine_threadsafe(_continue_mail_agent_run_async(arguments, invoke_id), loop)
+        return {"success": True, "tool": tool, "data": future.result(timeout=70.0)}
     if tool == "get_mail_agent_run":
         return {"success": True, "tool": tool, "data": get_mail_agent_run(arguments.get("run_id", ""))}
     if tool == "start_custom_scan":
@@ -3478,6 +4095,9 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "tool": tool, "data": _sync_delete_contact_memory(arguments)}
     if tool == "clear_contact_memories":
         return {"success": True, "tool": tool, "data": _sync_clear_contact_memories(arguments)}
+    if tool == "generate_contact_memories":
+        future = asyncio.run_coroutine_threadsafe(_generate_contact_memories_async(arguments, invoke_id), loop)
+        return {"success": True, "tool": tool, "data": future.result(timeout=600.0)}
 
     if tool == "get_active_cards":
         return {"success": True, "tool": tool, "data": _sync_get_active_cards(arguments)}

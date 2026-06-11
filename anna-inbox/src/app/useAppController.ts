@@ -1,8 +1,8 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
-import { makeCustomRunProgress, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
+import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { ActiveCardsPayload, AppState, FrontendCard, MailboxInfo, RunStatus, ScanState, TestSamplingBriefResult, TestSamplingResult } from "../types/mail";
+import type { ActiveCardsPayload, AppState, CleanupMessage, CustomRunResultItem, FrontendCard, MailboxInfo, RunStatus, ScanState, TestSamplingBriefResult, TestSamplingResult } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -146,10 +146,12 @@ export interface AppActions {
   enterAskDraftEdit(key: string, draft: string): void;
   updateAskDraft(key: string, value: string): void;
   cancelAskDraft(key: string): void;
-  sendAskDraft(key: string, threadId: string, to: string, mailbox?: string): Promise<void>;
+  sendAskDraft(key: string, threadId: string, to: string, mailbox?: string, draftOverride?: string): Promise<void>;
   toggleAskHistory(idx: number): void;
   setGapAnswers(cardKey: string, answers: Record<string, string>): void;
+  setAskGapAnswers(actionKey: string, answers: Record<string, string>): void;
   generateDraftWithAnswers(answers: Record<string, string>): Promise<void>;
+  generateAskDraftWithAnswers(actionKey: string, item: CustomRunResultItem, answers: Record<string, string>, mailbox?: string): Promise<void>;
   copyDraft(text: string): Promise<void>;
 }
 
@@ -203,16 +205,44 @@ export function useAppController() {
       let offset = 0;
       let hasMore = true;
       let scanState: ActiveCardsPayload["scan_state"];
-      let cleanupBundle: ActiveCardsPayload["cleanup_bundle"];
+      const cleanupItems: NonNullable<ActiveCardsPayload["cleanup_bundle"]> = [];
       const MAX_PAGES = 20;
+      const CLEANUP_PAGE = 100;
+      let cleanupOffset = 0;
+      let cleanupHasMore = true;
       while (hasMore && offset < MAX_PAGES * PAGE_SIZE) {
-        const payload = await client.loadActiveCards(mailbox, provider, offset, PAGE_SIZE, offset === 0);
+        const isFirstCardPage = offset === 0;
+        const payload = await client.loadActiveCards(
+          mailbox, provider, offset, PAGE_SIZE,
+          isFirstCardPage, cleanupOffset, isFirstCardPage ? CLEANUP_PAGE : 0,
+        );
+        // Only first page includes cleanup; subsequent card pages skip it
+        const gotCleanup = isFirstCardPage && payload.cleanup_bundle;
         allCards.push(...(payload.cards || []));
         hasMore = Boolean(payload.has_more);
         offset += PAGE_SIZE;
         if (payload.scan_state) scanState = payload.scan_state;
-        if (payload.cleanup_bundle) cleanupBundle = payload.cleanup_bundle;
+        if (gotCleanup) {
+          cleanupItems.push(...payload.cleanup_bundle!);
+          cleanupOffset += CLEANUP_PAGE;
+          cleanupHasMore = Boolean(payload.cleanup_has_more);
+        }
       }
+      // Load remaining cleanup pages
+      while (cleanupHasMore && cleanupOffset < MAX_PAGES * CLEANUP_PAGE) {
+        const payload = await client.loadActiveCards(
+          mailbox, provider, 0, 1,
+          true, cleanupOffset, CLEANUP_PAGE,
+        );
+        if (payload.cleanup_bundle) {
+          cleanupItems.push(...payload.cleanup_bundle);
+          cleanupOffset += CLEANUP_PAGE;
+          cleanupHasMore = Boolean(payload.cleanup_has_more);
+        } else {
+          break;
+        }
+      }
+      const cleanupBundle = cleanupItems.length > 0 ? cleanupItems : undefined;
       const keyedCards = withCardKeys(allCards, mailbox === "all" ? state.mailbox : mailbox);
       refreshStoredCardFields(keyedCards);
       setState((s) => {
@@ -643,13 +673,13 @@ export function useAppController() {
         showToast("Select at least one mailbox.");
         return;
       }
-      setState((s) => ({ ...s, isScanning: true, scanError: "", scanStepIndex: 0, scanStage: "", scanProgress: {}, resultFilter: "all" }));
+      setState((s) => ({ ...s, isScanning: true, scanError: "", scanStatus: "", scanStepIndex: 0, scanStage: "scan", scanProgress: {}, resultFilter: "all" }));
       try {
         const failures: string[] = [];
-        let gotCardsFromRun = false;
         for (let index = 0; index < mailboxesToScan.length; index += 1) {
           const mailbox = mailboxesToScan[index];
-          setState((s) => ({ ...s, scanStatus: mailboxesToScan.length > 1 ? `Scanning ${mailbox} (${index + 1}/${mailboxesToScan.length})` : s.scanStatus }));
+          const runId = `bg_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+          // 先创建可轮询的 run；真实扫描和 LLM 进度由 continue 调用写入。
           const started = await client.startBriefRun({
             user_request: requestForMode(state.strategyMode || DEFAULT_MODE),
             mailbox,
@@ -659,79 +689,89 @@ export function useAppController() {
             ai_provider: state.llmProvider,
             storage_provider: state.storageProvider,
             reason,
+            run_id: runId,
           });
-          if (!started.run_id) throw new Error(started.error || "start_mail_agent_run did not return a run id");
+          const applyBriefStatus = (status: RunStatus) => {
+            setState((s) => ({
+              ...s,
+              scanStepIndex: stageToStep(status.stage || ""),
+              scanStage: status.stage || "",
+              scanProgress: status.progress || {},
+              scanStatus: scanProgressLabel(status.stage, status.progress) || scanStageLabel(status.stage, status.progress),
+            }));
+          };
+          const refreshBriefStatus = async () => {
+            try {
+              applyBriefStatus(await client.getRun(runId));
+            } catch {
+            }
+          };
+          await refreshBriefStatus();
+          // 轮询同一个 run_id，真实进度由 continue_mail_agent_run 所在 invoke 写入。
+          const pollTimer = window.setInterval(() => {
+            void refreshBriefStatus();
+          }, 1500);
+          let result: RunStatus = started;
+          let cardsVersion = 0;
+          const collectWarnings = (status: RunStatus) => {
+            const ws = status.warnings;
+            if (!ws || !ws.length) return;
+            for (const w of ws) {
+              const detail = w.detail || {};
+              const errs = Array.isArray(detail.errors) ? detail.errors : [];
+              const apsErrs = Array.isArray(detail.aps_cache_errors) ? detail.aps_cache_errors : [];
+              for (const e of [...errs, ...apsErrs.map((e: string) => `[APS cache] ${e}`)]) {
+                if (e && !failures.includes(e)) failures.push(`${mailbox}: ${e}`);
+              }
+            }
+          };
           try {
-            for (let poll = 0; poll < POLL_LIMIT; poll += 1) {
-              await sleep(POLL_INTERVAL_MS);
-              const status = await client.getRun(started.run_id);
-              setState((s) => ({
-                ...s,
-                scanStepIndex: stageToStep(status.stage || ""),
-                scanStage: status.stage || "",
-                scanProgress: status.progress || {},
-                scanStatus: mailboxesToScan.length > 1 ? `${status.stage || "Scanning"} · ${mailbox} · ${index + 1}/${mailboxesToScan.length}` : s.scanStatus,
-              }));
-              if (status.status === "done") {
-                // Use cards from run result directly (process may die before loadActiveCards)
-                if (Array.isArray(status.cards) && status.cards.length > 0) {
-                  gotCardsFromRun = true;
-                  const runCards = status.cards as FrontendCard[];
-                  const keyedCards = withCardKeys(runCards, mailbox);
-                  refreshStoredCardFields(keyedCards);
-                  setState((s) => {
-                    const selected = activeBriefMailboxes(s.selectedMailboxes, s.briefMailboxFilter, s.mailbox);
-                    // Merge with existing cards across mailboxes: replace this
-                    // mailbox's cards, keep cards from other mailboxes.
-                    const otherCards = s.allCards.filter(c => cardMailbox(c) !== mailbox);
-                    const mergedAll = [...otherCards, ...keyedCards];
-                    const visible = filterCardsByMailboxes(mergedAll, selected);
-                    return {
-                      ...s,
-                      allCards: mergedAll,
-                      cards: visible,
-                      briefMailboxFilter: selected,
-                      actionCount: actionCount(visible),
-                      scanState: (status.scan_state as ScanState) || s.scanState,
-                      scanError: "",
-                      loading: false,
-                    };
-                  });
-                }
-                // Collect scan-level warnings (APS cache errors, Gmail API fallback)
-                const ws = status.warnings;
-                if (ws && ws.length) {
-                  for (const w of ws) {
-                    const detail = w.detail || {};
-                    const errs = Array.isArray(detail.errors) ? detail.errors : [];
-                    const apsErrs = Array.isArray(detail.aps_cache_errors) ? detail.aps_cache_errors : [];
-                    for (const e of [...errs, ...apsErrs.map((e: string) => `[APS cache] ${e}`)]) {
-                      if (e && !failures.includes(e)) failures.push(`${mailbox}: ${e}`);
-                    }
-                  }
-                }
+            for (let step = 0; step < POLL_LIMIT; step += 1) {
+              // 每次 continue 都是短 invoke，只推进 Brief 状态机的一小段。
+              result = await client.continueBriefRun({
+                run_id: runId,
+                user_request: requestForMode(state.strategyMode || DEFAULT_MODE),
+                mailbox,
+                mode: state.strategyMode,
+                primary_count: 30,
+                max_messages: 50,
+                ai_provider: state.llmProvider,
+                storage_provider: state.storageProvider,
+              });
+              applyBriefStatus(result);
+              collectWarnings(result);
+              const nextCardsVersion = Number(result.cards_version || 0);
+              if (Number(result.cards_added || 0) > 0 || nextCardsVersion > cardsVersion) {
+                cardsVersion = nextCardsVersion;
+                await loadActiveCards();
+              }
+              if (result.status === "done" || result.status === "failed" || result.needs_continue === false) {
                 break;
               }
-              if (status.status === "failed") throw new Error(status.error || "Mail agent scan failed");
-              if (poll === POLL_LIMIT - 1) throw new Error("Mail agent scan timed out");
             }
-          } catch (error) {
-            failures.push(`${mailbox}: ${error instanceof Error ? error.message : String(error)}`);
+          } finally {
+            window.clearInterval(pollTimer);
+            await refreshBriefStatus();
           }
-          if (!gotCardsFromRun) {
-            await loadActiveCards();
+          if (result.status === "failed" || result.error) {
+            failures.push(`${mailbox}: ${result.error || "Scan failed"}`);
+            continue;
           }
-        }
-        if (!gotCardsFromRun) {
+          if (result.status !== "done") {
+            failures.push(`${mailbox}: Scan paused before completion`);
+          }
           await loadActiveCards();
+          // 卡片已经持久化并刷新到界面后，再用独立 invoke 在后台补写联系人记忆。
+          window.setTimeout(() => {
+            void client.generateContactMemories({
+              mailbox,
+              since: started.started_at || result.started_at || "",
+              ai_provider: state.llmProvider,
+              storage_provider: state.storageProvider,
+            }).catch(() => {});
+          }, 0);
         }
-        // Load full cleanup bundle once after all mailboxes are scanned
-        try {
-          const cleanupPayload = await client.loadActiveCards("all", state.storageProvider, 0, 1, true);
-          if (cleanupPayload.cleanup_bundle) {
-            setState((s) => ({ ...s, cleanupBundle: cleanupPayload.cleanup_bundle! }));
-          }
-        } catch { /* cleanup is non-critical */ }
+        await loadActiveCards();
         await loadRunHistory();
         const statusText = failures.length
           ? `Scan complete with ${failures.length} issue${failures.length === 1 ? "" : "s"}.`
@@ -942,31 +982,34 @@ export function useAppController() {
         customRunProgress: { runId: "", question: userRequest, status: "queued", stage: "planning", stageKey: "planning", progress: {}, partial: {}, startedAt: "" },
       }));
       try {
-        const started = await client.startCustomScan({
+        const runId = `cs_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+        const scanPromise = client.startCustomScan({
           user_request: userRequest,
           mailbox: selectedOrPrimary(state.selectedMailboxes, state.mailbox),
           primary_count: CUSTOM_SCAN_MESSAGE_LIMIT,
           max_messages: CUSTOM_SCAN_MESSAGE_LIMIT,
           ai_provider: state.llmProvider,
           storage_provider: state.storageProvider,
+          run_id: runId,
         });
-        if (!started.run_id) throw new Error(started.error || "start_custom_scan did not return a run id");
-        let progress = makeCustomRunProgress(null, started, { runId: started.run_id, question: userRequest, startedAt: started.started_at || "" });
-        setState((s) => ({ ...s, customRunProgress: progress }));
-        for (let poll = 0; poll < POLL_LIMIT; poll += 1) {
-          await sleep(POLL_INTERVAL_MS);
-          const status = await client.getRun(started.run_id);
-          progress = makeCustomRunProgress(progress, status, { runId: started.run_id, question: userRequest });
-          setState((s) => ({ ...s, customRunProgress: progress, scanStatus: scanStageLabel(status.stage, status.progress) }));
-          if (status.status === "done") break;
-          if (status.status === "failed") throw new Error(status.error || "Custom scan failed");
-          if (poll === POLL_LIMIT - 1) throw new Error("Custom scan timed out");
+        const pollTimer = window.setInterval(() => {
+          client.getRun(runId).then((status) => {
+            setState((s) => ({
+              ...s,
+              customRunProgress: makeCustomRunProgress(s.customRunProgress!, status, { runId, question: userRequest }),
+              scanStatus: scanStageLabel(status.stage, status.progress),
+            }));
+          }).catch(() => {});
+        }, POLL_INTERVAL_MS);
+        const started = await scanPromise;
+        window.clearInterval(pollTimer);
+        if (started.status === "failed" || started.error) {
+          throw new Error(started.error || "Custom scan failed");
         }
         await loadActiveCards();
         await loadRunHistory();
         await loadCustomPlans();
-        const doneStatus = await client.getRun(started.run_id);
-        const result = buildCustomRunResult(started.run_id || "", doneStatus.result || {});
+        const result = buildCustomRunResult(runId, (started.result || {}) as Record<string, unknown>);
         setState((s) => ({
           ...s,
           scanStatus: "",
@@ -986,41 +1029,45 @@ export function useAppController() {
     async reRunCustomPlan(planId) {
       if (state.isCustomScanning) return;
       const plan = state.customPlans.find((item) => item.plan_id === planId);
+      const question = plan?.user_request || "Re-run saved scan";
       setState((s) => ({
         ...s,
         isCustomScanning: true,
         scanError: "",
         scanStatus: "Re-running saved scan...",
         askItemActions: {},
-        customRunProgress: { runId: "", question: plan?.user_request || "Re-run saved scan", status: "queued", stage: "planning_done", stageKey: "planning", progress: {}, partial: { plan: plan || {} }, startedAt: "" },
+        customRunProgress: { runId: "", question, status: "queued", stage: "planning_done", stageKey: "planning", progress: {}, partial: { plan: plan || {} }, startedAt: "" },
       }));
       try {
-        const started = await client.reRunCustomScan({
+        const runId = `rr_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+        const scanPromise = client.reRunCustomScan({
           plan_id: planId,
           mailbox: selectedOrPrimary(state.selectedMailboxes, state.mailbox),
           primary_count: CUSTOM_SCAN_MESSAGE_LIMIT,
           max_messages: CUSTOM_SCAN_MESSAGE_LIMIT,
           ai_provider: state.llmProvider,
           storage_provider: state.storageProvider,
+          run_id: runId,
         });
-        if (!started.run_id) throw new Error(started.error || "re_run_custom_scan did not return a run id");
-        let progress = makeCustomRunProgress(null, started, { runId: started.run_id, question: plan?.user_request || "Re-run saved scan" });
-        for (let poll = 0; poll < POLL_LIMIT; poll += 1) {
-          await sleep(POLL_INTERVAL_MS);
-          const status = await client.getRun(started.run_id);
-          progress = makeCustomRunProgress(progress, status, { runId: started.run_id, question: plan?.user_request || "Re-run saved scan" });
-          setState((s) => ({ ...s, customRunProgress: progress, scanStatus: scanStageLabel(status.stage, status.progress) }));
-          if (status.status === "done") break;
-          if (status.status === "failed") throw new Error(status.error || "Custom scan re-run failed");
-          if (poll === POLL_LIMIT - 1) throw new Error("Custom scan re-run timed out");
+        const pollTimer = window.setInterval(() => {
+          client.getRun(runId).then((status) => {
+            setState((s) => ({
+              ...s,
+              customRunProgress: makeCustomRunProgress(s.customRunProgress!, status, { runId, question }),
+              scanStatus: scanStageLabel(status.stage, status.progress),
+            }));
+          }).catch(() => {});
+        }, POLL_INTERVAL_MS);
+        const started = await scanPromise;
+        window.clearInterval(pollTimer);
+        if (started.status === "failed" || started.error) {
+          throw new Error(started.error || "Custom scan re-run failed");
         }
         await loadActiveCards();
         await loadRunHistory();
         await loadCustomPlans();
-        const doneStatus = await client.getRun(started.run_id);
-        const result = buildCustomRunResult(started.run_id || "", doneStatus.result || {});
-        const query = plan?.user_request || "Re-run saved scan";
-        setState((s) => ({ ...s, scanStatus: "", askHistory: [{ query, result, timestamp: new Date().toISOString() }, ...s.askHistory], customRunProgress: null }));
+        const result = buildCustomRunResult(runId, (started.result || {}) as Record<string, unknown>);
+        setState((s) => ({ ...s, scanStatus: "", askHistory: [{ query: question, result, timestamp: new Date().toISOString() }, ...s.askHistory], customRunProgress: null }));
         showToast("Re-run complete.");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1067,7 +1114,7 @@ export function useAppController() {
       try {
         const result = await client.resetAllData();
         if (result.ok) {
-          setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, askItemActions: {}, askEditDraft: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
+          setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, askItemActions: {}, askEditDraft: {}, askGapAnswers: {}, askDraftsByKey: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
           showToast("All data reset. Ready for a fresh start.");
           window.location.reload();
         }
@@ -1110,8 +1157,8 @@ export function useAppController() {
         return { ...s, askEditDraft };
       });
     },
-    async sendAskDraft(key, threadId, to, mailboxOverride) {
-      const draft = (state.askEditDraft[key] || "").trim();
+    async sendAskDraft(key, threadId, to, mailboxOverride, draftOverride) {
+      const draft = ((draftOverride ?? state.askEditDraft[key]) || "").trim();
       if (!draft) {
         showToast("Draft is empty.");
         return;
@@ -1150,6 +1197,36 @@ export function useAppController() {
     },
     async generateDraftWithAnswers(answers) {
       await (actions as any).generateDraft(undefined, answers);
+    },
+    setAskGapAnswers(actionKey, answers) {
+      setState((s) => ({ ...s, askGapAnswers: { ...s.askGapAnswers, [actionKey]: answers } }));
+    },
+    async generateAskDraftWithAnswers(actionKey, item, answers, mailboxOverride) {
+      const mailbox = mailboxOverride || state.selectedMailboxes[0] || state.mailbox;
+      setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [actionKey]: { ...s.askItemActions[actionKey], sending: true } } }));
+      try {
+        const result = await client.generateAskDraft({
+          mailbox,
+          message_id: item.message_id || "",
+          thread_id: item.thread_id || "",
+          from_addr: item.from || "",
+          subject: item.subject || "",
+          user_answers: answers,
+        });
+        const draftBody = result.body || result.note || "";
+        setState((s) => ({
+          ...s,
+          askDraftsByKey: { ...s.askDraftsByKey, [actionKey]: draftBody },
+          askEditDraft: { ...s.askEditDraft, [actionKey]: draftBody },
+          askItemActions: { ...s.askItemActions, [actionKey]: { ...s.askItemActions[actionKey], sending: false } },
+        }));
+        if (result.fallback_used) {
+          showToast("Draft generation fell back — result may be incomplete.");
+        }
+      } catch (error) {
+        setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [actionKey]: { ...s.askItemActions[actionKey], sending: false } } }));
+        showToast(error instanceof Error ? error.message : String(error));
+      }
     },
   };
 

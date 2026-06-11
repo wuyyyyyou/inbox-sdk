@@ -469,21 +469,31 @@ function HistoryDrawer() {
     void actions.restoreCard(run.card_id, run.mailbox);
   };
 
-  const scanTags = (run: RunHistoryEntry) => {
+  const scanSummary = (run: RunHistoryEntry) => {
     if (!run.result || run.entry_type === "card_action") return null;
     const parts = run.result.split(", ");
-    const tags: { label: string; color: string }[] = [];
+    const metrics: { value: string; label: string; color: string }[] = [];
     for (const p of parts) {
-      if (p.includes("needs reply")) tags.push({ label: p.trim(), color: "reply" });
-      else if (p.includes("needs review")) tags.push({ label: p.trim(), color: "review" });
-      else if (p.includes("cleanup")) tags.push({ label: p.trim(), color: "cleanup" });
-      else if (p.includes("important")) tags.push({ label: p.trim(), color: "important" });
-      else if (p.toLowerCase().startsWith("scanned")) tags.push({ label: p.trim(), color: "scanned" });
+      const text = p.trim();
+      const scanned = text.match(/^Scanned\s+(\d+)\s+emails?/i);
+      const counted = text.match(/^(\d+)\s+(.+)$/);
+      if (scanned) metrics.push({ value: scanned[1], label: "emails scanned", color: "scanned" });
+      else if (text.includes("needs reply") && counted) metrics.push({ value: counted[1], label: "needs reply", color: "reply" });
+      else if (text.includes("needs review") && counted) metrics.push({ value: counted[1], label: "needs review", color: "review" });
+      else if (text.includes("cleanup") && counted) metrics.push({ value: counted[1], label: "cleanup", color: "cleanup" });
     }
-    if (!tags.length) return null;
+    if (!metrics.length) return null;
     return (
-      <div className="history-entry-tags">
-        {tags.map((t, i) => <span key={i} className={`history-tag history-tag-${t.color}`}>{t.label}</span>)}
+      <div className="history-scan-card">
+        <div className="history-scan-metrics">
+          {metrics.map((metric, i) => (
+            <span key={i} className={`history-scan-metric history-scan-metric-${metric.color}`}>
+              <span className="history-scan-value">{metric.value}</span>
+              <span className="history-scan-label">{metric.label}</span>
+            </span>
+          ))}
+        </div>
+        {run.mailbox ? <div className="history-scan-mailbox">Mailbox · {run.mailbox}</div> : null}
       </div>
     );
   };
@@ -497,12 +507,15 @@ function HistoryDrawer() {
     const title = isCard
       ? (run.card_title || run.card_id || "")
       : (run.request || run.strategy || "Mailbox scan");
-    const tags = !isCard ? scanTags(run) : null;
+    const scanBlock = !isCard ? scanSummary(run) : null;
+    const scanLines = !isCard
+      ? (scanBlock ? [] : [run.result, run.summary, run.mailbox ? `Mailbox: ${run.mailbox}` : ""].filter(Boolean))
+      : [];
 
     return (
       <div className="history-entry" key={entryKey(run)}>
         <div
-          className={`history-entry-row ${isCard ? "is-expandable" : ""} ${tags ? "has-tags" : ""}`}
+          className={`history-entry-row ${isCard ? "is-expandable" : ""} ${scanBlock ? "has-tags" : ""}`}
           onClick={isCard ? () => toggleExpand(run) : undefined}
         >
           <span className="history-entry-time">{formatBeijingTimestamp(run.ts)}</span>
@@ -520,7 +533,12 @@ function HistoryDrawer() {
           ) : null}
           {isCard ? <span className="history-entry-arrow">{isExpanded ? "▾" : "▸"}</span> : null}
         </div>
-        {tags}
+        {scanBlock}
+        {scanLines.length ? (
+          <div className="history-entry-body is-scan">
+            {scanLines.map((line, index) => <div className="history-entry-line" key={index}>{line}</div>)}
+          </div>
+        ) : null}
         {isExpanded ? (
           <div className="history-entry-body">
             {hasCardContext ? (

@@ -425,10 +425,11 @@ async def _run_phase1_single_batch(
         fallback={"classifications": []},
         temperature=0.1,
         max_tokens=8192,
-        timeout=240.0,
+        timeout=55.0 if strict_anna_sampling else 240.0,
         metadata=metadata,
         allow_fallback=not strict_anna_sampling,
         allow_sampling_provider_fallback=not strict_anna_sampling,
+        max_attempts=1 if strict_anna_sampling else None,
     )
 
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}

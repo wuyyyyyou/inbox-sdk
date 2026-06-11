@@ -62,6 +62,8 @@ export function createInitialState(): AppState {
     storageProvider: "local",
     generatingDraft: false,
     gapAnswersByCard: {} as Record<string, Record<string, string>>,
+    askGapAnswers: {} as Record<string, Record<string, string>>,
+    askDraftsByKey: {} as Record<string, string>,
     draftDots: "",
     summarizingThread: false,
     cleanupReadState: {},

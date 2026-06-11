@@ -130,6 +130,8 @@ export interface ActiveCardsPayload {
   action_count?: number;
   scan_state?: ScanState;
   cleanup_bundle?: CleanupMessage[] | null;
+  cleanup_total?: number;
+  cleanup_has_more?: boolean;
 }
 
 export interface RunStatus {
@@ -145,6 +147,9 @@ export interface RunStatus {
   scan_state?: ScanState | null;
   started_at?: string;
   updated_at?: string;
+  needs_continue?: boolean;
+  cards_added?: number;
+  cards_version?: number;
   error?: string;
 }
 
@@ -208,6 +213,7 @@ export interface CustomRunResultItem {
   context?: string;
   suggestion?: string;
   draft?: string;
+  reply_gaps?: ReplyGaps;
   mailbox?: string;
   message_id?: string;
   thread_id?: string;
@@ -361,6 +367,8 @@ export interface AppState {
   threadSummaryById: Record<string, Record<string, unknown>>;
   draftById: Record<string, string>;
   gapAnswersByCard: Record<string, Record<string, string>>;
+  askGapAnswers: Record<string, Record<string, string>>;
+  askDraftsByKey: Record<string, string>;
   revisionById: Record<string, string>;
   replyModeById: Record<string, string>;
   threadContextExpanded: Record<string, boolean>;

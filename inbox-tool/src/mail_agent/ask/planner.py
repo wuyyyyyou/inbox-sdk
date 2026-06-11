@@ -88,7 +88,7 @@ User: "找找候选人的未回复邮件"
 → relevance_hint: "unknown senders (not colleagues) discussing job applications, interviews, or position inquiries — especially where the sender appears to be waiting for a response"
 → direction: "all"
 → timeframe: "7d" (need both inbox and sent to determine who replied last)
-→ goal: "check_reply_status"
+→ goal: "draft_replies"
 
 User: "有没有合作相关的邮件"
 → concept: "partnership opportunities"
@@ -119,7 +119,7 @@ User: "等我回复的邮件"
 → relevance_hint: "sender explicitly asked a question, sent a proposal, or followed up — and the latest message in the thread is from them, not me"
 → direction: "all" (need both sides to determine who sent last)
 → timeframe: "7d"
-→ goal: "check_reply_status"
+→ goal: "draft_replies"
 
 User: "帮我看看未读邮件"
 → concept: "unread inbox"
@@ -135,7 +135,7 @@ User: "我发了邮件但谁还没回复我"
 → relevance_hint: "threads where the user sent a message and the other person hasn't replied — latest message is from the user"
 → direction: "all" (need sent mail to find threads the user started, plus inbox to check if there's a reply)
 → timeframe: "14d"
-→ goal: "check_reply_status"
+→ goal: "draft_replies"
 
 User: "总结一下我和Alice最近的沟通"
 → concept: "conversation summary with Alice"
@@ -215,8 +215,8 @@ In detail:
 count_items — user asks "how many", "count"
 summarize_threads — summarizing conversations, catching up on discussions
 find_emails — looking for specific emails
-check_reply_status — asking about reply/waiting status
-draft_replies — explicitly asking for reply drafts
+check_reply_status — asking about reply/waiting status WITHOUT needing drafts (e.g. "did I reply to X?", "has anyone replied to my proposal?")
+draft_replies — asking for reply drafts, OR looking for emails that need a reply ("find emails I haven't replied to", "what needs my response", "谁还没回复"). When the user wants to FIND emails needing replies, the natural next step is drafting one — use draft_replies so the answer includes ready-to-send drafts.
 general_qa — everything else
 
 ## task_prompt
@@ -226,6 +226,7 @@ Write as if instructing a smart assistant. Tell it:
 2. How to group and organize findings into sections
 3. What kind of items to surface (people, threads, action items, dates)
 4. For thread-aware tasks: check who sent the LATEST message — if from mailbox owner → already handled; if from someone else → needs attention
+5. When goal is draft_replies: instruct it to draft a reply for EVERY item that needs one. If key information is missing, use reply_gaps to ask the user instead of guessing.
 
 Do NOT include JSON output format in task_prompt.
 
@@ -274,7 +275,7 @@ async def plan_ask_request(
         timeout=90.0,
         metadata={"tool": "ask_planner"},
         allow_fallback=False,
-        allow_sampling_provider_fallback=not strict_anna_sampling,
+        allow_sampling_provider_fallback=True,
         max_attempts=3 if strict_anna_sampling else None,
     )
 

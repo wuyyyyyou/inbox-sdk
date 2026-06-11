@@ -1,9 +1,10 @@
 {
   "name": "tool-zhaopy-inbox-executa-8jj3cw76",
   "display_name": "Zhaopy Mail Agent RD6B87R5",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "Minimal Anna Executa skeleton for reading Gmail through local token files and DashScope or Anna sampling LLM.",
   "author": "Zhaopy",
+
   "host_capabilities": [
     "llm.sample",
     "llm.complete",
@@ -273,7 +274,7 @@
     },
     {
       "name": "start_mail_agent_run",
-      "description": "Start the full mail-agent pipeline in the background and poll status separately.",
+      "description": "Prepare a pollable brief run. Follow with continue_mail_agent_run to execute scan and LLM phases.",
       "parameters": [
         {
           "name": "user_request",
@@ -291,6 +292,66 @@
           "name": "mode",
           "type": "string",
           "description": "Strategy mode: auto, default_secretary, creator_opportunity, security_billing",
+          "required": false
+        },
+        {
+          "name": "max_messages",
+          "type": "integer",
+          "description": "Maximum messages to scan.",
+          "required": false
+        },
+        {
+          "name": "primary_count",
+          "type": "integer",
+          "description": "How many recent Primary emails to fetch first.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
+          "required": false
+        },
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "Client-generated run ID for polling progress.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage provider: local or aps.",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "continue_mail_agent_run",
+      "description": "Advance one short Brief state-machine slice with sampling bound to this invoke.",
+      "parameters": [
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "Run ID from start_mail_agent_run.",
+          "required": true
+        },
+        {
+          "name": "user_request",
+          "type": "string",
+          "description": "Natural language request from user.",
+          "required": false
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": false
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "description": "Strategy mode.",
           "required": false
         },
         {
@@ -1013,6 +1074,42 @@
           "name": "mailboxes",
           "type": "array",
           "description": "Mailbox email addresses.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "generate_contact_memories",
+      "description": "Generate contact memories for active brief cards without blocking card display.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address, or all.",
+          "required": false
+        },
+        {
+          "name": "mailboxes",
+          "type": "array",
+          "description": "Mailbox email addresses.",
+          "required": false
+        },
+        {
+          "name": "since",
+          "type": "string",
+          "description": "Only process cards created at or after this ISO timestamp.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
           "required": false
         },
         {

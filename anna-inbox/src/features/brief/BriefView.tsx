@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { CATEGORY_NOTE, CATEGORY_TABS } from "../../app/constants";
 import { useApp } from "../../app/AppContext";
-import { scanProgressLabel, SCAN_STEPS } from "./runHelpers";
+import { SCAN_STEPS, scanProgressLabel } from "./runHelpers";
 import type { CleanupMessage, FrontendCard } from "../../types/mail";
 import { formatBeijingTimestamp } from "../../shared/format";
 import {
@@ -489,23 +489,32 @@ export function BriefView() {
   const lower = lowerCards(state.cards);
   const hasCards = visibleCards(cardsInEnabledMailboxes).length > 0;
   const totalScans = Number(state.scanState?.total_scans || 0);
-  const isFresh = !state.loading && !state.isScanning && totalScans === 0 && !hasCards;
+  const isFresh = !state.loading && totalScans === 0 && !hasCards;
 
   if (isFresh) {
     return (
       <div className="first-run-layout">
         <section className="first-run-center" aria-label="First inbox scan">
-          <button className="scan-launch-btn" aria-label="Start first scan" disabled={!state.runtime.connected} onClick={() => void actions.startScan("first")}>
-            <span className="scan-launch-core"><span className="scan-orb">A</span></span>
+          <button className="scan-launch-btn" aria-label="Start first scan" disabled={!state.runtime.connected || state.isScanning} onClick={() => void actions.startScan("first")}>
+            <span className="scan-launch-core">{state.isScanning ? <span className="scan-orb is-scanning">A</span> : <span className="scan-orb">A</span>}</span>
           </button>
           <div>
-            <h1 className="first-run-title">Let Anna take a first look.</h1>
-            <p className="first-run-copy">She'll find what needs attention, and leave the noise behind.</p>
+            <h1 className="first-run-title">{state.isScanning ? "Anna is scanning your inbox." : "Let Anna take a first look."}</h1>
+            <p className="first-run-copy">{state.isScanning ? (state.scanStatus || "Scanning…") : "She'll find what needs attention, and leave the noise behind."}</p>
           </div>
-          <div className="first-run-actions">
-            <button className="primary-btn" disabled={!state.runtime.connected} onClick={() => void actions.startScan("first")}>Start scan</button>
-            <button className="soft-btn" onClick={() => actions.openSourcesWithConfig?.()}>Scan setting</button>
-          </div>
+          {state.isScanning ? (
+            <div className="scan-progress-bar">
+              <div className="scan-progress-track">
+                <div className="scan-progress-fill" style={{ width: `${Math.round((state.scanStepIndex / (SCAN_STEPS.length - 1)) * 100)}%` }} />
+              </div>
+              <p className="assistant-copy">{scanProgressLabel(state.scanStage, state.scanProgress) || SCAN_STEPS[state.scanStepIndex]?.title || "Scanning..."}</p>
+            </div>
+          ) : (
+            <div className="first-run-actions">
+              <button className="primary-btn" disabled={!state.runtime.connected} onClick={() => void actions.startScan("first")}>Start scan</button>
+              <button className="soft-btn" onClick={() => actions.openSourcesWithConfig?.()}>Scan setting</button>
+            </div>
+          )}
           <ScanErrorBlock error={state.scanError} />
         </section>
       </div>
@@ -547,20 +556,16 @@ export function BriefView() {
     <div className="start-grid">
       <section className="assistant-card">
         <div>
-          <h1 className="assistant-says">{state.isScanning && totalVisible > 0 ? "Anna is scanning your inbox." : title}</h1>
-          {state.isScanning && totalVisible > 0 ? (
-            <div className="scan-progress-bar">
-              <div className="scan-progress-track">
-                <div className="scan-progress-fill" style={{ width: `${Math.round((state.scanStepIndex / (SCAN_STEPS.length - 1)) * 100)}%` }} />
-              </div>
-              <p className="assistant-copy" style={{ flexShrink: 0 }}>{scanProgressLabel(state.scanStage, state.scanProgress) || SCAN_STEPS[state.scanStepIndex]?.title || "Scanning..."}</p>
-            </div>
-          ) : (
+          <h1 className="assistant-says">{state.isScanning ? "Anna is scanning your inbox." : title}</h1>
+          {state.isScanning && totalVisible === 0 ? (
+            <p className="assistant-copy">{state.scanStatus || "Scanning..."}</p>
+          ) : null}
+          {!state.isScanning ? (
             <>
               {state.scanStatus ? <p className="assistant-copy">{state.scanStatus}</p> : null}
               <ScanErrorBlock error={state.scanError} />
             </>
-          )}
+          ) : null}
         </div>
       </section>
       <SamplingDebugPanel info={state.samplingDebug as Record<string, unknown> | null} />
@@ -655,6 +660,15 @@ export function BriefView() {
               <button className="primary-btn danger-btn" onClick={() => { void actions.clearCards(confirmClear); setConfirmClear(null); }}>Delete</button>
             </div>
           </div>
+        </div>
+      ) : null}
+      {state.isScanning && totalVisible > 0 ? (
+        <div className="scan-bottom-bar">
+          <div className="scan-bottom-track">
+            <div className="scan-bottom-fill" style={{ width: `${Math.round((state.scanStepIndex / (SCAN_STEPS.length - 1)) * 100)}%` }} />
+          </div>
+          <span className="scan-bottom-label">{scanProgressLabel(state.scanStage, state.scanProgress) || SCAN_STEPS[state.scanStepIndex]?.title || "Scanning..."}</span>
+          {state.scanStatus ? <span className="scan-bottom-meta">{state.scanStatus}</span> : null}
         </div>
       ) : null}
     </div>

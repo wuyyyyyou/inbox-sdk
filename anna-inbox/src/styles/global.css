@@ -375,6 +375,38 @@
       margin-top: 4px;
     }
 
+    .ask-gap-form {
+      width: 100%;
+      max-width: 720px;
+    }
+
+    .ask-gap-row {
+      display: flex;
+      align-items: flex-end;
+      gap: 12px;
+    }
+
+    .ask-gap-fields {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .ask-gap-actions {
+      flex: 0 0 auto;
+      margin-top: 0;
+    }
+
+    @media (max-width: 720px) {
+      .ask-gap-row {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .ask-gap-actions {
+        justify-content: flex-start;
+      }
+    }
+
     .app-content {
       min-height: 0;
       overflow: auto;
@@ -4168,9 +4200,6 @@
     .sampling-debug-mono { font-family:monospace; font-size:11px; word-break:break-all; }
     .text-muted-inline { color:var(--text-muted); }
     .text-accent-inline { color:var(--accent); font-weight:500; }
-    .draft-preview-box { margin-top:6px; padding:8px; border-radius:8px; background:rgba(255,255,255,0.5); border:1px solid rgba(40,40,70,0.08); font-size:12px; white-space:pre-wrap; }
-    .draft-preview-btn { margin-top:4px; font-size:11px; }
-
     /* ── Ask item action buttons ── */
     .ask-item-actions { display:flex; gap:6px; margin-top:8px; }
     .ask-mailbox-chip { display:inline-flex; max-width:100%; margin:0 0 5px; padding:2px 8px; border-radius:999px; color:#6257d2; background:rgba(139,124,248,0.08); border:1px solid rgba(139,124,248,0.12); font-size:11px; font-weight:520; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -4183,6 +4212,7 @@
     .ask-action-trash { color:var(--rose); background:rgba(217,116,140,0.06); border-color:rgba(217,116,140,0.16); }
     .ask-action-trash:hover:not(:disabled) { background:rgba(217,116,140,0.14); }
     .ask-action-done { font-size:0.76rem; color:var(--muted); }
+    .ask-draft-editor { display:flex; flex-direction:column; gap:8px; margin-top:8px; }
     .ask-edit-textarea { width:100%; min-height:80px; padding:8px 10px; border-radius:8px; border:1px solid rgba(139,124,248,0.25); background:rgba(255,255,255,0.7); font-size:0.82rem; line-height:1.5; resize:vertical; font-family:inherit; }
     .ask-edit-textarea:focus { outline:none; border-color:rgba(139,124,248,0.5); box-shadow:0 0 0 3px rgba(139,124,248,0.08); }
     .ask-action-cancel { color:var(--muted); background:rgba(0,0,0,0.04); border-color:rgba(0,0,0,0.1); }
@@ -4706,6 +4736,35 @@
   font-size: 22px;
   font-weight: 600;
 }
+@keyframes scan-orb-pulse {
+  0%, 100% { box-shadow: inset 0 0 0 1px rgba(139,124,248,0.14), 0 12px 28px rgba(139,124,248,0.16); }
+  50% { box-shadow: inset 0 0 0 1px rgba(139,124,248,0.24), 0 12px 36px rgba(139,124,248,0.32); }
+}
+.scan-orb.is-scanning {
+  animation: scan-orb-pulse 1.5s ease-in-out infinite;
+}
+
+/* bottom scan bar for subsequent mailbox scans */
+.scan-bottom-bar {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  z-index: 50;
+  background: rgba(255,255,255,0.96);
+  backdrop-filter: blur(8px);
+  border-top: 1px solid rgba(40,40,70,0.08);
+  padding: 10px 20px;
+  display: flex; align-items: center; gap: 12px;
+}
+.scan-bottom-track {
+  flex: 0 0 140px; height: 4px; border-radius: 2px;
+  background: rgba(40,40,70,0.06); overflow: hidden;
+}
+.scan-bottom-fill {
+  height: 100%; border-radius: 2px;
+  background: linear-gradient(90deg, #6f64d8, #75a7ff);
+  transition: width 0.6s ease;
+}
+.scan-bottom-label { font-size: 13px; color: #4d4964; font-weight: 500; }
+.scan-bottom-meta { font-size: 12px; color: var(--text-muted); margin-left: auto; }
 
 .first-run-title {
   margin: 0;
@@ -5554,6 +5613,67 @@
   flex-wrap: wrap;
   gap: 4px;
   padding: 3px 0 0 96px;
+}
+
+.history-scan-card {
+  margin: 6px 0 7px 96px;
+  padding: 7px 8px;
+  border: 1px solid rgba(93, 82, 128, 0.08);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.36);
+}
+
+.history-scan-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.history-scan-metric {
+  min-width: 0;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.65);
+  border: 1px solid rgba(93, 82, 128, 0.06);
+}
+
+.history-scan-value {
+  font-size: 12px;
+  line-height: 1;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.history-scan-label {
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-muted);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.history-scan-metric-scanned { background: rgba(75,85,99,0.05); }
+.history-scan-metric-reply { background: rgba(37,99,235,0.07); }
+.history-scan-metric-review { background: rgba(139,92,246,0.07); }
+.history-scan-metric-cleanup { background: rgba(107,114,128,0.07); }
+
+.history-scan-mailbox {
+  margin-top: 6px;
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(93, 82, 128, 0.06);
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .history-tag {

@@ -100,8 +100,8 @@ export class MailAgentClient {
     return this.invoke<{ ok?: boolean; mailboxes: MailboxInfo[]; selected: string[] }>("remove_mailbox", { mailbox, storage_provider: storageProvider });
   }
 
-  loadActiveCards(mailbox: string, storageProvider: string, offset = 0, limit = 50, includeCleanup = false) {
-    return this.invoke<ActiveCardsPayload>("get_active_cards", { mailbox, storage_provider: storageProvider, offset, limit, include_cleanup: includeCleanup });
+  loadActiveCards(mailbox: string, storageProvider: string, offset = 0, limit = 50, includeCleanup = false, cleanupOffset = 0, cleanupLimit = 100) {
+    return this.invoke<ActiveCardsPayload>("get_active_cards", { mailbox, storage_provider: storageProvider, offset, limit, include_cleanup: includeCleanup, cleanup_offset: cleanupOffset, cleanup_limit: cleanupLimit });
   }
 
   loadRunHistory() {
@@ -119,6 +119,10 @@ export class MailAgentClient {
 
   startBriefRun(args: Record<string, unknown>) {
     return this.invoke<RunStatus>("start_mail_agent_run", args);
+  }
+
+  continueBriefRun(args: Record<string, unknown>) {
+    return this.invoke<RunStatus>("continue_mail_agent_run", args, { timeoutMs: 70_000 });
   }
 
   getRun(runId: string) {
@@ -159,6 +163,10 @@ export class MailAgentClient {
 
   clearContactMemories(mailboxes: string[], storageProvider: string) {
     return this.invoke<{ ok?: boolean; deleted?: number; error?: string }>("clear_contact_memories", { mailboxes, storage_provider: storageProvider });
+  }
+
+  generateContactMemories(args: Record<string, unknown>) {
+    return this.invoke<{ ok?: boolean; backfilled?: number; skipped_old?: number; error?: string }>("generate_contact_memories", args, { timeoutMs: 600_000 });
   }
 
   startSummarizeThread(args: Record<string, unknown>) {
@@ -202,11 +210,11 @@ export class MailAgentClient {
   }
 
   startCustomScan(args: Record<string, unknown>) {
-    return this.invoke<RunStatus>("start_custom_scan", args);
+    return this.invoke<RunStatus>("start_custom_scan", args, { timeoutMs: 600_000 });
   }
 
   reRunCustomScan(args: Record<string, unknown>) {
-    return this.invoke<RunStatus>("re_run_custom_scan", args);
+    return this.invoke<RunStatus>("re_run_custom_scan", args, { timeoutMs: 600_000 });
   }
 
   clearCards(mailbox: string, category: string) {
@@ -231,5 +239,9 @@ export class MailAgentClient {
 
   replyFromAsk(args: Record<string, unknown>) {
     return this.invoke<{ ok?: boolean; dry_run?: boolean; error?: string }>("reply_from_ask", args);
+  }
+
+  generateAskDraft(args: Record<string, unknown>) {
+    return this.invoke<{ subject?: string; body?: string; fallback_used?: boolean; note?: string }>("generate_ask_draft", args);
   }
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime
 from typing import Any
 
 from .indexer import ingest_card_event, parse_contact
@@ -23,14 +24,27 @@ async def list_memory_summaries(mailboxes: list[str]) -> dict[str, Any]:
     }
 
 
-async def backfill_active_card_memories(mailboxes: list[str]) -> dict[str, Any]:
+async def backfill_active_card_memories(
+    mailboxes: list[str],
+    *,
+    sampling_create_message: Any = None,
+    source: str = "active_card_backfill",
+    since: str = "",
+) -> dict[str, Any]:
     from ..storage.ops import get_active_cards
 
     backfilled = 0
+    skipped_old = 0
+    since_dt = _parse_dt(since)
     for mailbox in _normalize_mailboxes(mailboxes):
         active = await get_active_cards(mailbox)
         for card in active.cards:
             if getattr(card, "card_type", "") == "cleanup_bundle":
+                continue
+            # 后台补写只处理本次扫描后的卡片，避免每次扫描重复触发旧卡片的 LLM 写入。
+            card_dt = _parse_dt(getattr(card, "created_at", "") or getattr(card, "updated_at", ""))
+            if since_dt and card_dt and card_dt < since_dt:
+                skipped_old += 1
                 continue
             contact_email, _ = parse_contact(getattr(card.original, "from_addr", ""))
             thread_id = getattr(card, "thread_id", "") or getattr(card, "message_id", "")
@@ -40,12 +54,12 @@ async def backfill_active_card_memories(mailboxes: list[str]) -> dict[str, Any]:
                 mailbox,
                 card,
                 event_type="card_created",
-                source="active_card_backfill",
+                source=source,
                 user_action="backfill",
-                sampling_create_message=None,
+                sampling_create_message=sampling_create_message,
             )
             backfilled += 1
-    return {"ok": True, "backfilled": backfilled}
+    return {"ok": True, "backfilled": backfilled, "skipped_old": skipped_old}
 
 
 async def get_memory_detail(mailbox: str, contact_email: str) -> dict[str, Any]:
@@ -100,6 +114,13 @@ def _memory_summary(memory: ContactMemoryFile) -> dict[str, Any]:
         "latest_summary": latest.thread_summary.summary if latest else "",
         "latest_status": latest.thread_summary.status if latest else "unknown",
     }
+
+
+def _parse_dt(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value or ""))
+    except Exception:
+        return None
 
 
 def _latest_thread(memory: ContactMemoryFile) -> ContactThreadMemory | None:

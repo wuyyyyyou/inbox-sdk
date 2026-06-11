@@ -510,6 +510,43 @@ async def get_cleanup_bundle(mailbox: str) -> list[dict[str, Any]]:
     return messages
 
 
+async def get_cleanup_bundle_page(mailbox: str, offset: int = 0, limit: int = 100) -> dict:
+    """Return one page of cleanup messages, reading only the needed shards."""
+    result = await get_storage().get(_cleanup_index_key(mailbox), scope=default_scope())
+    if not result.get("exists") or not isinstance(result.get("value"), dict):
+        legacy = await get_storage().get(_cleanup_legacy_key(mailbox), scope=default_scope())
+        if legacy.get("exists") and isinstance(legacy.get("value"), list):
+            await set_cleanup_bundle(mailbox, legacy["value"])
+            await get_storage().delete(_cleanup_legacy_key(mailbox), scope=default_scope())
+            return await get_cleanup_bundle_page(mailbox, offset, limit)
+        return {"items": [], "total": 0, "has_more": False}
+    idx = result["value"]
+    total = int(idx.get("total", 0))
+    shard_count = int(idx.get("shards", 0))
+    page: list[dict[str, Any]] = []
+    global_offset = 0
+    for i in range(shard_count):
+        shard_size = CLEANUP_SHARD_SIZE if i < shard_count - 1 else total - (shard_count - 1) * CLEANUP_SHARD_SIZE
+        shard_start = global_offset
+        shard_end = global_offset + shard_size
+        global_offset = shard_end
+        if shard_end <= offset or shard_start >= offset + limit:
+            continue
+        shard = await get_storage().get(_cleanup_shard_key(mailbox, i), scope=default_scope())
+        if shard.get("exists") and isinstance(shard.get("value"), list):
+            for j, item in enumerate(shard["value"]):
+                pos = shard_start + j
+                if offset <= pos < offset + limit:
+                    if "mailbox" not in item:
+                        item["mailbox"] = mailbox
+                    page.append(item)
+                elif pos >= offset + limit:
+                    break
+        if global_offset >= offset + limit:
+            break
+    return {"items": page, "total": total, "has_more": (offset + limit) < total}
+
+
 async def set_cleanup_bundle(mailbox: str, messages: list[dict[str, Any]]) -> dict:
     total = len(messages)
     shard_count = max(1, (total + CLEANUP_SHARD_SIZE - 1) // CLEANUP_SHARD_SIZE) if total > 0 else 0
@@ -575,7 +612,10 @@ async def append_run_history(entry: RunHistoryEntry) -> dict:
     if not isinstance(raw, dict):
         raw = {"entries": []}
     entries: list[dict] = raw.get("entries", [])
-    entries.insert(0, _dataclass_to_dict(entry))
+    entry_data = _dataclass_to_dict(entry)
+    if entry.run_id:
+        entries = [e for e in entries if not (isinstance(e, dict) and e.get("run_id") == entry.run_id)]
+    entries.insert(0, entry_data)
     # Keep last 50
     if len(entries) > 50:
         entries = entries[:50]

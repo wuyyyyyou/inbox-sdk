@@ -1,5 +1,6 @@
+import { useState } from "react";
 import { useApp } from "../../app/AppContext";
-import type { AskHistoryEntry, CustomPlanQuery, CustomRunResult, CustomRunResultItem } from "../../types/mail";
+import type { AskHistoryEntry, CustomPlanQuery, CustomRunResult, CustomRunResultItem, ReplyGaps } from "../../types/mail";
 import { formatBeijingTimestamp, normalizeSubject } from "../../shared/format";
 import { CUSTOM_PROGRESS_STEPS, customStageCopy } from "../brief/runHelpers";
 
@@ -74,35 +75,94 @@ function AskProgress() {
   );
 }
 
+function AskGapForm({ actionKey, gaps, item, mailbox }: {
+  actionKey: string;
+  gaps: ReplyGaps;
+  item: CustomRunResultItem;
+  mailbox: string;
+}) {
+  const { state, actions } = useApp();
+  const saved = state.askGapAnswers[actionKey] || {};
+  const [answers, setAnswers] = useState<Record<string, string>>(saved);
+  const acts = state.askItemActions[actionKey] || {};
+  const questions = Array.isArray(gaps.questions) ? gaps.questions : [];
+
+  return (
+    <div className="ask-item-actions">
+      <div className="gap-form ask-gap-form">
+        <p className="gap-form-summary">{gaps.summary || "Need a few details before drafting:"}</p>
+        <div className="ask-gap-row">
+          <div className="ask-gap-fields">
+            {questions.map((q) => (
+              <div className="gap-form-field" key={q.id}>
+                <label className="gap-form-label">{q.question}{q.required ? " *" : ""}</label>
+                <input
+                  type="text"
+                  className="gap-form-input"
+                  placeholder={q.hint || ""}
+                  value={answers[q.id] || ""}
+                  onChange={(e) => {
+                    const next = { ...answers, [q.id]: e.target.value };
+                    setAnswers(next);
+                    actions.setAskGapAnswers(actionKey, next);
+                  }}
+                />
+              </div>
+            ))}
+          </div>
+          <div className="gap-form-actions ask-gap-actions">
+            <button className="primary-btn" disabled={acts.sending} onClick={() => void actions.generateAskDraftWithAnswers(actionKey, item, answers, mailbox)}>
+              {acts.sending ? "Generating..." : "Generate draft"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AskItemActions({ item }: { item: CustomRunResultItem }) {
   const { state, actions } = useApp();
   const mid = item.message_id || "";
   const itemMailbox = item.mailbox || state.selectedMailboxes[0] || state.mailbox;
   const actionKey = `${itemMailbox}::${mid || item.thread_id || ""}`;
   const acts = state.askItemActions[actionKey] || state.askItemActions[mid] || {};
-  const hasDraft = Boolean(item.draft && item.draft.trim());
+
+  const generatedDraft = state.askDraftsByKey[actionKey] || "";
+  const draft = generatedDraft || item.draft || "";
+  const hasDraft = Boolean(draft.trim());
+  const editableDraft = state.askEditDraft[actionKey] ?? draft;
+
+  const replyGaps = item.reply_gaps;
+  const hasGaps = replyGaps?.needs_user_input && Array.isArray(replyGaps?.questions) && replyGaps.questions.length > 0;
+  const showGapForm = hasGaps && !hasDraft;
+
+  if (showGapForm) {
+    return <AskGapForm actionKey={actionKey} gaps={replyGaps!} item={item} mailbox={itemMailbox} />;
+  }
+
   const canReply = hasDraft && item.thread_id && item.from;
   const canMark = Boolean(mid);
   const canTrash = Boolean(mid);
   if (!canReply && !canMark && !canTrash) return null;
   if (acts.trashed && !canReply) return <div className="ask-item-actions"><span className="ask-action-done">Trashed</span></div>;
-  const editing = state.askEditDraft[actionKey] !== undefined;
-  if (editing) {
+  if (hasDraft) {
     return (
-      <div className="ask-item-actions">
-        <textarea className="ask-edit-textarea" rows={4} value={state.askEditDraft[actionKey]} onChange={(e) => actions.updateAskDraft(actionKey, e.target.value)} />
+      <div className="ask-draft-editor">
+        <textarea className="ask-edit-textarea" rows={4} value={editableDraft} onChange={(e) => actions.updateAskDraft(actionKey, e.target.value)} />
         <div className="ask-item-actions">
-          <button className="ask-action-btn ask-action-reply" onClick={() => void actions.sendAskDraft(actionKey, item.thread_id || "", item.from || "", itemMailbox)}>Send</button>
-          <button className="ask-action-btn ask-action-cancel" onClick={() => actions.cancelAskDraft(actionKey)}>Cancel</button>
+          {canReply ? <button className="ask-action-btn ask-action-reply" disabled={acts.replied || acts.sending} onClick={() => void actions.sendAskDraft(actionKey, item.thread_id || "", item.from || "", itemMailbox, editableDraft)}>{acts.sending ? "Sending..." : acts.replied ? "Replied" : "Send"}</button> : null}
+          <button className="ask-action-btn ask-action-cancel" onClick={() => void actions.copyDraft(editableDraft)}>Copy draft</button>
           {canMark ? <button className="ask-action-btn ask-action-read" disabled={acts.read} onClick={() => void actions.handleAskMarkRead(actionKey, mid, itemMailbox)}>{acts.read ? "Read" : "Mark read"}</button> : null}
           {canTrash ? <button className="ask-action-btn ask-action-trash" onClick={() => void actions.handleAskTrash(actionKey, mid, itemMailbox)}>Trash</button> : null}
+          {acts.trashed ? <span className="ask-action-done">Trashed</span> : null}
         </div>
       </div>
     );
   }
   return (
     <div className="ask-item-actions">
-      {canReply ? <button className="ask-action-btn ask-action-reply" disabled={acts.replied || acts.sending} onClick={() => actions.enterAskDraftEdit(actionKey, item.draft || "")}>{acts.sending ? "Sending..." : acts.replied ? "Replied" : "Reply"}</button> : null}
+      {canReply ? <button className="ask-action-btn ask-action-reply" disabled={acts.replied || acts.sending} onClick={() => actions.enterAskDraftEdit(actionKey, draft)}>{acts.sending ? "Sending..." : acts.replied ? "Replied" : "Reply"}</button> : null}
       {canMark ? <button className="ask-action-btn ask-action-read" disabled={acts.read || acts.sending} onClick={() => void actions.handleAskMarkRead(actionKey, mid, itemMailbox)}>{acts.read ? "Read" : "Mark read"}</button> : null}
       {canTrash ? <button className="ask-action-btn ask-action-trash" disabled={acts.sending} onClick={() => void actions.handleAskTrash(actionKey, mid, itemMailbox)}>Trash</button> : null}
       {acts.trashed ? <span className="ask-action-done">Trashed</span> : null}
@@ -146,7 +206,7 @@ function CustomTrace({ result }: { result: CustomRunResult }) {
 }
 
 function CustomRunResultCard({ result }: { result: CustomRunResult }) {
-  const { state, actions } = useApp();
+  const { state } = useApp();
   const sections = Array.isArray(result.sections) ? result.sections : [];
   return (
     <section className="custom-result-card">
@@ -161,16 +221,17 @@ function CustomRunResultCard({ result }: { result: CustomRunResult }) {
           {sec.body ? <p>{sec.body}</p> : null}
           {sec.items?.length ? (
             <ul className="simple-list simple-list-sm">
-              {sec.items.map((it, j) => (
+              {sec.items.map((it, j) => {
+                  return (
                 <li key={j}>
                   {it.mailbox && state.selectedMailboxes.length > 1 ? <span className="ask-mailbox-chip">{it.mailbox}</span> : null}
                   <strong>{it.subject || ""}</strong>
                   {it.context ? <><br /><span className="text-muted-inline">{it.context}</span></> : null}
                   {it.suggestion ? <><br /><span className="text-accent-inline">→ {it.suggestion}</span></> : null}
-                  {it.draft ? <><div className="draft-preview-box">{it.draft}</div><button className="soft-btn draft-preview-btn" onClick={() => void actions.copyDraft(it.draft || "")}>Copy draft</button></> : null}
                   <AskItemActions item={it} />
                 </li>
-              ))}
+                  );
+              })}
             </ul>
           ) : null}
         </div>
