@@ -128,6 +128,7 @@ export interface ActiveCardsPayload {
   limit?: number;
   action_count?: number;
   scan_state?: ScanState;
+  cleanup_bundle?: CleanupMessage[] | null;
 }
 
 export interface RunStatus {
@@ -376,6 +377,7 @@ export interface AppState {
   draftDots: string;
   summarizingThread: boolean;
   cleanupReadState: Record<string, { read: boolean; readMsgIndices: number[] }>;
+  cleanupBundle: CleanupMessage[] | null;
   markingReadIds: Record<string, boolean>;
   gmailAuthStatus: GmailAuthStatus;
   samplingDebug: SamplingDebugInfo | null;

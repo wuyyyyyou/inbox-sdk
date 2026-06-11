@@ -100,8 +100,8 @@ export class MailAgentClient {
     return this.invoke<{ ok?: boolean; mailboxes: MailboxInfo[]; selected: string[] }>("remove_mailbox", { mailbox, storage_provider: storageProvider });
   }
 
-  loadActiveCards(mailbox: string, storageProvider: string, offset = 0, limit = 50) {
-    return this.invoke<ActiveCardsPayload>("get_active_cards", { mailbox, storage_provider: storageProvider, offset, limit });
+  loadActiveCards(mailbox: string, storageProvider: string, offset = 0, limit = 50, includeCleanup = false) {
+    return this.invoke<ActiveCardsPayload>("get_active_cards", { mailbox, storage_provider: storageProvider, offset, limit, include_cleanup: includeCleanup });
   }
 
   loadRunHistory() {

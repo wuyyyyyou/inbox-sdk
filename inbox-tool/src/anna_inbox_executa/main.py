@@ -2607,6 +2607,7 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
         return {"error": "mailbox is required"}
     offset = int(arguments.get("offset", 0))
     limit = int(arguments.get("limit", 50))
+    include_cleanup = bool(arguments.get("include_cleanup"))
 
     from mail_agent.cards.service import cards_to_frontend
     from mail_agent.storage.ops import (
@@ -2656,6 +2657,11 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
             action_count = 0  # computed below from active page for consistency; full count would need all cards
             action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
 
+        cleanup_bundle = None
+        if include_cleanup and mailbox.lower() != "all":
+            from mail_agent.storage.ops import get_cleanup_bundle
+            cleanup_bundle = _run_storage_query(get_cleanup_bundle(mailbox))
+
         return {
             "cards": cards_to_frontend(active),
             "total": total,
@@ -2665,6 +2671,7 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
             "limit": limit,
             "action_count": action_count,
             "scan_state": scan_state,
+            "cleanup_bundle": cleanup_bundle,
         }
     except Exception as exc:
         log(f"get_active_cards sync entry failed: {type(exc).__name__}: {exc}")
@@ -2673,6 +2680,7 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
             "total": 0,
             "count": 0,
             "has_more": False,
+            "cleanup_bundle": None,
             "action_count": 0,
             "scan_state": {"total_scans": 0, "total_processed": 0, "last_scan_ts": "", "last_message_internal_date": ""},
             "error": f"{type(exc).__name__}: {exc}"[:200],

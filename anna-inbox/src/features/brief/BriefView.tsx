@@ -230,8 +230,9 @@ function CleanupBundleCard({ card }: { card: FrontendCard }) {
   const expanded = Boolean(state.expandedDetails[key]);
   const readState = state.cleanupReadState[key];
   const isAllRead = readState?.read;
-  const messages = Array.isArray(card.bundledMessages) ? card.bundledMessages : [];
-  const count = card.bundledCount || messages.length;
+  const fullBundle = Array.isArray(state.cleanupBundle) && state.cleanupBundle.length > 0 ? state.cleanupBundle : null;
+  const messages = fullBundle ?? (Array.isArray(card.bundledMessages) ? card.bundledMessages : []);
+  const count = fullBundle ? fullBundle.length : (card.bundledCount || messages.length);
   const readCount = readState ? readState.readMsgIndices.length : 0;
   return (
     <article className={`cleanup-bundle-card ${expanded ? "is-expanded" : ""} ${isAllRead ? "is-all-read" : ""}`}>
@@ -516,10 +517,11 @@ export function BriefView() {
         : filteredCards(state.cards, activeFilter).filter(isMainCard);
   const cleanupCards = lowerCards(state.cards).filter((c) => c.cardType === "cleanup_bundle");
   const regularLower = lowerCards(state.cards).filter((c) => c.cardType !== "cleanup_bundle");
-  const cleanupMessages = cleanupCards.flatMap((c) =>
-    (Array.isArray(c.bundledMessages) ? c.bundledMessages : []).map((msg, i) => ({ msg, index: i, cardId: c.uiKey || c.id }))
-  );
-  const cleanupCount = cleanupMessages.length;
+  const fullCleanupBundle = Array.isArray(state.cleanupBundle) && state.cleanupBundle.length > 0 ? state.cleanupBundle : null;
+  const cleanupMessages = fullCleanupBundle
+    ? fullCleanupBundle.map((msg, index) => ({ msg, index, cardId: cleanupCards[0]?.uiKey || cleanupCards[0]?.id || "cleanup" }))
+    : cleanupCards.flatMap((c) => (Array.isArray(c.bundledMessages) ? c.bundledMessages : []).map((msg, i) => ({ msg, index: i, cardId: c.uiKey || c.id })));
+  const cleanupCount = fullCleanupBundle ? fullCleanupBundle.length : cleanupMessages.length;
 
   return (
     <div className="start-grid">

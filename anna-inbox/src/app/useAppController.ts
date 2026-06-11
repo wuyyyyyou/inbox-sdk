@@ -203,13 +203,15 @@ export function useAppController() {
       let offset = 0;
       let hasMore = true;
       let scanState: ActiveCardsPayload["scan_state"];
-      const MAX_PAGES = 20;  // safety: 1000 cards at 50/page
+      let cleanupBundle: ActiveCardsPayload["cleanup_bundle"];
+      const MAX_PAGES = 20;
       while (hasMore && offset < MAX_PAGES * PAGE_SIZE) {
-        const payload = await client.loadActiveCards(mailbox, provider, offset, PAGE_SIZE);
+        const payload = await client.loadActiveCards(mailbox, provider, offset, PAGE_SIZE, offset === 0);
         allCards.push(...(payload.cards || []));
         hasMore = Boolean(payload.has_more);
         offset += PAGE_SIZE;
         if (payload.scan_state) scanState = payload.scan_state;
+        if (payload.cleanup_bundle) cleanupBundle = payload.cleanup_bundle;
       }
       const keyedCards = withCardKeys(allCards, mailbox === "all" ? state.mailbox : mailbox);
       refreshStoredCardFields(keyedCards);
@@ -223,6 +225,7 @@ export function useAppController() {
           briefMailboxFilter: selected,
           actionCount: actionCount(visible),
           scanState: scanState || s.scanState,
+          cleanupBundle: cleanupBundle ?? s.cleanupBundle,
           scanError: "",
           loading: false,
         };
@@ -851,7 +854,7 @@ export function useAppController() {
     async markCleanupAsRead(cardId) {
       const card = findCard(state.cards, cardId);
       const key = card?.uiKey || (card ? cardUiKey(card, state.mailbox) : cardId);
-      const messages = Array.isArray(card?.bundledMessages) ? card.bundledMessages : [];
+      const messages = (Array.isArray(state.cleanupBundle) && state.cleanupBundle.length > 0 ? state.cleanupBundle : (Array.isArray(card?.bundledMessages) ? card.bundledMessages : []));
       const messageIds = messages.map((m) => m.message_id || m.id).filter(Boolean) as string[];
       if (!card || !messageIds.length) return;
       setState((s) => ({ ...s, markingReadIds: { ...s.markingReadIds, [key]: true }, cleanupReadState: { ...s.cleanupReadState, [key]: { read: true, readMsgIndices: messages.map((_m, i) => i) } } }));

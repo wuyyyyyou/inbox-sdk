@@ -65,6 +65,7 @@ export function createInitialState(): AppState {
     draftDots: "",
     summarizingThread: false,
     cleanupReadState: {},
+    cleanupBundle: null,
     markingReadIds: {},
     gmailAuthStatus: { checked: false, authorized: true },
     samplingDebug: null,
