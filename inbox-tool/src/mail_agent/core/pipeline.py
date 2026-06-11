@@ -51,7 +51,7 @@ from ..domain.types import (
 )
 
 ProgressCallback = Callable[[str, dict[str, Any]], None]
-EVALUATE_CONCURRENCY = 3  # maxCalls=8 per invoke; 3 main + retries within limit
+EVALUATE_CONCURRENCY = 2  # maxCalls=8 per invoke; 2 main + retries within limit
 _PERSIST_LOCKS: dict[str, asyncio.Lock] = {}
 
 # Storage integration (lazy import to avoid circular deps at module level)
@@ -296,66 +296,9 @@ async def run_mail_task(
     _report_progress(progress_callback, "thread_dedup", before=len(new_id_set), after=len(new_messages))
     _logger.info("thread_dedup: %d messages → %d after dedup", len(new_id_set), len(new_messages))
 
-    # 过滤已回复线程：最新一封来自用户本人 → 已处理过，跳过
-    # 使用 8 路并发 Gmail API 调用，200 线程从 ~100s 降到 ~12s
-    already_replied_count = 0
-    check_timeouts = 0
-    filtered_messages: list[Any] = []
-    total_after_dedup = len(new_messages)
-    if total_after_dedup > 0:
-        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
-        # Collect all check results concurrently
-        _tid_to_msg: dict[str, Any] = {}
-        with ThreadPoolExecutor(max_workers=8, thread_name_prefix="check-replied") as _pool:
-            _futures: dict[Any, Any] = {}
-            for _m in new_messages:
-                _tid = _m.thread_id or _m.message_id
-                _tid_to_msg[_tid] = _m
-                _futures[_pool.submit(_thread_latest_is_from_owner, input_.mailbox_id, _tid, input_.mailbox_id)] = _tid
-            _done_count = 0
-            for _future in _as_completed(_futures):
-                _done_count += 1
-                _tid = _futures[_future]
-                _m = _tid_to_msg[_tid]
-                _report_progress(progress_callback, "check_replied", current=_done_count, total=total_after_dedup)
-                try:
-                    _result = _future.result()
-                except Exception:
-                    _logger.warning("check_replied error for thread %s, keeping message", _tid)
-                    check_timeouts += 1
-                    filtered_messages.append(_m)
-                    continue
-                if _result is None:
-                    check_timeouts += 1
-                    filtered_messages.append(_m)
-                elif _result:
-                    already_replied_count += 1
-                    try:
-                        from ..contact_memory.indexer import ingest_thread_observation
-                        await ingest_thread_observation(
-                            input_.mailbox_id, _tid, _m.from_addr, _m.subject,
-                            sampling_create_message=sampling_create_message,
-                            source="gmail_scan", user_action="owner_replied",
-                        )
-                    except Exception:
-                        pass
-                else:
-                    filtered_messages.append(_m)
-        # Restore original order
-        _msg_order = {(_m.thread_id or _m.message_id): _m for _m in new_messages}
-        filtered_messages.sort(key=lambda _m: new_messages.index(_msg_order.get(_m.thread_id or _m.message_id, _m)))
-    _tick(f"already_replied_filter filtered={already_replied_count} timeouts={check_timeouts}")
-    _logger.info("already_replied_filter: %d filtered (already replied), %d timeouts, %d remaining",
-                 already_replied_count, check_timeouts, len(filtered_messages))
-    _report_progress(
-        progress_callback,
-        "already_replied_filter",
-        filtered=already_replied_count,
-        remaining=len(filtered_messages),
-        timeout=check_timeouts,
-    )
-    new_messages = filtered_messages
-
+    # ── Phase 1: classify BEFORE thread check ──
+    # Gmail thread checks are expensive (1 API call per thread).  Run phase1
+    # first to narrow 200 messages → ~20-50 candidates, then only check those.
     _report_progress(progress_callback, "phase1", scanned=len(new_messages))
     _logger.info("phase1 started: %d messages to classify", len(new_messages))
     phase1_result = await run_phase1_batch_classify(new_messages, strategy, mailbox_profile, sampling_create_message)
@@ -376,6 +319,51 @@ async def run_mail_task(
     )
     _tick(f"phase1_done candidates={len(candidates)}")
     _logger.info("phase1 done: %d candidates, %d low_value", len(candidates), len(low_value_items))
+
+    # ── Thread reply check (only for candidate threads, not all messages) ──
+    candidate_tids: set[str] = {c.thread_id for c in candidates if c.thread_id}
+    already_replied_count = 0
+    check_timeouts = 0
+    filtered_candidates: list[Any] = []
+    tid_to_candidate = {c.thread_id: c for c in candidates if c.thread_id}
+    for i, tid in enumerate(candidate_tids, start=1):
+        _report_progress(progress_callback, "check_replied", current=i, total=len(candidate_tids))
+        try:
+            result = _thread_latest_is_from_owner(input_.mailbox_id, tid, input_.mailbox_id)
+            if result is None:
+                check_timeouts += 1
+            elif result:
+                already_replied_count += 1
+                try:
+                    from ..contact_memory.indexer import ingest_thread_observation
+                    c = tid_to_candidate[tid]
+                    await ingest_thread_observation(
+                        input_.mailbox_id,
+                        tid,
+                        c.evidence.get("from", ""),
+                        c.evidence.get("subject", ""),
+                        sampling_create_message=sampling_create_message,
+                        source="gmail_scan",
+                        user_action="owner_replied",
+                    )
+                except Exception:
+                    pass
+                continue
+        except Exception:
+            _logger.warning("check_replied error for thread %s, keeping candidate", tid)
+            check_timeouts += 1
+        filtered_candidates.append(tid)
+    candidates = [c for c in candidates if (c.thread_id or "") in set(filtered_candidates)]
+    _tick(f"already_replied_filter filtered={already_replied_count} timeouts={check_timeouts}")
+    _logger.info("already_replied_filter: %d filtered (already replied), %d timeouts, %d candidates remaining",
+                 already_replied_count, check_timeouts, len(candidates))
+    _report_progress(
+        progress_callback,
+        "already_replied_filter",
+        filtered=already_replied_count,
+        remaining=len(candidates),
+        timeout=check_timeouts,
+    )
 
     contexts = []
     for index, candidate in enumerate(candidates, start=1):

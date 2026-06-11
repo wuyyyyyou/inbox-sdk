@@ -2,16 +2,17 @@ import type { CustomRunProgress, RunStatus } from "../../types/mail";
 
 export const SCAN_STEPS = [
   { title: "Connecting mailbox", microcopy: "Connecting to your Gmail source and reading recent activity.", stagePrefix: "scan" },
-  { title: "Processing messages", microcopy: "Filtering duplicates, deduplicating threads, and running first-pass classification.", stagePrefix: "storage_filter" },
-  { title: "Reading context", microcopy: "Fetching thread context and message details for candidates.", stagePrefix: "read_context" },
+  { title: "Classifying headers", microcopy: "Reading headers and snippets to find candidate attention items.", stagePrefix: "phase1" },
+  { title: "Checking open threads", microcopy: "Checking candidate threads to skip conversations you already answered.", stagePrefix: "check_replied" },
   { title: "Evaluating items", microcopy: "LLM is reviewing each candidate and preparing judgments.", stagePrefix: "evaluate" },
-  { title: "Preparing brief", microcopy: "Building action plan and saving cards to local storage.", stagePrefix: "plan" },
+  { title: "Preparing brief", microcopy: "Saving cards, cleanup bundles, and scan history.", stagePrefix: "finalizing" },
 ];
 
 const STAGE_STEP_MAP: Record<string, number> = {
   queued: 0, parse_intent: 0, scan: 0, scanning: 0, scan_cache: 0, scan_done: 0, scan_fallback: 0, scan_fallback_empty: 0,
-  storage_filter: 1, thread_dedup: 1, check_replied: 1, already_replied_filter: 1, phase1: 1, phase1_done: 1,
+  storage_filter: 1, thread_dedup: 1, phase1: 1, phase1_done: 1,
   filtering: 1,
+  check_replied: 2, already_replied_filter: 2,
   read_context: 2, read_context_done: 2,
   evaluate: 3, evaluate_done: 3, phase2: 3,
   plan: 4, finalizing: 4, storage_saved: 4, reading_cards: 4, read_cards_error: 4, storage_error: 4, done: 4,
@@ -37,7 +38,7 @@ export function scanStageLabel(stage: string | undefined, progress: Record<strin
     storage_filter: "Skipping messages already processed.",
     filtering: "Filtering messages.",
     thread_dedup: "Deduplicating threads.",
-    check_replied: "Checking thread reply status.",
+    check_replied: "Checking candidate thread status.",
     already_replied_filter: "Filtering already-replied threads.",
     phase1: "Finding candidate attention items.",
     phase1_done: "Candidate scan complete.",
@@ -68,7 +69,7 @@ export function scanProgressLabel(stage: string | undefined, progress: Record<st
   if (stage === "scan_fallback_empty") return "No cache available — check network & token";
   if (stage === "storage_filter") return `${p.skipped || 0} skipped, ${p.new || 0} new`;
   if (stage === "thread_dedup") return `${p.after || 0} after dedup`;
-  if (stage === "check_replied") return `Checking reply status ${p.current || 0}/${p.total || 0}`;
+  if (stage === "check_replied") return `Checking candidate threads ${p.current || 0}/${p.total || 0}`;
   if (stage === "already_replied_filter") return `${p.filtered || 0} already replied`;
   if (stage === "filtering") return `${p.new || 0} new after filtering`;
   if (stage === "phase1") {
@@ -77,7 +78,7 @@ export function scanProgressLabel(stage: string | undefined, progress: Record<st
     if (total) return `Classifying headers ${current}/${total}`;
     return `Classifying ${p.scanned || 0} emails...`;
   }
-  if (stage === "phase1_done") return `${p.candidates || 0} candidates, ${p.low_value || 0} low-priority`;
+  if (stage === "phase1_done") return `${p.candidates || 0} candidates, checking open threads next`;
   if (stage === "read_context") return `Reading context ${p.current || 0}/${p.total || 0}`;
   if (stage === "read_context_done") return `${p.total || 0} contexts loaded`;
   if (stage === "phase2" || stage === "evaluate") {

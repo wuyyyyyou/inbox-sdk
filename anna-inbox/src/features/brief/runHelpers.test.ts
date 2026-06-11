@@ -5,14 +5,16 @@ describe("run helpers", () => {
   it("maps backend stages to scan steps", () => {
     expect(stageToStep("scan")).toBe(0);
     expect(stageToStep("phase1")).toBe(1);
-    expect(stageToStep("read_context")).toBe(2);
-    expect(stageToStep("evaluate")).toBe(3);
-    expect(stageToStep("done")).toBe(4);
+    expect(stageToStep("check_replied")).toBe(2);
+    expect(stageToStep("read_context")).toBe(3);
+    expect(stageToStep("evaluate")).toBe(4);
+    expect(stageToStep("done")).toBe(5);
   });
 
   it("formats scan labels", () => {
     expect(scanStageLabel("evaluate", { current: 1, total: 3 })).toBe("Evaluating cards. (1/3)");
-    expect(scanProgressLabel("phase1_done", { candidates: 2, low_value: 5 })).toBe("2 candidates, 5 low-priority");
+    expect(scanProgressLabel("phase1_done", { candidates: 2, low_value: 5 })).toBe("2 candidates, checking open threads next");
+    expect(scanProgressLabel("check_replied", { current: 1, total: 2 })).toBe("Checking candidate threads 1/2");
   });
 
   it("normalizes custom scan stages", () => {

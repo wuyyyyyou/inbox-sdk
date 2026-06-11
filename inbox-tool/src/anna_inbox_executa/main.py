@@ -2169,7 +2169,7 @@ def _brief_update_state(run_id: str, *, status: str = "running", stage: str, pro
 
 async def _brief_prepare_scan(run_id: str, arguments: dict[str, Any]) -> None:
     import re as _re
-    from mail_agent.core.pipeline import _apply_incremental_window, _dedupe_by_thread, _get_scan_plan_config, _storage_ready, _thread_latest_is_from_owner
+    from mail_agent.core.pipeline import _apply_incremental_window, _dedupe_by_thread, _get_scan_plan_config, _storage_ready
     from mail_agent.core.scan import build_scan_plan, run_mail_scan
     from mail_agent.domain.types import MailTaskInput
     from mail_agent.planning.intent import parse_intent
@@ -2224,25 +2224,11 @@ async def _brief_prepare_scan(run_id: str, arguments: dict[str, Any]) -> None:
     new_id_set = set(new_message_ids)
     new_messages = _dedupe_by_thread([m for m in messages if m.message_id in new_id_set])
 
-    filtered_messages = []
-    already_replied_count = 0
-    total_after_dedup = len(new_messages)
-    for i, msg in enumerate(new_messages):
-        _brief_update_state(run_id, stage="check_replied", progress={"current": i + 1, "total": total_after_dedup})
-        tid = msg.thread_id or msg.message_id
-        try:
-            if _thread_latest_is_from_owner(mailbox, tid, mailbox):
-                already_replied_count += 1
-                continue
-        except Exception:
-            pass
-        filtered_messages.append(msg)
-
     brief.update({
         "stage": "phase1",
         "strategy_mode": task_plan.strategy_mode,
         "task_plan": _brief_to_dict_list([task_plan])[0],
-        "messages": _brief_to_dict_list(filtered_messages),
+        "messages": _brief_to_dict_list(new_messages),
         "phase1_cursor": 0,
         "phase1_batch_size": 20,
         "candidates": [],
@@ -2255,11 +2241,10 @@ async def _brief_prepare_scan(run_id: str, arguments: dict[str, Any]) -> None:
         stage="phase1",
         progress={
             "current": 0,
-            "total": len(filtered_messages),
+            "total": len(new_messages),
             "scanned": len(messages),
             "new": len(new_message_ids),
             "deduped": len(new_messages),
-            "already_replied": already_replied_count,
         },
     )
 
@@ -2281,8 +2266,8 @@ async def _brief_run_phase1_slice(run_id: str, sampling_create_message: Any) -> 
     profile = MailboxProfile(mailbox_id=str((state.get("partial") or {}).get("_args", {}).get("mailbox") or ""), owner=str((state.get("partial") or {}).get("_args", {}).get("mailbox") or ""))
 
     if cursor >= total:
-        brief["stage"] = "phase2"
-        _brief_update_state(run_id, stage="phase2", progress={"evaluated": int(brief.get("phase2_cursor") or 0), "total": len(brief.get("candidates") or [])})
+        brief["stage"] = "check_replied"
+        _brief_update_state(run_id, stage="check_replied", progress={"current": 0, "total": len(brief.get("candidates") or [])})
         return
 
     batches = []
@@ -2314,7 +2299,7 @@ async def _brief_run_phase1_slice(run_id: str, sampling_create_message: Any) -> 
     brief["candidates"] = _brief_to_dict_list(list(deduped.values()))
     brief["low_value_items"] = low_value_items
     if cursor >= total:
-        brief["stage"] = "phase2"
+        brief["stage"] = "check_replied"
         stage = "phase1_done"
     else:
         stage = "phase1"
@@ -2322,6 +2307,51 @@ async def _brief_run_phase1_slice(run_id: str, sampling_create_message: Any) -> 
         run_id,
         stage=stage,
         progress={"current": cursor, "total": total, "candidates": len(brief["candidates"]), "low_value": len(low_value_items), "sampling_calls_used": len(batches)},
+    )
+
+
+async def _brief_check_replied_after_phase1(run_id: str) -> None:
+    from mail_agent.core.pipeline import _thread_latest_is_from_owner
+
+    state = MAIL_AGENT_RUNS[run_id]
+    brief = state.setdefault("brief", {})
+    args = (state.get("partial") or {}).get("_args", {})
+    mailbox = str(args.get("mailbox") or "")
+    candidates = _brief_candidates_from_dict(list(brief.get("candidates") or []))
+    if not candidates:
+        brief["stage"] = "phase2"
+        brief["phase2_cursor"] = 0
+        _brief_update_state(run_id, stage="phase2", progress={"evaluated": 0, "total": 0, "already_replied": 0})
+        return
+
+    kept_candidates = []
+    latest_from_owner_by_thread: dict[str, bool] = {}
+    already_replied_count = 0
+    total = len(candidates)
+    for index, candidate in enumerate(candidates, 1):
+        _brief_update_state(run_id, stage="check_replied", progress={"current": index, "total": total})
+        thread_key = candidate.thread_id or (candidate.message_ids[0] if candidate.message_ids else candidate.candidate_id)
+        if not thread_key:
+            kept_candidates.append(candidate)
+            continue
+        if thread_key not in latest_from_owner_by_thread:
+            try:
+                latest_from_owner_by_thread[thread_key] = bool(_thread_latest_is_from_owner(mailbox, thread_key, mailbox))
+            except Exception:
+                latest_from_owner_by_thread[thread_key] = False
+        if latest_from_owner_by_thread[thread_key]:
+            already_replied_count += 1
+            continue
+        kept_candidates.append(candidate)
+
+    brief["candidates"] = _brief_to_dict_list(kept_candidates)
+    brief["already_replied_count"] = already_replied_count
+    brief["phase2_cursor"] = 0
+    brief["stage"] = "phase2"
+    _brief_update_state(
+        run_id,
+        stage="phase2",
+        progress={"evaluated": 0, "total": len(kept_candidates), "checked": total, "already_replied": already_replied_count},
     )
 
 
@@ -2582,6 +2612,8 @@ async def _continue_mail_agent_run_async(arguments: dict[str, Any], invoke_id: s
             await _brief_prepare_scan(run_id, saved_args)
         elif stage == "phase1":
             await _brief_run_phase1_slice(run_id, sampling_fn)
+        elif stage == "check_replied":
+            await _brief_check_replied_after_phase1(run_id)
         elif stage == "phase2":
             await _brief_run_phase2_slice(run_id, sampling_fn)
         elif stage == "finalizing":
