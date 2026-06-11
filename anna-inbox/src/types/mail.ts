@@ -140,6 +140,7 @@ export interface RunStatus {
   warnings?: RunWarning[];
   result?: Record<string, unknown>;
   cards?: FrontendCard[] | null;
+  scan_state?: ScanState | null;
   started_at?: string;
   updated_at?: string;
   error?: string;

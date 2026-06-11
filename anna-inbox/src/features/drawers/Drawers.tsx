@@ -119,7 +119,7 @@ function SourcesDrawer() {
                         </span>
                         {mailbox.last_error ? <span className="source-meta is-error">{mailbox.last_error}</span> : null}
                       </span>
-                      <span className="mailbox-config-arrow">{isExpanded ? "▼" : "▶"}</span>
+                      <span className="mailbox-config-arrow">{isExpanded ? "▼" : "◀"}</span>
                     </div>
                   </article>
                   {isExpanded ? <PerMailboxConfig /> : null}

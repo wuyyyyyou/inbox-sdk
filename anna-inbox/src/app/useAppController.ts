@@ -2,7 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { ActiveCardsPayload, AppState, FrontendCard, MailboxInfo, RunStatus, TestSamplingBriefResult, TestSamplingResult } from "../types/mail";
+import type { ActiveCardsPayload, AppState, FrontendCard, MailboxInfo, RunStatus, ScanState, TestSamplingBriefResult, TestSamplingResult } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -685,7 +685,7 @@ export function useAppController() {
                       cards: visible,
                       briefMailboxFilter: selected,
                       actionCount: actionCount(visible),
-                      scanState: s.scanState,
+                      scanState: (status.scan_state as ScanState) || s.scanState,
                       scanError: "",
                       loading: false,
                     };

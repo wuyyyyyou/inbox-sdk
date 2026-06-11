@@ -352,22 +352,23 @@ def build_cleanup_bundle(
     mailbox: str,
     low_value_items: list[dict[str, Any]],
     messages: list[MessageLite],
-) -> PersistentCard | None:
-    """Build a single folded cleanup card from Phase 1 low-value items.
+) -> tuple[PersistentCard | None, list[dict[str, Any]]]:
+    """Build a folded cleanup card + separate full bundled messages list.
 
-    No LLM involved — uses Phase 1 header info directly.
+    The card stores only count + first 3 previews.  The caller must persist
+    the full bundled list via `set_cleanup_bundle(mailbox, full_bundled)`.
     """
     if not low_value_items:
-        return None
+        return None, []
 
     msg_map: dict[str, MessageLite] = {}
     if messages:
         msg_map = {m.message_id: m for m in messages if m.message_id}
 
-    bundled: list[dict[str, Any]] = []
+    full_bundled: list[dict[str, Any]] = []
     for item in low_value_items:
         msg = msg_map.get(item["message_id"])
-        bundled.append({
+        full_bundled.append({
             "message_id": item["message_id"],
             "from_addr": (msg.from_addr or "")[:80] if msg else "",
             "subject": (msg.subject or "")[:120] if msg else "",
@@ -378,8 +379,9 @@ def build_cleanup_bundle(
             "confidence": float(item.get("confidence", 0.5)),
         })
 
-    n = len(bundled)
-    return PersistentCard(
+    n = len(full_bundled)
+    preview = full_bundled[:3]
+    card = PersistentCard(
         card_id=f"cleanup_{run_id}",
         message_id="",
         thread_id=f"cleanup_{run_id}",
@@ -410,9 +412,11 @@ def build_cleanup_bundle(
         ],
         status="pending",
         card_type="cleanup_bundle",
-        bundled_messages=bundled,
+        bundled_messages=preview,
+        bundled_count=n,
         user_action="cleanup",
     )
+    return card, full_bundled
 
 
 # ── Merge new and existing cards ────────────────────────────────────
@@ -433,25 +437,12 @@ def _merge_cleanup_bundles(
     if not new:
         return old
 
-    seen: set[str] = set()
-    merged_msgs: list[dict[str, Any]] = []
-
-    for m in old.bundled_messages:
-        mid = str(m.get("message_id", ""))
-        if mid and mid not in seen:
-            seen.add(mid)
-            merged_msgs.append(m)
-
-    for m in new.bundled_messages:
-        mid = str(m.get("message_id", ""))
-        if mid and mid not in seen:
-            seen.add(mid)
-            merged_msgs.append(m)
-
-    n = len(merged_msgs)
-    old.bundled_messages = merged_msgs
-    old.title = f"Cleanup · {n} low-priority email{'s' if n != 1 else ''}"
-    old.original.status = f"{n} messages total"
+    # Full merge happens at the storage layer (via set_cleanup_bundle).
+    # Card carries only preview; use the new run's count as the total.
+    old.bundled_messages = (new.bundled_messages or [])[:3]
+    old.bundled_count = new.bundled_count or old.bundled_count
+    old.title = f"Cleanup · {old.bundled_count} low-priority email{'s' if old.bundled_count != 1 else ''}"
+    old.original.status = f"{old.bundled_count} messages total"
     old.updated_at = _now()
     return old
 
@@ -572,9 +563,9 @@ def cards_to_frontend(cards: ActiveCards) -> list[dict[str, Any]]:
             frontend_card["userAction"] = card.user_action
         if card.card_type:
             frontend_card["cardType"] = card.card_type
-        if card.bundled_messages:
+        if card.bundled_messages or card.bundled_count > 0:
             frontend_card["bundledMessages"] = card.bundled_messages
-            frontend_card["bundledCount"] = len(card.bundled_messages)
+            frontend_card["bundledCount"] = card.bundled_count or len(card.bundled_messages)
         if card.reply_gaps:
             frontend_card["replyGaps"] = card.reply_gaps
         result.append(frontend_card)

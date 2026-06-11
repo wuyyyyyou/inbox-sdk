@@ -2609,11 +2609,22 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
     limit = int(arguments.get("limit", 50))
 
     from mail_agent.cards.service import cards_to_frontend
-    from mail_agent.storage.ops import aggregate_active_cards, get_active_cards, get_scan_state
+    from mail_agent.storage.ops import (
+        aggregate_active_cards,
+        get_active_cards,
+        get_active_cards_page,
+        get_scan_state,
+    )
+    from mail_agent.storage.types import ActiveCards as ActiveCardsType
 
     try:
         if mailbox.lower() == "all":
-            active = _run_storage_query(aggregate_active_cards())
+            full_active = _run_storage_query(aggregate_active_cards())
+            total = len(full_active.cards)
+            action_count = sum(1 for c in full_active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
+            # Paginate in-memory for cross-mailbox aggregation
+            page = full_active.cards[offset:offset + limit] if limit > 0 else full_active.cards
+            active = ActiveCardsType(cards=list(page), updated_at=full_active.updated_at)
             # Aggregate scan state across all registered mailboxes
             try:
                 from mail_agent.storage.ops import get_mailbox_registry
@@ -2632,7 +2643,9 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
             except Exception:
                 scan_state = {"total_scans": 0, "total_processed": 0, "last_scan_ts": "", "last_message_internal_date": ""}
         else:
-            active = _run_storage_query(get_active_cards(mailbox))
+            page_result = _run_storage_query(get_active_cards_page(mailbox, offset, limit))
+            active = page_result["active"]
+            total = page_result["total"]
             state = _run_storage_query(get_scan_state(mailbox))
             scan_state = {
                 "last_scan_ts": getattr(state, "last_scan_ts", ""),
@@ -2640,18 +2653,13 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
                 "total_scans": getattr(state, "total_scans", 0),
                 "total_processed": getattr(state, "total_processed", 0),
             }
-
-        total = len(active.cards)
-        page = active.cards[offset:offset + limit] if limit > 0 else active.cards
-        from mail_agent.storage.types import ActiveCards as ActiveCardsType
-        page_active = ActiveCardsType(cards=list(page), updated_at=active.updated_at)
-
-        action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
+            action_count = 0  # computed below from active page for consistency; full count would need all cards
+            action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
 
         return {
-            "cards": cards_to_frontend(page_active),
+            "cards": cards_to_frontend(active),
             "total": total,
-            "count": len(page),
+            "count": len(active.cards),
             "has_more": (offset + limit) < total if limit > 0 else False,
             "offset": offset,
             "limit": limit,
@@ -2685,10 +2693,16 @@ def get_mail_agent_run(run_id_arg: str) -> dict[str, Any]:
     status = state.get("status")
     result = _compact_run_result(state.get("result"))
     cards = None
+    scan_state = None
     if status == "done":
         full_result = state.get("result")
         if isinstance(full_result, dict):
             cards = full_result.get("cards")
+            # Provide scan_state from the pipeline result so the frontend
+            # shows category tabs immediately without needing loadActiveCards.
+            scan_state = full_result.get("scan_state")
+            if not isinstance(scan_state, dict):
+                scan_state = {"total_scans": 1, "total_processed": 0}
     return {
         "success": True,
         "run_id": run_id,
@@ -2702,6 +2716,7 @@ def get_mail_agent_run(run_id_arg: str) -> dict[str, Any]:
         "error": state.get("error") or "",
         "result": result,
         "cards": cards,
+        "scan_state": scan_state,
     }
 
 
@@ -2932,6 +2947,15 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             contact_ctx = asdict(contact)
         except Exception:
             contact_ctx = {}
+        # Load full cleanup bundle if this is a cleanup card
+        if card.card_type == "cleanup_bundle" and card.bundled_count > 0:
+            from mail_agent.storage.ops import get_cleanup_bundle
+            try:
+                full_bundled = await get_cleanup_bundle(mailbox)
+                if full_bundled:
+                    card.bundled_messages = full_bundled
+            except Exception:
+                pass
         return {
             "card": _serialize_card_for_frontend(card),
             "thread_context": thread_ctx,
@@ -3148,12 +3172,15 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             except Exception:
                 pass
         # If it's a cleanup bundle card, mark messages as UNREAD in Gmail
-        if card and card.card_type == "cleanup_bundle" and card.bundled_messages:
+        if card and card.card_type == "cleanup_bundle" and card.bundled_count > 0:
             try:
+                from mail_agent.storage.ops import get_cleanup_bundle
+                full_bundled = await get_cleanup_bundle(mailbox)
+                bundled = full_bundled if full_bundled else card.bundled_messages
                 import json as _json3
                 import urllib.request as _ur2
                 from mail_agent.mail_providers.gmail.adapter import get_access_token as _gt2
-                msg_ids = [str(m.get("message_id", "")) for m in card.bundled_messages if str(m.get("message_id", ""))]
+                msg_ids = [str(m.get("message_id", "")) for m in bundled if str(m.get("message_id", ""))]
                 if msg_ids:
                     token = _gt2(mailbox)
                     body = _json3.dumps({"ids": msg_ids, "addLabelIds": ["UNREAD"]}).encode("utf-8")

@@ -964,16 +964,33 @@ async def _persist_run_results_locked(
             card = build_card(c, j, msg, mailbox)
             new_cards.append(card)
 
-    # 2a. Build cleanup bundle from Phase 1 low-value items
+    # 2a. Build cleanup bundle — persist full list separately, store preview in card
+    cleanup_full: list[dict[str, Any]] = []
     if low_value_items:
-        cleanup_card = build_cleanup_bundle(run_id, mailbox, low_value_items, messages)
-        if cleanup_card:
+        cleanup_card, cleanup_full = build_cleanup_bundle(run_id, mailbox, low_value_items, messages)
+        if cleanup_card is not None:
             new_cards.append(cleanup_card)
 
-    # 3. Merge with existing active cards
+    # 3. Persist full cleanup bundle separately (card only stores preview)
+    if cleanup_full:
+        from ..storage.ops import get_cleanup_bundle as _gcb, set_cleanup_bundle as _scb
+        existing_cleanup = await _gcb(mailbox)
+        seen_cleanup: set[str] = {str(m.get("message_id", "")) for m in existing_cleanup if m.get("message_id")}
+        for m in cleanup_full:
+            if str(m.get("message_id", "")) not in seen_cleanup:
+                existing_cleanup.append(m)
+                seen_cleanup.add(str(m.get("message_id", "")))
+        await _scb(mailbox, existing_cleanup)
+        # Update card's bundled_count to reflect the merged total
+        for c in new_cards:
+            if getattr(c, "card_type", "") == "cleanup_bundle":
+                c.bundled_count = len(existing_cleanup)
+
+    # 4. Merge with existing active cards
     existing = await get_active_cards(mailbox)
     merged = merge_cards(existing, new_cards)
     await set_active_cards(mailbox, merged)
+
     try:
         from ..contact_memory.indexer import ingest_card_event, ingest_thread_observation
         card_thread_ids = {card.thread_id for card in new_cards if getattr(card, "thread_id", "")}

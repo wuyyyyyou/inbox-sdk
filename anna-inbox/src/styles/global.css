@@ -3836,7 +3836,7 @@
 
     .mailbox-source-row {
       display: grid;
-      grid-template-columns: auto auto minmax(0, 1fr);
+      grid-template-columns: auto auto minmax(0, 1fr) auto;
       align-items: flex-start;
       gap: 10px;
       cursor: pointer;
@@ -4476,11 +4476,16 @@
 .auth-status.is-off { color: var(--rose); }
 
 .mailbox-config-arrow {
-      font-size: 10px;
+      align-self: center;
+      justify-self: end;
+      width: 28px;
+      height: 28px;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 999px;
       color: var(--text-muted);
-      flex-shrink: 0;
-      margin-left: auto;
-      padding-left: 8px;
+      font-size: 13px;
+      line-height: 1;
     }
 
     .mailbox-config-hint {

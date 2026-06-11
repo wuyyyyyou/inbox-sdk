@@ -161,7 +161,8 @@ class PersistentCard:
     resolution: str = ""         # "no_action_needed" | "handled_manually" | "dismissed"
     # cleanup bundle
     card_type: str = ""          # "cleanup_bundle" for folded low-priority cards
-    bundled_messages: list = field(default_factory=list)  # list of BundledMessage dicts
+    bundled_messages: list = field(default_factory=list)  # preview: first 3 items
+    bundled_count: int = 0       # total count of cleanup messages
     user_action: str = ""        # "reply" | "review" — drives frontend category tabs
     reply_gaps: dict = field(default_factory=dict)  # {needs_user_input, summary, questions: [{id, question, hint, required}]}
 

@@ -322,28 +322,133 @@ async def is_message_processed(mailbox: str, message_id: str) -> bool:
     return bool(result.get("exists"))
 
 
-# ── Active cards ────────────────────────────────────────────────────
+# ── Active cards (sharded) ───────────────────────────────────────────
 
-def _cards_key(mailbox: str) -> str:
+ACTIVE_CARDS_SHARD_SIZE = 50
+
+
+def _cards_index_key(mailbox: str) -> str:
+    return f"{_mailbox_prefix(mailbox)}/cards/active_index"
+
+
+def _cards_shard_key(mailbox: str, shard_index: int) -> str:
+    return f"{_mailbox_prefix(mailbox)}/cards/active_{shard_index:04d}"
+
+
+def _cards_legacy_key(mailbox: str) -> str:
     return f"{_mailbox_prefix(mailbox)}/cards/active"
 
 
-async def \
-        get_active_cards(mailbox: str) -> ActiveCards:
-    result = await get_storage().get(_cards_key(mailbox), scope=default_scope())
-    if result.get("exists") and result.get("value"):
-        raw = result["value"]
-        cards = [_dict_to_persistent_card(c) for c in raw.get("cards", [])]
-        cards.sort(key=lambda c: (_priority_rank(c.priority), c.created_at or ""), reverse=True)
-        return ActiveCards(cards=cards, updated_at=raw.get("updated_at", ""))
-    return ActiveCards()
+async def _migrate_legacy_cards(mailbox: str) -> bool:
+    """One-shot migration: read old single-file cards, write sharded format."""
+    legacy = await get_storage().get(_cards_legacy_key(mailbox), scope=default_scope())
+    if not legacy.get("exists") or not legacy.get("value"):
+        return False
+    raw = legacy["value"]
+    cards = [_dict_to_persistent_card(c) for c in raw.get("cards", [])]
+    cards.sort(key=lambda c: (_priority_rank(c.priority), c.created_at or ""), reverse=True)
+    active = ActiveCards(cards=cards, updated_at=raw.get("updated_at", "") or _now())
+    await _set_active_cards_sharded(mailbox, active)
+    await get_storage().delete(_cards_legacy_key(mailbox), scope=default_scope())
+    return True
+
+
+async def _set_active_cards_sharded(mailbox: str, cards: ActiveCards) -> dict:
+    """Write cards in shards + index."""
+    cards.updated_at = _now()
+    total = len(cards.cards)
+    shard_count = max(1, (total + ACTIVE_CARDS_SHARD_SIZE - 1) // ACTIVE_CARDS_SHARD_SIZE)
+    storage = get_storage()
+    for i in range(shard_count):
+        shard_cards = cards.cards[i * ACTIVE_CARDS_SHARD_SIZE:(i + 1) * ACTIVE_CARDS_SHARD_SIZE]
+        await storage.set(
+            _cards_shard_key(mailbox, i),
+            _dataclass_to_dict(ActiveCards(cards=shard_cards, updated_at=cards.updated_at)),
+            scope=default_scope(),
+        )
+    # Delete stale shards beyond current count
+    idx_result = await storage.get(_cards_index_key(mailbox), scope=default_scope())
+    old_count = 0
+    if idx_result.get("exists") and isinstance(idx_result.get("value"), dict):
+        old_count = int(idx_result["value"].get("shards", 0))
+    for i in range(shard_count, old_count):
+        try:
+            await storage.delete(_cards_shard_key(mailbox, i), scope=default_scope())
+        except Exception:
+            pass
+    await storage.set(
+        _cards_index_key(mailbox),
+        {"shards": shard_count, "total_cards": total, "updated_at": cards.updated_at},
+        scope=default_scope(),
+    )
+    await update_mailbox_registry_fields(mailbox, card_count=total)
+    return {"ok": True, "shards": shard_count, "total_cards": total}
+
+
+async def get_active_cards(mailbox: str) -> ActiveCards:
+    result = await get_storage().get(_cards_index_key(mailbox), scope=default_scope())
+    if not result.get("exists") or not isinstance(result.get("value"), dict):
+        # Try legacy migration
+        if await _migrate_legacy_cards(mailbox):
+            return await get_active_cards(mailbox)
+        return ActiveCards()
+    idx = result["value"]
+    shard_count = int(idx.get("shards", 0))
+    updated_at = str(idx.get("updated_at", ""))
+    all_cards: list[PersistentCard] = []
+    for i in range(shard_count):
+        shard_result = await get_storage().get(_cards_shard_key(mailbox, i), scope=default_scope())
+        if shard_result.get("exists") and shard_result.get("value"):
+            raw = shard_result["value"]
+            for c in raw.get("cards", []):
+                all_cards.append(_dict_to_persistent_card(c))
+    all_cards.sort(key=lambda c: (_priority_rank(c.priority), c.created_at or ""), reverse=True)
+    return ActiveCards(cards=all_cards, updated_at=updated_at)
+
+
+async def get_active_cards_page(mailbox: str, offset: int = 0, limit: int = 50) -> dict:
+    """Return one page of active cards directly from a single shard when possible."""
+    result = await get_storage().get(_cards_index_key(mailbox), scope=default_scope())
+    if not result.get("exists") or not isinstance(result.get("value"), dict):
+        if await _migrate_legacy_cards(mailbox):
+            return await get_active_cards_page(mailbox, offset, limit)
+        return {"active": ActiveCards(), "total": 0, "has_more": False}
+    idx = result["value"]
+    total = int(idx.get("total_cards", 0))
+    shard_count = int(idx.get("shards", 0))
+    updated_at = str(idx.get("updated_at", ""))
+    page_cards: list[PersistentCard] = []
+    # Each non-last shard has exactly ACTIVE_CARDS_SHARD_SIZE cards
+    global_offset = 0
+    for i in range(shard_count):
+        shard_size = ACTIVE_CARDS_SHARD_SIZE if i < shard_count - 1 else total - (shard_count - 1) * ACTIVE_CARDS_SHARD_SIZE
+        shard_start = global_offset
+        shard_end = global_offset + shard_size
+        global_offset = shard_end
+        # Does this shard overlap with [offset, offset+limit)?
+        if shard_end <= offset or shard_start >= offset + limit:
+            continue
+        shard_result = await get_storage().get(_cards_shard_key(mailbox, i), scope=default_scope())
+        if shard_result.get("exists") and shard_result.get("value"):
+            raw_cards = shard_result["value"].get("cards", [])
+            for j, c in enumerate(raw_cards):
+                card_pos = shard_start + j
+                if offset <= card_pos < offset + limit:
+                    page_cards.append(_dict_to_persistent_card(c))
+                elif card_pos >= offset + limit:
+                    break
+        if global_offset >= offset + limit:
+            break
+    page_active = ActiveCards(cards=page_cards, updated_at=updated_at)
+    return {
+        "active": page_active,
+        "total": total,
+        "has_more": (offset + limit) < total,
+    }
 
 
 async def set_active_cards(mailbox: str, cards: ActiveCards) -> dict:
-    cards.updated_at = _now()
-    result = await get_storage().set(_cards_key(mailbox), _dataclass_to_dict(cards), scope=default_scope())
-    await update_mailbox_registry_fields(mailbox, card_count=len(cards.cards))
-    return result
+    return await _set_active_cards_sharded(mailbox, cards)
 
 
 async def update_card_status(
@@ -361,6 +466,72 @@ async def update_card_status(
             await set_active_cards(mailbox, active)
             return card
     return None
+
+
+# ── Cleanup bundle (sharded, separate from active cards) ────────────
+
+CLEANUP_SHARD_SIZE = 50
+
+
+def _cleanup_index_key(mailbox: str) -> str:
+    return f"{_mailbox_prefix(mailbox)}/cards/cleanup_index"
+
+
+def _cleanup_shard_key(mailbox: str, shard_index: int) -> str:
+    return f"{_mailbox_prefix(mailbox)}/cards/cleanup_{shard_index:04d}"
+
+
+def _cleanup_legacy_key(mailbox: str) -> str:
+    return f"{_mailbox_prefix(mailbox)}/cards/cleanup_bundle"
+
+
+async def get_cleanup_bundle(mailbox: str) -> list[dict[str, Any]]:
+    result = await get_storage().get(_cleanup_index_key(mailbox), scope=default_scope())
+    if not result.get("exists") or not isinstance(result.get("value"), dict):
+        # Try legacy single-file migration
+        legacy = await get_storage().get(_cleanup_legacy_key(mailbox), scope=default_scope())
+        if legacy.get("exists") and isinstance(legacy.get("value"), list):
+            messages = legacy["value"]
+            await set_cleanup_bundle(mailbox, messages)
+            await get_storage().delete(_cleanup_legacy_key(mailbox), scope=default_scope())
+            return messages
+        return []
+    idx = result["value"]
+    shard_count = int(idx.get("shards", 0))
+    all_msgs: list[dict[str, Any]] = []
+    for i in range(shard_count):
+        shard = await get_storage().get(_cleanup_shard_key(mailbox, i), scope=default_scope())
+        if shard.get("exists") and isinstance(shard.get("value"), list):
+            all_msgs.extend(shard["value"])
+    return all_msgs
+
+
+async def set_cleanup_bundle(mailbox: str, messages: list[dict[str, Any]]) -> dict:
+    total = len(messages)
+    shard_count = max(1, (total + CLEANUP_SHARD_SIZE - 1) // CLEANUP_SHARD_SIZE) if total > 0 else 0
+    storage = get_storage()
+    if shard_count == 0:
+        await storage.set(_cleanup_index_key(mailbox), {"shards": 0, "total": 0, "updated_at": _now()}, scope=default_scope())
+        return {"ok": True, "shards": 0, "total": 0}
+    for i in range(shard_count):
+        s = messages[i * CLEANUP_SHARD_SIZE:(i + 1) * CLEANUP_SHARD_SIZE]
+        await storage.set(_cleanup_shard_key(mailbox, i), s, scope=default_scope())
+    # Delete stale shards
+    idx_result = await storage.get(_cleanup_index_key(mailbox), scope=default_scope())
+    old_count = 0
+    if idx_result.get("exists") and isinstance(idx_result.get("value"), dict):
+        old_count = int(idx_result["value"].get("shards", 0))
+    for i in range(shard_count, old_count):
+        try:
+            await storage.delete(_cleanup_shard_key(mailbox, i), scope=default_scope())
+        except Exception:
+            pass
+    await storage.set(
+        _cleanup_index_key(mailbox),
+        {"shards": shard_count, "total": total, "updated_at": _now()},
+        scope=default_scope(),
+    )
+    return {"ok": True, "shards": shard_count, "total": total}
 
 
 # ── Run records ─────────────────────────────────────────────────────
@@ -439,6 +610,21 @@ async def clear_cards_by_category(mailbox: str, category: str) -> int:
     if removed > 0:
         await set_active_cards(mailbox, active)
         await update_mailbox_registry_fields(mailbox, card_count=len(active.cards))
+        # Also clear the separate cleanup bundle if applicable
+        if category in ("all", "cleanup"):
+            try:
+                # Delete cleanup shards + index + legacy key
+                idx = await get_storage().get(_cleanup_index_key(mailbox), scope=default_scope())
+                if idx.get("exists") and isinstance(idx.get("value"), dict):
+                    for i in range(int(idx["value"].get("shards", 0))):
+                        try:
+                            await get_storage().delete(_cleanup_shard_key(mailbox, i), scope=default_scope())
+                        except Exception:
+                            pass
+                await get_storage().delete(_cleanup_index_key(mailbox), scope=default_scope())
+                await get_storage().delete(_cleanup_legacy_key(mailbox), scope=default_scope())
+            except Exception:
+                pass
     return removed
 
 
@@ -455,11 +641,35 @@ async def reset_all_data() -> dict:
         mbox = entry.email
         prefix = _mailbox_prefix(mbox)
         # Use correct key suffixes matching _cards_key, _scan_key etc
-        for sub in ("cards/active", "scan_state", "scan_plan", "processed"):
+        for sub in ("cards/active", "cards/active_index", "cards/cleanup_bundle", "cards/cleanup_index", "scan_state", "scan_plan", "processed"):
             try:
                 await storage.delete(f"{prefix}/{sub}", scope=default_scope())
             except Exception:
                 pass
+        # Delete all card shards for this mailbox
+        try:
+            idx_result = await storage.get(f"{prefix}/cards/active_index", scope=default_scope())
+            if idx_result.get("exists") and isinstance(idx_result.get("value"), dict):
+                shard_count = int(idx_result["value"].get("shards", 0))
+                for i in range(shard_count):
+                    try:
+                        await storage.delete(f"{prefix}/cards/active_{i:04d}", scope=default_scope())
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Delete all cleanup shards for this mailbox
+        try:
+            cleanup_idx = await storage.get(f"{prefix}/cards/cleanup_index", scope=default_scope())
+            if cleanup_idx.get("exists") and isinstance(cleanup_idx.get("value"), dict):
+                for i in range(int(cleanup_idx["value"].get("shards", 0))):
+                    try:
+                        await storage.delete(f"{prefix}/cards/cleanup_{i:04d}", scope=default_scope())
+                    except Exception:
+                        pass
+            await storage.delete(f"{prefix}/cards/cleanup_index", scope=default_scope())
+        except Exception:
+            pass
         # Contact memories
         try:
             from ..contact_memory.store import list_contact_memories, clear_contact_memories
@@ -630,6 +840,7 @@ def _dict_to_persistent_card(d: dict) -> PersistentCard:
         resolution=d.get("resolution", ""),
         card_type=d.get("card_type", ""),
         bundled_messages=d.get("bundled_messages", []),
+        bundled_count=d.get("bundled_count", 0),
         user_action=d.get("user_action", ""),
         reply_gaps=d.get("reply_gaps", {}) if isinstance(d.get("reply_gaps"), dict) else {},
     )
