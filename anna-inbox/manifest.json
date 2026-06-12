@@ -14,7 +14,7 @@
   ],
   "required_executas": [
     {
-      "tool_id": "tool-zhaopy-inbox-executa-8jj3cw76",
+      "tool_id": "tool-peiyuan-inbox-executa-yhbzbap8",
       "min_version": "0.6.0",
       "version": "latest"
     }
@@ -54,7 +54,7 @@
     ],
     "host_api": {
       "tools": [
-        "required:tool-zhaopy-inbox-executa-8jj3cw76"
+        "required:tool-peiyuan-inbox-executa-yhbzbap8"
       ],
       "chat": [
         "write_message"
