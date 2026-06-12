@@ -3,7 +3,7 @@
   "tool_id": "tool-peiyuan-inbox-executa-yhbzbap8",
   "name": "tool-peiyuan-inbox-executa-yhbzbap8",
   "display_name": "Anna Inbox Executa",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "python",
   "enabled": true,
   "description": "Anna Inbox — Gmail agent that surfaces attention cards and drafts replies via Executa Sampling LLM.",

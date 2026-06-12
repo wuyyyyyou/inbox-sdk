@@ -2807,7 +2807,7 @@
     .original-body-html {
       white-space: normal;
       overflow-wrap: break-word;
-      word-break: break-word;
+      word-break: break-all;
     }
 
     .original-body-html.is-clamped {
@@ -2851,7 +2851,7 @@
 
     .original-body-html pre {
       white-space: pre-wrap;
-      word-break: break-word;
+      word-break: break-all;
     }
 
     .original-body-html blockquote {
@@ -5997,6 +5997,9 @@
 .detail-card .original-body,
 .detail-card .original-body * {
   max-width: 100%;
+  word-break: break-all;
+  overflow-wrap: break-word;
+  white-space: pre-wrap !important;
 }
 
 /* ── Original email block inside card details ─────────────────────── */

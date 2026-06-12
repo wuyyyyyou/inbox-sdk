@@ -189,6 +189,7 @@ export function HandleView() {
           <section className="review-block">
             <div
               className={`original-body original-body-html${bodyTruncated && !bodyExpanded ? " is-clamped" : ""}`}
+              style={{ wordBreak: "break-all", overflowWrap: "break-word" }}
               dangerouslySetInnerHTML={{
                 __html: DOMPurify.sanitize(latestBodyHtml, {
                   ALLOWED_TAGS: [
