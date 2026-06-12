@@ -127,6 +127,7 @@
       position: relative;
       z-index: 2;
       display: grid;
+      grid-template-columns: minmax(0, 1fr);
       grid-template-rows: auto 1fr auto;
       overflow: hidden;
       border-radius: 0;
@@ -2786,6 +2787,9 @@
     .toggle.is-on span { transform: translateX(18px); }
 
     .original-body {
+      min-width: 0;
+      max-width: 100%;
+      overflow-x: hidden;
       padding: 14px;
       border-radius: 18px;
       background: rgba(255,255,255,0.58);
@@ -2794,6 +2798,8 @@
       font-size: 13px;
       line-height: 1.55;
       white-space: pre-wrap;
+      overflow-wrap: break-word;
+      word-break: break-all;
     }
 
     /* ── HTML email body ── */
@@ -2834,6 +2840,7 @@
 
     .original-body-html table {
       max-width: 100%;
+      table-layout: fixed;
       border-collapse: collapse;
     }
 
@@ -4635,18 +4642,23 @@
 .detail-shell {
   max-width: 860px;
   width: 100%;
+  min-width: 0;
   margin: 0 auto;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
+  overflow-x: hidden;
 }
 
 .detail-card {
+  min-width: 0;
   padding: 18px;
   border-radius: 24px;
   border: 1px solid rgba(255,255,255,0.66);
   background: rgba(250,250,252,0.62);
   backdrop-filter: blur(20px);
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 13px;
   box-shadow: 0 12px 34px rgba(43,35,86,0.06);
 }
@@ -5733,11 +5745,13 @@
 }
 
 .review-block {
+  min-width: 0;
   padding: 12px;
   border-radius: var(--radius-lg);
   background: rgba(255,255,255,0.38);
   border: 1px solid rgba(93,82,128,0.07);
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
 }
 
@@ -5791,10 +5805,13 @@
 }
 
 .review-block p {
+  min-width: 0;
   margin: 0;
   color: var(--text-muted);
   font-size: 13px;
   line-height: 1.45;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .review-block ul {
@@ -5907,6 +5924,79 @@
 .review-block.is-loading {
   animation: blockPulse 1.6s ease-in-out infinite;
   pointer-events: none;
+}
+
+.email-body-loading {
+  gap: 14px;
+  background:
+    radial-gradient(circle at 0% 0%, rgba(139,124,248,0.08), transparent 42%),
+    rgba(255,255,255,0.58);
+}
+
+.email-body-loading-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.email-body-loading-dot {
+  width: 9px;
+  height: 9px;
+  margin-top: 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 6px rgba(139,124,248,0.12);
+  animation: askDotPulse 1.25s ease-in-out infinite;
+}
+
+.email-body-loading-title {
+  margin: 0;
+  color: var(--text-main);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.email-body-loading-copy {
+  margin: 2px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.email-body-skeleton {
+  display: grid;
+  gap: 8px;
+}
+
+.email-body-skeleton span {
+  height: 10px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(119,114,135,0.09), rgba(139,124,248,0.18), rgba(119,114,135,0.09));
+  background-size: 220% 100%;
+  animation: askLoadingBar 1.4s ease-in-out infinite;
+}
+
+.email-body-skeleton span:nth-child(1) { width: 96%; }
+.email-body-skeleton span:nth-child(2) { width: 88%; animation-delay: 0.06s; }
+.email-body-skeleton span:nth-child(3) { width: 74%; animation-delay: 0.12s; }
+.email-body-skeleton span:nth-child(4) { width: 91%; animation-delay: 0.18s; }
+.email-body-skeleton span:nth-child(5) { width: 52%; animation-delay: 0.24s; }
+
+.detail-card .original-body {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  overflow-x: hidden;
+  overflow-wrap: break-word;
+  word-break: break-all;
+}
+
+.detail-card .original-body,
+.detail-card .original-body * {
+  max-width: 100%;
 }
 
 /* ── Original email block inside card details ─────────────────────── */

@@ -72,7 +72,9 @@
       "Bash(cmd.exe /c \"npm view @anna-ai/cli version 2>&1\")",
       "Read(//c/Users/24848/AppData/Roaming/npm/**)",
       "Bash(uv run *)",
-      "Bash(dir *)"
+      "Bash(dir *)",
+      "Bash(grep -oP '\\(?<=\\\\.app-shell\\\\{|\\\\\\\\.detail-shell\\\\{|\\\\\\\\.detail-card\\\\{|\\\\\\\\.review-block\\\\{|\\\\\\\\.original-body\\\\{\\)[^}]*' bundle/style.css)",
+      "Bash(grep -oP '.{0,100}Anna can read the full thread.{0,200}' bundle/app.js)"
     ]
   }
 }

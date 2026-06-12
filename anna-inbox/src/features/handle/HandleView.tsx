@@ -82,9 +82,10 @@ export function HandleView() {
   const key = card.uiKey || card.id;
   const original = card.original || {};
   const detail = state.selectedCardDetail || {};
+  const detailLoaded = Boolean(state.selectedCardDetail);
   const context = detail.thread_context || {};
   const contactContext = detail.contact_context || {};
-  const latestBody = detail.latest_body || original.body || "";
+  const latestBody = detail.latest_body || "";
   const latestBodyHtml = detail.latest_body_html || "";
   const summary = state.threadSummaryById[key];
   const draft = state.draftById[key] || "";
@@ -101,7 +102,6 @@ export function HandleView() {
   const draftDisplay = state.generatingDraft && !draft ? "Anna is drafting a reply..." : draft;
   const nid = nextCardId(state);
   const messageCount = Number(context.message_count || 1);
-  const isSingleShort = messageCount <= 1 && asString(original.body || "").trim().length <= 280;
   const relatedContext = contactContextLines(contactContext);
   const BODY_PREVIEW = 500;
   const bodyTruncated = latestBodyHtml
@@ -113,7 +113,8 @@ export function HandleView() {
       return <section className="review-block is-summary is-loading"><p>Anna is reading the thread and preparing a summary...</p></section>;
     }
     if (!summary) {
-      if (isSingleShort) {
+      if (!detailLoaded) return null;
+      if (messageCount <= 1) {
         if (!relatedContext.length) return null;
         return (
           <section className="review-block is-summary">
@@ -167,7 +168,24 @@ export function HandleView() {
           </div>
           <span className={`category-tag ${hasDraft ? "is-ready-state" : ""}`}>{hasDraft ? "Reply ready" : "Needs review"}</span>
         </div>
-        {latestBodyHtml ? (
+        {!detailLoaded ? (
+          <section className="review-block is-loading email-body-loading">
+            <div className="email-body-loading-head">
+              <span className="email-body-loading-dot" aria-hidden="true" />
+              <div>
+                <p className="email-body-loading-title">Loading full email...</p>
+                <p className="email-body-loading-copy">Fetching the message body and preparing images.</p>
+              </div>
+            </div>
+            <div className="email-body-skeleton" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+              <span />
+              <span />
+            </div>
+          </section>
+        ) : latestBodyHtml ? (
           <section className="review-block">
             <div
               className={`original-body original-body-html${bodyTruncated && !bodyExpanded ? " is-clamped" : ""}`}
@@ -204,7 +222,7 @@ export function HandleView() {
           </section>
         ) : latestBody ? (
           <section className="review-block">
-            <div className="original-body" style={{ whiteSpace: "pre-wrap" }}>
+            <div className="original-body" style={{ whiteSpace: "pre-wrap", wordBreak: "break-all", overflowWrap: "break-word" }}>
               {bodyTruncated && !bodyExpanded ? latestBody.slice(0, BODY_PREVIEW) + "…" : latestBody}
             </div>
             {bodyTruncated ? (
@@ -213,7 +231,11 @@ export function HandleView() {
               </button>
             ) : null}
           </section>
-        ) : null}
+        ) : (
+          <section className="review-block is-quiet">
+            <p>Full email body is not available for this card.</p>
+          </section>
+        )}
         {summaryBlock()}
         <section className={`review-block is-composer ${state.generatingDraft ? "is-loading" : ""}`}>
           <h3 className="review-block-title">Draft reply</h3>

@@ -24,7 +24,7 @@ for _stream in (sys.stdin, sys.stdout):
     try:
         _stream.reconfigure(encoding="utf-8")
     except Exception:
-        log(f"reconfigure {_stream} failed")
+        pass
 
 # Ensure src/ is on sys.path so mail_agent and executa_sdk are importable
 # when running via `py -3 src/anna_inbox_executa/main.py`

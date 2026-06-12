@@ -326,6 +326,85 @@ def _resolve_cid_images(html_text: str, payload: dict[str, Any]) -> str:
     return html_text
 
 
+def _inline_remote_images(
+    html_text: str,
+    *,
+    max_images: int = 8,
+    max_image_bytes: int = 96 * 1024,
+    max_total_bytes: int = 220 * 1024,
+    timeout: float = 3.0,
+) -> str:
+    """把远程邮件图片转成 data URI，适配 Anna 宿主的图片 CSP。"""
+    if not html_text:
+        return html_text
+
+    import base64
+    import re
+    import urllib.parse
+    import urllib.request
+
+    transparent_gif = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+    inlined_count = 0
+    total_bytes = 0
+    cache: dict[str, str] = {}
+
+    def _fetch_image(url: str) -> str:
+        nonlocal inlined_count, total_bytes
+        if url in cache:
+            return cache[url]
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            cache[url] = url
+            return url
+        if inlined_count >= max_images or total_bytes >= max_total_bytes:
+            cache[url] = transparent_gif
+            return transparent_gif
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 AnnaInbox/1.0",
+                    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                },
+                method="GET",
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                content_type = str(response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > max_image_bytes:
+                    cache[url] = transparent_gif
+                    return transparent_gif
+                data = response.read(max_image_bytes + 1)
+            if len(data) > max_image_bytes or total_bytes + len(data) > max_total_bytes:
+                cache[url] = transparent_gif
+                return transparent_gif
+            if not content_type.startswith("image/"):
+                content_type = "image/png"
+            total_bytes += len(data)
+            inlined_count += 1
+            cache[url] = f"data:{content_type};base64,{base64.b64encode(data).decode('ascii')}"
+            return cache[url]
+        except Exception:
+            cache[url] = transparent_gif
+            return transparent_gif
+
+    def _replace_src(match: re.Match[str]) -> str:
+        prefix = match.group(1)
+        quote = match.group(2)
+        src = match.group(3).strip()
+        if src.startswith(("data:", "blob:", "cid:")):
+            return match.group(0)
+        return f"{prefix}{quote}{_fetch_image(src)}{quote}"
+
+    # 只处理 img 的 src，避免改动链接 href。
+    return re.sub(
+        r"(<img\b[^>]*?\bsrc\s*=\s*)([\"'])([^\"']+)\2",
+        _replace_src,
+        html_text,
+        flags=re.IGNORECASE,
+    )
+
+
 def extract_attachments(part: dict[str, Any]) -> list[dict[str, Any]]:
     attachments: list[dict[str, Any]] = []
 

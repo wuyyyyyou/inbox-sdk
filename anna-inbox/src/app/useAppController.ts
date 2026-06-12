@@ -626,6 +626,7 @@ export function useAppController() {
           cards: filterCardsByMailboxes(s.allCards, selectedMailboxes),
           actionCount: actionCount(filterCardsByMailboxes(s.allCards, selectedMailboxes)),
         }));
+        await loadActiveCards();
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       }

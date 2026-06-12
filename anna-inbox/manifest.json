@@ -15,7 +15,7 @@
   "required_executas": [
     {
       "tool_id": "tool-peiyuan-inbox-executa-yhbzbap8",
-      "min_version": "0.6.1",
+      "min_version": "1.0.0",
       "version": "latest"
     }
   ],

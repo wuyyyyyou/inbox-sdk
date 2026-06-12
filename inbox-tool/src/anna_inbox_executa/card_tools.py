@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from anna_inbox_executa.common import *
+from anna_inbox_executa.sampling_tools import _build_sampling_for_run
 
 def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
     """同步入口通过统一 storage_ops 读取 active cards 和 scan state。"""

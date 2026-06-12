@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from anna_inbox_executa.common import *
 from anna_inbox_executa.sampling_tools import *
+from anna_inbox_executa.mailbox_tools import _discover_mailboxes
 
 def _memory_mailboxes(arguments: dict[str, Any]) -> list[str]:
     raw_mailboxes = arguments.get("mailboxes")
