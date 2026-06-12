@@ -24,6 +24,14 @@ export function App() {
     ? `Scanning ${mailboxLabel}`
     : `${visibleCards(state.cards).length} active · ${mailboxLabel}`;
 
+  const llmStatusText = {
+    unknown: "unknown",
+    checking: "checking",
+    connected: "connected",
+    unavailable: "unavailable",
+    error: "error",
+  }[state.llmStatus.status] || "unknown";
+
   return (
     <AppContext.Provider value={{ state, actions }}>
       <div className="desktop">
@@ -38,8 +46,16 @@ export function App() {
               <div>
                 <div className="brand-title">Anna Inbox</div>
                 <div className="brand-subtitle">{subtitle}</div>
-                <div className={`connection-status ${state.runtime.connected ? "is-live" : "is-offline"}`}>
-                  {state.runtime.connected ? `Live · ${mailboxLabel}` : "Runtime not connected"}
+                <div className="connection-row">
+                  <span className={`connection-status ${state.runtime.connected ? "is-live" : "is-offline"}`}>
+                    {state.runtime.connected ? `Live · ${mailboxLabel}` : "Runtime not connected"}
+                  </span>
+                  {state.runtime.connected ? (
+                    <span className={`llm-status-chip is-${state.llmStatus.status}`} title={state.llmStatus.message || "Anna LLM status"}>
+                      <span className="llm-status-dot" />
+                      LLM {llmStatusText}
+                    </span>
+                  ) : null}
                 </div>
               </div>
             </div>

@@ -24,6 +24,7 @@ _SKIP_FILTER_THRESHOLD = 10
 
 # ── Filter ─────────────────────────────────────────────────────────────
 
+# 中文注释：候选数较少时跳过过滤 LLM，避免多消耗一次 sampling 调用。
 _FILTER_SYSTEM_PROMPT = """You are Anna's relevance filter. For each email header, answer one question:
 "Is this email relevant to the user's request?"
 

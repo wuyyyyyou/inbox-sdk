@@ -666,10 +666,11 @@ def list_threads_page(
     mailbox: str,
     page_token: str | None = None,
     max_results: int = THREAD_PAGE_SIZE,
+    query: str = "-in:chats",
 ) -> dict[str, Any]:
     """List one page of threads from Gmail, newest first. 50 threads per page."""
     query_params: dict[str, Any] = {
-        "q": "-in:chats",
+        "q": query or "-in:chats",
         "maxResults": min(max_results, 100),
         "fields": "threads(id,snippet,historyId),nextPageToken,resultSizeEstimate",
     }

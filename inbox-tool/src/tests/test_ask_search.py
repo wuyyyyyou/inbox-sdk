@@ -260,6 +260,55 @@ async def test_resolve_people_no_matches():
     print("[PASS] test_resolve_people_no_matches")
 
 
+async def test_execute_search_uses_gmail_query():
+    """execute_search 应该使用 Gmail query 搜索，而不是把 scan_plan dict 传给 run_mail_scan。"""
+    from mail_agent.ask.search import execute_search
+    from mail_agent.domain.types import MessageLite
+    from mail_agent.mail_providers.gmail import adapter
+
+    calls: list[tuple[str, str, int]] = []
+
+    def fake_live_search_and_cache(mailbox: str, query: str, max_results: int = 100, **_: object) -> list[str]:
+        calls.append((mailbox, query, max_results))
+        return ["m1"]
+
+    async def fake_get_messages_lite_async(mailbox: str, message_ids: list[str]) -> list[MessageLite]:
+        assert mailbox == "test@gmail.com"
+        assert message_ids == ["m1"]
+        return [
+            MessageLite(
+                message_id="m1",
+                thread_id="t1",
+                from_addr="alice@example.com",
+                to_addr="me@example.com",
+                cc="",
+                subject="Project update",
+                snippet="Please reply",
+                internal_date="1710000000000",
+                label_ids=["INBOX"],
+            )
+        ]
+
+    original_live_search = adapter.live_search_and_cache
+    original_get_lite = adapter.get_messages_lite_async
+    adapter.live_search_and_cache = fake_live_search_and_cache
+    adapter.get_messages_lite_async = fake_get_messages_lite_async
+    try:
+        messages = await execute_search(
+            "test@gmail.com",
+            [{"query": "from:alice newer_than:30d", "max_results": 25}],
+            max_broaden_attempts=0,
+        )
+    finally:
+        adapter.live_search_and_cache = original_live_search
+        adapter.get_messages_lite_async = original_get_lite
+
+    assert calls == [("test@gmail.com", "from:alice newer_than:30d", 25)]
+    assert len(messages) == 1
+    assert messages[0].message_id == "m1"
+    print("[PASS] test_execute_search_uses_gmail_query")
+
+
 # ── Main ────────────────────────────────────────────────────────────────
 
 async def main_async():
@@ -290,6 +339,9 @@ async def main_async():
     print("\n--- _resolve_people ---\n")
     await test_resolve_people_empty()
     await test_resolve_people_no_matches()
+
+    print("\n--- execute_search ---\n")
+    await test_execute_search_uses_gmail_query()
 
     print(f"\n[ALL TESTS PASSED]")
 

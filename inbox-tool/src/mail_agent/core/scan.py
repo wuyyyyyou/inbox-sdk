@@ -23,6 +23,45 @@ BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 _logger = logging.getLogger(__name__)
 
 
+def _build_thread_scan_query(newer_than_days: int | None = None) -> str:
+    """根据扫描窗口生成 Gmail thread 查询。"""
+    query = "-in:chats"
+    if newer_than_days is None:
+        return query
+    try:
+        days = int(newer_than_days)
+    except (TypeError, ValueError):
+        return query
+    if days > 0:
+        query = f"{query} newer_than:{days}d"
+    return query
+
+
+def _scan_cutoff_ms(newer_than_days: int | None = None) -> int | None:
+    """按北京时间计算扫描窗口的最早邮件时间戳。"""
+    if newer_than_days is None:
+        return None
+    try:
+        days = int(newer_than_days)
+    except (TypeError, ValueError):
+        return None
+    if days <= 0:
+        return None
+    cutoff = datetime.now(BEIJING_TZ) - timedelta(days=days)
+    return int(cutoff.timestamp() * 1000)
+
+
+def _within_scan_window(message: dict[str, Any], cutoff_ms: int | None) -> bool:
+    """判断邮件是否落在扫描窗口内。"""
+    if cutoff_ms is None:
+        return True
+    try:
+        internal_date = int(message.get("internal_date") or message.get("internalDate") or 0)
+    except (TypeError, ValueError):
+        return False
+    return internal_date >= cutoff_ms
+
+
 # ── 扫描计划构建 ─────────────────────────────────────────────────
 
 def _quote_or_term(term: str) -> str:
@@ -114,6 +153,7 @@ async def run_mail_scan(
     mailbox: str,
     max_threads: int = 100,
     *,
+    newer_than_days: int | None = None,
     progress_callback: Any = None,
 ) -> list[MessageLite]:
     """Paginate Gmail threads newest-first, 50 per page, until max_threads unique threads.
@@ -136,6 +176,8 @@ async def run_mail_scan(
     _clear_aps_cache_errors()
 
     normalized = normalize_mailbox(mailbox)
+    scan_query = _build_thread_scan_query(newer_than_days)
+    cutoff_ms = _scan_cutoff_ms(newer_than_days)
     all_messages: list[MessageLite] = []
     seen_threads: set[str] = set()
     page_token: str | None = None
@@ -146,14 +188,14 @@ async def run_mail_scan(
     while len(all_messages) < max_threads:
         # 1. List one page of threads (50 per call = 1 invoke)
         try:
-            page = list_threads_page(normalized, page_token=page_token)
+            page = list_threads_page(normalized, page_token=page_token, query=scan_query)
         except Exception as exc:
             # Fall back to local cache if Gmail API is unreachable
             fallback_used = True
             _logger.warning("threads.list failed, falling back to cache: %s", exc)
             cached = list_messages(normalized)
             for m in cached:
-                if isinstance(m, dict) and m.get("id"):
+                if isinstance(m, dict) and m.get("id") and _within_scan_window(m, cutoff_ms):
                     try:
                         all_messages.append(_to_message_lite(m))
                     except Exception:
@@ -189,6 +231,8 @@ async def run_mail_scan(
                 for msg in raw_msgs:
                     try:
                         n = _normalize_message(normalized, msg)
+                        if not _within_scan_window(n, cutoff_ms):
+                            continue
                         write_message(normalized, n)
                         normalized_msgs.append(n)
                     except Exception:
@@ -215,6 +259,7 @@ async def run_mail_scan(
             progress_callback("scan", {
                 "threads_fetched": len(all_messages),
                 "max_threads": max_threads,
+                "scan_window_days": newer_than_days,
                 "page_size": len(thread_ids),
             })
 

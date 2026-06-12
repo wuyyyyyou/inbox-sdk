@@ -4,6 +4,14 @@ export type CardStatus = "pending" | "snoozed" | "resolved" | "dismissed" | stri
 export type ResultFilter = "all" | "reply" | "review" | "cleanup";
 export type LlmProvider = "anna-llm" | "dashscope";
 export type StorageProvider = "aps" | "local";
+export type LlmStatusValue = "unknown" | "checking" | "connected" | "unavailable" | "error";
+
+export interface LlmStatus {
+  status: LlmStatusValue;
+  checked: boolean;
+  message?: string;
+  elapsed_ms?: number;
+}
 
 export interface MailboxInfo {
   email: string;
@@ -390,6 +398,7 @@ export interface AppState {
   minimized: boolean;
   resultFilter: ResultFilter;
   llmProvider: LlmProvider;
+  llmStatus: LlmStatus;
   storageProvider: StorageProvider;
   generatingDraft: boolean;
   draftDots: string;

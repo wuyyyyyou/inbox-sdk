@@ -374,6 +374,42 @@ export function useAppController() {
     }
   }, [client, state.mailbox]);
 
+  const refreshSamplingStatus = useCallback(async (): Promise<AppState["llmStatus"]> => {
+    setState((s) => ({ ...s, llmStatus: { ...s.llmStatus, status: "checking", message: "Checking Anna LLM..." } }));
+    try {
+      const result = await client.checkSamplingStatus();
+      const status = result.ok === false
+        ? (result.status === "error" ? "error" : "unavailable")
+        : (result.status || "connected");
+      const next: AppState["llmStatus"] = {
+        status: status === "connected" ? "connected" : status === "error" ? "error" : "unavailable",
+        checked: true,
+        message: result.message || (status === "connected" ? "Anna LLM sampling is connected." : "Anna LLM sampling is unavailable."),
+        elapsed_ms: result.elapsed_ms,
+      };
+      setState((s) => ({ ...s, llmStatus: next }));
+      return next;
+    } catch (error) {
+      const next: AppState["llmStatus"] = {
+        status: "error",
+        checked: true,
+        message: error instanceof Error ? error.message : String(error),
+      };
+      setState((s) => ({ ...s, llmStatus: next }));
+      return next;
+    }
+  }, [client]);
+
+  const ensureSamplingAvailable = useCallback(async (): Promise<boolean> => {
+    if (state.llmProvider !== "anna-llm") return true;
+    const status = await refreshSamplingStatus();
+    if (status.status === "connected") return true;
+    const message = "Anna LLM is unavailable. Please enable sampling permission for this Executa app, then try again.";
+    showToast(message);
+    setState((s) => ({ ...s, scanError: status.message ? `${message}\n${status.message}` : message }));
+    return false;
+  }, [refreshSamplingStatus, showToast, state.llmProvider]);
+
   const loadMailboxes = useCallback(async (storageOverride?: string): Promise<{ mailboxes: MailboxInfo[]; selected: string[]; primary: string }> => {
     const provider = storageOverride ?? state.storageProvider;
     try {
@@ -382,7 +418,8 @@ export function useAppController() {
       const selected = (Array.isArray(payload.selected) && payload.selected.length
         ? payload.selected
         : mailboxes.filter((item) => item.selected !== false).map((item) => item.email)
-      ).map(normalizedMailbox).filter(Boolean);
+      ).map(normalizedMailbox).filter(Boolean)
+        .filter((email) => mailboxes.find((m) => m.email === email)?.authorized !== false);
       const primary = selectedOrPrimary(selected, mailboxes[0]?.email || state.mailbox);
       setState((s) => ({
         ...s,
@@ -466,6 +503,7 @@ export function useAppController() {
       setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: systemAuthorized, source: authResult?.source || "none" } }));
       if (authWarning) showToast(`Auth notice: ${authWarning}`);
       if (runtime.connected) {
+        void refreshSamplingStatus();
         if (!systemAuthorized) {
           setState((s) => ({ ...s, loading: false }));
           return;
@@ -480,7 +518,7 @@ export function useAppController() {
       showToast(`Init failed: ${msg}`);
       setState((s) => ({ ...s, loading: false }));
     }
-  }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadMailboxes, loadRunHistory, loadScanPlan, showToast, state.mailbox]);
+  }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadMailboxes, loadRunHistory, loadScanPlan, refreshSamplingStatus, showToast, state.mailbox]);
 
   const actions: AppActions = {
     showToast,
@@ -635,6 +673,7 @@ export function useAppController() {
         showToast("Select at least one mailbox.");
         return;
       }
+      if (!(await ensureSamplingAvailable())) return;
       setState((s) => ({ ...s, isScanning: true, scanError: "", scanStatus: "", scanStepIndex: 0, scanStage: "scan", scanProgress: {}, resultFilter: "all" }));
       const contactMemoryJobs: Array<Record<string, unknown>> = [];
       try {
@@ -771,6 +810,7 @@ export function useAppController() {
     },
     async summarizeSelectedThread() {
       if (!state.selectedCard || state.summarizingThread) return;
+      if (!(await ensureSamplingAvailable())) return;
       const cardId = state.selectedCard.id;
       const key = state.selectedCard.uiKey || cardUiKey(state.selectedCard, state.mailbox);
       setState((s) => ({ ...s, summarizingThread: true }));
@@ -792,6 +832,7 @@ export function useAppController() {
     },
     async generateDraft(presetRevision, userAnswers?: Record<string, string>) {
       if (!state.selectedCard || state.generatingDraft) return;
+      if (!(await ensureSamplingAvailable())) return;
       const cardId = state.selectedCard.id;
       const key = state.selectedCard.uiKey || cardUiKey(state.selectedCard, state.mailbox);
       const currentDraft = state.draftById[key] || "";
@@ -962,6 +1003,7 @@ export function useAppController() {
     async startCustomScan() {
       const userRequest = state.customScanInput.trim();
       if (!userRequest || state.isCustomScanning) return;
+      if (!(await ensureSamplingAvailable())) return;
       setState((s) => ({
         ...s,
         isCustomScanning: true,
@@ -1017,6 +1059,7 @@ export function useAppController() {
     },
     async reRunCustomPlan(planId) {
       if (state.isCustomScanning) return;
+      if (!(await ensureSamplingAvailable())) return;
       const plan = state.customPlans.find((item) => item.plan_id === planId);
       const question = plan?.user_request || "Re-run saved scan";
       setState((s) => ({
@@ -1192,6 +1235,7 @@ export function useAppController() {
     },
     async generateAskDraftWithAnswers(actionKey, item, answers, mailboxOverride) {
       const mailbox = mailboxOverride || state.selectedMailboxes[0] || state.mailbox;
+      if (!(await ensureSamplingAvailable())) return;
       setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [actionKey]: { ...s.askItemActions[actionKey], sending: true } } }));
       try {
         const result = await client.generateAskDraft({
@@ -1201,6 +1245,7 @@ export function useAppController() {
           from_addr: item.from || "",
           subject: item.subject || "",
           user_answers: answers,
+          ai_provider: state.llmProvider,
         });
         const draftBody = result.body || result.note || "";
         setState((s) => ({

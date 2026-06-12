@@ -15,7 +15,7 @@
   "required_executas": [
     {
       "tool_id": "tool-zhaopy-inbox-executa-8jj3cw76",
-      "min_version": "0.5.3",
+      "min_version": "0.6.0",
       "version": "latest"
     }
   ],
@@ -79,6 +79,12 @@
       ],
       "style-src": [
         "'self'"
+      ],
+      "img-src": [
+        "'self'",
+        "data:",
+        "blob:",
+        "https:"
       ]
     },
     "state_merge": "last_writer_wins"

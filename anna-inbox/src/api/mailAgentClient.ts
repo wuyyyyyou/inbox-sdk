@@ -5,6 +5,7 @@ import type {
   ContactMemoryDetailPayload,
   ContactMemorySummary,
   CustomPlanSummary,
+  LlmStatus,
   MailboxInfo,
   RunHistoryEntry,
   RunStatus,
@@ -84,6 +85,10 @@ export class MailAgentClient {
 
   checkAnyGmailAuth() {
     return this.invoke<{ authorized?: boolean; source?: string; authorized_email?: string }>("check_gmail_auth", { mailbox: "" });
+  }
+
+  checkSamplingStatus() {
+    return this.invoke<LlmStatus & { ok?: boolean; code?: string; provider?: string }>("check_sampling_status", {}, { timeoutMs: 15_000 });
   }
 
   listMailboxes(storageProvider: string) {

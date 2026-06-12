@@ -59,6 +59,7 @@ export function createInitialState(): AppState {
     minimized: false,
     resultFilter: "all",
     llmProvider: "anna-llm",
+    llmStatus: { status: "unknown", checked: false },
     storageProvider: "local",
     generatingDraft: false,
     gapAnswersByCard: {} as Record<string, Record<string, string>>,

@@ -229,6 +229,7 @@ async def run_mail_task(
     scan_plan_config = await _get_scan_plan_config(input_.mailbox_id)
 
     configured_max = scan_plan_config.max_messages if scan_plan_config else 100
+    scan_window_days = scan_plan_config.scan_window_days if scan_plan_config else 7
 
     # Quick Gmail connectivity check (platform only; skip in local dev)
     import os as _os, sys as _sys
@@ -251,9 +252,9 @@ async def run_mail_task(
             _logger.warning("gmail_check failed: %s", _exc)
             raise RuntimeError(f"Gmail connection failed — check your token or network. ({_exc})") from _exc
 
-    _report_progress(progress_callback, "scan", max_threads=configured_max)
-    _logger.info("scan started: mailbox=%s max_threads=%s", input_.mailbox_id, configured_max)
-    messages = await run_mail_scan(input_.mailbox_id, configured_max, progress_callback=progress_callback)
+    _report_progress(progress_callback, "scan", max_threads=configured_max, scan_window_days=scan_window_days)
+    _logger.info("scan started: mailbox=%s max_threads=%s scan_window_days=%s", input_.mailbox_id, configured_max, scan_window_days)
+    messages = await run_mail_scan(input_.mailbox_id, configured_max, newer_than_days=scan_window_days, progress_callback=progress_callback)
     _report_progress(progress_callback, "scan_done", scanned=len(messages), max_threads=configured_max)
     _logger.info("scan done: %d messages fetched", len(messages))
 

@@ -1,7 +1,7 @@
 {
   "name": "tool-zhaopy-inbox-executa-8jj3cw76",
   "display_name": "Zhaopy Mail Agent RD6B87R5",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Minimal Anna Executa skeleton for reading Gmail through local token files and DashScope or Anna sampling LLM.",
   "author": "Zhaopy",
   "host_capabilities": [
@@ -155,6 +155,12 @@
         }
       ],
       "timeout": 120
+    },
+    {
+      "name": "check_sampling_status",
+      "description": "Lightweight Anna LLM sampling connectivity check.",
+      "parameters": [],
+      "timeout": 15
     },
     {
       "name": "test_aps_storage",

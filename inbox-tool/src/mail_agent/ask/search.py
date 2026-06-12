@@ -5,9 +5,9 @@ build_queries(): constructs validated Gmail queries from AskPlan structured para
   - Topics: uses search_terms (NOT concept) for Gmail OR groups
   - Applies direction, timeframe, and syntax normalization
 
-execute_search(): wraps run_mail_scan() with adaptive broadening.
+execute_search(): runs Gmail query search with adaptive broadening.
   - 0 results → progressively broaden the query
-  - Reuses run_mail_scan() which has built-in Gmail API failover to local cache
+  - Caches matched messages, then reads them as MessageLite objects
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from .planner import AskPlan
 
 _logger = logging.getLogger(__name__)
 
-# 默认值
+# 中文注释：Ask 搜索默认最多读取的邮件数量，避免旧 scan_plan dict 被当成 max_threads。
 _DEFAULT_MAX_MESSAGES = 200
 _DEFAULT_MAX_PER_QUERY = 100
 
@@ -101,7 +101,7 @@ def _quote_gmail_term(term: str) -> str:
 async def build_queries(plan: AskPlan, mailbox: str) -> list[dict[str, Any]]:
     """Build validated Gmail search queries from an AskPlan.
 
-    Returns a list of query dicts compatible with run_mail_scan():
+    Returns a list of query dicts compatible with execute_search():
       [{"query": "...", "purpose": "...", "max_results": N, "priority": "high"}]
 
     Does NOT write Gmail syntax from scratch — constructs it deterministically
@@ -280,19 +280,35 @@ async def execute_search(
     Attempt 2 (0 results): broaden level 1 (drop person/topic filters)
     Attempt 3 (0 results): broaden level 2 (keep only direction + timeframe)
 
-    Reuses run_mail_scan() which handles Gmail API failover to local cache.
+    Uses Gmail query search, caches matched messages, and returns MessageLite.
     """
-    from ..core.scan import run_mail_scan
+    from ..mail_providers.gmail.adapter import get_messages_lite_async, live_search_and_cache
 
     current_queries = list(queries)
 
     for attempt in range(max_broaden_attempts + 1):
-        scan_plan = {
-            "queries": current_queries,
-            "budget": {"max_messages": _DEFAULT_MAX_MESSAGES},
-        }
+        message_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for query in current_queries:
+            query_text = str(query.get("query") or "").strip()
+            if not query_text:
+                continue
+            try:
+                query_limit = int(query.get("max_results", _DEFAULT_MAX_PER_QUERY))
+            except (TypeError, ValueError):
+                query_limit = _DEFAULT_MAX_PER_QUERY
+            query_limit = max(1, min(query_limit, _DEFAULT_MAX_MESSAGES))
+            matched_ids = live_search_and_cache(mailbox, query_text, query_limit)
+            for msg_id in matched_ids:
+                if msg_id not in seen_ids:
+                    seen_ids.add(msg_id)
+                    message_ids.append(msg_id)
+                if len(message_ids) >= _DEFAULT_MAX_MESSAGES:
+                    break
+            if len(message_ids) >= _DEFAULT_MAX_MESSAGES:
+                break
 
-        messages = await run_mail_scan(mailbox, scan_plan, progress_callback=progress_callback)
+        messages = await get_messages_lite_async(mailbox, message_ids)
 
         if messages:
             if attempt > 0:

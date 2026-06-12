@@ -2842,6 +2842,11 @@
       text-decoration: underline;
     }
 
+    .original-body-html pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
     .original-body-html blockquote {
       margin: 8px 0;
       padding: 4px 12px;
@@ -4169,9 +4174,22 @@
     }
 
     /* — replaced inline styles for CSP compliance — */
-    .connection-status { font-size:10px; opacity:0.7; margin-top:2px; }
-    .connection-status.is-live { color:#58b889; }
-    .connection-status.is-offline { color:#d9748c; }
+.connection-row { display:flex; align-items:center; gap:10px; margin-top:3px; flex-wrap:wrap; }
+.connection-status { font-size:12px; font-weight:500; line-height:1.2; opacity:0.9; }
+.connection-status.is-live { color:#58b889; }
+.connection-status.is-offline { color:#d9748c; }
+.llm-status-chip { display:inline-flex; align-items:center; gap:5px; max-width:170px; padding:0; border-radius:0; font-size:12px; font-weight:500; line-height:1.2; color:#58b889; opacity:0.9; background:transparent; border:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.llm-status-chip::before { content:""; width:1px; height:12px; margin-right:1px; background:rgba(38,35,54,0.12); }
+.llm-status-dot { width:5px; height:5px; border-radius:999px; background:#a5a0b5; flex:none; }
+.llm-status-chip.is-unknown { color:#8a8496; }
+.llm-status-chip.is-checking { color:#8b7cf8; }
+.llm-status-chip.is-checking .llm-status-dot { background:#8b7cf8; animation:pulse 1.4s ease-in-out infinite; }
+.llm-status-chip.is-connected { color:#58b889; }
+.llm-status-chip.is-connected .llm-status-dot { background:#58b889; }
+.llm-status-chip.is-unavailable { color:#a17028; }
+.llm-status-chip.is-unavailable .llm-status-dot { background:#e8ae48; }
+.llm-status-chip.is-error { color:#b6526b; }
+.llm-status-chip.is-error .llm-status-dot { background:#d9748c; }
     .assistant-copy.is-error { color:var(--rose); }
     .assistant-copy.is-error .inline-link { background:none; border:none; color:var(--rose); cursor:pointer; font-size:inherit; padding:0; text-decoration:underline; opacity:0.8; }
     .assistant-copy.is-error .inline-link:hover { opacity:1; }
@@ -4615,6 +4633,8 @@
 
 /* ── Fullscreen detail shell (Handle thread) ─────────────────────── */
 .detail-shell {
+  max-width: 860px;
+  width: 100%;
   margin: 0 auto;
   display: grid;
   gap: 10px;

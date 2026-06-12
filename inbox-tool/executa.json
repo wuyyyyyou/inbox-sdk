@@ -3,7 +3,7 @@
   "tool_id": "tool-zhaopy-inbox-executa-8jj3cw76",
   "name": "tool-zhaopy-inbox-executa-8jj3cw76",
   "display_name": "Anna Inbox Executa",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "type": "python",
   "enabled": true,
   "description": "Anna Inbox — Gmail agent that surfaces attention cards and drafts replies via Executa Sampling LLM.",

@@ -1,0 +1,358 @@
+from __future__ import annotations
+
+from anna_inbox_executa.common import *
+
+def _build_sampling_for_run(arguments: dict[str, Any], invoke_id: str) -> Any:
+    """Build sampling_create_message for a run based on ai_provider arg."""
+    provider = str(arguments.get("ai_provider", "anna-llm")).strip()
+    if provider == "anna-llm":
+        async def _sampling(**kwargs: Any) -> dict[str, Any]:
+            metadata = {str(key): str(value) for key, value in (kwargs.get("metadata") or {}).items()}
+            metadata["executa_invoke_id"] = invoke_id
+            kwargs["metadata"] = metadata
+            tool_name = metadata.get("tool", "unknown")
+            started = time.time()
+            log(f"anna ask sampling start: tool={tool_name} max_tokens={kwargs.get('max_tokens')} metadata={metadata}")
+            result = await sampling.create_message(**kwargs)
+            log(f"anna ask sampling done: tool={tool_name} elapsed_ms={int((time.time() - started) * 1000)} model={result.get('model')} shape={_sampling_result_shape(result)}")
+            return result
+        return _sampling
+    return None
+
+
+async def _check_sampling_status(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
+    started = time.time()
+    req_id = uuid.uuid4().hex[:12]
+    try:
+        result = await sampling.create_message(
+            messages=[{"role": "user", "content": {"type": "text", "text": "Reply exactly OK."}}],
+            max_tokens=4,
+            system_prompt="Return only OK.",
+            temperature=0.0,
+            include_context="none",
+            metadata={"tool": "check_sampling_status", "executa_invoke_id": invoke_id, "test_req_id": req_id},
+            timeout=8.0,
+        )
+        text = ""
+        content = result.get("content") if isinstance(result, dict) else None
+        if isinstance(content, dict):
+            text = str(content.get("text") or "")
+        return {
+            "ok": True,
+            "status": "connected",
+            "provider": "anna-llm",
+            "message": "Anna LLM sampling is connected.",
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "invoke_id": invoke_id,
+            "test_req_id": req_id,
+            "text": text[:16],
+        }
+    except SamplingError as exc:
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "provider": "anna-llm",
+            "message": exc.message or "Anna LLM sampling is unavailable.",
+            "code": exc.code,
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "invoke_id": invoke_id,
+            "test_req_id": req_id,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "error",
+            "provider": "anna-llm",
+            "message": str(exc) or "Anna LLM sampling check failed.",
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "invoke_id": invoke_id,
+            "test_req_id": req_id,
+        }
+
+
+async def _test_sampling(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
+    """Test Anna sampling with a minimal one-shot call. Returns detailed diagnostics."""
+    started = time.time()
+    req_id = ""
+    try:
+        sampling_fn = _build_sampling_for_run({"ai_provider": "anna-llm"}, invoke_id)
+        if sampling_fn is None:
+            return {"ok": False, "error": "sampling_fn is None — ai_provider must be 'anna-llm'", "invoke_id": invoke_id}
+
+        req_id = uuid.uuid4().hex[:12]
+        result = await sampling_fn(
+            messages=[{"role": "user", "content": {"type": "text", "text": "Say 'hello' in exactly one word. Reply with only that word."}}],
+            max_tokens=16,
+            system_prompt="You are a test probe. Reply concisely.",
+            temperature=0.0,
+            include_context="none",
+            metadata={"tool": "test_sampling", "executa_invoke_id": invoke_id, "test_req_id": req_id},
+            timeout=30.0,
+        )
+        elapsed_ms = int((time.time() - started) * 1000)
+        return {
+            "ok": True,
+            "elapsed_ms": elapsed_ms,
+            "test_req_id": req_id,
+            "invoke_id": invoke_id,
+            "model": result.get("model"),
+            "stop_reason": result.get("stopReason"),
+            "content_type": result.get("content", {}).get("type") if isinstance(result.get("content"), dict) else "unknown",
+            "text": str(result.get("content", {}).get("text", ""))[:200] if isinstance(result.get("content"), dict) else "",
+            "usage": result.get("usage"),
+        }
+    except SamplingError as exc:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return {
+            "ok": False,
+            "elapsed_ms": elapsed_ms,
+            "test_req_id": req_id,
+            "invoke_id": invoke_id,
+            "error_code": exc.code,
+            "error_message": exc.message,
+            "error_data": exc.data,
+        }
+    except Exception as exc:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return {
+            "ok": False,
+            "elapsed_ms": elapsed_ms,
+            "test_req_id": req_id,
+            "invoke_id": invoke_id,
+            "error_code": "client_exception",
+            "error_message": str(exc),
+        }
+
+
+# Mirrors the real pipeline's wire format:
+#   system_prompt  = short JSON-only instruction
+#   user_message   = rubric + email + output format + JSON instruction
+# See call_llm_json() in llm_runtime/service.py:494 and
+# build_anna_single_judgment_prompt() in judgment_engine/service.py:495.
+
+_BRIEF_TEST_SYSTEM_PROMPT = "You are a strict JSON generator. Output ONLY valid JSON — no explanation, no markdown, no code fences."
+
+_BRIEF_TEST_USER_MESSAGE = """\
+You are Anna, an executive email assistant. Evaluate exactly ONE email candidate against the strategy below.
+Output ONLY a single JSON object. Do NOT wrap in markdown. Do NOT explain. The very first character you write MUST be `{`.
+
+## Strategy
+Default 秘书模式: 找出真正需要用户注意的邮件事项。
+
+## Judgment Rubric — Binary Decision
+
+First, answer THIS question about the email:
+
+  **"Does this email require the user to send a reply message?"**
+
+  If YES → user_action = "reply"
+    Then pick the BEST action_reason:
+    - question_asked: the sender explicitly asked a question or made a request that needs an answer. EXCLUDE automated notifications from noreply/notification addresses and social media alerts.
+    - waiting_for_you: the sender is clearly waiting for the user's input, approval, or decision. EXCLUDE automated reminders and system-generated messages.
+    - unsent_draft: this is a draft the user wrote but never sent
+    - courtesy_due: sender invested real effort (wrote 3+ substantive sentences, shared a document, or explicitly asked for the user's thoughts). Do NOT flag automated notifications, newsletters, receipts, or one-line status updates.
+
+  If NO → user_action = "review"
+    Then pick the BEST action_reason:
+    - upcoming_event: interview/meeting/deadline reminder — worth noting the time
+    - deal_or_pipeline: project/partnership/deal status update worth tracking
+    - security_or_billing: security alert, billing issue, subscription — needs checking
+    - receipt_or_notice: receipt, subscription confirmation, normal account notice — record only
+    - cleanup: newsletter, promotion, automated digest — safe to archive
+
+  CRITICAL: If the sender address looks automated (contains "noreply", "no-reply", "notification", "@linkedin.com" alerts, social media notification bots), set user_action="review" regardless of the email body content.
+
+  Priority & action_reason mapping (you MUST follow):
+    question_asked → priority=high when explicit deadline, money/pricing/contract, or key contact. priority=medium otherwise. surface=true.
+    waiting_for_you → priority=high when time-sensitive AND sender says "let me know"/"please confirm". priority=medium otherwise. surface=true.
+    unsent_draft → priority=medium, surface=true
+    courtesy_due → priority=medium, surface=true
+    security_or_billing → priority=critical when unauthorized/payment failed/imminent interruption. priority=high otherwise. surface=true.
+    upcoming_event → priority=high when within 48h. priority=medium otherwise.
+    deal_or_pipeline → priority=medium
+    receipt_or_notice → priority=low
+    cleanup → priority=low
+
+## Mailbox Owner
+You are evaluating mail for: test@example.com
+Match by EMAIL ADDRESS (between < >), not by display name.
+- If the sender's email IS the mailbox owner → OUTGOING mail.
+  SENT: user already sent it → surface=false, priority=low, user_action=review, action_reason=cleanup.
+  DRAFT: user hasn't sent it yet → user_action=reply, action_reason=unsent_draft, priority=medium.
+
+## Email
+candidate_id: test_cand_001
+kind: reply_required_possible
+priority_hint: high
+from: "Alice Zhang" <alice@acmecorp.com>
+subject: Q3 proposal review — need your sign-off by Friday
+snippet: Hi, I've attached the updated Q3 proposal incorporating feedback from the leadership review. Could you take a look and provide sign-off by Friday EOD? The procurement team is waiting on this to finalize the vendor contract. Let me know if you need any clarifications.
+date: 2026-06-09
+context_type: message_detail
+body_text: > Hi,\n> I've attached the updated Q3 proposal v3 incorporating the feedback from the leadership review last Thursday.\n> \n> Key changes:\n> - Budget adjusted from $180k to $210k to cover the expanded scope\n> - Timeline shifted: kickoff moved to July 15\n> - Vendor selection narrowed to two finalists (AcmeTech and BuildRight)\n> \n> Could you review and provide sign-off by Friday EOD? The procurement team is blocked on the vendor contract until they have your approval.\n> \n> Let me know if you need a call to walk through the changes.\n> \n> Thanks,\n> Alice
+
+## User request
+Find emails that need my attention.
+
+## Output format
+Return exactly this JSON shape:
+
+{
+  "candidate_id": "test_cand_001",
+  "priority": "medium",
+  "surface": true,
+  "user_action": "reply",
+  "action_reason": "question_asked",
+  "title": "Short card title (English ≤12 words)",
+  "context": "WHAT happened: who did what, when, and current status. Verifiable facts only. English ≤30 words.",
+  "suggestion": "Specific next action. Be concrete, not generic. English ≤15 words.",
+  "action": "create_draft",
+  "needs": "English ≤4 words label for what the user needs to decide or do.",
+  "latest_action": "English ≤8 words. What recently happened — the latest action by a person or service.",
+  "latest_actor": "English name or service. Who performed the latest_action.",
+  "reply_gaps": {"needs_user_input":true, "summary":"one-sentence summary", "questions":[{"id":"q1", "question":"What do you want to reply?", "hint":"short hint", "required":true}]},
+  "confidence": 0.85
+}
+
+Allowed user_action: reply, review.
+Allowed action_reason: question_asked, waiting_for_you, unsent_draft, courtesy_due, upcoming_event, deal_or_pipeline, security_or_billing, receipt_or_notice, cleanup.
+Allowed priority: critical, high, medium, low, ignore.
+Allowed action: create_draft, create_reminder, save_note, do_nothing.
+
+## Rules
+- user_action + action_reason MUST be consistent: question_asked/waiting_for_you/unsent_draft/courtesy_due → reply. upcoming_event/deal_or_pipeline/security_or_billing/receipt_or_notice/cleanup → review.
+- priority: reply reasons → medium or high. security_or_billing → critical or high. schedule/logistics → medium. receipt/cleanup → low.
+
+Return ONLY one valid JSON object. Do not include markdown fences, prose, analysis, or code comments.
+"""
+
+
+async def _test_sampling_brief(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
+    """Test Anna sampling with a realistic brief-style judgment call.
+
+    Uses the same message shape, system prompt complexity, and parameters
+    (max_tokens=8000, temperature=0.1, timeout=120s) as the real brief pipeline.
+    """
+    import json as _json
+    started = time.time()
+    req_id = ""
+    try:
+        sampling_fn = _build_sampling_for_run({"ai_provider": "anna-llm"}, invoke_id)
+        if sampling_fn is None:
+            return {"ok": False, "error": "sampling_fn is None", "invoke_id": invoke_id}
+
+        req_id = uuid.uuid4().hex[:12]
+        result = await sampling_fn(
+            messages=[{"role": "user", "content": {"type": "text", "text": _BRIEF_TEST_USER_MESSAGE}}],
+            max_tokens=8000,
+            system_prompt=_BRIEF_TEST_SYSTEM_PROMPT,
+            temperature=0.1,
+            include_context="none",
+            metadata={"tool": "test_sampling_brief", "executa_invoke_id": invoke_id, "test_req_id": req_id},
+            timeout=120.0,
+        )
+        elapsed_ms = int((time.time() - started) * 1000)
+        text = str(result.get("content", {}).get("text", "")) if isinstance(result.get("content"), dict) else ""
+        usage = result.get("usage", {})
+        output_tokens = usage.get("outputTokens") if isinstance(usage, dict) else "unknown"
+
+        json_ok = False
+        json_error = ""
+        parse_preview = ""
+        if text:
+            try:
+                parsed = _json.loads(text.strip())
+                json_ok = isinstance(parsed, dict) and "priority" in parsed
+                parse_preview = _json.dumps({k: v for k, v in parsed.items() if k in ("priority", "user_action", "action_reason", "title")})[:300]
+            except Exception as exc:
+                json_error = str(exc)[:200]
+                parse_preview = text.strip()[:300]
+
+        return {
+            "ok": True,
+            "elapsed_ms": elapsed_ms,
+            "test_req_id": req_id,
+            "invoke_id": invoke_id,
+            "model": result.get("model"),
+            "stop_reason": result.get("stopReason"),
+            "output_tokens": output_tokens,
+            "json_ok": json_ok,
+            "json_error": json_error,
+            "parse_preview": parse_preview,
+            "usage": usage,
+        }
+    except SamplingError as exc:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return {
+            "ok": False,
+            "elapsed_ms": elapsed_ms,
+            "test_req_id": req_id,
+            "invoke_id": invoke_id,
+            "error_code": exc.code,
+            "error_message": exc.message,
+            "error_data": exc.data,
+        }
+    except Exception as exc:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return {
+            "ok": False,
+            "elapsed_ms": elapsed_ms,
+            "test_req_id": req_id,
+            "invoke_id": invoke_id,
+            "error_code": "client_exception",
+            "error_message": str(exc),
+        }
+
+
+def _start_test_sampling_async(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
+    """Like test_sampling_brief, but returns immediately and runs sampling in background.
+
+    This is the decisive experiment: if the background call fails with -32001
+    while the synchronous test_sampling_brief succeeds, the Anna platform binds
+    sampling authorization to the *active* invoke lifecycle.
+    """
+    run_id = f"tsa_{uuid.uuid4().hex[:12]}"
+    MAIL_AGENT_RUNS[run_id] = {
+        "run_id": run_id,
+        "status": "queued",
+        "stage": "queued",
+        "progress": {},
+        "warnings": [],
+        "started_at": beijing_now(),
+        "updated_at": beijing_now(),
+        "result": None,
+        "error": "",
+        "partial": {"invoke_id": invoke_id},
+    }
+    asyncio.run_coroutine_threadsafe(_run_test_sampling_async(run_id, arguments, invoke_id), loop)
+    return {
+        "run_id": run_id,
+        "status": "queued",
+        "started_at": beijing_now(),
+        "note": "Sampling scheduled in background — poll with get_mail_agent_run",
+    }
+
+
+async def _run_test_sampling_async(run_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
+    """Background sampling test — waits 2s then calls the brief-style sampling."""
+    try:
+        await asyncio.sleep(2.0)  # simulate real scan delay
+        MAIL_AGENT_RUNS[run_id]["status"] = "running"
+        MAIL_AGENT_RUNS[run_id]["stage"] = "sampling"
+        MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
+        result = await _test_sampling_brief(arguments, invoke_id)
+        MAIL_AGENT_RUNS[run_id].update({
+            "status": "done",
+            "stage": "done",
+            "updated_at": beijing_now(),
+            "result": result,
+        })
+    except Exception as exc:
+        MAIL_AGENT_RUNS[run_id].update({
+            "status": "failed",
+            "stage": "failed",
+            "updated_at": beijing_now(),
+            "error": str(exc),
+        })
+
+__all__ = [name for name in globals() if not name.startswith("__")]
