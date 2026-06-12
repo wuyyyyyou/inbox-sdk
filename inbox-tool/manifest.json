@@ -1,7 +1,7 @@
 {
   "name": "tool-peiyuan-inbox-executa-yhbzbap8",
   "display_name": "Zhaopy Mail Agent RD6B87R5",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Minimal Anna Executa skeleton for reading Gmail through local token files and DashScope or Anna sampling LLM.",
   "author": "Zhaopy",
   "host_capabilities": [
