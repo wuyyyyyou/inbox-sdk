@@ -220,6 +220,16 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "get_cleanup_bundle_page",
+            "description": "Get one page of cleanup bundle messages without refreshing active cards.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address or all.", "required": True},
+                {"name": "offset", "type": "integer", "description": "Cleanup item offset.", "required": False},
+                {"name": "limit", "type": "integer", "description": "Maximum cleanup items to return.", "required": False},
+                {"name": "storage_provider", "type": "string", "description": "Storage provider: local or aps.", "required": False},
+            ],
+        },
+        {
             "name": "list_mailboxes",
             "description": "Discover and list registered mailboxes, including selected and authorization state.",
             "parameters": [],
@@ -2473,7 +2483,7 @@ async def _brief_run_phase2_slice(run_id: str, sampling_create_message: Any) -> 
 
 async def _brief_finalize_run(run_id: str) -> None:
     from mail_agent.cards.service import build_cleanup_bundle, cards_to_frontend, merge_cards
-    from mail_agent.storage.ops import append_run_history, get_active_cards, get_cleanup_bundle, get_scan_state, mark_messages_processed_batch, save_run_record, set_active_cards, set_cleanup_bundle, set_scan_state
+    from mail_agent.storage.ops import append_run_history, get_active_cards, get_scan_state, mark_messages_processed_batch, save_run_record, set_active_cards, set_cleanup_bundle, set_scan_state
     from mail_agent.storage.types import ProcessedMessage, RunHistoryEntry, RunRecord, ScanState, _now
 
     state = MAIL_AGENT_RUNS[run_id]
@@ -2516,15 +2526,9 @@ async def _brief_finalize_run(run_id: str) -> None:
     if brief.get("low_value_items"):
         cleanup_card, cleanup_full = build_cleanup_bundle(run_id, mailbox, list(brief.get("low_value_items") or []), messages)
     if cleanup_full:
-        existing_cleanup = await get_cleanup_bundle(mailbox)
-        seen_cleanup = {str(item.get("message_id") or "") for item in existing_cleanup if item.get("message_id")}
-        for item in cleanup_full:
-            if str(item.get("message_id") or "") not in seen_cleanup:
-                existing_cleanup.append(item)
-                seen_cleanup.add(str(item.get("message_id") or ""))
-        await set_cleanup_bundle(mailbox, existing_cleanup)
+        await set_cleanup_bundle(mailbox, cleanup_full)
         if cleanup_card is not None:
-            cleanup_card.bundled_count = len(existing_cleanup)
+            cleanup_card.bundled_count = len(cleanup_full)
             active = await get_active_cards(mailbox)
             await set_active_cards(mailbox, merge_cards(active, [cleanup_card]))
             brief["cards_version"] = int(brief.get("cards_version") or 0) + 1
@@ -3439,7 +3443,6 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
         return {"error": "mailbox is required"}
     offset = int(arguments.get("offset", 0))
     limit = int(arguments.get("limit", 50))
-    include_cleanup = bool(arguments.get("include_cleanup"))
 
     from mail_agent.cards.service import cards_to_frontend
     from mail_agent.storage.ops import get_active_cards_page, get_scan_state
@@ -3516,50 +3519,6 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
         cleanup_bundle = None
         cleanup_total = 0
         cleanup_has_more = False
-        if include_cleanup:
-            cleanup_offset = int(arguments.get("cleanup_offset", 0))
-            cleanup_limit = int(arguments.get("cleanup_limit", 100))
-            from mail_agent.storage.ops import get_cleanup_bundle_page, get_mailbox_registry
-            if mailbox.lower() == "all":
-                try:
-                    async def _load_cleanup_all() -> dict[str, Any]:
-                        registry = await get_mailbox_registry()
-                        entries = list(getattr(registry, "mailboxes", []) or [])
-                        selected_entries = [entry for entry in entries if getattr(entry, "selected", False)]
-                        scoped_entries = selected_entries or entries
-                        mailboxes = [
-                            str(getattr(entry, "email", "") or "").strip().lower()
-                            for entry in scoped_entries
-                        ]
-                        mailboxes = sorted(dict.fromkeys(item for item in mailboxes if item))
-                        results = await asyncio.gather(
-                            *(get_cleanup_bundle_page(item, cleanup_offset, cleanup_limit) for item in mailboxes),
-                            return_exceptions=True,
-                        )
-                        items: list[dict[str, Any]] = []
-                        total_items = 0
-                        for result in results:
-                            if isinstance(result, Exception) or not isinstance(result, dict):
-                                continue
-                            items.extend(result.get("items") or [])
-                            total_items += int(result.get("total") or 0)
-                        return {"items": items, "total": total_items}
-
-                    cleanup_result = _run_storage_query(_load_cleanup_all(), timeout=45.0)
-                    all_items = cleanup_result["items"]
-                    total_all = cleanup_result["total"]
-                    cleanup_bundle = all_items if all_items else None
-                    cleanup_total = total_all
-                    cleanup_has_more = (cleanup_offset + cleanup_limit) < total_all if cleanup_limit > 0 else False
-                except Exception:
-                    cleanup_bundle = None
-                    cleanup_total = 0
-                    cleanup_has_more = False
-            else:
-                page_result = _run_storage_query(get_cleanup_bundle_page(mailbox, cleanup_offset, cleanup_limit), timeout=45.0)
-                cleanup_bundle = page_result["items"] if page_result["items"] else None
-                cleanup_total = page_result["total"]
-                cleanup_has_more = page_result["has_more"]
 
         return {
             "cards": cards_to_frontend(active),
@@ -3588,6 +3547,58 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
             "scan_state": {"total_scans": 0, "total_processed": 0, "last_scan_ts": "", "last_message_internal_date": ""},
             "error": f"{type(exc).__name__}: {exc}"[:200],
         }
+
+
+def _sync_get_cleanup_bundle_page(arguments: dict[str, Any]) -> dict[str, Any]:
+    mailbox = str(arguments.get("mailbox", "")).strip()
+    if not mailbox:
+        return {"error": "mailbox is required"}
+    offset = max(0, int(arguments.get("offset", 0)))
+    limit = max(1, min(int(arguments.get("limit", 100)), 100))
+    from mail_agent.storage.ops import get_cleanup_bundle_page, get_mailbox_registry
+
+    try:
+        if mailbox.lower() == "all":
+            async def _load_cleanup_all() -> dict[str, Any]:
+                registry = await get_mailbox_registry()
+                entries = list(getattr(registry, "mailboxes", []) or [])
+                selected_entries = [entry for entry in entries if getattr(entry, "selected", False)]
+                scoped_entries = selected_entries or entries
+                mailboxes = [
+                    str(getattr(entry, "email", "") or "").strip().lower()
+                    for entry in scoped_entries
+                ]
+                mailboxes = sorted(dict.fromkeys(item for item in mailboxes if item))
+                results = await asyncio.gather(
+                    *(get_cleanup_bundle_page(item, offset, limit) for item in mailboxes),
+                    return_exceptions=True,
+                )
+                items: list[dict[str, Any]] = []
+                total_items = 0
+                for result in results:
+                    if isinstance(result, Exception) or not isinstance(result, dict):
+                        continue
+                    items.extend(result.get("items") or [])
+                    total_items += int(result.get("total") or 0)
+                return {"items": items[:limit], "total": total_items}
+
+            page_result = _run_storage_query(_load_cleanup_all(), timeout=45.0)
+        else:
+            page_result = _run_storage_query(get_cleanup_bundle_page(mailbox, offset, limit), timeout=45.0)
+
+        total = int(page_result.get("total") or 0)
+        items = list(page_result.get("items") or [])
+        return {
+            "items": items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "has_more": (offset + limit) < total,
+        }
+    except Exception as exc:
+        log(f"get_cleanup_bundle_page failed: {type(exc).__name__}: {exc}")
+        return {"items": [], "total": 0, "offset": offset, "limit": limit, "has_more": False, "error": str(exc)}
+
 
 def _sync_get_run_history() -> dict[str, Any]:
     from mail_agent.storage.ops import get_run_history
@@ -3711,7 +3722,6 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
     from mail_agent.storage.ops import (
         get_active_cards as storage_get_cards,
         get_scan_plan,
-        get_scan_state,
         set_scan_plan,
         update_card_status,
         add_snooze_sender,
@@ -3719,7 +3729,6 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         append_learning,
         get_run_history,
     )
-    from mail_agent.cards.service import cards_to_frontend
     from mail_agent.actions.service import (
         _fetch_thread_context_sync,
         summarize_thread,
@@ -3730,22 +3739,6 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
 
     mailbox = str(arguments.get("mailbox", "")).strip()
     card_id = str(arguments.get("card_id", "")).strip()
-
-    if tool == "get_active_cards":
-        if not mailbox:
-            return {"error": "mailbox is required"}
-        cards = await storage_get_cards(mailbox)
-        scan_state = await get_scan_state(mailbox)
-        return {
-            "cards": cards_to_frontend(cards),
-            "count": len(cards.cards),
-            "scan_state": {
-                "last_scan_ts": scan_state.last_scan_ts,
-                "last_message_internal_date": scan_state.last_message_internal_date,
-                "total_scans": scan_state.total_scans,
-                "total_processed": scan_state.total_processed,
-            },
-        }
 
     if tool == "get_scan_plan":
         if not mailbox:
@@ -4421,6 +4414,8 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
 
     if tool == "get_active_cards":
         return {"success": True, "tool": tool, "data": _sync_get_active_cards(arguments)}
+    if tool == "get_cleanup_bundle_page":
+        return {"success": True, "tool": tool, "data": _sync_get_cleanup_bundle_page(arguments)}
     if tool == "list_mailboxes":
         return {"success": True, "tool": tool, "data": _sync_list_mailboxes()}
     if tool == "set_mailbox_selected":

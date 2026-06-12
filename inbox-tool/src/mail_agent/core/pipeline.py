@@ -1057,20 +1057,14 @@ async def _persist_run_results_locked(
         if cleanup_card is not None:
             new_cards.append(cleanup_card)
 
-    # 3. Persist full cleanup bundle separately (card only stores preview)
+    # 3. 单独持久化本次 cleanup 明细，卡片本身只保存预览。
     if cleanup_full:
-        from ..storage.ops import get_cleanup_bundle as _gcb, set_cleanup_bundle as _scb
-        existing_cleanup = await _gcb(mailbox)
-        seen_cleanup: set[str] = {str(m.get("message_id", "")) for m in existing_cleanup if m.get("message_id")}
-        for m in cleanup_full:
-            if str(m.get("message_id", "")) not in seen_cleanup:
-                existing_cleanup.append(m)
-                seen_cleanup.add(str(m.get("message_id", "")))
-        await _scb(mailbox, existing_cleanup)
-        # Update card's bundled_count to reflect the merged total
+        from ..storage.ops import set_cleanup_bundle as _scb
+        await _scb(mailbox, cleanup_full)
+        # bundled_count 只反映本次扫描的 cleanup 总数，避免完成阶段全量读取历史明细。
         for c in new_cards:
             if getattr(c, "card_type", "") == "cleanup_bundle":
-                c.bundled_count = len(existing_cleanup)
+                c.bundled_count = len(cleanup_full)
 
     # 4. Merge with existing active cards
     existing = await get_active_cards(mailbox)

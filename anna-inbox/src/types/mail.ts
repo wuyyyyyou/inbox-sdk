@@ -134,6 +134,15 @@ export interface ActiveCardsPayload {
   cleanup_has_more?: boolean;
 }
 
+export interface CleanupBundlePayload {
+  items: CleanupMessage[];
+  total?: number;
+  offset?: number;
+  limit?: number;
+  has_more?: boolean;
+  error?: string;
+}
+
 export interface RunStatus {
   success?: boolean;
   run_id?: string;

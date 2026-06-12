@@ -193,10 +193,9 @@ export function useAppController() {
     });
   }, []);
 
-  const loadActiveCards = useCallback(async (storageOverride?: string, mailboxOverride?: string, options: { includeCleanup?: boolean; timeoutMs?: number } = {}) => {
+  const loadActiveCards = useCallback(async (storageOverride?: string, mailboxOverride?: string, options: { timeoutMs?: number } = {}) => {
     const provider = storageOverride ?? state.storageProvider;
     const mailbox = mailboxOverride ?? "all";
-    const includeCleanup = options.includeCleanup ?? true;
     const timeoutMs = options.timeoutMs ?? 55_000;
     const PAGE_SIZE = 50;
     try {
@@ -204,46 +203,17 @@ export function useAppController() {
       let offset = 0;
       let hasMore = true;
       let scanState: ActiveCardsPayload["scan_state"];
-      const cleanupItems: NonNullable<ActiveCardsPayload["cleanup_bundle"]> = [];
       const MAX_PAGES = 20;
-      const CLEANUP_PAGE = 100;
-      let cleanupOffset = 0;
-      let cleanupHasMore = true;
       while (hasMore && offset < MAX_PAGES * PAGE_SIZE) {
-        const isFirstCardPage = offset === 0;
         const payload = await client.loadActiveCards(
           mailbox, provider, offset, PAGE_SIZE,
-          includeCleanup && isFirstCardPage, cleanupOffset, includeCleanup && isFirstCardPage ? CLEANUP_PAGE : 0,
           timeoutMs,
         );
-        // Only first page includes cleanup; subsequent card pages skip it
-        const gotCleanup = isFirstCardPage && payload.cleanup_bundle;
         allCards.push(...(payload.cards || []));
         hasMore = Boolean(payload.has_more);
         offset += PAGE_SIZE;
         if (payload.scan_state) scanState = payload.scan_state;
-        if (gotCleanup) {
-          cleanupItems.push(...payload.cleanup_bundle!);
-          cleanupOffset += CLEANUP_PAGE;
-          cleanupHasMore = Boolean(payload.cleanup_has_more);
-        }
       }
-      // Load remaining cleanup pages
-      while (includeCleanup && cleanupHasMore && cleanupOffset < MAX_PAGES * CLEANUP_PAGE) {
-        const payload = await client.loadActiveCards(
-          mailbox, provider, 0, 1,
-          true, cleanupOffset, CLEANUP_PAGE,
-          timeoutMs,
-        );
-        if (payload.cleanup_bundle) {
-          cleanupItems.push(...payload.cleanup_bundle);
-          cleanupOffset += CLEANUP_PAGE;
-          cleanupHasMore = Boolean(payload.cleanup_has_more);
-        } else {
-          break;
-        }
-      }
-      const cleanupBundle = cleanupItems.length > 0 ? cleanupItems : undefined;
       const keyedCards = withCardKeys(allCards, mailbox === "all" ? state.mailbox : mailbox);
       refreshStoredCardFields(keyedCards);
       setState((s) => {
@@ -256,7 +226,7 @@ export function useAppController() {
           briefMailboxFilter: selected,
           actionCount: actionCount(visible),
           scanState: scanState || s.scanState,
-          cleanupBundle: includeCleanup ? cleanupBundle ?? s.cleanupBundle : s.cleanupBundle,
+          cleanupBundle: null,
           scanError: "",
           loading: false,
         };
@@ -269,6 +239,30 @@ export function useAppController() {
       // when the Executa process is no longer reachable.
     }
   }, [client, refreshStoredCardFields, state.mailbox, state.storageProvider]);
+
+  const loadCleanupBundle = useCallback(async (mailboxOverride = "all") => {
+    const provider = state.storageProvider;
+    const PAGE_SIZE = 100;
+    const MAX_PAGES = 20;
+    const items: CleanupMessage[] = [];
+    let offset = 0;
+    let hasMore = true;
+    try {
+      while (hasMore && offset < PAGE_SIZE * MAX_PAGES) {
+        const payload = await client.loadCleanupBundlePage(mailboxOverride, provider, offset, PAGE_SIZE, 55_000);
+        if (payload.error) {
+          console.warn("[loadCleanupBundle] partial failure:", payload.error);
+          break;
+        }
+        items.push(...(payload.items || []));
+        hasMore = Boolean(payload.has_more);
+        offset += PAGE_SIZE;
+      }
+      setState((s) => ({ ...s, cleanupBundle: items.length ? items : null }));
+    } catch (error) {
+      console.error("[loadCleanupBundle] failed:", error);
+    }
+  }, [client, state.storageProvider]);
 
   const loadRunHistory = useCallback(async () => {
     try {
@@ -511,9 +505,14 @@ export function useAppController() {
     },
     setResultFilter(value) {
       setState((s) => ({ ...s, resultFilter: value }));
+      if (value === "cleanup") void loadCleanupBundle("all");
     },
     toggleDetails(cardId) {
-      setState((s) => ({ ...s, expandedDetails: { ...s.expandedDetails, [cardId]: !s.expandedDetails[cardId] }, snoozeMenuCardId: "" }));
+      const card = findCard(state.cards, cardId);
+      const key = card?.uiKey || cardId;
+      const willExpand = !state.expandedDetails[key];
+      setState((s) => ({ ...s, expandedDetails: { ...s.expandedDetails, [key]: !s.expandedDetails[key] }, snoozeMenuCardId: "" }));
+      if (willExpand && card?.cardType === "cleanup_bundle") void loadCleanupBundle("all");
     },
     toggleLowerPriority() {
       setState((s) => ({ ...s, lowerPriorityOpen: !s.lowerPriorityOpen }));
@@ -707,7 +706,7 @@ export function useAppController() {
               const nextCardsVersion = Number(result.cards_version || 0);
               if (Number(result.cards_added || 0) > 0 || nextCardsVersion > cardsVersion) {
                 cardsVersion = nextCardsVersion;
-                void loadActiveCards(undefined, "all", { includeCleanup: false, timeoutMs: 55_000 });
+                void loadActiveCards(undefined, "all", { timeoutMs: 55_000 });
               }
               if (result.status === "done" || result.status === "failed" || result.needs_continue === false) {
                 break;
@@ -724,7 +723,7 @@ export function useAppController() {
           if (result.status !== "done") {
             failures.push(`${mailbox}: Scan paused before completion`);
           }
-          void loadActiveCards(undefined, "all", { includeCleanup: false, timeoutMs: 55_000 });
+          void loadActiveCards(undefined, "all", { timeoutMs: 55_000 });
           // 卡片刷新到界面后，只记录联系人记忆补写任务；扫描主流程结束后再后台续跑。
           contactMemoryJobs.push({
             mailbox,
@@ -739,7 +738,7 @@ export function useAppController() {
         setState((s) => ({ ...s, scanStatus: statusText, scanError: s.scanError || failures.join("\n") }));
         showToast(failures.length ? statusText : "Scan complete.");
         window.setTimeout(() => {
-          void loadActiveCards(undefined, "all", { includeCleanup: true, timeoutMs: 55_000 });
+          void loadActiveCards(undefined, "all", { timeoutMs: 55_000 });
           void loadRunHistory();
           if (contactMemoryJobs.length) {
             void runContactMemoryBackfill(contactMemoryJobs);
@@ -881,14 +880,31 @@ export function useAppController() {
     },
     async markCleanupAsRead(cardId) {
       const card = findCard(state.cards, cardId);
+      if (!card) return;
       const key = card?.uiKey || (card ? cardUiKey(card, state.mailbox) : cardId);
       const cardMbox = cardMailbox(card, state.mailbox);
-      const bundle = Array.isArray(state.cleanupBundle) && state.cleanupBundle.length > 0 ? state.cleanupBundle : (Array.isArray(card?.bundledMessages) ? card.bundledMessages : []);
-      const messages = cardMbox ? bundle.filter((m) => normalizedMailbox(m.mailbox ?? "") === normalizedMailbox(cardMbox)) : bundle;
-      const messageIds = messages.map((m) => m.message_id || m.id).filter(Boolean) as string[];
-      if (!card || !messageIds.length) return;
-      setState((s) => ({ ...s, markingReadIds: { ...s.markingReadIds, [key]: true }, cleanupReadState: { ...s.cleanupReadState, [key]: { read: true, readMsgIndices: messages.map((_m, i) => i) } } }));
+      let bundle = Array.isArray(state.cleanupBundle) && state.cleanupBundle.length > 0 ? state.cleanupBundle : (Array.isArray(card?.bundledMessages) ? card.bundledMessages : []);
+      const expectedCount = card.bundledCount || bundle.length;
       try {
+        if (expectedCount > bundle.length) {
+          const loaded: CleanupMessage[] = [];
+          let offset = 0;
+          let hasMore = true;
+          while (hasMore && offset < 2000) {
+            const payload = await client.loadCleanupBundlePage(cardMbox || "all", state.storageProvider, offset, 100, 55_000);
+            loaded.push(...(payload.items || []));
+            hasMore = Boolean(payload.has_more);
+            offset += 100;
+          }
+          if (loaded.length) {
+            bundle = loaded;
+            setState((s) => ({ ...s, cleanupBundle: loaded }));
+          }
+        }
+        const messages = cardMbox ? bundle.filter((m) => normalizedMailbox(m.mailbox ?? "") === normalizedMailbox(cardMbox)) : bundle;
+        const messageIds = messages.map((m) => m.message_id || m.id).filter(Boolean) as string[];
+        if (!messageIds.length) return;
+        setState((s) => ({ ...s, markingReadIds: { ...s.markingReadIds, [key]: true }, cleanupReadState: { ...s.cleanupReadState, [key]: { read: true, readMsgIndices: messages.map((_m, i) => i) } } }));
         const result = await client.markCleanupRead({ mailbox: cardMailbox(card, state.mailbox), card_id: card.id, message_ids: messageIds, storage_provider: state.storageProvider });
         if (!result.ok) {
           showToast(result.gmail_error || "Failed to mark as read in Gmail.");

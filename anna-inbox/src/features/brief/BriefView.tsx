@@ -155,7 +155,7 @@ function CleanupBundleCard({ card }: { card: FrontendCard }) {
     const mbox = normalizeMailbox(m.mailbox ?? "");
     return mbox ? briefSet.has(mbox) : true;
   });
-  const count = messages.length;
+  const count = fullBundle ? messages.length : card.bundledCount || messages.length;
   const readCount = readState ? readState.readMsgIndices.length : 0;
   return (
     <article className={`cleanup-bundle-card ${expanded ? "is-expanded" : ""} ${isAllRead ? "is-all-read" : ""}`}>
@@ -462,7 +462,8 @@ export function BriefView() {
     const mbox = normalizeMailbox(msg.mailbox ?? "");
     return mbox ? briefFilterSet.has(mbox) : true;
   });
-  const cleanupCount = cleanupMessages.length;
+  const cleanupPreviewCount = cleanupCards.reduce((sum, card) => sum + (card.bundledCount || (Array.isArray(card.bundledMessages) ? card.bundledMessages.length : 0)), 0);
+  const cleanupCount = fullCleanupBundle ? cleanupMessages.length : cleanupPreviewCount;
 
   return (
     <>
