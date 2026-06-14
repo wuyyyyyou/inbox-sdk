@@ -62,7 +62,7 @@ function filterCardsByMailboxes(cards: FrontendCard[], selected: string[]): Fron
 }
 
 function actionCount(cards: FrontendCard[]): number {
-  return cards.filter((card) => card.status !== "dismissed" && (card.priority || "" as string) !== "low" && card.priority !== "ignore").length;
+  return cards.filter((card) => card.status !== "dismissed" && card.cardType !== "cleanup_bundle" && (card.userAction === "reply" || card.userAction === "review")).length;
 }
 
 function selectableMailboxes(selected: string[], fallback: string): string[] {
@@ -138,6 +138,7 @@ export interface AppActions {
   clearCards(category: string): Promise<void>;
   clearHistory(): Promise<void>;
   resetAllData(): Promise<void>;
+  deleteMailboxData(mailbox: string): Promise<void>;
   handleAskMarkRead(actionKey: string, messageId: string, mailbox?: string): Promise<void>;
   handleAskTrash(actionKey: string, messageId: string, mailbox?: string): Promise<void>;
   enterAskDraftEdit(key: string, draft: string): void;
@@ -811,7 +812,6 @@ export function useAppController() {
     },
     async summarizeSelectedThread() {
       if (!state.selectedCard || state.summarizingThread) return;
-      if (!(await ensureSamplingAvailable())) return;
       const cardId = state.selectedCard.id;
       const key = state.selectedCard.uiKey || cardUiKey(state.selectedCard, state.mailbox);
       setState((s) => ({ ...s, summarizingThread: true }));
@@ -833,7 +833,6 @@ export function useAppController() {
     },
     async generateDraft(presetRevision, userAnswers?: Record<string, string>) {
       if (!state.selectedCard || state.generatingDraft) return;
-      if (!(await ensureSamplingAvailable())) return;
       const cardId = state.selectedCard.id;
       const key = state.selectedCard.uiKey || cardUiKey(state.selectedCard, state.mailbox);
       const currentDraft = state.draftById[key] || "";
@@ -1004,7 +1003,6 @@ export function useAppController() {
     async startCustomScan() {
       const userRequest = state.customScanInput.trim();
       if (!userRequest || state.isCustomScanning) return;
-      if (!(await ensureSamplingAvailable())) return;
       setState((s) => ({
         ...s,
         isCustomScanning: true,
@@ -1060,7 +1058,6 @@ export function useAppController() {
     },
     async reRunCustomPlan(planId) {
       if (state.isCustomScanning) return;
-      if (!(await ensureSamplingAvailable())) return;
       const plan = state.customPlans.find((item) => item.plan_id === planId);
       const question = plan?.user_request || "Re-run saved scan";
       setState((s) => ({
@@ -1155,6 +1152,32 @@ export function useAppController() {
         showToast(error instanceof Error ? error.message : String(error));
       }
     },
+    async deleteMailboxData(mailbox) {
+      try {
+        const normalized = normalizedMailbox(mailbox);
+        const result = await client.deleteMailboxData(normalized);
+        if (result.ok) {
+          const deleted = result.deleted || {};
+          const remainingMailboxes = state.mailboxes.filter((m) => normalizedMailbox(m.email) !== normalized);
+          const remainingSelected = state.selectedMailboxes.filter((m) => normalizedMailbox(m) !== normalized);
+          const nextMailbox = state.mailbox === normalized ? "all" : state.mailbox;
+          setState((s) => ({
+            ...s,
+            mailboxes: remainingMailboxes,
+            selectedMailboxes: remainingSelected,
+            briefMailboxFilter: remainingSelected,
+            mailbox: nextMailbox,
+            cards: nextMailbox === "all" ? s.cards : filterCardsByMailboxes(s.allCards, remainingSelected),
+            allCards: nextMailbox === "all" ? s.allCards : s.allCards.filter((c) => normalizedMailbox(cardMailbox(c, s.mailbox)) !== normalized),
+            actionCount: actionCount(nextMailbox === "all" ? s.cards : filterCardsByMailboxes(s.allCards, remainingSelected)),
+          }));
+          showToast(`Deleted ${deleted.keys || 0} records, ${deleted.cache_keys || 0} cached emails, ${deleted.history_entries || 0} history entries for ${normalized}.`);
+          await loadActiveCards();
+        }
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+      }
+    },
     async handleAskMarkRead(actionKey, messageId, mailboxOverride) {
       if (!messageId || state.askItemActions[actionKey]?.read) return;
       setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [actionKey]: { ...s.askItemActions[actionKey], read: true } } }));
@@ -1236,7 +1259,6 @@ export function useAppController() {
     },
     async generateAskDraftWithAnswers(actionKey, item, answers, mailboxOverride) {
       const mailbox = mailboxOverride || state.selectedMailboxes[0] || state.mailbox;
-      if (!(await ensureSamplingAvailable())) return;
       setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [actionKey]: { ...s.askItemActions[actionKey], sending: true } } }));
       try {
         const result = await client.generateAskDraft({

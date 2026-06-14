@@ -1,6 +1,7 @@
 # Phase 2 Judgment — 二叉决策改造
 
 > 2026-06-04
+> **状态：已实施。** `action_reason` 已替代 bucket 分类，`_enforce_consistency` 已包含 6 条硬约束。
 
 ## 改造目的
 

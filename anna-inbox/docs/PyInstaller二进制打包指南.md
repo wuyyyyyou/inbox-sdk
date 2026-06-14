@@ -1,5 +1,7 @@
 # PyInstaller 二进制打包指南
 
+> **注意：文档中 tool_id 示例需替换为当前值 `tool-peiyuan-inbox-executa-yhbzbap8`，版本当前为 `1.0.1`。**
+
 将 Executa Python 工具打包为 Windows 单文件 exe，通过 GitHub Releases 分发。
 
 ## 1. 前置条件

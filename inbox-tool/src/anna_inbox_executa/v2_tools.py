@@ -443,6 +443,13 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             shutil.rmtree(root, ignore_errors=True)
         return {"ok": True}
 
+    if tool == "delete_mailbox_data":
+        mbox = str(arguments.get("mailbox", "")).strip()
+        if not mbox:
+            return {"error": "mailbox is required"}
+        from mail_agent.storage.ops import delete_mailbox_data
+        return await delete_mailbox_data(mbox)
+
     if tool == "reply_now":
         log(f"[reply_now] mailbox={mailbox} card_id={card_id} dry_run={arguments.get('dry_run', True)} reply_mode={arguments.get('reply_mode', 'reply_to_sender')} draft_len={len(str(arguments.get('draft_body', '')))}")
         if not mailbox or not card_id:

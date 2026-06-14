@@ -1,5 +1,9 @@
 # PRD-V2 代码实现校验报告
 
+> **状态：已过时。** 前端引用的是旧单文件架构（`app.js`），当前前端为 React 组件（`BriefView.tsx` / `HandleView.tsx` / `Drawers.tsx`）。后端引用大部分已同步到当前模块结构。保留本文作为 PRD-V2 合规参考。
+
+> 当前前端文件对应关系：`app.js` → `anna-inbox/src/features/`（React 组件），`style.css` → `anna-inbox/src/styles/global.css`
+
 ## 校验方法
 
 逐条对照 PRD-V2 文档的每个要求，读取实际代码进行验证。不依赖记忆或推测，每条结论标注对应的文件和行号。

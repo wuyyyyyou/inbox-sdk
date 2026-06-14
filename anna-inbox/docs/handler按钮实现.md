@@ -1,5 +1,7 @@
 # Handle 按钮和抽屉实现分析
 
+> **状态：已实施。** `button_label` 字段已加入 `CardAction`，`_PRIMARY_BUTTON_LABELS` 映射已生效，`reply_now` 工具已实现。
+
 ## 一、PRD-V2 要求回顾
 
 ### 1.1 Handle（Primary Action）按钮 — §1.1.3

@@ -228,7 +228,7 @@ async def run_mail_task(
 
     scan_plan_config = await _get_scan_plan_config(input_.mailbox_id)
 
-    configured_max = scan_plan_config.max_messages if scan_plan_config else 100
+    max_threads = scan_plan_config.max_messages if scan_plan_config else 100
     scan_window_days = scan_plan_config.scan_window_days if scan_plan_config else 7
 
     # Quick Gmail connectivity check (platform only; skip in local dev)
@@ -252,10 +252,16 @@ async def run_mail_task(
             _logger.warning("gmail_check failed: %s", _exc)
             raise RuntimeError(f"Gmail connection failed — check your token or network. ({_exc})") from _exc
 
-    _report_progress(progress_callback, "scan", max_threads=configured_max, scan_window_days=scan_window_days)
-    _logger.info("scan started: mailbox=%s max_threads=%s scan_window_days=%s", input_.mailbox_id, configured_max, scan_window_days)
-    messages = await run_mail_scan(input_.mailbox_id, configured_max, newer_than_days=scan_window_days, progress_callback=progress_callback)
-    _report_progress(progress_callback, "scan_done", scanned=len(messages), max_threads=configured_max)
+    _report_progress(progress_callback, "scan", max_messages=max_threads, scan_window_days=scan_window_days)
+    _logger.info("scan started: mailbox=%s max_threads=%s scan_window_days=%s first=%s after_ts=%s",
+                 input_.mailbox_id, max_threads, scan_window_days, is_first_scan, last_message_internal_date[:20])
+    messages = await run_mail_scan(
+        input_.mailbox_id, max_threads,
+        newer_than_days=scan_window_days,
+        after_timestamp="" if is_first_scan else last_message_internal_date,
+        progress_callback=progress_callback,
+    )
+    _report_progress(progress_callback, "scan_done", scanned=len(messages), max_messages=max_threads)
     _logger.info("scan done: %d messages fetched", len(messages))
 
     # ── Storage: filter already-processed messages ─────────────────
@@ -674,8 +680,8 @@ async def run_custom_scan(
     normalized_mailbox = normalize_mailbox(mailbox)
 
     # 1. Search
-    max_threads = (plan.scan_budget or {}).get("max_messages", 200) if isinstance(plan.scan_budget, dict) else 200
-    messages = await run_mail_scan(mailbox, max_threads, progress_callback=progress_callback)
+    max_threads_ask = (plan.scan_budget or {}).get("max_messages", 200) if isinstance(plan.scan_budget, dict) else 200
+    messages = await run_mail_scan(mailbox, max_threads_ask, progress_callback=progress_callback)
     sources = [
         {
             "subject": getattr(msg, "subject", "") or "",
@@ -1058,14 +1064,14 @@ async def _persist_run_results_locked(
         if cleanup_card is not None:
             new_cards.append(cleanup_card)
 
-    # 3. 单独持久化本次 cleanup 明细，卡片本身只保存预览。
+    # 3. 持久化 cleanup 明细（与历史合并去重），卡片预览总数。
     if cleanup_full:
         from ..storage.ops import set_cleanup_bundle as _scb
-        await _scb(mailbox, cleanup_full)
-        # bundled_count 只反映本次扫描的 cleanup 总数，避免完成阶段全量读取历史明细。
+        result = await _scb(mailbox, cleanup_full)
+        merged_total = int(result.get("total", len(cleanup_full)))
         for c in new_cards:
             if getattr(c, "card_type", "") == "cleanup_bundle":
-                c.bundled_count = len(cleanup_full)
+                c.bundled_count = merged_total
 
     # 4. Merge with existing active cards
     existing = await get_active_cards(mailbox)

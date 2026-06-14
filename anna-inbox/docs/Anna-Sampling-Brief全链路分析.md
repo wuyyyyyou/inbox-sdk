@@ -1,6 +1,7 @@
 # Anna LLM Sampling — Brief 全链路分析
 
 > 创建时间：2026-05-31
+> 状态：参数已更新（max_tokens 8000, timeout 120s, max_attempts 2），文件路径已同步至当前代码结构。
 
 ---
 

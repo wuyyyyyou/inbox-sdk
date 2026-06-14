@@ -1,6 +1,7 @@
 # Phase 1 ignore 误判修复计划
 
 > 2026-05-29 14:50（北京时间）
+> **状态：已实施。** ignore 定义已收紧，review 正向示例已加入 `_PHASE1_SYSTEM` prompt。
 
 ## 问题报告
 

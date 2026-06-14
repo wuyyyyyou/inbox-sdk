@@ -36,7 +36,9 @@ function PerMailboxConfig() {
   const isCustomMax = ![50, 100, 150].includes(maxMsgs);
   const [customWindow, setCustomWindow] = useState(isCustomWindow ? String(windowDays) : "");
   const [customMax, setCustomMax] = useState(isCustomMax ? String(maxMsgs) : "");
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const save = actions.saveScanPlanField;
+  const mailboxEmail = state.configMailbox || state.mailbox;
 
   return (
     <div className="mailbox-config-body">
@@ -51,7 +53,7 @@ function PerMailboxConfig() {
         </div>
       </div>
       <div className="mailbox-config-section">
-        <h4 className="mailbox-config-label">Max messages</h4>
+        <h4 className="mailbox-config-label">Max threads</h4>
         <div className="preset-row preset-row-sm">
           {[50, 100, 150].map((n) => <button key={n} className={`preset-chip ${maxMsgs === n ? "is-active" : ""}`} onClick={() => { setCustomMax(""); save("max_messages", n); }}>{n}</button>)}
           <button className="custom-step-btn" onClick={() => save("max_messages", Math.max(10, maxMsgs - 10))}>−</button>
@@ -70,6 +72,21 @@ function PerMailboxConfig() {
           })}
         </div>
       </div>
+      <div style={{ marginTop: 12 }}>
+        <button className="danger-btn" style={{ fontSize: 12, padding: "6px 14px", borderRadius: 8 }} onClick={() => setConfirmDelete(true)}>Delete mailbox data</button>
+        <p className="drawer-copy" style={{ marginTop: 4 }}>Clears all cards, cache, contact memory, and scan history for this mailbox only.</p>
+      </div>
+      {confirmDelete ? (
+        <div className="confirm-overlay" onClick={() => setConfirmDelete(false)}>
+          <div className="confirm-dialog" onClick={(e) => e.stopPropagation()}>
+            <p>This will delete all data for <strong>{mailboxEmail}</strong>, including cards, cached emails, contact memory, scan history, and run records. Other mailboxes will not be affected. <strong>This cannot be undone.</strong></p>
+            <div className="confirm-actions">
+              <button className="soft-btn" onClick={() => setConfirmDelete(false)}>Cancel</button>
+              <button className="primary-btn danger-btn" onClick={() => { setConfirmDelete(false); void actions.deleteMailboxData(mailboxEmail); }}>Delete mailbox data</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -155,6 +172,10 @@ function SourcesDrawer() {
   );
 }
 
+function normalizeMailbox(mailbox: string | undefined): string {
+  return String(mailbox || "").trim().toLowerCase();
+}
+
 function memoryKey(item: ContactMemorySummary): string {
   return `${String(item.mailbox || "").trim().toLowerCase()}::${String(item.contact_email || "").trim().toLowerCase()}`;
 }
@@ -214,12 +235,31 @@ function isGenericMemoryState(value?: string): boolean {
 function MemoryDrawer() {
   const { state, actions } = useApp();
   const [expandedThreads, setExpandedThreads] = useState<Record<string, boolean>>({});
-  const contacts = state.contactMemories || [];
+  const allContacts = state.contactMemories || [];
   const selected = state.selectedMemory;
-  const selectedSummary = contacts.find((item) => memoryKey(item) === state.selectedMemoryKey);
   const selectedMailboxes = state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox].filter(Boolean);
+
+  // Mailbox filter
+  const uniqueMailboxes = [...new Set(allContacts.map((c) => normalizeMailbox(c.mailbox)).filter(Boolean))].sort();
+  const [memoryMailboxFilter, setMemoryMailboxFilter] = useState<string[]>([]);
+  const activeMemoryFilter = memoryMailboxFilter.length ? memoryMailboxFilter : uniqueMailboxes;
+  const memoryFilterSet = new Set(activeMemoryFilter);
+  const contacts = allContacts.filter((c) => memoryFilterSet.has(normalizeMailbox(c.mailbox)));
+
+  const selectedSummary = contacts.find((item) => memoryKey(item) === state.selectedMemoryKey);
   const totalThreads = contacts.reduce((sum, item) => sum + (item.thread_count || 0), 0);
   const totalMessages = contacts.reduce((sum, item) => sum + (item.message_count || 0), 0);
+
+  const toggleMemoryMailbox = (mailbox: string) => {
+    if (activeMemoryFilter.length === uniqueMailboxes.length) {
+      setMemoryMailboxFilter(uniqueMailboxes.filter((m) => m !== mailbox));
+    } else if (memoryFilterSet.has(mailbox)) {
+      if (activeMemoryFilter.length === 1) return;
+      setMemoryMailboxFilter(activeMemoryFilter.filter((m) => m !== mailbox));
+    } else {
+      setMemoryMailboxFilter([...activeMemoryFilter, mailbox]);
+    }
+  };
 
   const openContact = (item: ContactMemorySummary) => {
     if (memoryKey(item) === state.selectedMemoryKey) {
@@ -334,8 +374,22 @@ function MemoryDrawer() {
         </section>
 
         {state.memoryError ? <div className="memory-error">{state.memoryError}</div> : null}
-        {state.memoryLoading && !contacts.length ? <p className="assistant-copy">Loading memory...</p> : null}
-        {!state.memoryLoading && !contacts.length && !state.memoryError ? <p className="assistant-copy">No contact memory yet.</p> : null}
+        {state.memoryLoading && !allContacts.length ? <p className="assistant-copy">Loading memory...</p> : null}
+        {!state.memoryLoading && !allContacts.length && !state.memoryError ? <p className="assistant-copy">No contact memory yet.</p> : null}
+
+        {uniqueMailboxes.length > 1 ? (
+          <section className="memory-mailbox-filter" style={{ display: "flex", gap: 6, flexWrap: "wrap", padding: "0 0 10px" }}>
+            {uniqueMailboxes.map((mb) => {
+              const active = memoryFilterSet.has(mb);
+              const count = allContacts.filter((c) => normalizeMailbox(c.mailbox) === mb).length;
+              return (
+                <button key={mb} className={`preset-chip${active ? " is-active" : ""}`} style={{ fontSize: 11 }} onClick={() => toggleMemoryMailbox(mb)}>
+                  {mb} ({count})
+                </button>
+              );
+            })}
+          </section>
+        ) : null}
 
         <section className="memory-list">
           {contacts.map((item) => {
@@ -406,15 +460,33 @@ function HistoryDrawer() {
   const { state, actions } = useApp();
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  // Entries that have been restored — hidden from list immediately
   const restoredCardIds = state.restoredCardIds;
 
-  // Group entries
+  // Mailbox filter
+  const allHistory = state.history || [];
+  const historyMailboxes = [...new Set(allHistory.map((r) => normalizeMailbox(r.mailbox)).filter(Boolean))].sort();
+  const [historyMailboxFilter, setHistoryMailboxFilter] = useState<string[]>([]);
+  const activeHistoryFilter = historyMailboxFilter.length ? historyMailboxFilter : historyMailboxes;
+  const historyFilterSet = new Set(activeHistoryFilter);
+
+  // Group entries (filtered by mailbox)
   const grouped: Record<string, RunHistoryEntry[]> = {};
-  for (const run of state.history) {
+  for (const run of allHistory) {
+    if (!historyFilterSet.has(normalizeMailbox(run.mailbox))) continue;
     const gk = classifyEntry(run);
     (grouped[gk] ||= []).push(run);
   }
+
+  const toggleHistoryMailbox = (mailbox: string) => {
+    if (activeHistoryFilter.length === historyMailboxes.length) {
+      setHistoryMailboxFilter(historyMailboxes.filter((m) => m !== mailbox));
+    } else if (historyFilterSet.has(mailbox)) {
+      if (activeHistoryFilter.length === 1) return;
+      setHistoryMailboxFilter(activeHistoryFilter.filter((m) => m !== mailbox));
+    } else {
+      setHistoryMailboxFilter([...activeHistoryFilter, mailbox]);
+    }
+  };
 
   const toggleGroup = (key: string) => setCollapsed((c) => ({ ...c, [key]: !c[key] }));
 
@@ -567,6 +639,19 @@ function HistoryDrawer() {
         <button className="icon-btn" onClick={actions.closeDrawers}>×</button>
       </div>
       <div className="drawer-body">
+        {historyMailboxes.length > 1 ? (
+          <section className="history-mailbox-filter" style={{ display: "flex", gap: 6, flexWrap: "wrap", padding: "0 0 10px" }}>
+            {historyMailboxes.map((mb) => {
+              const active = historyFilterSet.has(mb);
+              const count = allHistory.filter((r) => normalizeMailbox(r.mailbox) === mb).length;
+              return (
+                <button key={mb} className={`preset-chip${active ? " is-active" : ""}`} style={{ fontSize: 11 }} onClick={() => toggleHistoryMailbox(mb)}>
+                  {mb} ({count})
+                </button>
+              );
+            })}
+          </section>
+        ) : null}
         {!hasAny ? <p className="assistant-copy">No history yet.</p> : null}
         {visibleGroups.map((g) => {
           const allEntries = (grouped[g.key] || []).filter((e) => e.action === "restore" || (!restoredCardIds.has(e.card_id || "") && !consumedEntryIds.has(entryKey(e))));

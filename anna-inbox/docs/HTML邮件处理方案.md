@@ -1,10 +1,12 @@
 # HTML 邮件处理方案
 
+> **状态：待确认实施进度。** 当前文件路径为 `mail_agent/mail_providers/gmail/adapter.py`（已从旧的 `mail_adapter.py` 重构）。
+
 ## 一、当前问题
 
 ### 1.1 现状：原始 HTML 直接进入 LLM
 
-`mail_adapter.py:259-280` 的 `_decode_body()` 函数：
+`mail_agent/mail_providers/gmail/adapter.py` 的 `_decode_body()` 函数：
 
 ```python
 def _decode_body(message: dict[str, Any]) -> str:

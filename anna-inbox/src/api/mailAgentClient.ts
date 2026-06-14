@@ -228,6 +228,10 @@ export class MailAgentClient {
     return this.invoke<{ ok: boolean }>("reset_all_data", {});
   }
 
+  deleteMailboxData(mailbox: string) {
+    return this.invoke<{ ok: boolean; deleted: Record<string, number> }>("delete_mailbox_data", { mailbox });
+  }
+
   markReadFromAsk(mailbox: string, messageIds: string[]) {
     return this.invoke<{ ok?: boolean; error?: string }>("mark_read_from_ask", { mailbox, message_ids: messageIds });
   }

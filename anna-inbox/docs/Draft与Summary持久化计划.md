@@ -1,5 +1,6 @@
 # Draft & Thread Summary 持久化 — 实施计划
 
+> **状态：已实施。** `PersistentCard.draft_reply` / `thread_summary` 字段已加入，前后端透传已完成。
 > 目标：草稿和摘要生成后自动持久化，下次打开卡片时直接加载，避免重复消耗 token
 > 约束：本地 JSON 和 Anna APS 两种存储路径必须保持同步兼容
 

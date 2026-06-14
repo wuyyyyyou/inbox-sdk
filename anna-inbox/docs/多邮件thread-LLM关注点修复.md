@@ -161,4 +161,4 @@ Message 5 ← LATEST:
 ## 实施状态
 
 - [x] 第一轮修复：`[:4]` → `[-4:]`，新增 `_render_body_and_thread`，最新标注（已实施）
-- [ ] 第三轮方案 C：截断 + 标注 UNREPLIED / LATEST（待实施）
+- [ ] 第三轮方案 C：截断 + 标注 UNREPLIED / LATEST（待实施，参考[[多邮件thread-LLM关注点修复]]）

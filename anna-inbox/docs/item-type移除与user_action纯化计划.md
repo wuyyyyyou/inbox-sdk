@@ -1,6 +1,7 @@
 # item_type 移除、Phase 1/2 Prompt 修正 实施计划
 
 > 2026-05-29（北京时间）
+> **状态：已实施。** `item_type` 已从 LLM 输出中删除，分类全由 `user_action` 驱动；reason 指令已改为论证式；自检规则已加入 prompt。
 
 ## 背景
 

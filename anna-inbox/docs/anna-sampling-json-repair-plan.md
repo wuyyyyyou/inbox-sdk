@@ -1,5 +1,7 @@
 # Anna Sampling JSON Repair Plan
 
+> **状态：已实施。** JSON repair 逻辑已集成至 `mail_agent/llm_runtime/service.py::call_llm_json_safe()`。本文档引用旧文件路径（`new/executas/.../llm.py`），当前对应文件为 `mail_agent/llm_runtime/service.py`。
+
 ## 背景
 
 Anna LLM sampling 当前没有 `response_format` 或 JSON schema 参数，业务链路只能通过提示词约束模型输出 JSON。实际运行中，Anna sampling 偶发返回非标准 JSON，导致 `parse_json_response()` 失败，后续进入重试或 fallback。现有重试会重新执行原任务，但如果模型持续输出坏 JSON，重试仍容易失败。

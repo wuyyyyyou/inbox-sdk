@@ -1,5 +1,7 @@
 # PRD-V3 + V3 前端改造实施计划
 
+> **状态：部分实施。** 自适应扫描窗口（`_determine_scan_window`）已实施；ScanPlan 持久化已实施（`get_scan_plan` / `set_scan_plan`）；`time_range` + `max_messages` 已在 pipeline 消费。未实施：查询优先级排序、触顶提示、扫描历史增强、V3 前端（已随 React 重构独立推进）。
+
 ## 文档依据
 
 - **PRD-V3**: `new/prd-v3-daily-brief-scan-scope.md`（扫描范围自适应策略）

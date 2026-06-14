@@ -1,6 +1,7 @@
 # Reply 两阶段草稿生成方案
 
 > 2026-06-07
+> **状态：已实施。** `reply_gaps` 字段已加入 Phase 2 输出 → `PersistentCard` → 前端 GapForm 组件。
 
 ## 问题
 

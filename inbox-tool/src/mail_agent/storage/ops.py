@@ -548,14 +548,30 @@ async def get_cleanup_bundle_page(mailbox: str, offset: int = 0, limit: int = 10
 
 
 async def set_cleanup_bundle(mailbox: str, messages: list[dict[str, Any]]) -> dict:
-    total = len(messages)
+    """Persist a cleanup bundle, merging with any existing bundle by message_id.
+
+    New items overwrite old items with the same message_id; old items not present
+    in the new list are preserved.  This prevents incremental scans from losing
+    cleanup cards accumulated across previous scans.
+    """
+    # Merge with existing bundle
+    existing = await get_cleanup_bundle(mailbox)
+    seen: set[str] = {str(m.get("message_id", "")) for m in messages if m.get("message_id")}
+    merged = list(messages)
+    for old in existing:
+        mid = str(old.get("message_id", ""))
+        if mid and mid not in seen:
+            merged.append(old)
+            seen.add(mid)
+
+    total = len(merged)
     shard_count = max(1, (total + CLEANUP_SHARD_SIZE - 1) // CLEANUP_SHARD_SIZE) if total > 0 else 0
     storage = get_storage()
     if shard_count == 0:
         await storage.set(_cleanup_index_key(mailbox), {"shards": 0, "total": 0, "updated_at": _now()}, scope=default_scope())
         return {"ok": True, "shards": 0, "total": 0}
     for i in range(shard_count):
-        s = messages[i * CLEANUP_SHARD_SIZE:(i + 1) * CLEANUP_SHARD_SIZE]
+        s = merged[i * CLEANUP_SHARD_SIZE:(i + 1) * CLEANUP_SHARD_SIZE]
         await storage.set(_cleanup_shard_key(mailbox, i), s, scope=default_scope())
     # Delete stale shards
     idx_result = await storage.get(_cleanup_index_key(mailbox), scope=default_scope())
@@ -670,6 +686,96 @@ async def clear_cards_by_category(mailbox: str, category: str) -> int:
             except Exception:
                 pass
     return removed
+
+
+async def delete_mailbox_data(mailbox: str) -> dict:
+    """Delete all persistent data for a single mailbox.
+
+    Nukes every key under the mailbox prefix (cards, processed, scan state,
+    run records, contact memories, etc.), plus Gmail cache, run-history
+    entries for this mailbox, and the registry entry.
+
+    Returns counts of deleted items.
+    """
+    storage = get_storage()
+    mbox = _normalize_email(mailbox)
+    prefix = _mailbox_prefix(mbox)
+    counts: dict[str, int] = {"keys": 0, "cache_keys": 0, "history_entries": 0}
+
+    # 1. Nuke all per-mailbox keys (covers cards, processed, scan state, scan plan, run records, contacts)
+    try:
+        result = await storage.list(f"{prefix}/", scope=default_scope())
+        for item in result.get("items", []):
+            try:
+                await storage.delete(item.get("key", ""), scope=default_scope())
+                counts["keys"] += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2. Also delete the mailbox prefix key itself (some storages keep it as a directory marker)
+    try:
+        await storage.delete(prefix, scope=default_scope())
+    except Exception:
+        pass
+
+    # 3. Nuke Gmail cache — APS keys
+    from ..mail_providers.gmail.adapter import _storage_cache_prefix
+    cache_prefix = _storage_cache_prefix(mbox)
+    try:
+        cache_result = await storage.list(f"{cache_prefix}/", scope=default_scope())
+        for item in cache_result.get("items", []):
+            try:
+                await storage.delete(item.get("key", ""), scope=default_scope())
+                counts["cache_keys"] += 1
+            except Exception:
+                pass
+        await storage.delete(cache_prefix, scope=default_scope())
+    except Exception:
+        pass
+
+    # 4. Nuke Gmail cache — local filesystem
+    try:
+        from ..mail_providers.gmail.adapter import _mailbox_cache_dir
+        import shutil
+        local_cache = _mailbox_cache_dir(mbox)
+        if local_cache.exists():
+            shutil.rmtree(str(local_cache))
+    except Exception:
+        pass
+
+    # 5. Nuke local mailbox data directory (Files storage)
+    try:
+        from anna_inbox_executa.common import data_root as _common_data_root
+        import shutil as _shutil
+        local_mbox_dir = _common_data_root() / "anna-inbox" / "mailbox" / _sanitize(mbox)
+        if local_mbox_dir.exists():
+            _shutil.rmtree(str(local_mbox_dir))
+    except Exception:
+        pass
+
+    # 6. Filter run-history entries for this mailbox (cross-mailbox key)
+    try:
+        hist_result = await storage.get(RUN_HISTORY_KEY, scope=default_scope())
+        if hist_result.get("exists") and isinstance(hist_result.get("value"), dict):
+            raw: dict = hist_result["value"]
+            entries: list = raw.get("entries", [])
+            before = len(entries)
+            entries = [e for e in entries if not (isinstance(e, dict) and _normalize_email(str(e.get("mailbox", ""))) == mbox)]
+            counts["history_entries"] = before - len(entries)
+            raw["entries"] = entries
+            await storage.set(RUN_HISTORY_KEY, raw, scope=default_scope())
+    except Exception:
+        pass
+
+    # 7. Remove from mailbox registry
+    try:
+        await remove_mailbox_from_registry(mbox)
+    except Exception:
+        pass
+
+    return {"ok": True, "mailbox": mbox, "deleted": counts}
 
 
 async def reset_all_data() -> dict:

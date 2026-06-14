@@ -235,6 +235,7 @@ function MailboxFilter({ allCards }: { allCards: FrontendCard[] }) {
   const allSelected = activeSet.size === enabledMailboxes.length;
   const counts = new Map<string, number>();
   for (const card of visibleCards(allCards)) {
+    if (card.cardType === "cleanup_bundle") continue;
     const mailbox = cardMailbox(card);
     if (enabledSet.has(mailbox)) counts.set(mailbox, (counts.get(mailbox) || 0) + 1);
   }
@@ -437,9 +438,9 @@ export function BriefView() {
   const title = state.loading
     ? "Anna is waking up..."
     : n > 0
-      ? `I found ${n} thing${n === 1 ? "" : "s"} worth your attention.`
+      ? `${n} need${n === 1 ? "s" : ""} reply or review.`
       : totalScans > 0
-        ? "No attention cards right now."
+        ? "Nothing needs attention right now."
         : "Welcome to Anna Inbox.";
   const activeFilter = state.resultFilter;
   const isAll = activeFilter === "all";

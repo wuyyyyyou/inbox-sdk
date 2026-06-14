@@ -1,5 +1,6 @@
 # Handle 详情页改造计划
 
+> **状态：部分实施。** 线程上下文折叠、预设修改芯片已实施。本文档引用旧前端架构（`app.js`），当前前端组件为 `anna-inbox/src/features/handle/HandleView.tsx`。
 > 目标：对齐 indexv4 的详情页设计
 > 后端：无需改动
 

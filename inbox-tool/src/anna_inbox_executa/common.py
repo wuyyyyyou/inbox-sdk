@@ -398,6 +398,13 @@ DEFAULT_MANIFEST = {
             "description": "Reset all persistent data — cards, history, cache, scan state, contacts. Returns app to first-run state.",
         },
         {
+            "name": "delete_mailbox_data",
+            "description": "Delete all persistent data for a single mailbox — cards, processed-message index, scan state, run records, Gmail cache, contact memories, and registry entry. Other mailboxes are not affected.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "The mailbox email address to delete all data for.", "required": True},
+            ],
+        },
+        {
             "name": "record_learning",
             "description": "Record a learning feedback from the user about email patterns.",
             "parameters": [

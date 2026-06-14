@@ -1,5 +1,8 @@
 # Next Scan 实现现状与 V3 差距分析
 
+> **状态：部分实施。** 后端 ScanPlan 字段基本齐全（`schedule` / `time_range` / `max_messages` / `batch_behavior` 等），pipeline 已消费 `time_range` + `max_messages`。前端引用的是旧架构（`app.js`），当前前端组件为 `Drawers.tsx`（scanPlan 配置）。
+> `priorities` / `include_archived` / `batch_behavior` 字段 pipeline 尚未消费。
+
 ## 一、当前实现逻辑链路
 
 ```

@@ -1,6 +1,7 @@
 # Brief 管线全链路设计
 
-> 更新时间：2026-05-29 14:26（北京时间）
+> 更新时间：2026-06-15（北京时间）
+> 状态：已实施。文件路径已同步至当前代码结构。
 
 ## 总览
 
@@ -203,22 +204,20 @@ card.userAction === "cleanup"  → "cleanup"
 
 ---
 
-## 改动文件清单
+## 改动文件清单（已同步至当前代码结构）
 
-| 文件 | 职责 |
-|------|------|
-| `phase1.py` | Phase 1 系统提示词；`parse_phase1_response` 三路分流；`run_phase1_batch_classify` |
-| `judgment.py` | 两条路径的 prompt 构建；`parse_judgment_output` / `_parse_compact_batch_item`；`_enforce_consistency` |
-| `types.py` | `FinalDecision` / `BaseJudgment` / `JudgmentResult` / `CandidateItem` 等数据类 |
-| `storage_types.py` | `PersistentCard`（含 `user_action`/`card_type`/`bundled_messages`）；`ProcessedMessage`；`ActiveCards` |
-| `card_service.py` | `build_card` / `build_cleanup_bundle`；`merge_cards`；`cards_to_frontend` |
-| `pipeline.py` | 主流水线编排；`_persist_run_results_locked` |
-| `llm.py` | `call_llm_json` / `call_llm_json_safe`；DashScope HTTP 调用 |
-| `storage_ops.py` | 统一存储操作（get/set/list/delete/cards/run/prefs） |
-| `storage_client.py` | 存储单例 |
-| `local_storage.py` | 本地 JSON 文件存储实现 |
-| `mail_adapter.py` | Gmail API 适配 + OAuth token 管理 |
-| `guards.py` | 安全策略守护 |
-| `main.py` | JSON-RPC 入口；Executa tool 清单；storage/LLM provider 切换 |
-| `app.js` | 前端 SPA：渲染、交互、状态管理 |
-| `style.css` | 前端样式 |
+| 当前文件路径 | 对应旧路径 | 职责 |
+|------|------|------|
+| `mail_agent/core/phase1.py` | `phase1.py` | Phase 1 系统提示词；`parse_phase1_response` 三路分流；`run_phase1_batch_classify` |
+| `mail_agent/judgment_engine/service.py` | `judgment.py` | 两条路径的 prompt 构建；`parse_judgment_output` / `_parse_compact_batch_item`；`_enforce_consistency` |
+| `mail_agent/domain/types.py` + `mail_agent/storage/types.py` | `types.py` | `FinalDecision` / `BaseJudgment` / `JudgmentResult` / `CandidateItem`；`PersistentCard` 等数据类 |
+| `mail_agent/cards/service.py` | `card_service.py` | `build_card` / `build_cleanup_bundle`；`merge_cards`；`cards_to_frontend` |
+| `mail_agent/core/pipeline.py` | `pipeline.py` | 主流水线编排；`_persist_run_results_locked`；Brief 可续跑状态机 |
+| `mail_agent/llm_runtime/service.py` | `llm.py` | `call_llm_json` / `call_llm_json_safe`；DashScope/Anna Sampling 统一调用 |
+| `mail_agent/storage/ops.py` | `storage_ops.py` | 统一存储操作（get/set/list/delete/cards/run/prefs/history） |
+| `mail_agent/storage/client.py` | `storage_client.py` | 存储单例 |
+| `mail_agent/core/guards.py` | `guards.py` | 安全策略守护 |
+| `mail_agent/mail_providers/gmail/adapter.py` | `mail_adapter.py` | Gmail API 适配 + OAuth token 管理 + 本地缓存 |
+| `anna_inbox_executa/main.py` | `main.py` | JSON-RPC 入口；Executa tool 清单 |
+| `anna_inbox_executa/dispatcher.py` | — | 工具路由分发（40+ 工具） |
+| `anna-inbox/src/` (React) | `app.js` / `style.css` | 前端 SPA：React + TypeScript + Vite |

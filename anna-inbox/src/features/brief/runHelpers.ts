@@ -66,7 +66,7 @@ export function scanProgressLabel(stage: string | undefined, progress: Record<st
   if (stage === "scan_cache") return `${p.lite_count || 0}/${p.matched_ids || 0} cached emails ready`;
   if (stage === "scan") {
     const threads = p.threads_fetched || 0;
-    const max = p.max_threads || 0;
+    const max = p.max_messages || 0;
     return max ? `Fetching threads ${threads}/${max}` : "Connecting to Gmail...";
   }
   if (stage === "scan_done") return `${p.scanned || 0} threads loaded`;

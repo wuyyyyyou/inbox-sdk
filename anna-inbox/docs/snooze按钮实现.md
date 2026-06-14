@@ -1,5 +1,7 @@
 # Snooze 按钮实现验证报告
 
+> **状态：已实施。** Snooze 偏好已通过 `_render_snooze_prefs_context()` 注入 Phase 2 prompt，`pipeline.py` 在 evaluation 前加载 `SnoozePrefs`。
+
 ## PRD-V2 要求（1.1.3 节）
 
 | 选项 | PRD 要求 |

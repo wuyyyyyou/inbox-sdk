@@ -1,5 +1,7 @@
 # Ask 功能重构计划
 
+> 状态：已实施。当前 Ask 架构即按此方案执行。文件路径已同步。
+
 ## 1. 设计原则
 
 **Brief 和 Ask 是同一层次，两种范式：**
@@ -192,19 +194,19 @@ Planner 根据用户意图选择，不硬编码：
 
 ## 6. 改动范围
 
-### 修改文件
+### 修改文件（已同步至当前代码结构）
 
-| 文件 | 改动 |
-|------|------|
-| **`types.py`** | `CustomScanPlan` 重定义：去掉 `candidate_kinds`、`llm_candidate_hints`、`evaluation_rubric`、`evaluation_buckets`、`output_mode`。新增 `read_depth`、`task_prompt` |
-| **`planner.py`** | System prompt 重写：指导 LLM 根据用户意图选择 `read_depth`，写 `task_prompt`（包含输出格式指令），生成 `gmail_queries` |
-| **`pipeline.py`** | `run_custom_scan` 重写为极简版（搜→读→一次 LLM→返回）。删掉 `_build_synthetic_strategy`，去掉 phase1/judgment/guard 等 Brief 管线环节的调用 |
-| **`main.py`** | `run_custom_scan_background` 适配新 result 格式。`start_custom_scan` / `re_run_custom_scan` handler 无需改动 |
-| **`app.js`** | `renderCustomRunResult` 改为通用容器渲染（sections / body / items） |
+| 旧文件路径 | 当前文件路径 | 改动 |
+|------|------|------|
+| **`types.py`** | `mail_agent/domain/types.py` | `CustomScanPlan` 重定义：去掉 `candidate_kinds`、`llm_candidate_hints`、`evaluation_rubric`、`evaluation_buckets`、`output_mode`。新增 `read_depth`、`task_prompt` |
+| **`planner.py`** | `mail_agent/planning/custom.py` | System prompt 重写：指导 LLM 根据用户意图选择 `read_depth`，写 `task_prompt`（包含输出格式指令），生成 `gmail_queries` |
+| **`pipeline.py`** | `mail_agent/core/pipeline.py` | `run_custom_scan` 重写为极简版（搜→读→一次 LLM→返回）。删掉 `_build_synthetic_strategy` |
+| **`main.py`** | `anna_inbox_executa/main.py` + `v2_tools.py` | 适配新 result 格式 |
+| **`app.js`** | `anna-inbox/src/features/ask/AskView.tsx` | 通用容器渲染（sections / body / items） |
 
-### 不改动的文件
+### 不改动的文件（已同步路径）
 
-`strategies.py`、`intent.py`、`phase1.py`、`candidate.py`、`context.py`、`judgment.py`、`guards.py`、`plan.py`、`card_service.py`、`scan.py`、`llm.py`、`mail_adapter.py`、`local_storage.py`、`storage_ops.py`、`storage_types.py`
+`mail_agent/core/phase1.py`、`mail_agent/core/candidate.py`、`mail_agent/core/context.py`、`mail_agent/judgment_engine/service.py`、`mail_agent/core/guards.py`、`mail_agent/cards/service.py`、`mail_agent/core/scan.py`、`mail_agent/llm_runtime/service.py`、`mail_agent/mail_providers/gmail/adapter.py`、`mail_agent/storage/ops.py`、`mail_agent/storage/types.py`
 
 ---
 

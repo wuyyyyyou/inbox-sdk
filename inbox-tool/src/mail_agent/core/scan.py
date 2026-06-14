@@ -23,17 +23,23 @@ BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 _logger = logging.getLogger(__name__)
 
 
-def _build_thread_scan_query(newer_than_days: int | None = None) -> str:
-    """根据扫描窗口生成 Gmail thread 查询。"""
+def _build_thread_scan_query(newer_than_days: int | None = None, after_timestamp: str = "") -> str:
+    """根据扫描窗口生成 Gmail thread 查询。增量扫描时追加 after: 过滤。"""
     query = "-in:chats"
-    if newer_than_days is None:
-        return query
-    try:
-        days = int(newer_than_days)
-    except (TypeError, ValueError):
-        return query
-    if days > 0:
-        query = f"{query} newer_than:{days}d"
+    if newer_than_days is not None:
+        try:
+            days = int(newer_than_days)
+        except (TypeError, ValueError):
+            days = 0
+        if days > 0:
+            query = f"{query} newer_than:{days}d"
+    if after_timestamp:
+        try:
+            after_sec = int(int(after_timestamp) / 1000)
+            if after_sec > 0:
+                query = f"{query} after:{after_sec}"
+        except (ValueError, TypeError):
+            pass
     return query
 
 
@@ -147,18 +153,24 @@ def _apply_user_scope_to_queries(
     return result
 
 
-# ── 邮件扫描器（Thread-based, 50 threads per invoke）─────────────────
+# ── 邮件扫描器（Thread-based, 50 threads per page）───────────────────
 
 async def run_mail_scan(
     mailbox: str,
     max_threads: int = 100,
     *,
     newer_than_days: int | None = None,
+    after_timestamp: str = "",
     progress_callback: Any = None,
 ) -> list[MessageLite]:
-    """Paginate Gmail threads newest-first, 50 per page, until max_threads unique threads.
+    """Paginate Gmail threads newest-first, 50 per page, until max_threads threads
+    that contain at least one message within the scan window have been fetched.
 
     Each page of 50 threads = one Gmail API call = one invoke-safe unit.
+
+    after_timestamp: Gmail internalDate milliseconds string. When non-empty,
+    the Gmail query adds ``after:{seconds}`` so only threads with messages
+    newer than the last scan are returned (incremental scan).
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from ..mail_providers.gmail.adapter import (
@@ -176,16 +188,17 @@ async def run_mail_scan(
     _clear_aps_cache_errors()
 
     normalized = normalize_mailbox(mailbox)
-    scan_query = _build_thread_scan_query(newer_than_days)
+    scan_query = _build_thread_scan_query(newer_than_days, after_timestamp)
     cutoff_ms = _scan_cutoff_ms(newer_than_days)
     all_messages: list[MessageLite] = []
+    fetched_thread_count = 0
     seen_threads: set[str] = set()
     page_token: str | None = None
     gmail_errors: list[str] = []
     fallback_used = False
     _errors_lock = threading.Lock()
 
-    while len(all_messages) < max_threads:
+    while fetched_thread_count < max_threads:
         # 1. List one page of threads (50 per call = 1 invoke)
         try:
             page = list_threads_page(normalized, page_token=page_token, query=scan_query)
@@ -200,7 +213,11 @@ async def run_mail_scan(
                         all_messages.append(_to_message_lite(m))
                     except Exception:
                         pass
-                if len(all_messages) >= max_threads:
+                    tid = str(m.get("thread_id") or "")
+                    if tid and tid not in seen_threads:
+                        seen_threads.add(tid)
+                        fetched_thread_count += 1
+                if fetched_thread_count >= max_threads:
                     break
             break
 
@@ -247,17 +264,19 @@ async def run_mail_scan(
             futures = {pool.submit(_fetch_one_thread, tid): tid for tid in thread_ids}
             for future in as_completed(futures):
                 msgs = future.result()
+                if msgs:
+                    fetched_thread_count += 1
                 for msg in msgs:
                     try:
                         all_messages.append(_to_message_lite(msg))
                     except Exception:
                         pass
-                if len(all_messages) >= max_threads:
+                if fetched_thread_count >= max_threads:
                     break
 
         if progress_callback:
             progress_callback("scan", {
-                "threads_fetched": len(all_messages),
+                "threads_fetched": fetched_thread_count,
                 "max_threads": max_threads,
                 "scan_window_days": newer_than_days,
                 "page_size": len(thread_ids),
@@ -307,4 +326,4 @@ async def run_mail_scan(
                 "hint": "Check Gmail token and network",
             })
 
-    return all_messages[:max_threads]
+    return all_messages

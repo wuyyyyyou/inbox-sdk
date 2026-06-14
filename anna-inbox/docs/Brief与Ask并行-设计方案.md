@@ -1,5 +1,8 @@
 # Brief 与 Ask 并行 — 设计方案
 
+> **状态：待验证。** 本文档引用的是旧的单文件前端架构（`app.js` / `render()` / `startScan()`）。当前前端为 React 组件（`BriefView.tsx` / `AskView.tsx`）。
+> 方案核心思路（Brief 扫描不抢占视图，进度缩到底部栏）仍然适用，但实现需改写为 React 状态管理。
+
 ## 问题
 
 Brief 扫描期间（`startScan()`），`state.view` 被强制设为 `"scanning"`，导致：
