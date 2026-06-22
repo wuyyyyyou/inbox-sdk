@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Any
 
 # Windows pipe encoding: -X utf8 covers console but not pipes;
-# explicit reconfigure ensures stdin/stdout are UTF-8 regardless.
-for _stream in (sys.stdin, sys.stdout):
+# explicit reconfigure keeps diagnostic writes and stdin/stdout stable.
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8")
     except Exception:
@@ -644,7 +644,9 @@ def _sampling_result_shape(result: Any) -> str:
 
 
 def write_frame(message: dict[str, Any]) -> None:
-    payload = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+    # Keep stdio frames ASCII-only. JSON escapes preserve the original Unicode
+    # after parsing, and avoid GBK pipe/logging crashes in Windows hosts.
+    payload = json.dumps(message, ensure_ascii=True, separators=(",", ":"))
 
     # Guard against lone surrogates (U+D800–U+DFFF) from LLM output or
     # cached email data that would break UTF-8 encoding on stdout.
@@ -661,7 +663,7 @@ def write_frame(message: dict[str, Any]) -> None:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="executa-resp-", delete=False, encoding="utf-8") as handle:
                 handle.write(payload)
                 path = handle.name
-            sys.stdout.write(json.dumps({"jsonrpc": JSONRPC_VERSION, "id": message.get("id"), "__file_transport": path}, ensure_ascii=False) + "\n")
+            sys.stdout.write(json.dumps({"jsonrpc": JSONRPC_VERSION, "id": message.get("id"), "__file_transport": path}, ensure_ascii=True) + "\n")
         else:
             sys.stdout.write(payload + "\n")
         sys.stdout.flush()

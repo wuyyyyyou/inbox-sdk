@@ -14,7 +14,7 @@
   ],
   "required_executas": [
     {
-      "tool_id": "tool-peiyuan-inbox-executa-yhbzbap8",
+      "tool_id": "bundled:inbox-executa",
       "min_version": "1.0.1",
       "version": "latest"
     }
@@ -36,7 +36,7 @@
     "views": [
       {
         "name": "main",
-        "title": "Zhaopy Mail Agent",
+        "title": "Panwb Mail Agent",
         "default": true,
         "entry": "index.html",
         "min_size": {
@@ -54,7 +54,7 @@
     ],
     "host_api": {
       "tools": [
-        "required:tool-peiyuan-inbox-executa-yhbzbap8"
+        "required:bundled:inbox-executa"
       ],
       "chat": [
         "write_message"
