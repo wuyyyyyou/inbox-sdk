@@ -1,7 +1,7 @@
 {
   "slug": "inbox-executa",
-  "tool_id": "tool-riazm4777-inbox-executa-ng6bh7wd",
-  "name": "tool-riazm4777-inbox-executa-ng6bh7wd",
+  "tool_id": "bundled:inbox-executa",
+  "name": "anna-inbox-executa",
   "display_name": "Anna Inbox Executa",
   "version": "1.0.1",
   "type": "python",

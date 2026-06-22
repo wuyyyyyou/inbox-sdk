@@ -1,6 +1,7 @@
 {
-  "name": "tool-riazm4777-inbox-executa-qdhf58d3",
-  "display_name": "Panwb Mail Agent QDHF58D3",
+  "slug": "mail-agent",
+  "name": "mail-agent",
+  "display_name": "Mail Agent",
   "version": "1.0.1",
   "description": "Minimal Anna Executa skeleton for reading Gmail through local token files and DashScope or Anna sampling LLM.",
   "author": "Panwb",
