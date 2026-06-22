@@ -37,45 +37,79 @@ function PerMailboxConfig() {
   const [customWindow, setCustomWindow] = useState(isCustomWindow ? String(windowDays) : "");
   const [customMax, setCustomMax] = useState(isCustomMax ? String(maxMsgs) : "");
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmFreshScan, setConfirmFreshScan] = useState(false);
   const save = actions.saveScanPlanField;
   const mailboxEmail = state.configMailbox || state.mailbox;
+  const clampInt = (value: number, min: number, max: number) => Math.min(max, Math.max(min, Math.round(value)));
+  const saveWindowDays = (value: number) => {
+    const next = clampInt(value, 1, 90);
+    setCustomWindow([4, 7, 14].includes(next) ? "" : String(next));
+    void save("scan_window_days", next);
+  };
+  const saveMaxEmails = (value: number) => {
+    const next = clampInt(value, 10, 500);
+    setCustomMax([50, 100, 150].includes(next) ? "" : String(next));
+    void save("max_messages", next);
+  };
 
   return (
     <div className="mailbox-config-body">
-      <p className="mailbox-config-hint">Configure scan settings for this mailbox.</p>
+      <p className="mailbox-config-hint">Scan settings are strict for this mailbox.</p>
       <div className="mailbox-config-section">
         <h4 className="mailbox-config-label">Scan window</h4>
         <div className="preset-row preset-row-sm">
-          {[4, 7, 14].map((d) => <button key={d} className={`preset-chip ${windowDays === d ? "is-active" : ""}`} onClick={() => { setCustomWindow(""); save("scan_window_days", d); }}>{d}d</button>)}
-          <button className="custom-step-btn" onClick={() => save("scan_window_days", Math.max(1, windowDays - 1))}>−</button>
-          <input className={`custom-days-input inline${isCustomWindow ? " is-custom" : ""}`} type="number" min={1} max={90} placeholder="···" value={isCustomWindow ? String(windowDays) : customWindow} onChange={(e) => { setCustomWindow(e.target.value); if (e.target.value) save("scan_window_days", Number(e.target.value)); }} />
-          <button className="custom-step-btn" onClick={() => save("scan_window_days", Math.min(90, windowDays + 1))}>+</button>
+          {[4, 7, 14].map((d) => <button key={d} className={`preset-chip ${windowDays === d ? "is-active" : ""}`} onClick={() => saveWindowDays(d)}>{d}d</button>)}
+          <button className="custom-step-btn" onClick={() => saveWindowDays(windowDays - 1)}>−</button>
+          <input className={`custom-days-input inline${isCustomWindow ? " is-custom" : ""}`} type="number" min={1} max={90} placeholder="days" value={isCustomWindow ? String(windowDays) : customWindow} onChange={(e) => { setCustomWindow(e.target.value); if (e.target.value) saveWindowDays(Number(e.target.value)); }} />
+          <button className="custom-step-btn" onClick={() => saveWindowDays(windowDays + 1)}>+</button>
         </div>
       </div>
       <div className="mailbox-config-section">
-        <h4 className="mailbox-config-label">Max threads</h4>
+        <h4 className="mailbox-config-label">Max emails</h4>
         <div className="preset-row preset-row-sm">
-          {[50, 100, 150].map((n) => <button key={n} className={`preset-chip ${maxMsgs === n ? "is-active" : ""}`} onClick={() => { setCustomMax(""); save("max_messages", n); }}>{n}</button>)}
-          <button className="custom-step-btn" onClick={() => save("max_messages", Math.max(10, maxMsgs - 10))}>−</button>
-          <input className={`custom-days-input inline${isCustomMax ? " is-custom" : ""}`} type="number" min={10} max={500} placeholder="···" value={isCustomMax ? String(maxMsgs) : customMax} onChange={(e) => { setCustomMax(e.target.value); if (e.target.value) save("max_messages", Number(e.target.value)); }} />
-          <button className="custom-step-btn" onClick={() => save("max_messages", Math.min(500, maxMsgs + 10))}>+</button>
+          {[50, 100, 150].map((n) => <button key={n} className={`preset-chip ${maxMsgs === n ? "is-active" : ""}`} onClick={() => saveMaxEmails(n)}>{n}</button>)}
+          <button className="custom-step-btn" onClick={() => saveMaxEmails(maxMsgs - 10)}>−</button>
+          <input className={`custom-days-input inline${isCustomMax ? " is-custom" : ""}`} type="number" min={10} max={500} placeholder="emails" value={isCustomMax ? String(maxMsgs) : customMax} onChange={(e) => { setCustomMax(e.target.value); if (e.target.value) saveMaxEmails(Number(e.target.value)); }} />
+          <button className="custom-step-btn" onClick={() => saveMaxEmails(maxMsgs + 10)}>+</button>
         </div>
       </div>
       <div className="mailbox-config-section">
-        <h4 className="mailbox-config-label">Categories</h4>
-        <div className="preset-row preset-row-sm">
-          <button className="preset-chip is-active" disabled>Primary</button>
-          {(["social", "promotions", "updates", "forums"] as const).map((cat) => {
-            const cats = plan.scan_categories || [];
-            const active = cats.includes(cat);
-            return <button key={cat} className={`preset-chip ${active ? "is-active" : ""}`} onClick={() => save("scan_categories", active ? cats.filter((c: string) => c !== cat) : [...cats, cat])}>{cat.charAt(0).toUpperCase() + cat.slice(1)}</button>;
-          })}
+        <div className="mailbox-scan-action-row">
+          <button
+            className="soft-btn compact danger mailbox-scan-action"
+            disabled={state.isScanning || !state.runtime.connected}
+            title="Delete Brief history for this mailbox and scan from scratch."
+            aria-label="Delete history and scan again"
+            onClick={() => setConfirmFreshScan(true)}
+          >
+            Reset &amp; Scan
+          </button>
+          <button
+            className="primary-btn mailbox-scan-action"
+            disabled={state.isScanning || !state.runtime.connected}
+            title="Keep existing records and continue scanning new mail."
+            aria-label="Keep current records and continue scanning"
+            onClick={() => void actions.startScan("continue", mailboxEmail)}
+          >
+            Continue Scan
+          </button>
         </div>
       </div>
       <div style={{ marginTop: 12 }}>
         <button className="danger-btn" style={{ fontSize: 12, padding: "6px 14px", borderRadius: 8 }} onClick={() => setConfirmDelete(true)}>Delete mailbox data</button>
         <p className="drawer-copy" style={{ marginTop: 4 }}>Clears all cards, cache, contact memory, and scan history for this mailbox only.</p>
       </div>
+      {confirmFreshScan ? (
+        <div className="confirm-overlay" onClick={() => setConfirmFreshScan(false)}>
+          <div className="confirm-dialog" onClick={(e) => e.stopPropagation()}>
+            <p>This clears Brief cards, scan history, and processed markers for <strong>{mailboxEmail}</strong>, then starts a fresh scan. Scan settings, cache, and contact memory stay intact.</p>
+            <div className="confirm-actions">
+              <button className="soft-btn" onClick={() => setConfirmFreshScan(false)}>Cancel</button>
+              <button className="primary-btn danger-btn" onClick={async () => { setConfirmFreshScan(false); await actions.resetMailboxScanHistory(mailboxEmail); await actions.startScan("reset", mailboxEmail); }}>Reset &amp; Scan</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {confirmDelete ? (
         <div className="confirm-overlay" onClick={() => setConfirmDelete(false)}>
           <div className="confirm-dialog" onClick={(e) => e.stopPropagation()}>

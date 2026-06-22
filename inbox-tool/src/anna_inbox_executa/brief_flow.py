@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 from anna_inbox_executa.common import *
+
+
+def _clamp_int(value: Any, fallback: int, min_value: int, max_value: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = fallback
+    return min(max_value, max(min_value, parsed))
 from anna_inbox_executa.gmail_tools import *
 from anna_inbox_executa.sampling_tools import *
 
@@ -163,8 +171,8 @@ async def run_mail_agent_background(run_id: str, arguments: dict[str, Any], invo
             budget["max_messages"] = min(budget.get("max_messages", 100), max_messages)
             scan_plan["budget"] = budget
             scan_plan_config = await _get_scan_plan_config(mailbox)
-            scan_max_messages = scan_plan_config.max_messages if scan_plan_config else int(budget.get("max_messages") or max_messages)
-            scan_window_days = scan_plan_config.scan_window_days if scan_plan_config else 7
+            scan_max_messages = _clamp_int(scan_plan_config.max_messages if scan_plan_config else arguments.get("max_messages", budget.get("max_messages") or max_messages), 100, 10, 500)
+            scan_window_days = _clamp_int(scan_plan_config.scan_window_days if scan_plan_config else arguments.get("scan_window_days", 7), 7, 1, 90)
             scanned = await run_mail_scan(mailbox, scan_max_messages, newer_than_days=scan_window_days)
             MAIL_AGENT_RUNS[run_id]["progress"] = {"scanned": len(scanned), "scan_window_days": scan_window_days}
         MAIL_AGENT_RUNS[run_id].update({
@@ -322,7 +330,7 @@ async def _brief_prepare_scan(run_id: str, arguments: dict[str, Any]) -> None:
     user_request = str(arguments.get("user_request") or "")
     mailbox = str(arguments.get("mailbox") or "")
     mode = str(arguments.get("mode") or "auto")
-    max_messages = int(arguments.get("max_messages") or 50)
+    max_messages = _clamp_int(arguments.get("max_messages"), 50, 10, 500)
 
     _brief_update_state(run_id, stage="scan", progress={"current": 0, "total": max_messages, "mailbox": mailbox})
     input_ = MailTaskInput(user_request=user_request, mailbox_id=mailbox, user_email=mailbox, mode=mode, max_messages=max_messages, dry_run=True)
@@ -332,8 +340,8 @@ async def _brief_prepare_scan(run_id: str, arguments: dict[str, Any]) -> None:
         raise ValueError(f"Unknown strategy mode: {task_plan.strategy_mode}")
 
     scan_plan_config = await _get_scan_plan_config(mailbox)
-    configured_max = scan_plan_config.max_messages if scan_plan_config else 100
-    scan_window_days = scan_plan_config.scan_window_days if scan_plan_config else 7
+    configured_max = _clamp_int(scan_plan_config.max_messages if scan_plan_config else arguments.get("max_messages"), max_messages, 10, 500)
+    scan_window_days = _clamp_int(scan_plan_config.scan_window_days if scan_plan_config else arguments.get("scan_window_days"), 7, 1, 90)
 
     last_message_internal_date = ""
     is_first_scan = True

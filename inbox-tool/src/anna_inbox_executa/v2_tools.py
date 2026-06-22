@@ -6,6 +6,14 @@ from anna_inbox_executa.gmail_tools import _dedup_body, _inline_remote_images, _
 from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.storage_tools import *
 
+def _clamp_int(value: Any, fallback: int, min_value: int, max_value: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = fallback
+    return min(max_value, max(min_value, parsed))
+
+
 def _card_context(card: Any) -> dict[str, str]:
     """Extract display fields from a PersistentCard for history entries."""
     try:
@@ -74,10 +82,12 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 return {"error": "no registered mailboxes"}
         for mb in targets:
             plan = await get_scan_plan(mb)
-            for field in ("scan_window_days", "max_messages"):
-                val = arguments.get(field)
-                if val is not None:
-                    setattr(plan, field, int(val))
+            val = arguments.get("scan_window_days")
+            if val is not None:
+                plan.scan_window_days = _clamp_int(val, plan.scan_window_days, 1, 90)
+            val = arguments.get("max_messages")
+            if val is not None:
+                plan.max_messages = _clamp_int(val, plan.max_messages, 10, 500)
             val = arguments.get("scan_categories")
             if isinstance(val, list):
                 plan.scan_categories = [str(c) for c in val if str(c) in ("promotions", "social", "updates", "forums")]
@@ -442,6 +452,13 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if root.exists():
             shutil.rmtree(root, ignore_errors=True)
         return {"ok": True}
+
+    if tool == "reset_mailbox_scan_history":
+        mbox = str(arguments.get("mailbox", "")).strip()
+        if not mbox:
+            return {"error": "mailbox is required"}
+        from mail_agent.storage.ops import reset_mailbox_scan_history
+        return await reset_mailbox_scan_history(mbox)
 
     if tool == "delete_mailbox_data":
         mbox = str(arguments.get("mailbox", "")).strip()

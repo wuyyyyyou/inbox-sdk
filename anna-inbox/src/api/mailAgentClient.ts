@@ -243,6 +243,10 @@ export class MailAgentClient {
     return this.invoke<{ ok: boolean }>("reset_all_data", {});
   }
 
+  resetMailboxScanHistory(mailbox: string, storageProvider: string) {
+    return this.invoke<{ ok: boolean; deleted: Record<string, number> }>("reset_mailbox_scan_history", { mailbox, storage_provider: storageProvider });
+  }
+
   deleteMailboxData(mailbox: string) {
     return this.invoke<{ ok: boolean; deleted: Record<string, number> }>("delete_mailbox_data", { mailbox });
   }

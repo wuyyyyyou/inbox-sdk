@@ -149,7 +149,7 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         "clear_active_cards", "mark_cleanup_read", "record_snooze", "restore_card", "record_learning",
         "start_summarize_thread", "start_generate_draft",
         "delete_custom_plan",
-        "clear_cards", "clear_history", "reset_all_data", "delete_mailbox_data",
+        "clear_cards", "clear_history", "reset_all_data", "reset_mailbox_scan_history", "delete_mailbox_data",
         "get_scan_plan", "set_scan_plan",
         "reply_now", "reply_from_ask", "mark_read_from_ask", "trash_from_ask",
     ):

@@ -2,7 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { ActiveCardsPayload, AppState, CleanupMessage, CustomRunResultItem, FrontendCard, GmailErrorPopup, MailboxInfo, RunStatus, ScanState } from "../types/mail";
+import type { ActiveCardsPayload, AppState, CleanupMessage, CustomRunResultItem, FrontendCard, GmailErrorPopup, MailboxInfo, RunStatus, ScanPlan, ScanState } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -14,6 +14,19 @@ import { createInitialState } from "./state";
 
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
+
+function normalizeScanPlan(plan: ScanPlan | null | undefined): Required<Pick<ScanPlan, "scan_window_days" | "max_messages">> {
+  return {
+    scan_window_days: clampInt(plan?.scan_window_days, 7, 1, 90),
+    max_messages: clampInt(plan?.max_messages, 100, 10, 500),
+  };
 }
 
 function resultToDraft(result: Record<string, unknown> | undefined, fallback: string): string {
@@ -117,9 +130,9 @@ export interface AppActions {
   clearContactMemories(): Promise<void>;
   loadCustomPlans(): Promise<void>;
   loadScanPlan(): Promise<void>;
-  saveScanPlanField(field: string, value: unknown): void;
+  saveScanPlanField(field: string, value: unknown): Promise<void>;
   setConfigMailbox(mailbox: string): Promise<void>;
-  startScan(reason?: string): Promise<void>;
+  startScan(reason?: string, mailboxOverride?: string): Promise<void>;
   openCard(cardId: string): Promise<void>;
   summarizeSelectedThread(): Promise<void>;
   generateDraft(presetRevision?: string): Promise<void>;
@@ -138,6 +151,7 @@ export interface AppActions {
   clearCards(category: string): Promise<void>;
   clearHistory(): Promise<void>;
   resetAllData(): Promise<void>;
+  resetMailboxScanHistory(mailbox: string): Promise<void>;
   deleteMailboxData(mailbox: string): Promise<void>;
   handleAskMarkRead(actionKey: string, messageId: string, mailbox?: string): Promise<void>;
   handleAskTrash(actionKey: string, messageId: string, mailbox?: string): Promise<void>;
@@ -356,11 +370,24 @@ export function useAppController() {
     const mailbox = mailboxOverride ?? state.mailbox;
     try {
       const plan = await client.loadScanPlan(mailbox, state.storageProvider);
-      setState((s) => ({ ...s, scanPlan: plan }));
+      setState((s) => ({ ...s, scanPlan: { ...plan, ...normalizeScanPlan(plan) } }));
     } catch {
       setState((s) => ({ ...s, scanPlan: { scan_window_days: 7, max_messages: 100, scan_categories: [] } }));
     }
   }, [client, state.mailbox, state.storageProvider]);
+
+  const loadScanPlanForRun = useCallback(async (mailbox: string): Promise<Required<Pick<ScanPlan, "scan_window_days" | "max_messages">>> => {
+    const normalized = normalizedMailbox(mailbox);
+    const visiblePlanMailbox = normalizedMailbox(state.configMailbox || state.mailbox);
+    if (normalized && normalized === visiblePlanMailbox && state.scanPlan) {
+      return normalizeScanPlan(state.scanPlan);
+    }
+    try {
+      return normalizeScanPlan(await client.loadScanPlan(mailbox, state.storageProvider));
+    } catch {
+      return normalizeScanPlan(null);
+    }
+  }, [client, state.configMailbox, state.mailbox, state.scanPlan, state.storageProvider]);
 
   const checkGmailAuth = useCallback(async (mailboxOverride?: string): Promise<{ authorized: boolean; source: string }> => {
     const mailbox = mailboxOverride ?? state.mailbox;
@@ -659,18 +686,29 @@ export function useAppController() {
     closeGmailErrorPopup() {
       setState((s) => ({ ...s, gmailErrorPopup: null }));
     },
-    saveScanPlanField(field, value) {
-      setState((s) => ({ ...s, scanPlan: { ...(s.scanPlan || {}), [field]: value, updated_at: new Date().toISOString() } }));
-      const targetMailbox = state.configMailbox || "";
-      client.saveScanPlanField(targetMailbox, state.storageProvider, field, value).catch(() => {});
+    async saveScanPlanField(field, value) {
+      const sanitizedValue = field === "scan_window_days"
+        ? clampInt(value, 7, 1, 90)
+        : field === "max_messages"
+          ? clampInt(value, 100, 10, 500)
+          : value;
+      setState((s) => ({ ...s, scanPlan: { ...(s.scanPlan || {}), [field]: sanitizedValue, updated_at: new Date().toISOString() } }));
+      const targetMailbox = normalizedMailbox(state.configMailbox || state.mailbox);
+      if (!targetMailbox) return;
+      try {
+        await client.saveScanPlanField(targetMailbox, state.storageProvider, field, sanitizedValue);
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+      }
     },
     async setConfigMailbox(mailbox) {
       setState((s) => ({ ...s, configMailbox: mailbox }));
       await loadScanPlan(mailbox || undefined);
     },
-    async startScan(reason = "manual") {
+    async startScan(reason = "manual", mailboxOverride?: string) {
       if (!state.runtime.connected || state.isScanning) return;
-      const mailboxesToScan = (state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox]).map(normalizedMailbox).filter(Boolean);
+      const mailboxesToScan = (mailboxOverride ? [mailboxOverride] : (state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox])).map(normalizedMailbox).filter(Boolean);
+      const scanMode = state.strategyMode || DEFAULT_MODE;
       if (!mailboxesToScan.length) {
         showToast("Select at least one mailbox.");
         return;
@@ -682,14 +720,16 @@ export function useAppController() {
         const failures: string[] = [];
         for (let index = 0; index < mailboxesToScan.length; index += 1) {
           const mailbox = mailboxesToScan[index];
+          const runScanPlan = await loadScanPlanForRun(mailbox);
           const runId = `bg_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
           // 先创建可轮询的 run；真实扫描和 LLM 进度由 continue 调用写入。
           const started = await client.startBriefRun({
-            user_request: requestForMode(state.strategyMode || DEFAULT_MODE),
+            user_request: requestForMode(scanMode),
             mailbox,
-            mode: state.strategyMode,
-            primary_count: 30,
-            max_messages: 50,
+            mode: scanMode,
+            primary_count: runScanPlan.max_messages,
+            max_messages: runScanPlan.max_messages,
+            scan_window_days: runScanPlan.scan_window_days,
             ai_provider: state.llmProvider,
             storage_provider: state.storageProvider,
             reason,
@@ -734,11 +774,12 @@ export function useAppController() {
               // 每次 continue 都是短 invoke，只推进 Brief 状态机的一小段。
               result = await client.continueBriefRun({
                 run_id: runId,
-                user_request: requestForMode(state.strategyMode || DEFAULT_MODE),
+                user_request: requestForMode(scanMode),
                 mailbox,
-                mode: state.strategyMode,
-                primary_count: 30,
-                max_messages: 50,
+                mode: scanMode,
+                primary_count: runScanPlan.max_messages,
+                max_messages: runScanPlan.max_messages,
+                scan_window_days: runScanPlan.scan_window_days,
                 ai_provider: state.llmProvider,
                 storage_provider: state.storageProvider,
               });
@@ -1147,6 +1188,39 @@ export function useAppController() {
           setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, askItemActions: {}, askEditDraft: {}, askGapAnswers: {}, askDraftsByKey: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
           showToast("All data reset. Ready for a fresh start.");
           window.location.reload();
+        }
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+      }
+    },
+    async resetMailboxScanHistory(mailbox) {
+      try {
+        const normalized = normalizedMailbox(mailbox);
+        if (!normalized) return;
+        const result = await client.resetMailboxScanHistory(normalized, state.storageProvider);
+        if (result.ok) {
+          setState((s) => {
+            const allCards = s.allCards.filter((card) => cardMailbox(card, s.mailbox) !== normalized);
+            const visible = filterCardsByMailboxes(allCards, activeBriefMailboxes(s.selectedMailboxes, s.briefMailboxFilter, s.mailbox));
+            return {
+              ...s,
+              allCards,
+              cards: visible,
+              actionCount: actionCount(visible),
+              scanState: null,
+              selectedCard: cardMailbox(s.selectedCard, s.mailbox) === normalized ? null : s.selectedCard,
+              selectedCardDetail: cardMailbox(s.selectedCard, s.mailbox) === normalized ? null : s.selectedCardDetail,
+              expandedDetails: {},
+              cleanupBundle: null,
+              cleanupReadState: {},
+              markingReadIds: {},
+            };
+          });
+          await loadMailboxes();
+          await loadActiveCards(undefined, "all");
+          await loadRunHistory();
+          const deleted = result.deleted || {};
+          showToast(`Reset ${deleted.keys || 0} scan record${deleted.keys === 1 ? "" : "s"} for ${normalized}.`);
         }
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));

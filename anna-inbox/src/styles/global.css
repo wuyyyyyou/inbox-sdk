@@ -4543,6 +4543,21 @@
       font-weight: 500;
     }
 
+    .mailbox-scan-action-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+    }
+
+    .mailbox-scan-action {
+      width: 100%;
+      min-height: 34px;
+      padding: 0 12px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
     .mailbox-config-body {
       padding: 12px 14px;
       margin: 2px 0 6px;

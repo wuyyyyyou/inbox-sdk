@@ -644,6 +644,87 @@ async def clear_run_history() -> dict:
     return await get_storage().set(RUN_HISTORY_KEY, {"entries": []}, scope=default_scope())
 
 
+async def reset_mailbox_scan_history(mailbox: str) -> dict:
+    """Clear Brief scan history for one mailbox while keeping auth/cache/plan.
+
+    This removes active cards, cleanup bundle, processed-message markers, scan
+    state, per-run records, and cross-mailbox run history entries for the
+    mailbox. It intentionally keeps Gmail cache, contact memory, scan plan, and
+    the mailbox registry entry.
+    """
+    storage = get_storage()
+    mbox = _normalize_email(mailbox)
+    prefix = _mailbox_prefix(mbox)
+    counts: dict[str, int] = {"keys": 0, "history_entries": 0}
+
+    async def delete_key(key: str) -> None:
+        try:
+            await storage.delete(key, scope=default_scope())
+            counts["keys"] += 1
+        except Exception:
+            pass
+
+    async def delete_prefix(prefix_key: str) -> None:
+        cursor: str | None = None
+        while True:
+            try:
+                result = await storage.list(prefix=prefix_key, cursor=cursor, limit=200, scope=default_scope())
+            except TypeError:
+                result = await storage.list(prefix_key, scope=default_scope())
+            except Exception:
+                return
+            items = result.get("items") or []
+            for item in items:
+                key = item.get("key", "") if isinstance(item, dict) else ""
+                if key:
+                    await delete_key(key)
+            cursor = result.get("cursor") or result.get("next_cursor")
+            if not cursor or not items:
+                break
+
+    # Active card shards and legacy card key.
+    try:
+        idx = await storage.get(_cards_index_key(mbox), scope=default_scope())
+        if idx.get("exists") and isinstance(idx.get("value"), dict):
+            for i in range(int(idx["value"].get("shards", 0))):
+                await delete_key(_cards_shard_key(mbox, i))
+    except Exception:
+        pass
+    await delete_key(_cards_index_key(mbox))
+    await delete_key(_cards_legacy_key(mbox))
+
+    # Cleanup bundle shards and legacy bundle key.
+    try:
+        idx = await storage.get(_cleanup_index_key(mbox), scope=default_scope())
+        if idx.get("exists") and isinstance(idx.get("value"), dict):
+            for i in range(int(idx["value"].get("shards", 0))):
+                await delete_key(_cleanup_shard_key(mbox, i))
+    except Exception:
+        pass
+    await delete_key(_cleanup_index_key(mbox))
+    await delete_key(_cleanup_legacy_key(mbox))
+
+    await delete_key(f"{prefix}/scan_state")
+    await delete_prefix(f"{prefix}/processed/")
+    await delete_prefix(f"{prefix}/run/")
+
+    try:
+        hist_result = await storage.get(RUN_HISTORY_KEY, scope=default_scope())
+        if hist_result.get("exists") and isinstance(hist_result.get("value"), dict):
+            raw: dict = hist_result["value"]
+            entries: list = raw.get("entries", [])
+            before = len(entries)
+            entries = [e for e in entries if not (isinstance(e, dict) and _normalize_email(str(e.get("mailbox", ""))) == mbox)]
+            counts["history_entries"] = before - len(entries)
+            raw["entries"] = entries
+            await storage.set(RUN_HISTORY_KEY, raw, scope=default_scope())
+    except Exception:
+        pass
+
+    await update_mailbox_registry_fields(mbox, card_count=0, last_scan_at="", last_scan_status="", last_error="")
+    return {"ok": True, "mailbox": mbox, "deleted": counts}
+
+
 async def clear_cards_by_category(mailbox: str, category: str) -> int:
     """Remove cards matching a given category from active cards. Returns count removed.
 

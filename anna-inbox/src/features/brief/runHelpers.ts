@@ -62,14 +62,14 @@ export function scanStageLabel(stage: string | undefined, progress: Record<strin
 export function scanProgressLabel(stage: string | undefined, progress: Record<string, unknown> = {}): string {
   const p = progress;
   if (!stage || stage === "queued") return "";
-  if (stage === "scan" || stage === "scanning" || stage === "parse_intent") return "Connecting to Gmail...";
-  if (stage === "scan_cache") return `${p.lite_count || 0}/${p.matched_ids || 0} cached emails ready`;
-  if (stage === "scan") {
-    const threads = p.threads_fetched || 0;
-    const max = p.max_messages || 0;
-    return max ? `Fetching threads ${threads}/${max}` : "Connecting to Gmail...";
+  if (stage === "scan" || stage === "scanning" || stage === "parse_intent") {
+    const fetched = Number(p.messages_fetched || p.current || 0);
+    const max = Number(p.max_messages || p.total || 0);
+    if (max && fetched > 0) return `Fetching emails ${fetched}/${max}`;
+    return "Connecting to Gmail...";
   }
-  if (stage === "scan_done") return `${p.scanned || 0} threads loaded`;
+  if (stage === "scan_cache") return `${p.lite_count || 0}/${p.matched_ids || 0} cached emails ready`;
+  if (stage === "scan_done") return `${p.scanned || 0} emails loaded`;
   if (stage === "scan_fallback") return `Gmail unreachable, using ${p.cached_count || 0} cached`;
   if (stage === "scan_fallback_empty") return "No cache available — check network & token";
   if (stage === "storage_filter") return `${p.skipped || 0} skipped, ${p.new || 0} new`;

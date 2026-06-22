@@ -24,7 +24,7 @@ export function BottomBar() {
         <p className="bar-copy">{state.loading ? "Connecting to Anna runtime..." : "Ready."}</p>
       </div>
       <div className="bar-actions">
-        <button className="primary-btn" disabled={state.isScanning || !state.runtime.connected} onClick={() => void actions.startScan("manual")}>Scan now</button>
+        <button className="primary-btn" disabled={state.isScanning || !state.runtime.connected} onClick={() => void actions.startScan("manual")}>Continue Scan</button>
       </div>
     </footer>
   );

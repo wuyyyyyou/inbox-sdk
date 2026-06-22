@@ -398,6 +398,13 @@ DEFAULT_MANIFEST = {
             "description": "Reset all persistent data — cards, history, cache, scan state, contacts. Returns app to first-run state.",
         },
         {
+            "name": "reset_mailbox_scan_history",
+            "description": "Clear Brief scan history for one mailbox — active cards, processed index, scan state, run records, and history entries. Keeps auth, cache, contact memory, scan plan, and mailbox registration.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "The mailbox email address whose Brief scan history should be reset.", "required": True},
+            ],
+        },
+        {
             "name": "delete_mailbox_data",
             "description": "Delete all persistent data for a single mailbox — cards, processed-message index, scan state, run records, Gmail cache, contact memories, and registry entry. Other mailboxes are not affected.",
             "parameters": [
