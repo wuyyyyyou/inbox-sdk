@@ -334,16 +334,50 @@ async def _brief_prepare_scan(run_id: str, arguments: dict[str, Any]) -> None:
     scan_plan_config = await _get_scan_plan_config(mailbox)
     configured_max = scan_plan_config.max_messages if scan_plan_config else 100
     scan_window_days = scan_plan_config.scan_window_days if scan_plan_config else 7
-    _brief_update_state(run_id, stage="scan", progress={"current": 0, "total": configured_max, "mailbox": mailbox, "scan_window_days": scan_window_days})
 
-    messages = await run_mail_scan(mailbox, configured_max, newer_than_days=scan_window_days, progress_callback=lambda stage, progress: _brief_update_state(run_id, stage=stage, progress=progress))
+    last_message_internal_date = ""
+    is_first_scan = True
+    if _storage_ready():
+        try:
+            from mail_agent.storage.ops import get_scan_state
+            scan_state = await get_scan_state(mailbox)
+            last_message_internal_date = str(scan_state.last_message_internal_date or "")
+            is_first_scan = int(scan_state.total_scans or 0) == 0
+        except Exception as exc:
+            log(f"brief scan_state read failed: {type(exc).__name__}: {exc}")
+
+    scan_started = time.time()
+    after_timestamp = "" if is_first_scan else last_message_internal_date
+    scan_base_progress = {
+        "current": 0,
+        "total": configured_max,
+        "mailbox": mailbox,
+        "scan_window_days": scan_window_days,
+        "incremental": bool(after_timestamp),
+        "after_timestamp": after_timestamp[:20],
+    }
+    _brief_update_state(run_id, stage="scan", progress=scan_base_progress)
+
+    def _scan_progress(stage: str, progress: dict[str, Any]) -> None:
+        merged = dict(scan_base_progress)
+        merged.update(progress or {})
+        _brief_update_state(run_id, stage=stage, progress=merged)
+
+    messages = await run_mail_scan(
+        mailbox,
+        configured_max,
+        newer_than_days=scan_window_days,
+        after_timestamp=after_timestamp,
+        progress_callback=_scan_progress,
+    )
+    scan_elapsed_ms = int((time.time() - scan_started) * 1000)
     all_message_ids = [m.message_id for m in messages if m.message_id]
     new_message_ids = all_message_ids
     if _storage_ready() and all_message_ids:
         from mail_agent.storage.ops import filter_unprocessed
         new_message_ids = await filter_unprocessed(mailbox, all_message_ids)
     new_id_set = set(new_message_ids)
-    new_messages = _dedupe_by_thread([m for m in messages if m.message_id in new_id_set])
+    new_messages = [m for m in messages if m.message_id in new_id_set]
 
     brief.update({
         "stage": "phase1",
@@ -365,7 +399,12 @@ async def _brief_prepare_scan(run_id: str, arguments: dict[str, Any]) -> None:
             "total": len(new_messages),
             "scanned": len(messages),
             "new": len(new_message_ids),
-            "deduped": len(new_messages),
+            "skipped": max(0, len(all_message_ids) - len(new_message_ids)),
+            "new_threads": len(_dedupe_by_thread(new_messages)),
+            "scan_elapsed_ms": scan_elapsed_ms,
+            "scan_window_days": scan_window_days,
+            "incremental": bool(after_timestamp),
+            "after_timestamp": after_timestamp[:20],
         },
     )
 
@@ -410,6 +449,16 @@ async def _brief_run_phase1_slice(run_id: str, sampling_create_message: Any) -> 
     for result in results:
         candidates.extend(result.get("candidates") or [])
         low_value_items.extend(result.get("low_value_items") or [])
+    phase1_metrics: dict[str, int] = {
+        "phase1_input": 0,
+        "phase1_prefiltered": 0,
+        "phase1_rule_candidates": 0,
+        "phase1_llm_messages": 0,
+    }
+    for result in results:
+        metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+        for key in phase1_metrics:
+            phase1_metrics[key] += int(metrics.get(key) or 0)
 
     deduped: dict[str, Any] = {}
     for candidate in candidates:
@@ -427,7 +476,14 @@ async def _brief_run_phase1_slice(run_id: str, sampling_create_message: Any) -> 
     _brief_update_state(
         run_id,
         stage=stage,
-        progress={"current": cursor, "total": total, "candidates": len(brief["candidates"]), "low_value": len(low_value_items), "sampling_calls_used": len(batches)},
+        progress={
+            "current": cursor,
+            "total": total,
+            "candidates": len(brief["candidates"]),
+            "low_value": len(low_value_items),
+            "sampling_calls_used": sum(1 for result in results if int(((result.get("metrics") if isinstance(result.get("metrics"), dict) else {}) or {}).get("phase1_llm_messages") or 0) > 0),
+            **phase1_metrics,
+        },
     )
 
 
@@ -538,6 +594,8 @@ async def _brief_run_phase2_slice(run_id: str, sampling_create_message: Any) -> 
         brief["stage"] = "finalizing"
         _brief_update_state(run_id, stage="finalizing", progress={"evaluated": cursor, "total": total})
         return
+    # Keep the original Phase 2 throughput, but advance progress as each
+    # candidate finishes so the UI does not sit at "Evaluating 0/N".
     batch = candidates[cursor:cursor + 4]
     _brief_update_state(run_id, stage="read_context", progress={"current": cursor, "total": total, "batch": len(batch)})
     contexts = [await read_candidate_context(mailbox, candidate) for candidate in batch]
@@ -552,7 +610,7 @@ async def _brief_run_phase2_slice(run_id: str, sampling_create_message: Any) -> 
                 fallback={},
                 temperature=0.1,
                 max_tokens=8000,
-                timeout=55.0,
+                timeout=60.0,
                 metadata={"tool": "evaluate_item_single", "strategy_mode": strategy.id, "candidate_count": "1"},
                 allow_fallback=True,
                 allow_sampling_provider_fallback=False,
@@ -566,20 +624,42 @@ async def _brief_run_phase2_slice(run_id: str, sampling_create_message: Any) -> 
         except Exception as exc:
             return create_fallback_judgment(ctx.candidate.candidate_id, strategy, f"evaluation failed: {type(exc).__name__}: {exc}")
 
-    _brief_update_state(run_id, stage="evaluate", progress={"evaluated": cursor, "total": total, "batch": len(batch), "sampling_calls_used": len(batch)})
-    judgments = await asyncio.gather(*[_evaluate_one(cursor + offset + 1, ctx) for offset, ctx in enumerate(contexts)])
-    all_judgments = _brief_judgments_from_dict(list(brief.get("judgments") or []))
-    all_judgments.extend(judgments)
-    brief["judgments"] = _brief_to_dict_list(all_judgments)
+    _brief_update_state(run_id, stage="evaluate", progress={"evaluated": cursor, "total": total, "batch": len(batch), "sampling_calls_used": len(batch), "timeout_s": 60})
+    judgments = []
+    pending = [
+        asyncio.create_task(_evaluate_one(cursor + offset + 1, ctx))
+        for offset, ctx in enumerate(contexts)
+    ]
+    for task in asyncio.as_completed(pending):
+        judgment = await task
+        judgments.append(judgment)
+        partial_cursor = min(total, cursor + len(judgments))
+        all_judgments = _brief_judgments_from_dict(list(brief.get("judgments") or []))
+        all_judgments.append(judgment)
+        brief["judgments"] = _brief_to_dict_list(all_judgments)
+        cards_added_partial = await _brief_persist_cards(run_id, [judgment])
+        _brief_update_state(
+            run_id,
+            stage="evaluate",
+            progress={
+                "evaluated": partial_cursor,
+                "total": total,
+                "batch": len(batch),
+                "sampling_calls_used": len(batch),
+                "cards_added": cards_added_partial,
+                "cards_version": int(brief.get("cards_version") or 0),
+                "timeout_s": 25,
+            },
+            cards_added=cards_added_partial,
+        )
     brief["phase2_cursor"] = min(total, cursor + len(judgments))
-    cards_added = await _brief_persist_cards(run_id, judgments)
     if brief["phase2_cursor"] >= total:
         brief["stage"] = "finalizing"
     _brief_update_state(
         run_id,
         stage="evaluate_done" if brief["stage"] != "finalizing" else "finalizing",
-        progress={"evaluated": brief["phase2_cursor"], "total": total, "cards_added": cards_added, "cards_version": int(brief.get("cards_version") or 0)},
-        cards_added=cards_added,
+        progress={"evaluated": brief["phase2_cursor"], "total": total, "cards_version": int(brief.get("cards_version") or 0), "timeout_s": 25},
+        cards_added=0,
     )
 
 

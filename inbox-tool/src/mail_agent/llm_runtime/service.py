@@ -77,6 +77,22 @@ def _sanitize_str(s: str) -> str:
     )
 
 
+def _ascii_escape_for_host_transport(s: str) -> str:
+    """Keep Anna Sampling reverse-RPC text ASCII-only for Windows hosts.
+
+    Some Anna host handlers still pass request text through a GBK-encoded
+    logging/transport path on Windows. Non-ASCII email bodies or filenames
+    such as "报价单 ©.pdf" can crash that handler before the model runs.
+    Preserve the information as Python-style escapes instead of dropping it.
+    """
+    s = _sanitize_str(s)
+    try:
+        s.encode("ascii")
+        return s
+    except UnicodeEncodeError:
+        return s.encode("ascii", "backslashreplace").decode("ascii")
+
+
 def _sanitize_value(obj: Any) -> Any:
     """Recursively sanitize surrogate characters from all strings in a nested structure."""
     if isinstance(obj, str):
@@ -250,7 +266,7 @@ async def repair_json_with_sampling(
                 "role": "user",
                 "content": {
                     "type": "text",
-                    "text": _sanitize_str(
+                    "text": _ascii_escape_for_host_transport(
                         _build_json_repair_user_message(
                             bad_text=bad_text,
                             parse_error=parse_error,
@@ -261,10 +277,10 @@ async def repair_json_with_sampling(
             }
         ],
         max_tokens=max(512, min(int(max_tokens or 1024), 4096)),
-        system_prompt=JSON_REPAIR_SYSTEM_PROMPT,
+        system_prompt=_ascii_escape_for_host_transport(JSON_REPAIR_SYSTEM_PROMPT),
         temperature=0.0,
         include_context="none",
-        metadata=metadata_payload,
+        metadata={str(key): _ascii_escape_for_host_transport(str(value)) for key, value in metadata_payload.items()},
         timeout=timeout,
     )
     repaired_text = extract_sampling_text(result)
@@ -490,21 +506,24 @@ async def call_llm_json(
                         f"Previous response excerpt: {last_text[:800]}. "
                         "Return the corrected JSON object only."
                     )
-                metadata_payload = {str(key): str(value) for key, value in (metadata or {}).items()}
+                metadata_payload = {
+                    str(key): _ascii_escape_for_host_transport(str(value))
+                    for key, value in (metadata or {}).items()
+                }
                 result = await sampling_create_message(
                     messages=[
                         {
                             "role": "user",
                             "content": {
                                 "type": "text",
-                                "text": _sanitize_str(
+                                "text": _ascii_escape_for_host_transport(
                                     _build_sampling_json_user_message(system_prompt, user_message, retry_note)
                                 ),
                             },
                         }
                     ],
                     max_tokens=max_tokens,
-                    system_prompt=_sanitize_str(system_prompt),
+                    system_prompt=_ascii_escape_for_host_transport(system_prompt),
                     temperature=temperature,
                     include_context="none",
                     metadata=metadata_payload,

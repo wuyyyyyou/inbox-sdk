@@ -130,6 +130,31 @@ async def test_empty_sampling_response_does_not_trigger_repair() -> None:
     assert len(stub.calls) == 1
 
 
+async def test_sampling_prompt_escapes_non_ascii_for_windows_host() -> None:
+    from mail_agent.llm_runtime.service import call_llm_json
+
+    stub = SamplingStub(['{"ok": true}'])
+    await call_llm_json(
+        stub,
+        system_prompt="Return JSON only. 版权 ©",
+        user_message="Evaluate attachment: 报价单 © Пример.pdf",
+        max_tokens=64,
+        max_attempts=1,
+        metadata={"tool": "unit_test", "filename": "报价单 ©.pdf"},
+        allow_sampling_provider_fallback=False,
+    )
+
+    call = stub.calls[0]
+    sent_text = call["messages"][0]["content"]["text"]
+    sent_system = call["system_prompt"]
+    sent_metadata = call["metadata"]
+    assert all(ord(ch) < 128 for ch in sent_text)
+    assert all(ord(ch) < 128 for ch in sent_system)
+    assert all(all(ord(ch) < 128 for ch in str(value)) for value in sent_metadata.values())
+    assert "\\u62a5" in sent_text
+    assert "\\xa9" in sent_text
+
+
 async def main() -> None:
     # 中文注释：确保测试不会因为本地 DashScope 环境变量而走 provider fallback。
     os.environ.pop("DASHSCOPE_API_KEY", None)
@@ -138,6 +163,7 @@ async def main() -> None:
     await test_invalid_json_triggers_one_sampling_repair()
     await test_repair_failure_uses_safe_fallback()
     await test_empty_sampling_response_does_not_trigger_repair()
+    await test_sampling_prompt_escapes_non_ascii_for_windows_host()
     print("PASS llm json repair tests")
 
 

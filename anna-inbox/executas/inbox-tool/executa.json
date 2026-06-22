@@ -1,9 +1,8 @@
 {
   "slug": "inbox-executa",
-  "tool_id": "tool-inbox-executa-12345678",
-  "name": "Inbox Executa",
-  "display_name": "Anna Inbox Executa",
-  "version": "1.0.1",
+  "tool_id": "tool-riazm4777-inbox-executa-dnsb9fqu",
+  "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
+  "version": "1.0.2",
   "type": "python",
   "enabled": true,
   "description": "Anna Inbox — Gmail agent that surfaces attention cards and drafts replies via Executa Sampling LLM.",

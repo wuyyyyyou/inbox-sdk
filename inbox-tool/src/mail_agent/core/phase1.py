@@ -15,8 +15,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
+import re
 from typing import Any
 
 from ..domain.types import (
@@ -39,6 +39,118 @@ def _user_action_to_kind(user_action: str) -> CandidateKind:
 
 # Anna sampling 目前没有 schema/streaming 约束，Phase 1 大批量 JSON 容易输出不完整。
 _ANNA_PHASE1_BATCH_SIZE = 8
+
+
+def _low_value_item_from_rule(msg: MessageLite, reason: str) -> dict[str, Any]:
+    return {
+        "message_id": msg.message_id,
+        "reason": reason[:200],
+        "confidence": 0.75,
+        "source": "rule_prefilter",
+    }
+
+
+def _is_obvious_bulk_low_value(msg: MessageLite, signals: list[str]) -> tuple[bool, str]:
+    """Conservatively identify emails that do not need Phase 1 LLM review."""
+    if not msg.message_id:
+        return False, ""
+
+    protected = {
+        "starred",
+        "important",
+        "security_keyword",
+        "billing_keyword",
+        "possible_request",
+        "human_reply",
+        "known_contact",
+    }
+    signal_set = set(signals)
+    if signal_set & protected:
+        return False, ""
+    if msg.has_attachment:
+        return False, ""
+
+    low_only = {"low_value_bulk_possible", "list_unsubscribe", "unread"}
+    if signal_set and signal_set.issubset(low_only) and signal_set & {"low_value_bulk_possible", "list_unsubscribe"}:
+        return True, "Rule prefilter: obvious bulk or unsubscribe-only message"
+
+    text = f"{msg.from_addr} {msg.subject} {msg.snippet}".lower()
+    obvious_bulk = re.search(
+        r"(newsletter|digest|promotion|promo|sale|webinar|unsubscribe|退订|促销|简报)",
+        text,
+        re.IGNORECASE,
+    )
+    if obvious_bulk and not re.search(
+        r"(security|login|verification|password|billing|invoice|payment|receipt|安全|登录|验证|密码|账单|付款|发票)",
+        text,
+        re.IGNORECASE,
+    ):
+        return True, f"Rule prefilter: obvious low-value bulk keyword '{obvious_bulk.group(1)}'"
+
+    return False, ""
+
+
+def _should_use_rule_fast_path(msg: MessageLite, signals: list[str], kind: CandidateKind | None) -> bool:
+    """Decide whether a message is clear enough to skip Phase 1 LLM."""
+    if not kind:
+        return False
+    signal_set = set(signals)
+    if signal_set & {"starred", "important", "security_keyword", "billing_keyword", "human_reply", "known_contact"}:
+        return True
+    if signal_set & {"possible_request", "collaboration_keyword"}:
+        if signal_set & {"low_value_bulk_possible", "list_unsubscribe"}:
+            return False
+        text = f"{msg.from_addr} {msg.subject} {msg.snippet}".lower()
+        if re.search(r"\b(no-?reply|noreply|notification|newsletter|digest|unsubscribe)\b", text, re.IGNORECASE):
+            return False
+        return True
+    return False
+
+
+def prefilter_phase1_messages(
+    messages: list[MessageLite],
+    strategy: MailStrategy,
+    profile: MailboxProfile,
+) -> dict[str, Any]:
+    """Split obvious low-value and clear rule candidates before Phase 1 LLM.
+
+    The filter is intentionally narrow: anything with possible action/risk
+    signals that rules cannot classify stays in the LLM path. Filtered low
+    value messages still become low_value items so cleanup bundle counts remain
+    complete.
+    """
+    from .candidate import classify_candidate_kind_by_rule, detect_signals
+
+    llm_messages: list[MessageLite] = []
+    rule_candidate_messages: list[MessageLite] = []
+    low_value_items: list[dict[str, Any]] = []
+    reason_counts: dict[str, int] = {}
+
+    for msg in messages:
+        signals = detect_signals(msg, strategy, profile)
+        is_low_value, reason = _is_obvious_bulk_low_value(msg, signals)
+        if is_low_value:
+            low_value_items.append(_low_value_item_from_rule(msg, reason))
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            continue
+        kind = classify_candidate_kind_by_rule(signals, strategy, msg)
+        if _should_use_rule_fast_path(msg, signals, kind):
+            rule_candidate_messages.append(msg)
+            continue
+        llm_messages.append(msg)
+
+    return {
+        "llm_messages": llm_messages,
+        "rule_candidate_messages": rule_candidate_messages,
+        "low_value_items": low_value_items,
+        "metrics": {
+            "phase1_input": len(messages),
+            "phase1_prefiltered": len(low_value_items),
+            "phase1_rule_candidates": len(rule_candidate_messages),
+            "phase1_llm_messages": len(llm_messages),
+            "phase1_prefilter_reasons": reason_counts,
+        },
+    }
 
 # ── Prompt 构建 ──────────────────────────────────────────────────
 
@@ -405,14 +517,25 @@ async def _run_phase1_single_batch(
 ) -> dict[str, Any]:
     from ..llm_runtime.service import call_llm_json_safe
 
+    prefiltered = prefilter_phase1_messages(messages, strategy, profile)
+    llm_messages: list[MessageLite] = list(prefiltered["llm_messages"])
+    rule_candidate_messages: list[MessageLite] = list(prefiltered["rule_candidate_messages"])
+    rule_low_value_items: list[dict[str, Any]] = list(prefiltered["low_value_items"])
+    metrics: dict[str, Any] = dict(prefiltered["metrics"])
+    from .candidate import generate_candidates
+    rule_candidates = generate_candidates(rule_candidate_messages, strategy, profile)
+    if not llm_messages:
+        return {"candidates": rule_candidates, "low_value_items": rule_low_value_items, "metrics": metrics}
+
     system_prompt = _PHASE1_SYSTEM
-    user_prompt = build_phase1_user_prompt(messages, strategy, profile)
+    user_prompt = build_phase1_user_prompt(llm_messages, strategy, profile)
     strict_anna_sampling = sampling_create_message is not None
 
     metadata = {
         "tool": "phase1_batch_classify",
         "strategy_mode": strategy.id,
-        "message_count": str(len(messages)),
+        "message_count": str(len(llm_messages)),
+        "prefiltered_count": str(len(rule_low_value_items)),
     }
     if batch_index is not None and batch_total is not None:
         metadata["batch_index"] = str(batch_index)
@@ -425,21 +548,24 @@ async def _run_phase1_single_batch(
         fallback={"classifications": []},
         temperature=0.1,
         max_tokens=8000,
-        timeout=55.0 if strict_anna_sampling else 240.0,
+        timeout=20.0 if strict_anna_sampling else 240.0,
         metadata=metadata,
-        allow_fallback=not strict_anna_sampling,
+        allow_fallback=True,
         allow_sampling_provider_fallback=not strict_anna_sampling,
         max_attempts=1 if strict_anna_sampling else None,
     )
 
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
     if not payload or result.get("fallback_used"):
-        from .candidate import generate_candidates
-        return {"candidates": generate_candidates(messages, strategy, profile), "low_value_items": []}
+        return {
+            "candidates": _dedupe_by_thread(rule_candidates + generate_candidates(llm_messages, strategy, profile)),
+            "low_value_items": rule_low_value_items,
+            "metrics": metrics,
+        }
 
-    classifications, low_value_items = parse_phase1_response(payload, messages, strategy)
-    candidates = classifications_to_candidates(classifications, messages, strategy, profile)
-    return {"candidates": candidates, "low_value_items": low_value_items}
+    classifications, low_value_items = parse_phase1_response(payload, llm_messages, strategy)
+    candidates = classifications_to_candidates(classifications, llm_messages, strategy, profile)
+    return {"candidates": _dedupe_by_thread(rule_candidates + candidates), "low_value_items": rule_low_value_items + low_value_items, "metrics": metrics}
 
 
 async def run_phase1_batch_classify(
