@@ -9,6 +9,6 @@
 
   "_comment_bundled_executas": "...",
   "bundled_executas": {
-    "inbox-executa": { "path": "../inbox-tool" }
+    "inbox-executa": { "path": "./executas/inbox-tool" }
   }
 }

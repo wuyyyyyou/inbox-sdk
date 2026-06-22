@@ -12,6 +12,8 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 SOURCE_MANIFEST = ROOT_DIR / "inbox-tool" / "manifest.json"
 APP_MANIFEST = ROOT_DIR / "anna-inbox" / "manifest.json"
 EXECUTA_STUB = ROOT_DIR / "anna-inbox" / "executas" / "inbox-tool" / "executa.json"
+BUNDLED_HANDLE = "inbox-executa"
+BUNDLED_TOOL_REF = f"bundled:{BUNDLED_HANDLE}"
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -59,7 +61,7 @@ def sync_app_manifest(tool_id: str, version: str | None, *, check: bool, changed
         raise ValueError("anna-inbox/manifest.json required_executas must be a list")
     if len(required_executas) != 1 or not isinstance(required_executas[0], dict):
         raise ValueError("sync script expects exactly one required Executa in anna-inbox/manifest.json")
-    required_executas[0]["tool_id"] = tool_id
+    required_executas[0]["tool_id"] = BUNDLED_TOOL_REF
     if version:
         required_executas[0]["min_version"] = version
 
@@ -67,7 +69,7 @@ def sync_app_manifest(tool_id: str, version: str | None, *, check: bool, changed
     tools = host_api.get("tools")
     if not isinstance(tools, list):
         raise ValueError("anna-inbox/manifest.json ui.host_api.tools must be a list")
-    required_ref = f"required:{tool_id}"
+    required_ref = f"required:{BUNDLED_TOOL_REF}"
     replaced = False
     for index, value in enumerate(tools):
         if isinstance(value, str) and value.startswith("required:"):

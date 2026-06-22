@@ -1,6 +1,6 @@
 {
   "slug": "mail-agent",
-  "name": "mail-agent",
+  "name": "tool-inbox-executa-12345678",
   "display_name": "Mail Agent",
   "version": "1.0.1",
   "description": "Minimal Anna Executa skeleton for reading Gmail through local token files and DashScope or Anna sampling LLM.",

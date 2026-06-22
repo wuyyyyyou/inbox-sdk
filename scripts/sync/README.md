@@ -16,6 +16,11 @@ python scripts/sync/sync_executa_identity.py
 - `anna-inbox/manifest.json`
 - `anna-inbox/executas/inbox-tool/executa.json`
 
+`anna-inbox/manifest.json` 使用 `bundled:inbox-executa` 作为 App bundled handle 引用；
+脚本只同步版本号和 host API 引用形态，不会把 App manifest 改成真实 `tool_id`。
+真实 `tool_id` 会同步到 `anna-inbox/executas/inbox-tool/executa.json`，供 `anna-app dev`
+通过 `anna-inbox/app.json#bundled_executas` 解析成本地 Executa。
+
 本地开发脚本 `anna-inbox/dev-wsl.sh` 和后端入口会直接读取 `inbox-tool/manifest.json`，不需要同步写入。
 
 只检查是否同步、不写文件：

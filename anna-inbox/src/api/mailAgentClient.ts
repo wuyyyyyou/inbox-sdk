@@ -15,7 +15,22 @@ import type {
 } from "../types/mail";
 import appManifest from "../../manifest.json";
 
+const BUNDLED_EXECUTA_HANDLE = "inbox-executa";
+
+declare global {
+  interface Window {
+    __ANNA_TOOL_IDS__?: Record<string, string>;
+  }
+}
+
 function getRequiredExecutaToolId(): string {
+  const resolvedToolId = typeof window !== "undefined"
+    ? window.__ANNA_TOOL_IDS__?.[BUNDLED_EXECUTA_HANDLE]
+    : undefined;
+  if (resolvedToolId) {
+    return resolvedToolId;
+  }
+
   const toolId = appManifest.required_executas[0]?.tool_id;
   if (!toolId) {
     throw new Error("anna-inbox/manifest.json is missing required_executas[0].tool_id");
