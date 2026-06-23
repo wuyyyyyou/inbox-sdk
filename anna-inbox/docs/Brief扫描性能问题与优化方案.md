@@ -1,7 +1,7 @@
 # Brief 扫描性能问题与优化方案
 
-> 更新时间：2026-06-22（北京时间）  
-> 状态：问题记录与预案。本文先不代表已实施，后续优化按优先级逐项落地。  
+> 更新时间：2026-06-23（北京时间）  
+> 状态：问题记录、实施记录与后续预案。后续优化按优先级逐项落地。  
 > 适用范围：Brief Gmail 扫描、短 invoke 状态机、Phase 1/2、前端扫描体验。
 
 ## 0. 实施记录
@@ -17,6 +17,115 @@
 - Phase 2 保留每批 4 个候选并发评估，但改为谁先完成就先更新进度并持久化卡片，避免第一批任一 LLM 慢导致前端长期停在 `Evaluating 0/N`。
 - Phase 2 单项 Anna Sampling timeout 从 55s 降到 25s，`max_tokens` 从 8000 降到 5000。
 - 已新增聚焦测试：`tests/test_brief_incremental_scan.py`、`tests/test_phase1_prefilter.py`。
+
+## 0.1 2026-06-23 第二轮已落地：HTML 正文清洗减轻 Phase 2 输入噪音
+
+本轮目标是不压低 Anna Sampling 的 `max_tokens` 或 `timeout`，而是先减少进入 Phase 2 prompt 的无效正文，尤其是 HTML 邮件中的 `<style>`、`<table>`、内联 CSS、追踪像素和重复 multipart 内容。
+
+### 结论摘要
+
+当前 Phase 2 慢，不建议优先通过继续压低 Anna Sampling 的 `max_tokens` 或 `timeout` 解决。`8000/55s` 一类参数承担了平台 LLM 响应稳定性的兜底作用，盲目降低会增加空响应、JSON 不完整和 fallback 卡片比例。
+
+更稳妥的方向是先减少进入 Phase 2 prompt 的无效正文，尤其是 HTML 邮件中的 `<style>`、`<table>`、内联 CSS、追踪像素和重复 multipart 内容。也就是说：保持 LLM 预算相对充足，但让模型读到更干净、更短、更接近正文语义的内容。
+
+### 已确认的关键现状
+
+- `mail_agent/mail_providers/gmail/adapter.py::_decode_body()` 当前会收集 `text/plain` 与 `text/html`，但实际优先使用 `text/html`。
+- 下游 Phase 2 prompt 构建只做字符截断，不负责真正清洗 HTML。
+- `MessageDetail.body_text` 会进入 Phase 2 的 `message_detail` 和 `thread_context`，因此 HTML 噪音会直接放大 Phase 2 token 与推理成本。
+- 老缓存中已经持久化的 `body_text` 可能仍是原始 HTML；仅修改扫描阶段 decode 不能马上修复已有缓存。
+- Phase 2 每个 candidate 一次 sampling，候选多时仍是线性成本；HTML 清洗不能改变调用次数，但能降低单次调用的输入噪音和失败概率。
+
+### 已实施内容
+
+按 `HTML邮件处理方案.md` 在 Gmail 适配层清洗正文：
+
+- 已修改 `_decode_body()` 的合并策略：
+  - 优先使用有效的 `text/plain`。
+  - 仅当纯文本不存在或明显无效时，使用 `text/html`。
+  - HTML 不再原样进入 `body_text`，先转为干净文本或 Markdown。
+- 已增加 HTML 清洗规则：
+  - 去掉 `style`、`script`、`noscript`、`head`、`meta`、`link`。
+  - 去掉 `display:none` 等隐藏内容。
+  - 保留链接文本和 URL，安全/账单邮件仍能判断跳转目标。
+  - 折叠多余空白，避免 layout 文本占满截断窗口。
+- 依赖策略：
+  - 不新增硬依赖。
+  - 若运行环境有 `html2text` / `beautifulsoup4`，优先使用它们。
+  - 若没有，则使用标准库 `html.parser` 或 regex fallback，保证 Executa 仍可运行。
+
+兼容旧缓存：
+
+- 在 `_to_message_detail()` 附近增加轻量保护：
+  - 如果缓存中的 `body_text` 看起来仍是 HTML，并且缓存保留了 Gmail `payload`，则读取时重新 decode。
+  - 这样不需要用户全量重新扫描，也能让已有卡片/候选逐步受益。
+
+Handle 原文展示与 LLM 正文分离：
+
+- 新增专门面向用户展示的 display decode 路径，保留原始 HTML/text MIME 内容，不复用 Phase 2 清洗后的 `body_text`。
+- `get_card_detail` 默认只返回卡片和 thread metadata，不返回原邮件正文。
+- 前端 Handle 页面默认隐藏原邮件正文；用户点击 `Show full email` 后才用 `include_body=true` 手动加载原始邮件展示内容。
+- 展示 HTML 仍走安全净化、CID 图片解析和远程图片处理；LLM prompt 继续使用清洗后的正文。
+
+新增聚焦测试：
+
+- `tests/test_gmail_body_decode.py`
+  - 同时有 `text/plain` + `text/html` 时优先使用有效纯文本。
+  - 只有 HTML 时输出不包含 `<style>`、`<table>`、`<script>` 等标签。
+  - HTML 链接被保留为可读文本或 Markdown 链接。
+  - 纯文本无效、HTML 有效时 fallback 到 HTML 清洗结果。
+  - 老缓存 raw HTML 读取时可被重新清洗。
+  - display decode 保留原始 HTML 标签和链接，用于手动查看原邮件。
+
+本轮已运行：
+
+- `uv run python tests/test_gmail_body_decode.py`
+- `uv run python tests/test_brief_phase2_slice.py`
+- `uv run python tests/test_llm_json_repair.py`
+- `npm run build`
+
+### 后续建议
+
+补 Phase 2 可观测性。
+
+- progress 或 debug 日志中增加非敏感指标：
+  - `context_type`
+  - `body_length_before_clean`
+  - `body_length_after_clean`
+  - `html_body_used`
+  - `plain_body_used`
+  - `phase2_prompt_chars`
+  - `phase2_sampling_elapsed_ms`
+- 指标不能记录正文、URL token、OAuth token、完整 credential context。
+
+Phase 2 可恢复性优化。
+
+- 保留每批 3-5 个候选的并发策略。
+- 不把已成功完成的 candidate 因为同批慢请求而重复评估。
+- 在 run state 中按 `candidate_id` 识别已完成 judgment；下次 continue 只处理缺失 judgment 的 candidates。
+- 该项能减少 invoke timeout 后的重复 LLM 消耗，但改动面比 HTML 清洗大，建议放在 HTML 清洗之后。
+
+### 暂不推荐的方案
+
+- 暂不把 Phase 2 `max_tokens` 从 8000 降到更低作为主方案。
+- 暂不把 Phase 2 `timeout` 大幅降到 25s 作为主方案。
+- 暂不把 Phase 2 改为多候选单次批量 judgment；这会减少调用次数，但会牺牲单候选可恢复性，且 JSON 漏项风险较高。
+- 暂不在本轮做复杂引用/签名剥离；先保证正文 HTML 清洗正确，再处理 quoted reply。
+
+### 预期收益
+
+- HTML-only 邮件的有效正文会更早出现在 Phase 2 截断窗口内。
+- 安全/账单/通知类 HTML 邮件不再把大量 CSS 和 table layout 送进 LLM。
+- `8000/55s` 预算用于真实语义内容，而不是 HTML 噪音。
+- 对 newsletter、营销邮件、商业系统通知尤其明显。
+- 不改变前端契约，不改变卡片 schema，不改变 Executa tool 参数。
+
+### 风险
+
+- `text/plain` 有时可能只是“请查看 HTML 版本”的占位文本，需要设置有效性判断，而不是只判空。
+- HTML 到文本的 fallback 若过于粗糙，可能丢失链接上下文；安全/账单邮件必须保留 URL。
+- 旧缓存 read-side 重新 decode 要避免大对象写回和重复重算造成额外延迟。
+- 不能在日志中记录清洗前后的正文内容，只记录长度和路径。
 
 ## 1. 背景
 

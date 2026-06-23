@@ -263,6 +263,7 @@ export interface CardDetailPayload {
   contact_context?: Record<string, unknown>;
   latest_body?: string;
   latest_body_html?: string;
+  body_loaded?: boolean;
 }
 
 export interface ContactMemorySummary {
@@ -380,6 +381,7 @@ export interface AppState {
   scanPlan: ScanPlan | null;
   configMailbox: string;
   selectedCard: FrontendCard | null;
+  lastOpenedCardKey: string;
   selectedCardDetail: CardDetailPayload | null;
   threadSummaryById: Record<string, Record<string, unknown>>;
   draftById: Record<string, string>;

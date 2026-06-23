@@ -307,6 +307,35 @@ def _brief_to_dict_list(items: list[Any]) -> list[dict[str, Any]]:
     return result
 
 
+def _brief_count_values(items: list[Any], attr: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        value = ""
+        if isinstance(item, dict):
+            value = str(item.get(attr) or "")
+        else:
+            value = str(getattr(item, attr, "") or "")
+        if not value:
+            value = "unknown"
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def _brief_count_judgment_priorities(items: list[Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        priority = ""
+        if isinstance(item, dict):
+            fd = item.get("final_decision") if isinstance(item.get("final_decision"), dict) else {}
+            priority = str(fd.get("priority") or "")
+        else:
+            priority = str(getattr(getattr(item, "final_decision", None), "priority", "") or "")
+        if not priority:
+            priority = "unknown"
+        counts[priority] = counts.get(priority, 0) + 1
+    return counts
+
+
 def _brief_update_state(run_id: str, *, status: str = "running", stage: str, progress: dict[str, Any], cards_added: int = 0, needs_continue: bool = True) -> None:
     state = MAIL_AGENT_RUNS[run_id]
     state["status"] = status
@@ -490,6 +519,7 @@ async def _brief_run_phase1_slice(run_id: str, sampling_create_message: Any) -> 
             "candidates": len(brief["candidates"]),
             "low_value": len(low_value_items),
             "sampling_calls_used": sum(1 for result in results if int(((result.get("metrics") if isinstance(result.get("metrics"), dict) else {}) or {}).get("phase1_llm_messages") or 0) > 0),
+            "phase1_priority_hint_distribution": _brief_count_values(brief["candidates"], "priority_hint"),
             **phase1_metrics,
         },
     )
@@ -656,6 +686,7 @@ async def _brief_run_phase2_slice(run_id: str, sampling_create_message: Any) -> 
                 "sampling_calls_used": len(batch),
                 "cards_added": cards_added_partial,
                 "cards_version": int(brief.get("cards_version") or 0),
+                "phase2_priority_distribution": _brief_count_judgment_priorities(brief.get("judgments") or []),
                 "timeout_s": 25,
             },
             cards_added=cards_added_partial,
@@ -666,7 +697,13 @@ async def _brief_run_phase2_slice(run_id: str, sampling_create_message: Any) -> 
     _brief_update_state(
         run_id,
         stage="evaluate_done" if brief["stage"] != "finalizing" else "finalizing",
-        progress={"evaluated": brief["phase2_cursor"], "total": total, "cards_version": int(brief.get("cards_version") or 0), "timeout_s": 25},
+        progress={
+            "evaluated": brief["phase2_cursor"],
+            "total": total,
+            "cards_version": int(brief.get("cards_version") or 0),
+            "phase2_priority_distribution": _brief_count_judgment_priorities(brief.get("judgments") or []),
+            "timeout_s": 25,
+        },
         cards_added=0,
     )
 

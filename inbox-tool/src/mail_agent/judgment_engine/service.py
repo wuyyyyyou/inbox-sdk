@@ -648,11 +648,17 @@ def _enforce_consistency(judgment: JudgmentResult) -> JudgmentResult:
         fd.should_show_in_main_result = True
         fd.should_show_in_lower_priority = False
 
-    # 4. cleanup → low priority
+    # 4. Medium review reasons should not collapse into low priority.
+    if action_reason in ("upcoming_event", "deal_or_pipeline") and fd.priority in ("low", "ignore"):
+        fd.priority = "medium"
+        fd.should_show_in_main_result = True
+        fd.should_show_in_lower_priority = False
+
+    # 5. cleanup → low priority
     if action_reason == "cleanup" and fd.priority not in ("low", "ignore"):
         fd.priority = "low"
 
-    # 5. Deadline words in recommendation → at least medium
+    # 6. Deadline words in recommendation → at least medium
     rec = fd.user_facing_recommendation.lower()
     deadline_words = ("before", "by tomorrow", "by friday", "by thursday", "today", "asap", "tonight")
     if any(w in rec for w in deadline_words) and fd.priority == "low":
@@ -660,7 +666,7 @@ def _enforce_consistency(judgment: JudgmentResult) -> JudgmentResult:
         fd.should_show_in_main_result = True
         fd.should_show_in_lower_priority = False
 
-    # 6. Surface → can't be ignore
+    # 7. Surface → can't be ignore
     if bj.should_surface and fd.priority == "ignore":
         fd.priority = "low"
 

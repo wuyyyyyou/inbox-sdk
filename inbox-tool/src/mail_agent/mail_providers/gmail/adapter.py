@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import base64
+import html as html_lib
+from html.parser import HTMLParser
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -546,6 +549,201 @@ def _header_map(message: dict[str, Any]) -> dict[str, str]:
     return result
 
 
+_BODY_TEXT_LIMIT = 30000
+_HTML_RE = re.compile(r"<\s*(?:!doctype|html|head|body|table|style|script|div|span|p|br|a)\b", re.IGNORECASE)
+_PLACEHOLDER_PLAIN_RE = re.compile(
+    r"\b(?:view|open|see|read)\b.{0,40}\b(?:html|browser|web version|online)\b|"
+    r"\b(?:html version|browser version)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _decode_base64_body(data: Any) -> str:
+    try:
+        raw = str(data or "")
+        if not raw:
+            return ""
+        return base64.urlsafe_b64decode(
+            raw + "=" * (-len(raw) % 4)
+        ).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _collapse_body_whitespace(text: str) -> str:
+    text = html_lib.unescape(str(text or "")).replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t\f\v]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _is_effective_plain_body(text: str) -> bool:
+    cleaned = _collapse_body_whitespace(text)
+    if not cleaned:
+        return False
+    if len(cleaned) < 40 and _PLACEHOLDER_PLAIN_RE.search(cleaned):
+        return False
+    return True
+
+
+def _strip_html_tags_regex(html: str) -> str:
+    """Best-effort HTML to readable text when optional parsers are unavailable."""
+    html = str(html or "")
+    html = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
+    html = re.sub(r"<(style|script|noscript|head|meta|link)\b[^>]*>.*?</\1>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(
+        r"<([a-z0-9]+)\b[^>]*style=[\"'][^\"']*display\s*:\s*none[^\"']*[\"'][^>]*>.*?</\1>",
+        " ",
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    def _replace_anchor(match: re.Match[str]) -> str:
+        attrs = match.group(1) or ""
+        body = match.group(2) or ""
+        href_match = re.search(r"href\s*=\s*(['\"])(.*?)\1", attrs, flags=re.IGNORECASE | re.DOTALL)
+        label = re.sub(r"<[^>]+>", " ", body)
+        label = _collapse_body_whitespace(label)
+        href = _collapse_body_whitespace(href_match.group(2)) if href_match else ""
+        if href and label and href not in label:
+            return f" {label} ({href}) "
+        return f" {label or href} "
+
+    html = re.sub(r"<a\b([^>]*)>(.*?)</a>", _replace_anchor, html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r"</(?:p|div|tr|li|h[1-6]|blockquote|section|article|br)\s*>", "\n", html, flags=re.IGNORECASE)
+    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    html = re.sub(r"<[^>]+>", " ", html)
+    return _collapse_body_whitespace(html)
+
+
+class _HTMLTextParser(HTMLParser):
+    """Small stdlib HTML-to-text fallback that preserves link destinations."""
+
+    _BLOCK_TAGS = {"p", "div", "br", "li", "tr", "table", "section", "article", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"}
+    _SKIP_CONTAINER_TAGS = {"style", "script", "noscript", "head"}
+    _DROP_TAGS = {"meta", "link"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip_depth = 0
+        self.anchor_href_stack: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in self._DROP_TAGS:
+            return
+        if self.skip_depth:
+            self.skip_depth += 1
+            return
+        if tag in self._SKIP_CONTAINER_TAGS:
+            self.skip_depth += 1
+            return
+        attr_map = {name.lower(): value or "" for name, value in attrs}
+        if "display:none" in re.sub(r"\s+", "", attr_map.get("style", "").lower()):
+            self.skip_depth += 1
+            return
+        if tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+        if tag == "a":
+            self.anchor_href_stack.append(attr_map.get("href", ""))
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if self.skip_depth:
+            self.skip_depth -= 1
+            return
+        if tag == "a" and self.anchor_href_stack:
+            href = self.anchor_href_stack.pop().strip()
+            if href:
+                self.parts.append(f" ({href})")
+        if tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip_depth and data:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        return _collapse_body_whitespace("".join(self.parts))
+
+
+def _html_to_text(html: str) -> str:
+    html = str(html or "")
+    if not html.strip():
+        return ""
+
+    cleaned_html = html
+    try:
+        from bs4 import BeautifulSoup  # type: ignore[import-not-found]
+
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all(["style", "script", "noscript", "head", "meta", "link"]):
+            tag.decompose()
+        for tag in soup.find_all(style=re.compile(r"display\s*:\s*none", re.IGNORECASE)):
+            tag.decompose()
+        cleaned_html = str(soup)
+    except Exception:
+        cleaned_html = html
+
+    try:
+        import html2text  # type: ignore[import-not-found]
+
+        converter = html2text.HTML2Text()
+        converter.ignore_links = False
+        converter.ignore_images = True
+        converter.ignore_emphasis = False
+        converter.body_width = 0
+        converter.skip_internal_anchors = True
+        converter.protect_links = True
+        return _collapse_body_whitespace(converter.handle(cleaned_html))
+    except Exception:
+        pass
+
+    try:
+        parser = _HTMLTextParser()
+        parser.feed(cleaned_html)
+        parser.close()
+        parsed = parser.text()
+        if parsed:
+            return parsed
+    except Exception:
+        pass
+    return _strip_html_tags_regex(cleaned_html)
+
+
+def _looks_like_html_body(text: str) -> bool:
+    return bool(_HTML_RE.search(str(text or "")))
+
+
+def decode_body_for_display(message: dict[str, Any]) -> dict[str, str]:
+    """Decode original Gmail body parts for user display, separate from LLM-cleaned body_text."""
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+
+    def walk(part: dict[str, Any]) -> None:
+        mime_type = str(part.get("mimeType") or "")
+        body = part.get("body") if isinstance(part.get("body"), dict) else {}
+        data = body.get("data")
+        if data and mime_type in {"text/plain", "text/html"}:
+            decoded = _decode_base64_body(data)
+            if decoded:
+                if mime_type == "text/html":
+                    html_parts.append(decoded)
+                else:
+                    plain_parts.append(decoded)
+        for child in part.get("parts") or []:
+            if isinstance(child, dict):
+                walk(child)
+
+    payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+    walk(payload)
+    html_body = "\n\n".join(part.strip() for part in html_parts if part.strip())[:_BODY_TEXT_LIMIT]
+    text_body = "\n\n".join(_collapse_body_whitespace(part) for part in plain_parts if part.strip())[:_BODY_TEXT_LIMIT]
+    return {"html": html_body, "text": text_body}
+
+
 def _decode_body(message: dict[str, Any]) -> str:
     plain_parts: list[str] = []
     html_parts: list[str] = []
@@ -555,16 +753,13 @@ def _decode_body(message: dict[str, Any]) -> str:
         body = part.get("body") if isinstance(part.get("body"), dict) else {}
         data = body.get("data")
         if data and mime_type in {"text/plain", "text/html"}:
-            try:
-                decoded = base64.urlsafe_b64decode(
-                    str(data) + "=" * (-len(str(data)) % 4)
-                ).decode("utf-8", errors="replace")
-                if mime_type == "text/plain":
-                    plain_parts.append(decoded)
-                else:
-                    html_parts.append(decoded)
-            except Exception:
+            decoded = _decode_base64_body(data)
+            if not decoded:
                 return
+            if mime_type == "text/plain":
+                plain_parts.append(decoded)
+            else:
+                html_parts.append(decoded)
         for child in part.get("parts") or []:
             if isinstance(child, dict):
                 walk(child)
@@ -572,10 +767,16 @@ def _decode_body(message: dict[str, Any]) -> str:
     payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
     walk(payload)
 
-    # Prefer text/html — modern email uses it as the canonical format.
-    # Callers are responsible for stripping HTML tags as needed.
-    parts = html_parts or plain_parts
-    return "\n\n".join(part.strip() for part in parts if part.strip())[:30000]
+    effective_plain = [_collapse_body_whitespace(part) for part in plain_parts if _is_effective_plain_body(part)]
+    if effective_plain:
+        return "\n\n".join(part for part in effective_plain if part)[:_BODY_TEXT_LIMIT]
+
+    html_text = _html_to_text("\n\n".join(html_parts))
+    if html_text:
+        return html_text[:_BODY_TEXT_LIMIT]
+
+    fallback_plain = [_collapse_body_whitespace(part) for part in plain_parts if part.strip()]
+    return "\n\n".join(part for part in fallback_plain if part)[:_BODY_TEXT_LIMIT]
 
 
 def _extract_attachments(part: dict[str, Any]) -> list[dict[str, Any]]:
@@ -857,6 +1058,10 @@ def get_message_detail(mailbox: str, message_id: str) -> MessageDetail | None:
 
 def _to_message_detail(msg: dict[str, Any], body_text: str | None = None) -> MessageDetail:
     body_text = str(msg.get("body_text") or "") if body_text is None else body_text
+    if _looks_like_html_body(body_text) and isinstance(msg.get("payload"), dict):
+        decoded = _decode_body(msg)
+        if decoded:
+            body_text = decoded
     return MessageDetail(
         message_id=str(msg.get("id") or ""),
         thread_id=str(msg.get("thread_id") or ""),

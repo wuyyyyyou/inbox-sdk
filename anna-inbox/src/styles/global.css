@@ -3539,6 +3539,11 @@
       box-shadow: 0 10px 30px rgba(40,40,70,0.04);
     }
 
+    .attention-item-card:focus-visible {
+      outline: 2px solid rgba(139, 124, 248, 0.42);
+      outline-offset: 3px;
+    }
+
     .attention-item-card.is-ignored {
       opacity: 0.54;
     }

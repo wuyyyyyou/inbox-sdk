@@ -81,7 +81,7 @@ def detect_signals(
         signals.append("possible_request")
 
     # --- 低价值/批量信号 ---
-    if re.search(r"(newsletter|digest|promotion|sale|webinar|event|unsubscribe|退订)", text, re.IGNORECASE):
+    if re.search(r"(newsletter|digest|promotion|sale|webinar|unsubscribe|退订)", text, re.IGNORECASE):
         signals.append("low_value_bulk_possible")
 
     # --- 退订头 ---

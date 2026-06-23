@@ -67,7 +67,12 @@ function AttentionCard({ card }: { card: FrontendCard }) {
   const resolutionLabel: Record<string, string> = { replied: "Replied", no_action_needed: "No action", handled_manually: "Handled", dismissed: "Dismissed" };
   const resolvedLabel = card.status === "snoozed" ? "Snoozed" : (resolutionLabel[card.resolution || ""] || "Resolved");
   return (
-    <article className={`attention-item-card ${expanded ? "is-expanded" : ""} ${isResolved ? "is-resolved" : ""}`}>
+    <article
+      className={`attention-item-card ${expanded ? "is-expanded" : ""} ${isResolved ? "is-resolved" : ""}`}
+      data-card-key={key}
+      tabIndex={-1}
+      aria-label={card.title || "Attention card"}
+    >
       <div className="attention-card-head">
         <h2 className="attention-title"><span className={`priority-badge priority-${card.priority || "low"}`}>{card.priority || "low"}</span>{card.title || "Email thread needs review"}</h2>
         {state.selectedMailboxes.length > 1 && mailbox ? (

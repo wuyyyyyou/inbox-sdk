@@ -97,58 +97,36 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
     if tool == "get_card_detail":
         if not mailbox or not card_id:
             return {"error": "mailbox and card_id are required"}
+        include_body = bool(arguments.get("include_body"))
         cards = await storage_get_cards(mailbox)
         card = next((c for c in cards.cards if c.card_id == card_id), None)
         if not card:
             return {"error": f"Card {card_id} not found"}
         thread_ctx = await asyncio.to_thread(_fetch_thread_context_sync, mailbox, card)
 
-        # Read full body from cache, re-decode to pick up _decode_body fix.
-        # New cache entries include raw payload for re-decoding; old ones
-        # fall back to cached body_text with light dedup.
-        latest_body = card.original.body or ""
+        latest_body = ""
         latest_body_html = ""
-        try:
-            from mail_agent.mail_providers.gmail.adapter import normalize_mailbox, _decode_body, read_message
-            msg = read_message(normalize_mailbox(mailbox), card.message_id)
-            if isinstance(msg, dict):
-                raw = _decode_body(msg)
-                if not raw.strip():
-                    raw = str(msg.get("body_text") or "")
-                    raw = _dedup_body(raw)  # old body_text may have duplicated parts
-                raw = raw[:8000]
-
-                # Build sanitized HTML for frontend display (before tag stripping)
-                if raw.strip():
-                    latest_body_html = _sanitize_email_html(raw)
-                    # Resolve cid: inline images to data URIs
+        body_loaded = False
+        if include_body:
+            body_loaded = True
+            try:
+                from mail_agent.mail_providers.gmail.adapter import decode_body_for_display, normalize_mailbox, read_message
+                msg = read_message(normalize_mailbox(mailbox), card.message_id)
+                if isinstance(msg, dict):
+                    display_body = decode_body_for_display(msg)
+                    raw_html = str(display_body.get("html") or "")
+                    raw_text = str(display_body.get("text") or "")
                     payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
-                    latest_body_html = _resolve_cid_images(latest_body_html, payload)
-                    latest_body_html = _inline_remote_images(latest_body_html)
-
-                import re
-                raw = re.sub(r"<style[^>]*>.*?</style>", "", raw, flags=re.DOTALL | re.IGNORECASE)
-                raw = re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL | re.IGNORECASE)
-                raw = re.sub(r"<[^>]+>", "", raw)
-                raw = re.sub(r"&nbsp;", " ", raw)
-                raw = re.sub(r"&amp;", "&", raw)
-                raw = re.sub(r"&lt;", "<", raw)
-                raw = re.sub(r"&gt;", ">", raw)
-                raw = re.sub(r"&quot;", '"', raw)
-                raw = re.sub(r"&#\d+;", "", raw)
-                raw = re.sub(r"\n{3,}", "\n\n", raw)
-                raw = raw.strip()
-                if raw:
-                    latest_body = raw
-        except Exception:
-            pass
-
-        # When re-decode couldn't produce a body (failed, or the message
-        # has no text parts), card.original.body still holds the old
-        # value set by decode_gmail_body which joined text/plain and
-        # text/html parts — dedup adjacent identical segments.
-        if not latest_body_html and latest_body:
-            latest_body = _dedup_body(latest_body)
+                    if raw_html.strip():
+                        latest_body_html = _sanitize_email_html(raw_html[:8000])
+                        latest_body_html = _resolve_cid_images(latest_body_html, payload)
+                        latest_body_html = _inline_remote_images(latest_body_html)
+                    if raw_text.strip():
+                        latest_body = raw_text[:8000]
+                    elif not latest_body_html:
+                        latest_body = _dedup_body(str(msg.get("body_text") or card.original.body or ""))[:8000]
+            except Exception:
+                latest_body = _dedup_body(str(card.original.body or ""))[:8000]
 
         contact_ctx = {}
         try:
@@ -160,7 +138,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 mailbox=mailbox,
                 contact_email=contact_email,
                 current_subject=card.original.thread or card.title,
-                current_body=latest_body,
+                current_body=latest_body or card.original.body,
                 current_thread_id=card.thread_id,
                 purpose="thread_summary",
             ), sampling_create_message=_detail_sampling)
@@ -183,6 +161,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             "contact_context": contact_ctx,
             "latest_body": latest_body,
             "latest_body_html": latest_body_html,
+            "body_loaded": body_loaded,
         }
 
     # Build sampling for Anna LLM path (same logic as _build_sampling_for_run)

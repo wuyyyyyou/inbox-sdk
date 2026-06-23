@@ -151,8 +151,8 @@ export class MailAgentClient {
     return this.invoke<RunStatus>("get_mail_agent_run", { run_id: runId });
   }
 
-  getCardDetail(mailbox: string, cardId: string, storageProvider: string) {
-    return this.invoke<CardDetailPayload>("get_card_detail", { mailbox, card_id: cardId, storage_provider: storageProvider });
+  getCardDetail(mailbox: string, cardId: string, storageProvider: string, includeBody = false) {
+    return this.invoke<CardDetailPayload>("get_card_detail", { mailbox, card_id: cardId, storage_provider: storageProvider, include_body: includeBody });
   }
 
   listContactMemories(mailboxes: string[], storageProvider: string) {

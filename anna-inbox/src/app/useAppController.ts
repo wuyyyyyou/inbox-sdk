@@ -98,6 +98,44 @@ function findCard(cards: FrontendCard[], keyOrId: string): FrontendCard | undefi
   return cards.find((card) => card.uiKey === keyOrId) || cards.find((card) => card.id === keyOrId);
 }
 
+function scrollToPageTop() {
+  const run = () => {
+    const scroller = document.getElementById("appContent");
+    if (scroller) {
+      scroller.scrollTo({ top: 0, behavior: "auto" });
+      return;
+    }
+    window.scrollTo({ top: 0, behavior: "auto" });
+  };
+  window.requestAnimationFrame(() => {
+    run();
+    window.requestAnimationFrame(run);
+  });
+}
+
+function scrollToCard(key: string) {
+  if (!key) return;
+  const run = () => {
+    const selector = `[data-card-key="${CSS.escape(key)}"]`;
+    const el = document.querySelector<HTMLElement>(selector);
+    if (!el) return;
+    const scroller = document.getElementById("appContent");
+    if (scroller) {
+      const scrollerBox = scroller.getBoundingClientRect();
+      const elBox = el.getBoundingClientRect();
+      const targetTop = scroller.scrollTop + elBox.top - scrollerBox.top - Math.max(24, (scroller.clientHeight - elBox.height) / 2);
+      scroller.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
+    } else {
+      el.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+    el.focus({ preventScroll: true });
+  };
+  window.requestAnimationFrame(() => {
+    run();
+    window.requestAnimationFrame(run);
+  });
+}
+
 export interface AppActions {
   showToast(message: string): void;
   closeDrawers(): void;
@@ -123,6 +161,7 @@ export interface AppActions {
   setBriefMailboxFilter(mailboxes: string[]): void;
   loadActiveCards(): Promise<void>;
   loadRunHistory(): Promise<void>;
+  loadSelectedEmailBody(): Promise<void>;
   loadContactMemories(): Promise<void>;
   openContactMemory(mailbox: string, contactEmail: string): Promise<void>;
   closeContactMemory(): void;
@@ -551,7 +590,9 @@ export function useAppController() {
   const actions: AppActions = {
     showToast,
     closeDrawers() {
+      const key = state.selectedCard?.uiKey || state.lastOpenedCardKey;
       setState((s) => ({ ...s, sourcesOpen: false, historyOpen: false, memoryOpen: false, originalOpen: false, scanPlanOpen: false, selectedCard: null, expandAllConfigs: false }));
+      scrollToCard(key);
     },
     setView(view) {
       setState((s) => ({ ...s, view, sourcesOpen: false, historyOpen: false, memoryOpen: false, originalOpen: false, scanPlanOpen: false, lowerPriorityOpen: view === "start" ? false : s.lowerPriorityOpen }));
@@ -844,11 +885,39 @@ export function useAppController() {
       const card = findCard(state.cards, cardId);
       if (card && card.status && card.status !== "pending") return;
       if (!card) return;
-      setState((s) => ({ ...s, selectedCard: card, selectedCardDetail: null, originalOpen: true, sourcesOpen: false, historyOpen: false, memoryOpen: false, snoozeMenuCardId: "" }));
+      const key = card.uiKey || cardUiKey(card, state.mailbox);
+      setState((s) => ({ ...s, selectedCard: card, lastOpenedCardKey: key, selectedCardDetail: null, originalOpen: true, sourcesOpen: false, historyOpen: false, memoryOpen: false, snoozeMenuCardId: "" }));
+      scrollToPageTop();
       try {
-        const detail = await client.getCardDetail(cardMailbox(card, state.mailbox), card.id, state.storageProvider);
+        const detail = await client.getCardDetail(cardMailbox(card, state.mailbox), card.id, state.storageProvider, false);
         setState((s) => ({ ...s, selectedCardDetail: detail }));
       } catch {
+      }
+    },
+    async loadSelectedEmailBody() {
+      if (!state.selectedCard) return;
+      const card = state.selectedCard;
+      const key = card.uiKey || cardUiKey(card, state.mailbox);
+      if (state.selectedCardDetail?.body_loaded || state.pendingAction === `body:${key}`) return;
+      setState((s) => ({ ...s, pendingAction: `body:${key}` }));
+      try {
+        const detail = await client.getCardDetail(cardMailbox(card, state.mailbox), card.id, state.storageProvider, true);
+        setState((s) => ({
+          ...s,
+          ...(s.selectedCard?.id !== card.id ? {} : {
+          selectedCardDetail: {
+            ...(s.selectedCardDetail || {}),
+            ...detail,
+            thread_context: detail.thread_context || s.selectedCardDetail?.thread_context,
+            contact_context: detail.contact_context || s.selectedCardDetail?.contact_context,
+            body_loaded: true,
+          },
+          }),
+        }));
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+      } finally {
+        setState((s) => ({ ...s, pendingAction: s.pendingAction === `body:${key}` ? "" : s.pendingAction }));
       }
     },
     async summarizeSelectedThread() {

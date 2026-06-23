@@ -17,6 +17,8 @@ export function BottomBar() {
       </footer>
     );
   }
+  const hasScanned = Number(state.scanState?.total_scans || 0) > 0 || state.cards.length > 0;
+  const scanButtonLabel = hasScanned ? "Continue Scan" : "Scan now";
   return (
     <footer className="bottom-bar">
       <div>
@@ -24,7 +26,7 @@ export function BottomBar() {
         <p className="bar-copy">{state.loading ? "Connecting to Anna runtime..." : "Ready."}</p>
       </div>
       <div className="bar-actions">
-        <button className="primary-btn" disabled={state.isScanning || !state.runtime.connected} onClick={() => void actions.startScan("manual")}>Continue Scan</button>
+        <button className="primary-btn" disabled={state.isScanning || !state.runtime.connected} onClick={() => void actions.startScan("manual")}>{scanButtonLabel}</button>
       </div>
     </footer>
   );

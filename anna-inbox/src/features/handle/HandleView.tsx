@@ -87,6 +87,7 @@ export function HandleView() {
   const contactContext = detail.contact_context || {};
   const latestBody = detail.latest_body || "";
   const latestBodyHtml = detail.latest_body_html || "";
+  const bodyLoaded = Boolean(detail.body_loaded);
   const summary = state.threadSummaryById[key];
   const draft = state.draftById[key] || "";
   const replyGaps = card.replyGaps;
@@ -103,7 +104,9 @@ export function HandleView() {
   const nid = nextCardId(state);
   const messageCount = Number(context.message_count || 1);
   const relatedContext = contactContextLines(contactContext);
+  const fallbackRelatedContext = uniqueLines([card.summary, card.thread_summary].map(asString).filter(Boolean));
   const BODY_PREVIEW = 500;
+  const loadingBody = state.pendingAction === `body:${key}`;
   const bodyTruncated = latestBodyHtml
     ? latestBodyHtml.length > BODY_PREVIEW
     : latestBody.length > BODY_PREVIEW;
@@ -113,13 +116,13 @@ export function HandleView() {
       return <section className="review-block is-summary is-loading"><p>Anna is reading the thread and preparing a summary...</p></section>;
     }
     if (!summary) {
-      if (!detailLoaded) return null;
-      if (messageCount <= 1) {
-        if (!relatedContext.length) return null;
+      const immediateRelated = relatedContext.length ? relatedContext : fallbackRelatedContext;
+      if (!detailLoaded || messageCount <= 1) {
+        if (!immediateRelated.length) return null;
         return (
           <section className="review-block is-summary">
             <div className="review-block-kicker">Related context</div>
-            <ul>{relatedContext.map((line, i) => <li key={i}>{line}</li>)}</ul>
+            <ul>{immediateRelated.map((line, i) => <li key={i}>{line}</li>)}</ul>
           </section>
         );
       }
@@ -168,21 +171,13 @@ export function HandleView() {
           </div>
           <span className={`category-tag ${hasDraft ? "is-ready-state" : ""}`}>{hasDraft ? "Reply ready" : "Needs review"}</span>
         </div>
-        {!detailLoaded ? (
-          <section className="review-block is-loading email-body-loading">
-            <div className="email-body-loading-head">
-              <span className="email-body-loading-dot" aria-hidden="true" />
-              <div>
-                <p className="email-body-loading-title">Loading full email...</p>
-                <p className="email-body-loading-copy">Fetching the message body and preparing images.</p>
-              </div>
-            </div>
-            <div className="email-body-skeleton" aria-hidden="true">
-              <span />
-              <span />
-              <span />
-              <span />
-              <span />
+        {!bodyLoaded ? (
+          <section className={`review-block is-quiet${loadingBody ? " is-loading" : ""}`}>
+            <p>Original email body is hidden until you choose to view it.</p>
+            <div className="proposal-actions">
+              <button className="soft-btn compact" disabled={loadingBody} onClick={() => void actions.loadSelectedEmailBody()}>
+                {loadingBody ? "Loading email..." : "Show full email"}
+              </button>
             </div>
           </section>
         ) : latestBodyHtml ? (

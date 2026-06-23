@@ -69,14 +69,15 @@ async def _run() -> None:
     starred = _msg("starred-1", subject="Newsletter digest", starred=True)
     request = _msg("request-1", subject="Can you review this proposal?", from_addr="ceo@example.com")
     ambiguous = _msg("ambiguous-1", subject="Team update", snippet="Sharing the latest note from the team")
+    event_update = _msg("event-1", subject="Upcoming event: candidate interview", snippet="Calendar event tomorrow")
 
-    pref = prefilter_phase1_messages([bulk, security, starred, request, ambiguous], strategy, profile)
+    pref = prefilter_phase1_messages([bulk, security, starred, request, ambiguous, event_update], strategy, profile)
     llm_ids = {m.message_id for m in pref["llm_messages"]}
     rule_candidate_ids = {m.message_id for m in pref["rule_candidate_messages"]}
     low_ids = {item["message_id"] for item in pref["low_value_items"]}
     check("bulk message is prefiltered", low_ids == {"bulk-1"})
     check("clear protected messages use rule fast path", rule_candidate_ids == {"security-1", "starred-1", "request-1"})
-    check("only ambiguous message stays in LLM path", llm_ids == {"ambiguous-1"})
+    check("ambiguous and event messages stay in LLM path", llm_ids == {"ambiguous-1", "event-1"})
 
     calls: list[str] = []
 

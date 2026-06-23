@@ -273,10 +273,11 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "get_card_detail",
-            "description": "Get a single card's full detail including thread context.",
+            "description": "Get a single card's detail including thread context. Set include_body=true only when the user explicitly asks to view the original email body.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
                 {"name": "card_id", "type": "string", "description": "Card ID from get_active_cards.", "required": True},
+                {"name": "include_body", "type": "boolean", "description": "Whether to include the original email body for user display.", "required": False},
             ],
         },
         {

@@ -44,6 +44,7 @@ export function createInitialState(): AppState {
     scanPlan: null,
     configMailbox: "",
     selectedCard: null,
+    lastOpenedCardKey: "",
     selectedCardDetail: null,
     threadSummaryById: {},
     draftById: {},
