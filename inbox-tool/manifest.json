@@ -1,0 +1,1298 @@
+{
+  "slug": "mail-agent",
+  "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
+  "version": "1.0.8",
+  "description": "Minimal Anna Executa skeleton for reading Gmail through local token files and DashScope or Anna sampling LLM.",
+  "author": "Panwb",
+  "host_capabilities": [
+    "llm.sample",
+    "llm.complete",
+    "storage.user",
+    "aps.kv",
+    "aps.scope.user.read",
+    "aps.scope.user.write"
+  ],
+  "credentials": [
+    {
+      "name": "GMAIL_ACCESS_TOKEN",
+      "display_name": "Gmail Access Token",
+      "description": "Optional Google OAuth access token. Local token files are used when platform injection is unavailable.",
+      "required": true,
+      "sensitive": true
+    },
+    {
+      "name": "GOOGLE_ACCESS_TOKEN",
+      "display_name": "Google Access Token",
+      "description": "Alternative Google OAuth access token name supported by Anna platform credential mapping.",
+      "required": true,
+      "sensitive": true
+    },
+    {
+      "name": "DASHSCOPE_API_KEY",
+      "display_name": "DashScope API Key",
+      "description": "DashScope API key for direct LLM access. Required when ai_provider is set to dashscope.",
+      "required": true,
+      "sensitive": true
+    },
+    {
+      "name": "DASHSCOPE_MODEL",
+      "display_name": "DashScope Model",
+      "description": "DashScope model name (e.g. qwen3-max). Defaults to qwen3-max if not set.",
+      "required": false,
+      "sensitive": false
+    },
+    {
+      "name": "GMAIL_MULTI_TOKENS",
+      "display_name": "Gmail Multi-Mailbox Tokens",
+      "description": "JSON array of {email, access_token, refresh_token, client_id, client_secret, expires_at} for additional mailboxes. Leave empty for single-mailbox mode.",
+      "required": false,
+      "sensitive": true
+    }
+  ],
+  "tools": [
+    {
+      "name": "check_google_oauth",
+      "description": "Check whether Anna injected a Google/Gmail OAuth credential for this invocation.",
+      "parameters": [],
+      "timeout": 120
+    },
+    {
+      "name": "ask_anna_llm",
+      "description": "Deprecated compatibility alias for ask_dashscope_llm. This still uses DashScope, not Anna sampling.",
+      "parameters": [
+        {
+          "name": "message",
+          "type": "string",
+          "description": "User message to send to DashScope.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "ask_dashscope_llm",
+      "description": "Ask the configured DashScope model. This is a direct DashScope wiring test.",
+      "parameters": [
+        {
+          "name": "message",
+          "type": "string",
+          "description": "User message to send to DashScope.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "ask_anna_sampling",
+      "description": "Ask Anna LLM through sampling/createMessage and return the model response.",
+      "parameters": [
+        {
+          "name": "message",
+          "type": "string",
+          "description": "User message to send through Anna sampling.",
+          "required": true
+        },
+        {
+          "name": "system_prompt",
+          "type": "string",
+          "description": "Optional system prompt.",
+          "required": false
+        },
+        {
+          "name": "max_tokens",
+          "type": "integer",
+          "description": "Maximum output tokens. Defaults to 512.",
+          "required": false
+        },
+        {
+          "name": "temperature",
+          "type": "number",
+          "description": "Sampling temperature. Defaults to 0.2.",
+          "required": false
+        },
+        {
+          "name": "model_preference",
+          "type": "string",
+          "description": "Optional model hint such as gpt or claude.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "test_anna_sampling",
+      "description": "Smoke-test Anna sampling/createMessage without touching Gmail or the mail-agent pipeline.",
+      "parameters": [
+        {
+          "name": "prompt",
+          "type": "string",
+          "description": "User message to send through Anna sampling.",
+          "required": true
+        },
+        {
+          "name": "system_prompt",
+          "type": "string",
+          "description": "Optional system prompt.",
+          "required": false
+        },
+        {
+          "name": "max_tokens",
+          "type": "integer",
+          "description": "Maximum output tokens. Defaults to 64.",
+          "required": false
+        },
+        {
+          "name": "temperature",
+          "type": "number",
+          "description": "Sampling temperature. Defaults to 0.2.",
+          "required": false
+        },
+        {
+          "name": "model_preference",
+          "type": "string",
+          "description": "Optional model hint such as gpt or claude.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "check_sampling_status",
+      "description": "Lightweight Anna LLM sampling connectivity check.",
+      "parameters": [],
+      "timeout": 15
+    },
+    {
+      "name": "test_aps_storage",
+      "description": "Smoke-test Anna Persistent Storage KV without touching Gmail or the mail-agent pipeline.",
+      "parameters": [
+        {
+          "name": "key_suffix",
+          "type": "string",
+          "description": "Optional suffix for the temporary debug key.",
+          "required": false
+        },
+        {
+          "name": "value",
+          "type": "string",
+          "description": "Optional value to write and read back.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "read_primary_emails",
+      "description": "Read recent Gmail Primary emails through local token files, save them as JSON, and deduplicate by message id.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email.",
+          "required": true
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "How many recent Primary messages to read.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "list_cached_emails",
+      "description": "List compact local Gmail message summaries for one mailbox.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "get_cached_email",
+      "description": "Read one full locally cached Gmail message JSON by message id.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email.",
+          "required": true
+        },
+        {
+          "name": "message_id",
+          "type": "string",
+          "description": "Gmail message id.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "check_gmail_auth",
+      "description": "Check whether Gmail authorization is available. Platform: checks for injected OAuth token. Local: checks for token file existence (does not validate expiry).",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "run_mail_agent",
+      "description": "Run the full Anna mail agent pipeline: scan emails, generate candidates, evaluate with LLM, and produce an action plan.",
+      "parameters": [
+        {
+          "name": "user_request",
+          "type": "string",
+          "description": "Natural language request from user, e.g. '帮我看看有什么重要邮件'",
+          "required": true
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "description": "Strategy mode: auto, default_secretary, creator_opportunity, security_billing",
+          "required": false
+        },
+        {
+          "name": "max_messages",
+          "type": "integer",
+          "description": "Maximum messages to scan.",
+          "required": false
+        },
+        {
+          "name": "primary_count",
+          "type": "integer",
+          "description": "How many recent Primary emails to fetch first.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "start_mail_agent_run",
+      "description": "Prepare a pollable brief run. Follow with continue_mail_agent_run to execute scan and LLM phases.",
+      "parameters": [
+        {
+          "name": "user_request",
+          "type": "string",
+          "description": "Natural language request from user.",
+          "required": true
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "description": "Strategy mode: auto, default_secretary, creator_opportunity, security_billing",
+          "required": false
+        },
+        {
+          "name": "max_messages",
+          "type": "integer",
+          "description": "Maximum messages to scan.",
+          "required": false
+        },
+        {
+          "name": "primary_count",
+          "type": "integer",
+          "description": "How many recent Primary emails to fetch first.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
+          "required": false
+        },
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "Client-generated run ID for polling progress.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage provider: local or aps.",
+          "required": false
+        }
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "continue_mail_agent_run",
+      "description": "Advance one short Brief state-machine slice with sampling bound to this invoke.",
+      "parameters": [
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "Run ID from start_mail_agent_run.",
+          "required": true
+        },
+        {
+          "name": "user_request",
+          "type": "string",
+          "description": "Natural language request from user.",
+          "required": false
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": false
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "description": "Strategy mode.",
+          "required": false
+        },
+        {
+          "name": "max_messages",
+          "type": "integer",
+          "description": "Maximum messages to scan.",
+          "required": false
+        },
+        {
+          "name": "primary_count",
+          "type": "integer",
+          "description": "How many recent Primary emails to fetch first.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
+          "required": false
+        }
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "get_mail_agent_run",
+      "description": "Poll a background mail-agent run by run id.",
+      "parameters": [
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "Run id returned by start_mail_agent_run.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "get_active_cards",
+      "description": "Get all active attention cards for a mailbox from persistent storage.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        }
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "get_cleanup_bundle_page",
+      "description": "Get one page of cleanup bundle messages without refreshing active cards.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address or all.",
+          "required": true
+        },
+        {
+          "name": "offset",
+          "type": "integer",
+          "description": "Cleanup item offset.",
+          "required": false
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Maximum cleanup items to return.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage provider: local or aps.",
+          "required": false
+        }
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "list_mailboxes",
+      "description": "Discover and list registered mailboxes, including selected and authorization state.",
+      "parameters": [],
+      "timeout": 120
+    },
+    {
+      "name": "set_mailbox_selected",
+      "description": "Set whether a mailbox participates in Brief scans and card display.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "selected",
+          "type": "boolean",
+          "description": "Whether the mailbox is selected.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "remove_mailbox",
+      "description": "Remove a mailbox from the registry without deleting its stored data.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "get_scan_plan",
+      "description": "Get the current scan plan configuration for a mailbox (schedule, time range, priorities, etc.).",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "set_scan_plan",
+      "description": "Save or update the scan plan for a mailbox.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "schedule",
+          "type": "string",
+          "description": "manual | every_morning | every_afternoon | twice_daily | workdays",
+          "required": false
+        },
+        {
+          "name": "time_range",
+          "type": "string",
+          "description": "auto | since_last | last_24h | last_7d | unread_backlog",
+          "required": false
+        },
+        {
+          "name": "max_messages",
+          "type": "integer",
+          "description": "Maximum messages per scan (50-300).",
+          "required": false
+        },
+        {
+          "name": "include_newsletters",
+          "type": "boolean",
+          "description": "Whether to include newsletter emails.",
+          "required": false
+        },
+        {
+          "name": "include_promotions",
+          "type": "boolean",
+          "description": "Whether to include promotion emails.",
+          "required": false
+        },
+        {
+          "name": "batch_behavior",
+          "type": "string",
+          "description": "ask | auto_300 | never_older",
+          "required": false
+        },
+        {
+          "name": "active",
+          "type": "boolean",
+          "description": "Whether the plan is active.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "get_card_detail",
+      "description": "Get a single card's detail including thread context. Set include_body=true only when the user explicitly asks to view the original email body.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID from get_active_cards.",
+          "required": true
+        },
+        {
+          "name": "include_body",
+          "type": "boolean",
+          "description": "Whether to include the original email body for user display.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "summarize_thread",
+      "description": "Ask Anna to summarize a thread behind a card.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "generate_draft_reply",
+      "description": "Ask Anna to draft a reply for a card's thread.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID.",
+          "required": true
+        },
+        {
+          "name": "reply_mode",
+          "type": "string",
+          "description": "reply_to_sender or reply_all.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "revise_draft",
+      "description": "Ask Anna to revise a draft reply based on user feedback.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID.",
+          "required": true
+        },
+        {
+          "name": "current_draft",
+          "type": "string",
+          "description": "The current draft text to revise.",
+          "required": true
+        },
+        {
+          "name": "revision_input",
+          "type": "string",
+          "description": "User's revision request.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "start_summarize_thread",
+      "description": "Start a background thread summarization. Returns run_id immediately. Poll with get_mail_agent_run.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID.",
+          "required": true
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "start_generate_draft",
+      "description": "Start background draft generation or revision. If current_draft is provided, revises it. Returns run_id immediately. Poll with get_mail_agent_run.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID.",
+          "required": true
+        },
+        {
+          "name": "reply_mode",
+          "type": "string",
+          "description": "reply_to_sender or reply_all.",
+          "required": false
+        },
+        {
+          "name": "current_draft",
+          "type": "string",
+          "description": "Existing draft to revise (optional).",
+          "required": false
+        },
+        {
+          "name": "revision_input",
+          "type": "string",
+          "description": "User instructions for generation or revision (optional).",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "record_card_decision",
+      "description": "Record a user decision on a card (no_action_needed, handled_manually, dismissed).",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID.",
+          "required": true
+        },
+        {
+          "name": "decision",
+          "type": "string",
+          "description": "no_action_needed | handled_manually | dismissed.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "clear_active_cards",
+      "description": "Dismiss all active cards for a mailbox (resets the brief).",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "reset_mailbox_scan_history",
+      "description": "Clear Brief scan history for one mailbox — active cards, processed index, scan state, run records, and history entries. Keeps auth, cache, contact memory, scan plan, and mailbox registration.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "The mailbox email address whose Brief scan history should be reset.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "mark_cleanup_read",
+      "description": "Mark cleanup-bundle messages as read both in Gmail (remove UNREAD label) and locally.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Cleanup bundle card ID.",
+          "required": true
+        },
+        {
+          "name": "message_ids",
+          "type": "array",
+          "description": "Gmail message IDs to mark as read.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "record_snooze",
+      "description": "Snooze a card (tomorrow, next_week) or record a permanent preference (dont_prioritize).",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID.",
+          "required": true
+        },
+        {
+          "name": "snooze_option",
+          "type": "string",
+          "description": "tomorrow | next_week | dont_prioritize.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "restore_card",
+      "description": "Restore a snoozed/dismissed/resolved card back to pending.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "record_learning",
+      "description": "Record a learning feedback from the user about email patterns.",
+      "parameters": [
+        {
+          "name": "pattern",
+          "type": "string",
+          "description": "The pattern the user noticed.",
+          "required": true
+        },
+        {
+          "name": "action",
+          "type": "string",
+          "description": "What action to remember.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "reply_now",
+      "description": "Send the draft reply via Gmail. Default dry_run=True mocks the send without actually emailing.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID.",
+          "required": true
+        },
+        {
+          "name": "draft_body",
+          "type": "string",
+          "description": "The draft body to send.",
+          "required": true
+        },
+        {
+          "name": "reply_mode",
+          "type": "string",
+          "description": "reply_to_sender | reply_all.",
+          "required": false
+        },
+        {
+          "name": "dry_run",
+          "type": "boolean",
+          "description": "If true (default), mock the send without actually emailing.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "reply_from_ask",
+      "description": "Send a reply via Gmail for Ask results (no card dependency).",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "thread_id",
+          "type": "string",
+          "description": "Gmail thread ID.",
+          "required": true
+        },
+        {
+          "name": "to_addr",
+          "type": "string",
+          "description": "Recipient email address.",
+          "required": true
+        },
+        {
+          "name": "body",
+          "type": "string",
+          "description": "Reply body text.",
+          "required": true
+        },
+        {
+          "name": "reply_mode",
+          "type": "string",
+          "description": "reply_to_sender | reply_all.",
+          "required": false
+        },
+        {
+          "name": "dry_run",
+          "type": "boolean",
+          "description": "Default true (mock). Set false to really send.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "mark_read_from_ask",
+      "description": "Mark Gmail messages as read (remove UNREAD label) for Ask results.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "message_ids",
+          "type": "array",
+          "description": "Gmail message IDs to mark as read.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "trash_from_ask",
+      "description": "Move Gmail messages to trash for Ask results.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "message_ids",
+          "type": "array",
+          "description": "Gmail message IDs to trash.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "get_run_history",
+      "description": "Get the history of past mail agent runs.",
+      "parameters": [],
+      "timeout": 120
+    },
+    {
+      "name": "start_custom_scan",
+      "description": "Start a custom (Ask) scan: generate a plan from natural language and execute it in the background.",
+      "parameters": [
+        {
+          "name": "user_request",
+          "type": "string",
+          "description": "Natural language request from user.",
+          "required": true
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "max_messages",
+          "type": "integer",
+          "description": "Maximum messages to scan.",
+          "required": false
+        },
+        {
+          "name": "primary_count",
+          "type": "integer",
+          "description": "How many recent Primary emails to fetch first.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "re_run_custom_scan",
+      "description": "Re-run a previously saved custom scan plan against the current inbox (skips LLM planning).",
+      "parameters": [
+        {
+          "name": "plan_id",
+          "type": "string",
+          "description": "Plan ID from get_custom_plans.",
+          "required": true
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "max_messages",
+          "type": "integer",
+          "description": "Maximum messages to scan.",
+          "required": false
+        },
+        {
+          "name": "primary_count",
+          "type": "integer",
+          "description": "How many recent Primary emails to fetch first.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "get_authorized_email",
+      "description": "Discover the authorized Gmail account from the platform-injected token. Returns empty string in local dev mode.",
+      "parameters": [],
+      "timeout": 120
+    },
+    {
+      "name": "get_custom_plans",
+      "description": "List all saved custom scan plans with lightweight metadata.",
+      "parameters": [],
+      "timeout": 120
+    },
+    {
+      "name": "get_custom_plan_detail",
+      "description": "Get a single custom plan's full details.",
+      "parameters": [
+        {
+          "name": "plan_id",
+          "type": "string",
+          "description": "Plan ID from get_custom_plans.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "list_contact_memories",
+      "description": "List contact memory summaries for one or more mailboxes.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address, or all.",
+          "required": false
+        },
+        {
+          "name": "mailboxes",
+          "type": "array",
+          "description": "Mailbox email addresses.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "get_contact_memory",
+      "description": "Get one contact memory file.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "contact_email",
+          "type": "string",
+          "description": "Contact email address.",
+          "required": true
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "delete_contact_memory",
+      "description": "Delete one contact memory file.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "contact_email",
+          "type": "string",
+          "description": "Contact email address.",
+          "required": true
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "clear_contact_memories",
+      "description": "Delete all contact memories for one or more mailboxes.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address, or all.",
+          "required": false
+        },
+        {
+          "name": "mailboxes",
+          "type": "array",
+          "description": "Mailbox email addresses.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "generate_contact_memories",
+      "description": "Start a contact-memory backfill run for active brief cards. Prefer start_contact_memory_run + continue_contact_memory_run.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address, or all.",
+          "required": false
+        },
+        {
+          "name": "mailboxes",
+          "type": "array",
+          "description": "Mailbox email addresses.",
+          "required": false
+        },
+        {
+          "name": "since",
+          "type": "string",
+          "description": "Only process cards created at or after this ISO timestamp.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "start_contact_memory_run",
+      "description": "Create a pollable contact-memory backfill run. Follow with continue_contact_memory_run.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address, or all.",
+          "required": false
+        },
+        {
+          "name": "mailboxes",
+          "type": "array",
+          "description": "Mailbox email addresses.",
+          "required": false
+        },
+        {
+          "name": "since",
+          "type": "string",
+          "description": "Only process cards created at or after this ISO timestamp.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "continue_contact_memory_run",
+      "description": "Advance a contact-memory backfill run by a small bounded batch.",
+      "parameters": [
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "Run ID from start_contact_memory_run.",
+          "required": true
+        },
+        {
+          "name": "batch_limit",
+          "type": "integer",
+          "description": "Maximum contact cards to process in this invoke. Defaults to 1.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage backend: local or aps.",
+          "required": false
+        }
+      ],
+      "timeout": 60
+    }
+  ],
+  "runtime": {
+    "type": "python",
+    "min_version": "3.10"
+  }
+}
