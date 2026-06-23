@@ -130,6 +130,7 @@ async def reconcile_active_cards_with_gmail(
     active = await get_active_cards(mailbox)
     checked_threads = 0
     resolved_replied = 0
+    resolved_read = 0
     marked_read = 0
     removed_missing = 0
     warnings: list[str] = []
@@ -167,7 +168,7 @@ async def reconcile_active_cards_with_gmail(
                 await append_card_action(mailbox, card.card_id, card.title, "gmail_removed", reason)
             continue
 
-        if state.latest_from_owner:
+        if card.user_action == "reply" and state.latest_from_owner:
             if card.status != "resolved" or card.resolution not in ("replied", "replied_in_gmail"):
                 card.status = "resolved"
                 card.resolution = "replied_in_gmail"
@@ -175,6 +176,17 @@ async def reconcile_active_cards_with_gmail(
                 resolved_replied += 1
                 changed = True
                 await append_card_action(mailbox, card.card_id, card.title, "replied_in_gmail", reason)
+            card.updated_at = _now()
+            continue
+
+        if card.user_action == "review" and not state.unread_message_ids:
+            if card.status != "resolved" or card.resolution != "read_in_gmail":
+                card.status = "resolved"
+                card.resolution = "read_in_gmail"
+                card.resolved_at = _now()
+                resolved_read += 1
+                changed = True
+                await append_card_action(mailbox, card.card_id, card.title, "read_in_gmail", reason)
             card.updated_at = _now()
             continue
 
@@ -191,6 +203,7 @@ async def reconcile_active_cards_with_gmail(
         "mailbox": mailbox,
         "checked_threads": checked_threads,
         "resolved_replied": resolved_replied,
+        "resolved_read": resolved_read,
         "marked_read": marked_read,
         "removed_missing": removed_missing,
         "last_history_id": str(max(history_values)) if history_values else "",

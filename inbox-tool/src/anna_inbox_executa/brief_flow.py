@@ -590,9 +590,10 @@ async def _brief_check_replied_after_phase1(run_id: str) -> None:
 
 
 async def _brief_persist_cards(run_id: str, new_judgments: list[Any]) -> int:
-    from mail_agent.cards.service import build_card, cards_to_frontend, merge_cards
+    from mail_agent.cards.service import build_card, cards_to_frontend, is_card_actionable, merge_cards
     from mail_agent.storage.ops import get_active_cards, set_active_cards
     from mail_agent.storage.types import ActiveCards
+    from mail_agent.sync.gmail_status import fetch_gmail_thread_state
 
     state = MAIL_AGENT_RUNS[run_id]
     brief = state.setdefault("brief", {})
@@ -607,6 +608,21 @@ async def _brief_persist_cards(run_id: str, new_judgments: list[Any]) -> int:
         if not candidate or not candidate.message_ids:
             continue
         card = build_card(candidate, judgment, msg_map.get(candidate.message_ids[0]), mailbox)
+        if card.thread_id and card.user_action in ("reply", "review"):
+            try:
+                thread_state = await asyncio.to_thread(fetch_gmail_thread_state, mailbox, card.thread_id)
+                card.gmail_state = thread_state.to_card_state()
+            except Exception as exc:
+                from mail_agent.storage.types import _now
+                card.gmail_state = {
+                    **(card.gmail_state or {}),
+                    "last_synced_at": _now(),
+                    "sync_failed": True,
+                    "sync_error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                }
+                log(f"brief new card gmail state failed: mailbox={mailbox} thread={card.thread_id} error={type(exc).__name__}: {exc}")
+        if not is_card_actionable(card):
+            continue
         new_cards.append(card)
     if not new_cards:
         return 0
@@ -772,7 +788,7 @@ async def _brief_finalize_run(run_id: str) -> None:
     if brief.get("low_value_items"):
         cleanup_card, cleanup_full = build_cleanup_bundle(run_id, mailbox, list(brief.get("low_value_items") or []), messages)
     if cleanup_full:
-        await set_cleanup_bundle(mailbox, cleanup_full)
+        await set_cleanup_bundle(mailbox, cleanup_full, preserve_existing=False)
         if cleanup_card is not None:
             cleanup_card.bundled_count = len(cleanup_full)
             active = await get_active_cards(mailbox)

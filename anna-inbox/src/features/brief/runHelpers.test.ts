@@ -6,9 +6,9 @@ describe("run helpers", () => {
     expect(stageToStep("scan")).toBe(0);
     expect(stageToStep("phase1")).toBe(1);
     expect(stageToStep("check_replied")).toBe(2);
-    expect(stageToStep("read_context")).toBe(3);
-    expect(stageToStep("evaluate")).toBe(4);
-    expect(stageToStep("done")).toBe(5);
+    expect(stageToStep("read_context")).toBe(2);
+    expect(stageToStep("evaluate")).toBe(3);
+    expect(stageToStep("done")).toBe(4);
   });
 
   it("formats scan labels", () => {

@@ -42,6 +42,11 @@ async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]
     from mail_agent.storage.ops import append_card_action
     if not gmail_error:
         await append_card_action(mailbox, card_id, card_title, "cleanup_read", f"{len(message_ids)} emails")
+        try:
+            from mail_agent.storage.ops import remove_cleanup_messages
+            await remove_cleanup_messages(mailbox, message_ids)
+        except Exception as exc:
+            log(f"remove cleanup messages failed: {type(exc).__name__}: {exc}")
 
     return {
         "ok": gmail_error == "",

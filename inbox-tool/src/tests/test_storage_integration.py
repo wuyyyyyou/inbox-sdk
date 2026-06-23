@@ -123,6 +123,7 @@ async def main():
         details=CardDetails(needs="Your reply", latest_activity="Alice · today", reviewed="Full thread", mailbox="test@example.com"),
         original=OriginalEmail(from_addr="alice@x.com", thread="Project timeline", time="today"),
         actions=[CardAction(id="draft", label="Prepare reply", primary=True)],
+        user_action="reply",
     )
     check("PersistentCard built", card.card_id == "card_1" and len(card.actions) == 1)
 
@@ -184,7 +185,7 @@ async def main():
     # Test merge: new card with same thread should replace old
     card_v2 = PersistentCard(
         card_id="card_2", message_id="msg_001", thread_id="thread_alice",
-        title="Alice needs a reply (updated)", status="pending",
+        title="Alice needs a reply (updated)", status="pending", user_action="reply",
     )
     merged = merge_cards(cards, [card_v2])
     check("merge replaces by thread", len(merged.cards) == 1 and merged.cards[0].title == "Alice needs a reply (updated)")

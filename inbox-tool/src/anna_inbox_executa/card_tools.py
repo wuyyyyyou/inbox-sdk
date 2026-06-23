@@ -68,7 +68,6 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
             active = loaded["active"]
             total = int(loaded["total"])
             scan_state = loaded["scan_state"]
-            action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
         else:
             page_result = _run_storage_query(get_active_cards_page(mailbox, offset, limit), timeout=45.0)
             active = page_result["active"]
@@ -80,17 +79,18 @@ def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
                 "total_scans": getattr(state, "total_scans", 0),
                 "total_processed": getattr(state, "total_processed", 0),
             }
-            action_count = 0  # computed below from active page for consistency; full count would need all cards
-            action_count = sum(1 for c in active.cards if c.status not in ("resolved", "dismissed") and c.user_action in ("reply", "review"))
+
+        frontend_cards = cards_to_frontend(active)
+        action_count = len(frontend_cards)
 
         cleanup_bundle = None
         cleanup_total = 0
         cleanup_has_more = False
 
         return {
-            "cards": cards_to_frontend(active),
+            "cards": frontend_cards,
             "total": total,
-            "count": len(active.cards),
+            "count": len(frontend_cards),
             "has_more": (offset + limit) < total if limit > 0 else False,
             "offset": offset,
             "limit": limit,

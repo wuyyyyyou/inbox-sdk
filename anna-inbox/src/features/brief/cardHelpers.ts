@@ -31,19 +31,9 @@ export function isMainCard(card: FrontendCard): boolean {
     !label.includes("safe") && !label.includes("cleanup") && !label.includes("low");
 }
 
-const RESOLVED_TTL_MS = 5 * 60 * 1000; // 5 min (test); production: 24 * 60 * 60 * 1000
-
-function _isResolvedExpired(card: FrontendCard): boolean {
-  if (card.status !== "resolved") return false;
-  if (!card.resolved_at) return false;
-  return new Date(card.resolved_at).getTime() + RESOLVED_TTL_MS < Date.now();
-}
-
 export function visibleCards(cards: FrontendCard[]): FrontendCard[] {
   return cards.filter((card) => {
     if (!card.status || card.status === "pending") return true;
-    if (card.status === "resolved") return !_isResolvedExpired(card);
-    if (card.status === "snoozed") return true; // snooze manages its own expiry via merge_cards
     return false;
   });
 }

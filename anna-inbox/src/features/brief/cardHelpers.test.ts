@@ -28,6 +28,15 @@ describe("card helpers", () => {
     expect(resolvedCards(cards).map((c) => c.id)).toEqual(["b", "c"]);
   });
 
+  it("hides replied cards from active lists", () => {
+    const cards = [
+      card({ id: "pending", status: "pending" }),
+      card({ id: "sent", status: "resolved", resolution: "replied" }),
+      card({ id: "gmail", status: "resolved", resolution: "replied_in_gmail" }),
+    ];
+    expect(visibleCards(cards).map((c) => c.id)).toEqual(["pending"]);
+  });
+
   it("separates main and lower cards", () => {
     const cards = [
       card({ id: "main", displaySection: "main" }),

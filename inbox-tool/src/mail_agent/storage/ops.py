@@ -547,22 +547,22 @@ async def get_cleanup_bundle_page(mailbox: str, offset: int = 0, limit: int = 10
     return {"items": page, "total": total, "has_more": (offset + limit) < total}
 
 
-async def set_cleanup_bundle(mailbox: str, messages: list[dict[str, Any]]) -> dict:
+async def set_cleanup_bundle(mailbox: str, messages: list[dict[str, Any]], *, preserve_existing: bool = True) -> dict:
     """Persist a cleanup bundle, merging with any existing bundle by message_id.
 
     New items overwrite old items with the same message_id; old items not present
     in the new list are preserved.  This prevents incremental scans from losing
     cleanup cards accumulated across previous scans.
     """
-    # Merge with existing bundle
-    existing = await get_cleanup_bundle(mailbox)
-    seen: set[str] = {str(m.get("message_id", "")) for m in messages if m.get("message_id")}
     merged = list(messages)
-    for old in existing:
-        mid = str(old.get("message_id", ""))
-        if mid and mid not in seen:
-            merged.append(old)
-            seen.add(mid)
+    if preserve_existing:
+        existing = await get_cleanup_bundle(mailbox)
+        seen: set[str] = {str(m.get("message_id", "")) for m in messages if m.get("message_id")}
+        for old in existing:
+            mid = str(old.get("message_id", ""))
+            if mid and mid not in seen:
+                merged.append(old)
+                seen.add(mid)
 
     total = len(merged)
     shard_count = max(1, (total + CLEANUP_SHARD_SIZE - 1) // CLEANUP_SHARD_SIZE) if total > 0 else 0
@@ -589,6 +589,19 @@ async def set_cleanup_bundle(mailbox: str, messages: list[dict[str, Any]]) -> di
         scope=default_scope(),
     )
     return {"ok": True, "shards": shard_count, "total": total}
+
+
+async def remove_cleanup_messages(mailbox: str, message_ids: list[str]) -> dict:
+    """Remove messages from the persisted cleanup bundle after they are read."""
+    remove_ids = {str(mid).strip() for mid in message_ids if str(mid).strip()}
+    if not remove_ids:
+        return {"ok": True, "removed": 0, "total": None}
+
+    existing = await get_cleanup_bundle(mailbox)
+    kept = [item for item in existing if str(item.get("message_id") or item.get("id") or "") not in remove_ids]
+    removed = len(existing) - len(kept)
+    result = await set_cleanup_bundle(mailbox, kept, preserve_existing=False)
+    return {"ok": True, "removed": removed, "total": result.get("total")}
 
 
 # ── Run records ─────────────────────────────────────────────────────

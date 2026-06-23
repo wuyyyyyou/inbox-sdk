@@ -368,6 +368,8 @@ def build_cleanup_bundle(
     full_bundled: list[dict[str, Any]] = []
     for item in low_value_items:
         msg = msg_map.get(item["message_id"])
+        if msg is None or not getattr(msg, "unread", False):
+            continue
         full_bundled.append({
             "message_id": item["message_id"],
             "mailbox": mailbox,
@@ -375,6 +377,7 @@ def build_cleanup_bundle(
             "subject": (msg.subject or "")[:120] if msg else "",
             "snippet": (msg.snippet or "")[:200] if msg else "",
             "date": (msg.internal_date or "")[:20] if msg else "",
+            "unread": bool(getattr(msg, "unread", False)),
             "item_type": "",
             "reason": str(item.get("reason", ""))[:100],
             "confidence": float(item.get("confidence", 0.5)),
@@ -448,6 +451,39 @@ def _merge_cleanup_bundles(
     return old
 
 
+def is_card_actionable(card: PersistentCard) -> bool:
+    """Return whether a card still represents unfinished user attention.
+
+    Gmail state is the source of truth when present.  If state is absent or a
+    recent sync failed, keep reply/review cards visible rather than hiding a
+    possible real task.
+    """
+    if card.status in ("dismissed", "resolved"):
+        return False
+    if card.card_type == "cleanup_bundle":
+        return False
+    if card.priority == "ignore":
+        return False
+
+    state = card.gmail_state if isinstance(card.gmail_state, dict) else {}
+    if state.get("missing"):
+        return False
+    if state.get("sync_failed"):
+        return card.user_action in ("reply", "review")
+
+    if card.user_action == "reply":
+        if "latest_from_owner" not in state:
+            return True
+        return not bool(state.get("latest_from_owner"))
+
+    if card.user_action == "review":
+        if "unread" not in state:
+            return True
+        return bool(state.get("unread"))
+
+    return False
+
+
 def merge_cards(existing: ActiveCards, new_cards: list[PersistentCard]) -> ActiveCards:
     """Merge new scan results with existing active cards.
 
@@ -478,7 +514,6 @@ def merge_cards(existing: ActiveCards, new_cards: list[PersistentCard]) -> Activ
     # Process existing cards
     for card in existing.cards:
         if card.status == "resolved":
-            merged[card.thread_id or card.card_id] = card
             continue
         if card.status == "dismissed":
             continue
@@ -497,7 +532,7 @@ def merge_cards(existing: ActiveCards, new_cards: list[PersistentCard]) -> Activ
 
     # Merge new regular cards (overwrite existing by thread_id or card_id)
     for card in new_regular:
-        if card.priority == "ignore":
+        if not is_card_actionable(card):
             continue
         key = card.thread_id or card.card_id
         merged[key] = card
@@ -516,7 +551,7 @@ def cards_to_frontend(cards: ActiveCards) -> list[dict[str, Any]]:
     """Serialize active cards to the V2 frontend format."""
     result: list[dict[str, Any]] = []
     for card in cards.cards:
-        if card.status == "dismissed":
+        if not is_card_actionable(card):
             continue
         frontend_card: dict[str, Any] = {
             "id": card.card_id,

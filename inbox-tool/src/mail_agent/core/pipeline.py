@@ -991,7 +991,7 @@ async def _persist_run_results_locked(
         ScanState,
         _now,
     )
-    from ..cards.service import build_card, build_action_memo, build_cleanup_bundle, cards_to_frontend, merge_cards
+    from ..cards.service import build_card, build_action_memo, build_cleanup_bundle, cards_to_frontend, is_card_actionable, merge_cards
 
     # 1. Mark ALL scanned messages as processed
     processed_msgs: list[ProcessedMessage] = []
@@ -1067,11 +1067,34 @@ async def _persist_run_results_locked(
     # 3. 持久化 cleanup 明细（与历史合并去重），卡片预览总数。
     if cleanup_full:
         from ..storage.ops import set_cleanup_bundle as _scb
-        result = await _scb(mailbox, cleanup_full)
+        result = await _scb(mailbox, cleanup_full, preserve_existing=False)
         merged_total = int(result.get("total", len(cleanup_full)))
         for c in new_cards:
             if getattr(c, "card_type", "") == "cleanup_bundle":
                 c.bundled_count = merged_total
+
+    # 3a. 补齐 Gmail 线程状态并过滤掉已经不需要展示的普通卡片。
+    # 扫描层保持宽入口；卡片层只保留未完成的 reply/review 注意力任务。
+    if new_cards:
+        from ..sync.gmail_status import fetch_gmail_thread_state
+
+        actionable_cards = []
+        for card in new_cards:
+            if getattr(card, "thread_id", "") and getattr(card, "user_action", "") in ("reply", "review") and not getattr(card, "card_type", ""):
+                try:
+                    state = await asyncio.to_thread(fetch_gmail_thread_state, mailbox, card.thread_id)
+                    card.gmail_state = state.to_card_state()
+                except Exception as exc:
+                    card.gmail_state = {
+                        **(card.gmail_state or {}),
+                        "last_synced_at": _now(),
+                        "sync_failed": True,
+                        "sync_error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                    }
+                    _logger.warning("new_card_gmail_state_failed mailbox=%s thread=%s error=%s", mailbox, card.thread_id, exc)
+            if is_card_actionable(card) or getattr(card, "card_type", "") == "cleanup_bundle":
+                actionable_cards.append(card)
+        new_cards = actionable_cards
 
     # 4. Merge with existing active cards
     existing = await get_active_cards(mailbox)
