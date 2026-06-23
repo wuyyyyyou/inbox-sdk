@@ -82,7 +82,6 @@ export function HandleView() {
   const key = card.uiKey || card.id;
   const original = card.original || {};
   const detail = state.selectedCardDetail || {};
-  const detailLoaded = Boolean(state.selectedCardDetail);
   const context = detail.thread_context || {};
   const contactContext = detail.contact_context || {};
   const latestBody = detail.latest_body || "";
@@ -97,35 +96,40 @@ export function HandleView() {
   const cc = asString(context.cc || original.cc || "None");
   const contextExpanded = Boolean(state.threadContextExpanded[key]);
   const bodyExpanded = Boolean(state.threadContextExpanded[`${key}_body`]);
+  const bodyVisible = bodyLoaded && bodyExpanded;
   const senderName = asString(context.from || original.from || "").split("<")[0].trim().replace(/"/g, "") || "Unknown";
   const threadSubject = asString(context.subject || original.thread || card.title || "").slice(0, 80);
   const hasDraft = Boolean(draft);
   const draftDisplay = state.generatingDraft && !draft ? "Anna is drafting a reply..." : draft;
   const nid = nextCardId(state);
-  const messageCount = Number(context.message_count || 1);
   const relatedContext = contactContextLines(contactContext);
   const fallbackRelatedContext = uniqueLines([card.summary, card.thread_summary].map(asString).filter(Boolean));
+  const relatedContextItems = uniqueLines([
+    ...relatedContext,
+    ...asList(summary?.related_context),
+    ...(relatedContext.length ? [] : fallbackRelatedContext),
+  ]);
   const BODY_PREVIEW = 500;
   const loadingBody = state.pendingAction === `body:${key}`;
   const bodyTruncated = latestBodyHtml
     ? latestBodyHtml.length > BODY_PREVIEW
     : latestBody.length > BODY_PREVIEW;
 
-  const summaryBlock = () => {
+  const relatedContextBlock = () => {
+    if (!relatedContextItems.length) return null;
+    return (
+      <section className="review-block is-summary">
+        <div className="review-block-kicker">Related context</div>
+        <ul>{relatedContextItems.map((line, i) => <li key={i}>{line}</li>)}</ul>
+      </section>
+    );
+  };
+
+  const threadSummaryBlock = () => {
     if (state.summarizingThread) {
       return <section className="review-block is-summary is-loading"><p>Anna is reading the thread and preparing a summary...</p></section>;
     }
     if (!summary) {
-      const immediateRelated = relatedContext.length ? relatedContext : fallbackRelatedContext;
-      if (!detailLoaded || messageCount <= 1) {
-        if (!immediateRelated.length) return null;
-        return (
-          <section className="review-block is-summary">
-            <div className="review-block-kicker">Related context</div>
-            <ul>{immediateRelated.map((line, i) => <li key={i}>{line}</li>)}</ul>
-          </section>
-        );
-      }
       return (
         <section className="review-block is-summary">
           <p>Anna can read the full thread and summarize what matters before you draft.</p>
@@ -143,19 +147,17 @@ export function HandleView() {
         </section>
       );
     }
-    const shouldShow = summary.should_show !== false;
     const bullets = uniqueLines([asString(summary.headline), ...asList(summary.what_happened)].filter(Boolean));
     const openQuestions = uniqueLines(asList(summary.open_questions));
-    const related = uniqueLines([...asList(summary.related_context), ...relatedContext]);
     const replyFocus = asString(summary.reply_focus).trim();
-    if (!shouldShow && !related.length) return null;
+    const hasSummaryContent = bullets.length || openQuestions.length || replyFocus;
     return (
       <section className="review-block is-summary">
-        <div className="review-block-kicker">{summary.thread_kind === "single_short" ? "Related context" : "Anna noticed"}</div>
+        <div className="review-block-kicker">Anna noticed</div>
         {bullets.length ? <ul>{bullets.map((line, i) => <li key={i}>{line}</li>)}</ul> : null}
-        {related.length ? <p><strong>Related context:</strong> {related.join(" ")}</p> : null}
         {openQuestions.length ? <p><strong>Open questions:</strong> {openQuestions.join(" ")}</p> : null}
         {replyFocus ? <p><strong>Reply focus:</strong> {replyFocus}</p> : null}
+        {!hasSummaryContent ? <p>Anna did not find additional thread details to summarize.</p> : null}
       </section>
     );
   };
@@ -171,7 +173,7 @@ export function HandleView() {
           </div>
           <span className={`category-tag ${hasDraft ? "is-ready-state" : ""}`}>{hasDraft ? "Reply ready" : "Needs review"}</span>
         </div>
-        {!bodyLoaded ? (
+        {!bodyVisible ? (
           <section className={`review-block is-quiet${loadingBody ? " is-loading" : ""}`}>
             <p>Original email body is hidden until you choose to view it.</p>
             <div className="proposal-actions">
@@ -210,29 +212,26 @@ export function HandleView() {
                 }),
               }}
             />
-            {bodyTruncated ? (
-              <button className="soft-btn compact" style={{ marginTop: 6 }} onClick={() => actions.toggleThreadContext(`${key}_body`)}>
-                {bodyExpanded ? "Show less" : "Show full email"}
-              </button>
-            ) : null}
+            <button className="soft-btn compact" style={{ marginTop: 6 }} onClick={() => actions.toggleThreadContext(`${key}_body`)}>
+              Show less
+            </button>
           </section>
         ) : latestBody ? (
           <section className="review-block">
             <div className="original-body" style={{ whiteSpace: "pre-wrap", wordBreak: "break-all", overflowWrap: "break-word" }}>
               {bodyTruncated && !bodyExpanded ? latestBody.slice(0, BODY_PREVIEW) + "…" : latestBody}
             </div>
-            {bodyTruncated ? (
-              <button className="soft-btn compact" style={{ marginTop: 6 }} onClick={() => actions.toggleThreadContext(`${key}_body`)}>
-                {bodyExpanded ? "Show less" : "Show full email"}
-              </button>
-            ) : null}
+            <button className="soft-btn compact" style={{ marginTop: 6 }} onClick={() => actions.toggleThreadContext(`${key}_body`)}>
+              Show less
+            </button>
           </section>
         ) : (
           <section className="review-block is-quiet">
             <p>Full email body is not available for this card.</p>
           </section>
         )}
-        {summaryBlock()}
+        {relatedContextBlock()}
+        {threadSummaryBlock()}
         <section className={`review-block is-composer ${state.generatingDraft ? "is-loading" : ""}`}>
           <h3 className="review-block-title">Draft reply</h3>
           {showGapForm ? (

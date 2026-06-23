@@ -886,11 +886,39 @@ export function useAppController() {
       if (card && card.status && card.status !== "pending") return;
       if (!card) return;
       const key = card.uiKey || cardUiKey(card, state.mailbox);
-      setState((s) => ({ ...s, selectedCard: card, lastOpenedCardKey: key, selectedCardDetail: null, originalOpen: true, sourcesOpen: false, historyOpen: false, memoryOpen: false, snoozeMenuCardId: "" }));
+      setState((s) => ({
+        ...s,
+        selectedCard: card,
+        lastOpenedCardKey: key,
+        selectedCardDetail: null,
+        originalOpen: true,
+        sourcesOpen: false,
+        historyOpen: false,
+        memoryOpen: false,
+        snoozeMenuCardId: "",
+        threadContextExpanded: { ...s.threadContextExpanded, [`${key}_body`]: false },
+      }));
       scrollToPageTop();
       try {
         const detail = await client.getCardDetail(cardMailbox(card, state.mailbox), card.id, state.storageProvider, false);
-        setState((s) => ({ ...s, selectedCardDetail: detail }));
+        setState((s) => {
+          const selectedKey = s.selectedCard ? s.selectedCard.uiKey || cardUiKey(s.selectedCard, s.mailbox) : "";
+          if (selectedKey !== key) return s;
+          if (!s.selectedCardDetail?.body_loaded) {
+            return { ...s, selectedCardDetail: detail };
+          }
+          return {
+            ...s,
+            selectedCardDetail: {
+              ...detail,
+              latest_body: s.selectedCardDetail.latest_body,
+              latest_body_html: s.selectedCardDetail.latest_body_html,
+              body_loaded: true,
+              thread_context: detail.thread_context || s.selectedCardDetail.thread_context,
+              contact_context: detail.contact_context || s.selectedCardDetail.contact_context,
+            },
+          };
+        });
       } catch {
       }
     },
@@ -898,22 +926,29 @@ export function useAppController() {
       if (!state.selectedCard) return;
       const card = state.selectedCard;
       const key = card.uiKey || cardUiKey(card, state.mailbox);
-      if (state.selectedCardDetail?.body_loaded || state.pendingAction === `body:${key}`) return;
+      if (state.pendingAction === `body:${key}`) return;
+      if (state.selectedCardDetail?.body_loaded) {
+        setState((s) => ({ ...s, threadContextExpanded: { ...s.threadContextExpanded, [`${key}_body`]: true } }));
+        return;
+      }
       setState((s) => ({ ...s, pendingAction: `body:${key}` }));
       try {
         const detail = await client.getCardDetail(cardMailbox(card, state.mailbox), card.id, state.storageProvider, true);
-        setState((s) => ({
-          ...s,
-          ...(s.selectedCard?.id !== card.id ? {} : {
-          selectedCardDetail: {
-            ...(s.selectedCardDetail || {}),
-            ...detail,
-            thread_context: detail.thread_context || s.selectedCardDetail?.thread_context,
-            contact_context: detail.contact_context || s.selectedCardDetail?.contact_context,
-            body_loaded: true,
-          },
-          }),
-        }));
+        setState((s) => {
+          const selectedKey = s.selectedCard ? s.selectedCard.uiKey || cardUiKey(s.selectedCard, s.mailbox) : "";
+          if (selectedKey !== key) return s;
+          return {
+            ...s,
+            selectedCardDetail: {
+              ...(s.selectedCardDetail || {}),
+              ...detail,
+              thread_context: detail.thread_context || s.selectedCardDetail?.thread_context,
+              contact_context: detail.contact_context || s.selectedCardDetail?.contact_context,
+              body_loaded: true,
+            },
+            threadContextExpanded: { ...s.threadContextExpanded, [`${key}_body`]: true },
+          };
+        });
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       } finally {

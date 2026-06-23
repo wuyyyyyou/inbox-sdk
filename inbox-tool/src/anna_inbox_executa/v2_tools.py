@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from anna_inbox_executa.common import *
 from anna_inbox_executa.card_tools import _handle_generate_draft_background, _handle_summarize_background, _serialize_card_for_frontend
-from anna_inbox_executa.gmail_tools import _dedup_body, _inline_remote_images, _resolve_cid_images, _sanitize_email_html
+from anna_inbox_executa.gmail_tools import _dedup_body, _resolve_cid_images, _sanitize_email_html
 from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.storage_tools import *
 
@@ -120,7 +120,6 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                     if raw_html.strip():
                         latest_body_html = _sanitize_email_html(raw_html[:8000])
                         latest_body_html = _resolve_cid_images(latest_body_html, payload)
-                        latest_body_html = _inline_remote_images(latest_body_html)
                     if raw_text.strip():
                         latest_body = raw_text[:8000]
                     elif not latest_body_html:
