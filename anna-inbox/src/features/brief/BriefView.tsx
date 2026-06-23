@@ -120,9 +120,12 @@ function AttentionCard({ card }: { card: FrontendCard }) {
 }
 
 function LowValueEmailCard({ msg, index, cardId }: { msg: CleanupMessage; index: number; cardId: string }) {
-  const { state } = useApp();
+  const { state, actions } = useApp();
   const readState = state.cleanupReadState[cardId];
   const isRead = Boolean(readState && readState.readMsgIndices.includes(index));
+  const messageId = msg.message_id || msg.id || "";
+  const itemKey = messageId ? `${cardId}:${messageId}` : `${cardId}:${index}`;
+  const isMarking = Boolean(state.markingReadIds[itemKey]);
   const displayDate = msg.date ? formatBeijingTimestamp(Number(msg.date)) : "";
   return (
     <div className={`low-value-email-card ${isRead ? "is-read" : ""}`}>
@@ -136,6 +139,11 @@ function LowValueEmailCard({ msg, index, cardId }: { msg: CleanupMessage; index:
       <div className="low-value-email-meta">
         <span className="low-value-email-type">low priority</span>
         {msg.reason ? <span className="low-value-email-reason">{msg.reason}</span> : null}
+        {messageId ? (
+          <button className="soft-btn compact cleanup-read-btn" disabled={Boolean(isRead || isMarking)} onClick={() => void actions.markCleanupAsRead(cardId, messageId, index)}>
+            {isMarking ? "Marking..." : isRead ? "Read" : "Mark read"}
+          </button>
+        ) : null}
       </div>
     </div>
   );
@@ -183,9 +191,12 @@ function CleanupBundleCard({ card }: { card: FrontendCard }) {
 }
 
 function CleanupIndividualCard({ msg, index, cardId }: { msg: CleanupMessage; index: number; cardId: string }) {
-  const { state } = useApp();
+  const { state, actions } = useApp();
   const readState = state.cleanupReadState[cardId];
   const isRead = Boolean(readState && readState.readMsgIndices.includes(index));
+  const messageId = msg.message_id || msg.id || "";
+  const itemKey = messageId ? `${cardId}:${messageId}` : `${cardId}:${index}`;
+  const isMarking = Boolean(state.markingReadIds[itemKey]);
   const displayDate = msg.date ? formatBeijingTimestamp(Number(msg.date)) : "";
   return (
     <article className={`cleanup-single-card ${isRead ? "is-read" : ""}`}>
@@ -198,6 +209,11 @@ function CleanupIndividualCard({ msg, index, cardId }: { msg: CleanupMessage; in
       <div className="low-value-email-meta">
         <span className="low-value-email-type">low priority</span>
         {msg.reason ? <span className="low-value-email-reason">{msg.reason}</span> : null}
+        {messageId ? (
+          <button className="soft-btn compact cleanup-read-btn" disabled={Boolean(isRead || isMarking)} onClick={() => void actions.markCleanupAsRead(cardId, messageId, index)}>
+            {isMarking ? "Marking..." : isRead ? "Read" : "Mark read"}
+          </button>
+        ) : null}
       </div>
     </article>
   );
@@ -467,7 +483,7 @@ export function BriefView() {
   ).filter(({ msg }) => {
     const mbox = normalizeMailbox(msg.mailbox ?? "");
     return mbox ? briefFilterSet.has(mbox) : true;
-  });
+  }).map((entry, index) => ({ ...entry, index }));
   const cleanupPreviewCount = cleanupCards.reduce((sum, card) => sum + (card.bundledCount || (Array.isArray(card.bundledMessages) ? card.bundledMessages.length : 0)), 0);
   const cleanupCount = fullCleanupBundle ? cleanupMessages.length : cleanupPreviewCount;
 

@@ -569,6 +569,8 @@ def cards_to_frontend(cards: ActiveCards) -> list[dict[str, Any]]:
             frontend_card["bundledCount"] = card.bundled_count or len(card.bundled_messages)
         if card.reply_gaps:
             frontend_card["replyGaps"] = card.reply_gaps
+        if card.gmail_state:
+            frontend_card["gmailState"] = card.gmail_state
         result.append(frontend_card)
     return result
 

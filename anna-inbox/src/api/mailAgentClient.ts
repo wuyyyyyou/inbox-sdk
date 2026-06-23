@@ -200,7 +200,7 @@ export class MailAgentClient {
   }
 
   markCleanupRead(args: Record<string, unknown>) {
-    return this.invoke<{ ok?: boolean; gmail_error?: string }>("mark_cleanup_read", args);
+    return this.invoke<{ ok?: boolean; gmail_error?: string; gmail_code?: string; marked_count?: number }>("mark_cleanup_read", args);
   }
 
   restoreCard(mailbox: string, cardId: string, storageProvider: string) {

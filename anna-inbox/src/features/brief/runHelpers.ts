@@ -9,7 +9,7 @@ export const SCAN_STEPS = [
 ];
 
 const STAGE_STEP_MAP: Record<string, number> = {
-  queued: 0, parse_intent: 0, scan: 0, scanning: 0, scan_cache: 0, scan_done: 0, scan_fallback: 0, scan_fallback_empty: 0,
+  queued: 0, parse_intent: 0, sync_gmail_state: 0, scan: 0, scanning: 0, scan_cache: 0, scan_done: 0, scan_fallback: 0, scan_fallback_empty: 0,
   storage_filter: 1, thread_dedup: 1, phase1: 1, phase1_done: 1,
   filtering: 1,
   check_replied: 2, already_replied_filter: 2,
@@ -29,6 +29,7 @@ export function scanStageLabel(stage: string | undefined, progress: Record<strin
     planning: "Generating scan plan with Anna LLM.",
     planning_done: "Plan ready. Starting scan.",
     parse_intent: "Choosing scan strategy.",
+    sync_gmail_state: "Syncing Gmail state.",
     scan: "Reading Gmail source.",
     scanning: "Reading Gmail source.",
     scan_cache: "Loading Gmail cache.",
@@ -62,6 +63,11 @@ export function scanStageLabel(stage: string | undefined, progress: Record<strin
 export function scanProgressLabel(stage: string | undefined, progress: Record<string, unknown> = {}): string {
   const p = progress;
   if (!stage || stage === "queued") return "";
+  if (stage === "sync_gmail_state") {
+    const resolved = Number(p.resolved_replied || 0);
+    const checked = Number(p.checked_threads || 0);
+    return resolved > 0 ? `${resolved} replied threads synced` : `Checking Gmail state${checked ? ` · ${checked} threads` : ""}`;
+  }
   if (stage === "scan" || stage === "scanning" || stage === "parse_intent") {
     const fetched = Number(p.messages_fetched || p.current || 0);
     const max = Number(p.max_messages || p.total || 0);

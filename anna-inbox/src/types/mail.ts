@@ -107,6 +107,7 @@ export interface FrontendCard {
   bundledMessages?: CleanupMessage[];
   bundledCount?: number;
   replyGaps?: ReplyGaps;
+  gmailState?: Record<string, unknown>;
 }
 
 export interface CleanupMessage {

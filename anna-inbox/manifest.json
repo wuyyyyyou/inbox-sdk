@@ -15,7 +15,7 @@
   "required_executas": [
     {
       "tool_id": "bundled:inbox-executa",
-      "min_version": "1.0.7",
+      "min_version": "1.0.8",
       "version": "latest"
     }
   ],
@@ -71,7 +71,14 @@
       ],
       "window": [
         "set_title"
-      ]
+      ],
+      "agent": {
+        "session": { 
+          "auto": true,
+          "fixed": {}
+        },
+        "tools": []
+      }
     },
     "csp_overrides": {
       "script-src": [

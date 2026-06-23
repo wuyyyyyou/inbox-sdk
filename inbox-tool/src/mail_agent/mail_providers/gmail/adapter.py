@@ -886,7 +886,7 @@ def fetch_thread_full(mailbox: str, thread_id: str) -> dict[str, Any]:
     return gmail_request(
         mailbox,
         f"/users/me/threads/{_up.quote(str(thread_id), safe='')}",
-        {"format": "full", "fields": "messages(id,threadId,labelIds,internalDate,payload(parts,headers,body,mimeType),snippet)"},
+        {"format": "full", "fields": "messages(id,threadId,historyId,labelIds,internalDate,payload(parts,headers,body,mimeType),snippet)"},
     )
 
 
@@ -912,6 +912,70 @@ def fetch_and_cache_message(mailbox: str, message_id: str) -> dict[str, Any] | N
     normalized = _normalize_message(mailbox, full)
     write_message(mailbox, normalized)
     return normalized
+
+
+def refresh_thread_cache(mailbox: str, thread_id: str) -> list[dict[str, Any]]:
+    """Fetch a Gmail thread, normalize/cache all messages, and update the index."""
+    normalized_mailbox = normalize_mailbox(mailbox)
+    full = fetch_thread_full(normalized_mailbox, thread_id)
+    raw_msgs = extract_messages_from_thread(full)
+    normalized_msgs: list[dict[str, Any]] = []
+    for msg in raw_msgs:
+        n = _normalize_message(normalized_mailbox, msg)
+        write_message(normalized_mailbox, n)
+        normalized_msgs.append(n)
+
+    if normalized_msgs:
+        cache = read_cache(normalized_mailbox)
+        by_id: dict[str, dict[str, Any]] = {}
+        for item in cache.get("messages") or []:
+            if isinstance(item, dict) and item.get("id"):
+                by_id[str(item["id"])] = item
+        for msg in normalized_msgs:
+            by_id[str(msg.get("id") or "")] = message_summary(msg)
+        merged = sorted(by_id.values(), key=lambda item: int(item.get("internal_date") or 0), reverse=True)
+        write_index(normalized_mailbox, merged)
+
+    return normalized_msgs
+
+
+def patch_cached_messages_read(mailbox: str, message_ids: list[str]) -> None:
+    """Best-effort local cache patch after Gmail UNREAD labels are removed."""
+    normalized_mailbox = normalize_mailbox(mailbox)
+    target_ids = {str(mid) for mid in message_ids if str(mid)}
+    if not target_ids:
+        return
+
+    changed_summaries: dict[str, dict[str, Any]] = {}
+    for mid in target_ids:
+        try:
+            msg = read_message(normalized_mailbox, mid)
+        except Exception:
+            continue
+        labels = [str(label) for label in (msg.get("label_ids") or []) if str(label).upper() != "UNREAD"]
+        msg["label_ids"] = labels
+        write_message(normalized_mailbox, msg)
+        changed_summaries[mid] = message_summary(msg)
+
+    if not changed_summaries:
+        return
+
+    cache = read_cache(normalized_mailbox)
+    summaries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in cache.get("messages") or []:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("id") or "")
+        if not mid:
+            continue
+        summaries.append(changed_summaries.get(mid, item))
+        seen.add(mid)
+    for mid, summary in changed_summaries.items():
+        if mid not in seen:
+            summaries.append(summary)
+    summaries.sort(key=lambda item: int(item.get("internal_date") or 0), reverse=True)
+    write_index(normalized_mailbox, summaries)
 
 
 _FETCH_WORKERS = 6

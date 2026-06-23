@@ -1074,6 +1074,7 @@ def _dict_to_persistent_card(d: dict) -> PersistentCard:
         bundled_count=d.get("bundled_count", 0),
         user_action=d.get("user_action", ""),
         reply_gaps=d.get("reply_gaps", {}) if isinstance(d.get("reply_gaps"), dict) else {},
+        gmail_state=d.get("gmail_state", {}) if isinstance(d.get("gmail_state"), dict) else {},
     )
 
 

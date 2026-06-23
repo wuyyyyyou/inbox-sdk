@@ -372,6 +372,24 @@ async def _brief_prepare_scan(run_id: str, arguments: dict[str, Any]) -> None:
     configured_max = _clamp_int(scan_plan_config.max_messages if scan_plan_config else arguments.get("max_messages"), max_messages, 10, 500)
     scan_window_days = _clamp_int(scan_plan_config.scan_window_days if scan_plan_config else arguments.get("scan_window_days"), 7, 1, 90)
 
+    sync_summary: dict[str, Any] = {}
+    if _storage_ready():
+        _brief_update_state(run_id, stage="sync_gmail_state", progress={"mailbox": mailbox, "current": 0, "total": 1})
+        try:
+            from mail_agent.sync.gmail_status import reconcile_active_cards_with_gmail
+            sync_summary = await reconcile_active_cards_with_gmail(mailbox, reason="scan_start")
+            brief["gmail_sync"] = sync_summary
+            _brief_update_state(run_id, stage="sync_gmail_state", progress={
+                "mailbox": mailbox,
+                "checked_threads": sync_summary.get("checked_threads", 0),
+                "resolved_replied": sync_summary.get("resolved_replied", 0),
+                "removed_missing": sync_summary.get("removed_missing", 0),
+            })
+        except Exception as exc:
+            sync_summary = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            brief["gmail_sync"] = sync_summary
+            log(f"brief gmail sync failed: {type(exc).__name__}: {exc}")
+
     last_message_internal_date = ""
     is_first_scan = True
     if _storage_ready():
@@ -442,6 +460,7 @@ async def _brief_prepare_scan(run_id: str, arguments: dict[str, Any]) -> None:
             "scan_window_days": scan_window_days,
             "incremental": bool(after_timestamp),
             "after_timestamp": after_timestamp[:20],
+            "gmail_sync": sync_summary,
         },
     )
 
@@ -762,10 +781,12 @@ async def _brief_finalize_run(run_id: str) -> None:
 
     previous_state = await get_scan_state(mailbox)
     latest_internal_date = max((str(m.internal_date) for m in messages if m.internal_date), default=previous_state.last_message_internal_date, key=lambda value: int(value or 0))
+    sync_history_id = str((brief.get("gmail_sync") or {}).get("last_history_id") or "")
     await set_scan_state(mailbox, ScanState(
         mailbox=mailbox,
         last_scan_ts=_now(),
         last_message_internal_date=latest_internal_date,
+        last_history_id=sync_history_id or previous_state.last_history_id,
         total_scans=previous_state.total_scans + 1,
         total_processed=previous_state.total_processed + len(processed_msgs),
     ))

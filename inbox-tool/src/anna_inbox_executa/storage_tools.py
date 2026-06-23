@@ -14,29 +14,20 @@ async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]
     # 1. Gmail batchModify: remove UNREAD label
     gmail_result = None
     gmail_error = ""
+    gmail_code = ""
     try:
-        import json as _json2
-        import urllib.request as _ur
-        from mail_agent.mail_providers.gmail.adapter import get_access_token
-        token = get_access_token(mailbox)
-        body = _json2.dumps({
-            "ids": message_ids,
-            "removeLabelIds": ["UNREAD"],
-        }).encode("utf-8")
-        req = _ur.Request(
-            "https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify",
-            data=body,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with _ur.urlopen(req, timeout=30) as resp:
-            raw_body = resp.read().decode("utf-8")
-            gmail_result = _json2.loads(raw_body) if raw_body.strip() else {"ok": True}
+        import asyncio as _asyncio
+        from mail_agent.mail_providers.gmail.adapter import batch_mark_read, patch_cached_messages_read
+        gmail_result = await _asyncio.to_thread(batch_mark_read, mailbox, message_ids)
+        patch_cached_messages_read(mailbox, message_ids)
     except Exception as exc:
         gmail_error = str(exc)
+        if "403" in gmail_error:
+            gmail_code = "403"
+            gmail_error = (
+                "Gmail rejected mark-as-read with 403. The current OAuth token likely does not include Gmail modify permission. "
+                "Please re-authorize Gmail with modify scope, then try again."
+            )
 
     # 2. Keep card visible (pending) — read state is tracked frontend-side
     # Write history
@@ -49,13 +40,15 @@ async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]
     except Exception:
         pass
     from mail_agent.storage.ops import append_card_action
-    await append_card_action(mailbox, card_id, card_title, "cleanup_read", f"{len(message_ids)} emails")
+    if not gmail_error:
+        await append_card_action(mailbox, card_id, card_title, "cleanup_read", f"{len(message_ids)} emails")
 
     return {
         "ok": gmail_error == "",
         "marked_count": len(message_ids),
         "gmail_result": gmail_result,
         "gmail_error": gmail_error,
+        "gmail_code": gmail_code,
     }
 
 

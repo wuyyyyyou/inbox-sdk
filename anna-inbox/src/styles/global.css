@@ -6182,9 +6182,15 @@
 
 .low-value-email-meta {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   font-size: 10px;
   color: var(--muted);
+}
+
+.cleanup-read-btn {
+  margin-left: auto;
 }
 
 .low-value-email-type {

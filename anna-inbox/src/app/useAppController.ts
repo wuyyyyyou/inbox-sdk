@@ -178,7 +178,7 @@ export interface AppActions {
   recordDecision(decision: string, cardId?: string): Promise<void>;
   replyNow(): Promise<void>;
   clearAllCards(): Promise<void>;
-  markCleanupAsRead(cardId: string): Promise<void>;
+  markCleanupAsRead(cardId: string, messageId?: string, messageIndex?: number): Promise<void>;
   restoreCard(cardId: string, mailbox?: string): Promise<void>;
   snoozeCard(cardId: string, option: string, reasons?: string[]): Promise<void>;
   openSnoozeReasons(cardId: string): void;
@@ -1064,10 +1064,11 @@ export function useAppController() {
         showToast(error instanceof Error ? error.message : String(error));
       }
     },
-    async markCleanupAsRead(cardId) {
+    async markCleanupAsRead(cardId, messageId, messageIndex) {
       const card = findCard(state.cards, cardId);
       if (!card) return;
       const key = card?.uiKey || (card ? cardUiKey(card, state.mailbox) : cardId);
+      const targetKey = messageId ? `${key}:${messageId}` : key;
       const cardMbox = cardMailbox(card, state.mailbox);
       let bundle = Array.isArray(state.cleanupBundle) && state.cleanupBundle.length > 0 ? state.cleanupBundle : (Array.isArray(card?.bundledMessages) ? card.bundledMessages : []);
       const expectedCount = card.bundledCount || bundle.length;
@@ -1088,20 +1089,39 @@ export function useAppController() {
           }
         }
         const messages = cardMbox ? bundle.filter((m) => normalizedMailbox(m.mailbox ?? "") === normalizedMailbox(cardMbox)) : bundle;
-        const messageIds = messages.map((m) => m.message_id || m.id).filter(Boolean) as string[];
+        const selectedMessages = messageId ? messages.filter((m) => (m.message_id || m.id) === messageId) : messages;
+        const messageIds = selectedMessages.map((m) => m.message_id || m.id).filter(Boolean) as string[];
         if (!messageIds.length) return;
-        setState((s) => ({ ...s, markingReadIds: { ...s.markingReadIds, [key]: true }, cleanupReadState: { ...s.cleanupReadState, [key]: { read: true, readMsgIndices: messages.map((_m, i) => i) } } }));
+        setState((s) => ({ ...s, markingReadIds: { ...s.markingReadIds, [targetKey]: true } }));
         const result = await client.markCleanupRead({ mailbox: cardMailbox(card, state.mailbox), card_id: card.id, message_ids: messageIds, storage_provider: state.storageProvider });
         if (!result.ok) {
           showToast(result.gmail_error || "Failed to mark as read in Gmail.");
+          return;
         }
+        setState((s) => {
+          const existing = s.cleanupReadState[key] || { read: false, readMsgIndices: [] };
+          const existingIndices = new Set(existing.readMsgIndices || []);
+          if (messageId) {
+            if (typeof messageIndex === "number") existingIndices.add(messageIndex);
+          } else {
+            messages.forEach((_m, i) => existingIndices.add(i));
+          }
+          const readMsgIndices = Array.from(existingIndices).sort((a, b) => a - b);
+          return {
+            ...s,
+            cleanupReadState: {
+              ...s.cleanupReadState,
+              [key]: { read: readMsgIndices.length >= messages.length, readMsgIndices },
+            },
+          };
+        });
         await loadRunHistory();
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       } finally {
         setState((s) => {
           const markingReadIds = { ...s.markingReadIds };
-          delete markingReadIds[key];
+          delete markingReadIds[targetKey];
           return { ...s, markingReadIds };
         });
       }

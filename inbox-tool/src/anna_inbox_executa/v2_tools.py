@@ -275,6 +275,23 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             if card:
                 await append_learning(card.original.from_addr, "no_action_needed")
         if card:
+            if decision == "handled_manually":
+                try:
+                    from mail_agent.sync.gmail_status import fetch_gmail_thread_state
+                    state = fetch_gmail_thread_state(mailbox, card.thread_id) if card.thread_id else None
+                    if state:
+                        card.gmail_state = state.to_card_state()
+                    if state and state.latest_from_owner:
+                        from mail_agent.storage.types import _now
+                        decision = "replied_in_gmail"
+                        card.status = "resolved"
+                        card.resolution = decision
+                        card.resolved_at = card.resolved_at or _now()
+                        card.updated_at = _now()
+                    from mail_agent.storage.ops import set_active_cards
+                    await set_active_cards(mailbox, cards)
+                except Exception:
+                    pass
             try:
                 from mail_agent.contact_memory.indexer import ingest_card_event
                 await ingest_card_event(
@@ -462,10 +479,42 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             log(f"[reply_now] card not found: {card_id} among {len(cards.cards)} cards")
             return {"error": f"Card {card_id} not found"}
         log(f"[reply_now] card found: {card.title} thread_id={card.thread_id} to={card.original.from_addr}")
+        if not dry_run:
+            try:
+                from mail_agent.sync.gmail_status import fetch_gmail_thread_state
+                pre_state = fetch_gmail_thread_state(mailbox, card.thread_id) if card.thread_id else None
+                if pre_state and pre_state.latest_from_owner:
+                    from mail_agent.storage.types import _now
+                    card.gmail_state = pre_state.to_card_state()
+                    card.status = "resolved"
+                    card.resolution = "replied_in_gmail"
+                    card.resolved_at = _now()
+                    card.updated_at = _now()
+                    from mail_agent.storage.ops import set_active_cards
+                    await set_active_cards(mailbox, cards)
+                    return {"ok": True, "dry_run": False, "already_replied": True, "message": "Thread already has a Gmail reply from the mailbox owner."}
+            except Exception as exc:
+                log(f"[reply_now] pre-send Gmail state check failed, continuing: {type(exc).__name__}: {exc}")
         result = await reply_now(card, mailbox, draft_body, reply_mode, dry_run=dry_run)
         log(f"[reply_now] result: ok={result.get('ok')} dry_run={result.get('dry_run')} error={result.get('error', '')}")
         if result.get("ok") and not dry_run:
-            await update_card_status(mailbox, card_id, "resolved", "replied")
+            warnings = list(result.get("warnings") or []) if isinstance(result.get("warnings"), list) else []
+            try:
+                from mail_agent.sync.gmail_status import mark_card_thread_read_in_gmail, refresh_card_gmail_state
+                sync_result = await mark_card_thread_read_in_gmail(mailbox, card)
+                result["gmail_sync"] = sync_result
+                await refresh_card_gmail_state(mailbox, card)
+            except Exception as exc:
+                warnings.append(f"gmail sync after reply failed: {type(exc).__name__}: {exc}")
+            from mail_agent.storage.types import _now
+            card.status = "resolved"
+            card.resolution = "replied"
+            card.resolved_at = _now()
+            card.updated_at = _now()
+            from mail_agent.storage.ops import set_active_cards
+            await set_active_cards(mailbox, cards)
+            if warnings:
+                result["warnings"] = warnings
         if result.get("ok"):
             try:
                 from mail_agent.contact_memory.indexer import ingest_card_event
