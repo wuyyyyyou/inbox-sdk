@@ -147,6 +147,15 @@ function triggerDownloadUrl(url: string, filename: string) {
   link.remove();
 }
 
+function base64ToBlobUrl(contentB64: string, mimeType: string) {
+  const binary = window.atob(contentB64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return URL.createObjectURL(new Blob([bytes], { type: mimeType || "application/octet-stream" }));
+}
+
 export interface AppActions {
   showToast(message: string): void;
   closeDrawers(): void;
@@ -976,10 +985,21 @@ export function useAppController() {
       setState((s) => ({ ...s, attachmentDownloads: { ...s.attachmentDownloads, [stateKey]: "preparing" } }));
       try {
         const result = await client.prepareAttachmentDownload(cardMailbox(card, state.mailbox), card.id, attachmentId, state.storageProvider);
-        if (!result.ok || !result.download_url) {
+        if (!result.ok) {
           throw new Error(result.error || "Attachment download is unavailable in this runtime.");
         }
-        triggerDownloadUrl(result.download_url, result.filename || "attachment");
+        if (result.download_url) {
+          triggerDownloadUrl(result.download_url, result.filename || "attachment");
+        } else if (result.content_b64) {
+          const blobUrl = base64ToBlobUrl(result.content_b64, result.mime_type || "application/octet-stream");
+          try {
+            triggerDownloadUrl(blobUrl, result.filename || "attachment");
+          } finally {
+            window.setTimeout(() => URL.revokeObjectURL(blobUrl), 30_000);
+          }
+        } else {
+          throw new Error(result.error || "Attachment download did not return a usable file.");
+        }
         setState((s) => ({ ...s, attachmentDownloads: { ...s.attachmentDownloads, [stateKey]: "ready" } }));
       } catch (error) {
         setState((s) => ({ ...s, attachmentDownloads: { ...s.attachmentDownloads, [stateKey]: "error" } }));

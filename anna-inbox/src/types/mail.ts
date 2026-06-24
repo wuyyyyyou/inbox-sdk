@@ -271,10 +271,12 @@ export interface MailAttachmentMeta {
 
 export interface AttachmentDownloadPayload {
   ok?: boolean;
+  delivery?: "url" | "inline" | string;
   filename?: string;
   mime_type?: string;
   size?: number;
   download_url?: string;
+  content_b64?: string;
   expires_at?: string;
   error?: string;
 }

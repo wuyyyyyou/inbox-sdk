@@ -250,6 +250,7 @@ class HostUploadClient:
             "filename": filename,
             "mime_type": mime_type,
             "size_bytes": int(size_bytes),
+            "expected_bytes": int(size_bytes),
         }
         if purpose is not None:
             params["purpose"] = purpose

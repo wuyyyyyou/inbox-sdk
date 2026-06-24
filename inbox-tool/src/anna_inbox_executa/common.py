@@ -50,6 +50,7 @@ def data_root() -> Path:
 
 from executa_sdk import PROTOCOL_VERSION_V2, SamplingClient, SamplingError
 from executa_sdk.storage import StorageClient, FilesClient, StorageError, make_response_router
+from executa_sdk.host_upload import HostUploadClient
 from mail_agent.storage.keys import app_key
 
 JSONRPC_VERSION = "2.0"
@@ -70,6 +71,10 @@ DEFAULT_MANIFEST = {
     "host_capabilities": [
         "llm.sample",
         "llm.complete",
+        "host.upload",
+        "upload.inline",
+        "upload.negotiate",
+        "upload.confirm",
         "storage.user",
         "aps.kv",
         "aps.scope.user.read",
@@ -687,6 +692,7 @@ def write_frame(message: dict[str, Any]) -> None:
 
 
 sampling = SamplingClient(write_frame=write_frame)
+host_upload = HostUploadClient(write_frame=write_frame)
 
 
 def _normalize_storage_provider(value: Any = "") -> str:
@@ -886,11 +892,12 @@ def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
             f"  [UNKNOWN] User granted sampling permission — check Anna platform Settings → App Permissions",
         ]
         sampling.disable("\n".join(lines))
+        host_upload.disable("Host upload unavailable because protocol v2 was not negotiated.")
     return {
         "protocolVersion": PROTOCOL_VERSION_V2 if v2 else "1.1",
         "serverInfo": {"name": TOOL_ID, "version": VERSION},
-        "client_capabilities": {"sampling": {}, "storage": {}} if v2 else {},
-        "capabilities": {"sampling": {}, "storage": {}} if v2 else {},
+        "client_capabilities": {"sampling": {}, "storage": {}, "upload": {}} if v2 else {},
+        "capabilities": {"sampling": {}, "storage": {}, "upload": {}} if v2 else {},
     }
 
 
@@ -972,5 +979,9 @@ def _run_storage_query(coro: Any, timeout: float = 60.0) -> Any:
 
 def dispatch_storage_response(message: dict[str, Any]) -> bool:
     return _route_storage_response(message)
+
+
+def dispatch_host_upload_response(message: dict[str, Any]) -> bool:
+    return host_upload.dispatch_response(message)
 
 __all__ = [name for name in globals() if not name.startswith("__")]

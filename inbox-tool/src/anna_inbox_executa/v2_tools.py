@@ -6,6 +6,22 @@ from anna_inbox_executa.gmail_tools import _dedup_body, _resolve_cid_images, _sa
 from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.storage_tools import *
 
+INLINE_ATTACHMENT_DIRECT_MAX_BYTES = 4 * 1024 * 1024
+_DOWNLOAD_SERVER_LOCK = threading.Lock()
+_DOWNLOAD_SERVER: Any | None = None
+_DOWNLOAD_SERVER_THREAD: threading.Thread | None = None
+_DOWNLOAD_TOKENS: dict[str, dict[str, Any]] = {}
+_DOWNLOAD_TOKEN_TTL_SECONDS = 15 * 60
+
+
+def _attachment_download_mode() -> str:
+    raw = str(os.environ.get("ANNA_INBOX_ATTACHMENT_DOWNLOAD_MODE") or "").strip().lower()
+    if raw in {"host", "host_preferred", "upload"}:
+        return "host_preferred"
+    if raw in {"loopback", "local_url", "local-http"}:
+        return "loopback"
+    return "direct_inline"
+
 
 def _safe_attachment_filename(filename: str) -> str:
     import re
@@ -14,36 +30,133 @@ def _safe_attachment_filename(filename: str) -> str:
     return name[:160] or "attachment"
 
 
-def _put_presigned_url_sync(url: str, headers: dict[str, Any], content: bytes) -> str:
-    import urllib.request
+def _put_presigned_url_sync(url: str, headers: dict[str, Any], content: bytes, mime_type: str) -> str:
+    import subprocess
+    import tempfile
 
-    req = urllib.request.Request(
-        url,
-        data=content,
-        headers={str(k): str(v) for k, v in (headers or {}).items()},
-        method="PUT",
-    )
-    with urllib.request.urlopen(req, timeout=120) as response:
-        return str(response.headers.get("ETag") or "").strip('"')
+    normalized_headers = {str(k): str(v) for k, v in (headers or {}).items()}
+    if not any(key.lower() == "content-type" for key in normalized_headers):
+        normalized_headers["Content-Type"] = mime_type or "application/octet-stream"
+    if not any(key.lower() == "content-length" for key in normalized_headers):
+        normalized_headers["Content-Length"] = str(len(content))
+    if not any(key.lower() == "user-agent" for key in normalized_headers):
+        normalized_headers["User-Agent"] = "anna-inbox-attachment-upload/1.0"
+    if not any(key.lower() == "connection" for key in normalized_headers):
+        normalized_headers["Connection"] = "close"
+
+    helper = r"""
+import json
+import sys
+import urllib.request
+
+payload = json.loads(sys.stdin.read())
+with open(payload["path"], "rb") as handle:
+    data = handle.read()
+request = urllib.request.Request(
+    payload["url"],
+    data=data,
+    headers=payload["headers"],
+    method="PUT",
+)
+with urllib.request.urlopen(request, timeout=float(payload["timeout"])) as response:
+    sys.stdout.write(str(response.headers.get("ETag") or "").strip('"'))
+"""
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", prefix="anna-inbox-upload-", delete=False) as handle:
+            handle.write(content)
+            temp_path = handle.name
+        payload = json.dumps(
+            {
+                "url": url,
+                "headers": normalized_headers,
+                "path": temp_path,
+                "timeout": 120,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", helper],
+            input=payload,
+            text=True,
+            capture_output=True,
+            timeout=150,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise RuntimeError(f"presigned PUT helper exited with code {completed.returncode}: {detail[-600:]}")
+        return completed.stdout.strip()
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
-async def _upload_attachment_to_files(mailbox: str, card_id: str, attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
-    """Upload attachment bytes to Anna Files and return a short-lived URL.
+async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
+    """Upload attachment bytes and return a short-lived URL.
 
-    Local development may initialise a storage stub without file methods; in
-    that case this intentionally fails instead of returning attachment bytes
-    through JSON-RPC.
+    Prefer host/uploadFile because it is independent of the selected KV
+    backend. Fall back to APS Files only when host upload is unavailable.
     """
     from mail_agent.mail_providers.gmail.adapter import sanitize_mailbox_id
+
+    filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
+    mime_type = str(attachment.get("mime_type") or "application/octet-stream")
+
+    host_presign_started = False
+    host_unavailable_error = ""
+    try:
+        negotiated = await host_upload.negotiate(
+            filename=filename,
+            mime_type=mime_type,
+            size_bytes=len(content),
+            purpose="user_artifact",
+            metadata={
+                "mailbox": mailbox,
+                "card_id": card_id,
+                "message_id": str(attachment.get("message_id") or ""),
+                "artifact_kind": "email_attachment",
+            },
+            timeout=30.0,
+        )
+        host_presign_started = True
+        put_url = str(negotiated.get("put_url") or "")
+        r2_key = str(negotiated.get("r2_key") or "")
+        if not put_url or not r2_key:
+            raise RuntimeError("Host upload did not return a presigned upload target.")
+        put_error: Exception | None = None
+        try:
+            await asyncio.to_thread(_put_presigned_url_sync, put_url, negotiated.get("headers") or {}, content, mime_type)
+        except Exception as exc:
+            put_error = exc
+            log(f"host attachment presigned PUT returned error before confirm: {type(exc).__name__}: {exc}")
+        if put_error is None:
+            return await host_upload.confirm(r2_key=r2_key, timeout=30.0)
+        try:
+            return await host_upload.confirm(r2_key=r2_key, timeout=30.0)
+        except Exception as confirm_exc:
+            raise RuntimeError(f"Temporary attachment upload failed after presigned PUT error: {put_error}") from confirm_exc
+    except Exception as host_exc:
+        if host_presign_started:
+            raise
+        host_unavailable_error = f"{type(host_exc).__name__}: {host_exc}"
+        log(f"host attachment upload unavailable: {type(host_exc).__name__}: {host_exc}")
+
     from mail_agent.storage.client import get_files
 
     files = get_files()
     for method_name in ("upload_begin", "upload_complete", "download_url"):
         if not hasattr(files, method_name):
-            raise RuntimeError("Attachment download requires Anna Files storage in this runtime.")
+            if host_unavailable_error:
+                raise RuntimeError(
+                    "Attachment download requires host upload or Anna Files storage in this runtime. "
+                    f"Host upload failed first: {host_unavailable_error}"
+                )
+            raise RuntimeError("Attachment download requires host upload or Anna Files storage in this runtime.")
 
-    filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
-    mime_type = str(attachment.get("mime_type") or "application/octet-stream")
     path = (
         f"anna-inbox/mailbox/{sanitize_mailbox_id(mailbox)}/attachments/"
         f"{_safe_attachment_filename(card_id)}/{attachment.get('id')}/{filename}"
@@ -60,18 +173,139 @@ async def _upload_attachment_to_files(mailbox: str, card_id: str, attachment: di
         },
         scope="user",
     )
-    put_url = str(begin.get("put_url") or "")
+    put_url = str(begin.get("put_url") or begin.get("presigned_url") or "")
     if not put_url:
         raise RuntimeError("Anna Files did not return an upload URL.")
-    etag = await asyncio.to_thread(_put_presigned_url_sync, put_url, begin.get("headers") or {}, content)
-    await files.upload_complete(
-        path=path,
-        etag=etag or None,
-        size_bytes=len(content),
-        content_type=mime_type,
-        scope="user",
-    )
+    upload_headers = begin.get("headers") or begin.get("fields") or {}
+    put_error: Exception | None = None
+    etag = ""
+    try:
+        etag = await asyncio.to_thread(_put_presigned_url_sync, put_url, upload_headers, content, mime_type)
+    except Exception as exc:
+        put_error = exc
+        log(f"aps files presigned PUT returned error before complete: {type(exc).__name__}: {exc}")
+    try:
+        await files.upload_complete(
+            path=path,
+            etag=etag or None,
+            size_bytes=len(content),
+            content_type=mime_type,
+            scope="user",
+        )
+    except Exception as complete_exc:
+        if put_error is not None:
+            raise RuntimeError(f"Attachment file upload failed after presigned PUT error: {put_error}") from complete_exc
+        raise
     return await files.download_url(path=path, expires_in=900, scope="user")
+
+
+def _inline_attachment_download_payload(attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "delivery": "inline",
+        "filename": attachment.get("filename") or "attachment",
+        "mime_type": attachment.get("mime_type") or "application/octet-stream",
+        "size": len(content),
+        "content_b64": base64.b64encode(content).decode("ascii"),
+    }
+
+
+def _attachment_download_dir() -> Path:
+    path = data_root() / "anna-inbox" / "downloads"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _cleanup_expired_download_tokens() -> None:
+    now = time.time()
+    expired = [token for token, meta in _DOWNLOAD_TOKENS.items() if float(meta.get("expires_at_ts") or 0) <= now]
+    for token in expired:
+        meta = _DOWNLOAD_TOKENS.pop(token, {})
+        file_path = meta.get("path")
+        if file_path:
+            try:
+                Path(str(file_path)).unlink()
+            except OSError:
+                pass
+
+
+def _ensure_loopback_download_server() -> str:
+    import http.server
+    import socketserver
+
+    global _DOWNLOAD_SERVER, _DOWNLOAD_SERVER_THREAD
+    with _DOWNLOAD_SERVER_LOCK:
+        if _DOWNLOAD_SERVER is not None:
+            return f"http://127.0.0.1:{_DOWNLOAD_SERVER.server_address[1]}"
+
+        class AttachmentDownloadHandler(http.server.BaseHTTPRequestHandler):
+            server_version = "AnnaInboxAttachment/1.0"
+
+            def do_GET(self) -> None:
+                _cleanup_expired_download_tokens()
+                prefix = "/download/"
+                if not self.path.startswith(prefix):
+                    self.send_error(404)
+                    return
+                token = self.path[len(prefix):].split("/", 1)[0].strip()
+                meta = _DOWNLOAD_TOKENS.get(token)
+                if not meta:
+                    self.send_error(404)
+                    return
+                file_path = Path(str(meta.get("path") or ""))
+                if not file_path.exists():
+                    _DOWNLOAD_TOKENS.pop(token, None)
+                    self.send_error(404)
+                    return
+                filename = _safe_attachment_filename(str(meta.get("filename") or "attachment"))
+                mime_type = str(meta.get("mime_type") or "application/octet-stream")
+                data = file_path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", mime_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+        class ThreadedLocalServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+        _DOWNLOAD_SERVER = ThreadedLocalServer(("127.0.0.1", 0), AttachmentDownloadHandler)
+        _DOWNLOAD_SERVER_THREAD = threading.Thread(target=_DOWNLOAD_SERVER.serve_forever, daemon=True, name="anna-inbox-downloads")
+        _DOWNLOAD_SERVER_THREAD.start()
+        log(f"attachment loopback server listening on http://127.0.0.1:{_DOWNLOAD_SERVER.server_address[1]}")
+        return f"http://127.0.0.1:{_DOWNLOAD_SERVER.server_address[1]}"
+
+
+def _loopback_attachment_download_payload(attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
+    _cleanup_expired_download_tokens()
+    filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
+    mime_type = str(attachment.get("mime_type") or "application/octet-stream")
+    token = uuid.uuid4().hex
+    file_path = _attachment_download_dir() / f"{token}-{filename}"
+    file_path.write_bytes(content)
+    expires_at_ts = time.time() + _DOWNLOAD_TOKEN_TTL_SECONDS
+    _DOWNLOAD_TOKENS[token] = {
+        "path": str(file_path),
+        "filename": filename,
+        "mime_type": mime_type,
+        "expires_at_ts": expires_at_ts,
+    }
+    base_url = _ensure_loopback_download_server()
+    return {
+        "ok": True,
+        "delivery": "url",
+        "filename": filename,
+        "mime_type": mime_type,
+        "size": len(content),
+        "download_url": f"{base_url}/download/{token}/{urllib.parse.quote(filename, safe='')}",
+        "expires_at": datetime.fromtimestamp(expires_at_ts, tz=timezone.utc).isoformat(),
+    }
 
 
 def _clamp_int(value: Any, fallback: int, min_value: int, max_value: int) -> int:
@@ -271,15 +505,36 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 str(attachment.get("message_id") or card.message_id),
                 str(attachment.get("gmail_attachment_id") or ""),
             )
-            download = await _upload_attachment_to_files(normalized_mailbox, card_id, attachment, content)
-            return {
-                "ok": True,
-                "filename": attachment.get("filename") or "attachment",
-                "mime_type": attachment.get("mime_type") or "application/octet-stream",
-                "size": len(content),
-                "download_url": download.get("url") or download.get("download_url") or "",
-                "expires_at": download.get("expires_at") or "",
-            }
+            download_mode = _attachment_download_mode()
+            if not _should_use_aps_storage():
+                return _loopback_attachment_download_payload(attachment, content)
+            if download_mode == "loopback":
+                return _loopback_attachment_download_payload(attachment, content)
+            if download_mode != "host_preferred" and len(content) <= INLINE_ATTACHMENT_DIRECT_MAX_BYTES:
+                return _inline_attachment_download_payload(attachment, content)
+            try:
+                download = await _upload_attachment_for_download(normalized_mailbox, card_id, attachment, content)
+                return {
+                    "ok": True,
+                    "delivery": "url",
+                    "filename": attachment.get("filename") or "attachment",
+                    "mime_type": attachment.get("mime_type") or "application/octet-stream",
+                    "size": len(content),
+                    "download_url": download.get("url") or download.get("download_url") or "",
+                    "expires_at": download.get("expires_at") or "",
+                }
+            except Exception as upload_exc:
+                if len(content) <= INLINE_ATTACHMENT_DIRECT_MAX_BYTES:
+                    log(
+                        "attachment download falling back to inline payload "
+                        f"({len(content)} bytes): {type(upload_exc).__name__}: {upload_exc}"
+                    )
+                    return _inline_attachment_download_payload(attachment, content)
+                raise RuntimeError(
+                    "Attachment download requires host upload or Anna Files storage in this runtime "
+                    f"for files larger than {INLINE_ATTACHMENT_DIRECT_MAX_BYTES // (1024 * 1024)} MB. "
+                    f"Upload failed first: {upload_exc}"
+                ) from upload_exc
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 

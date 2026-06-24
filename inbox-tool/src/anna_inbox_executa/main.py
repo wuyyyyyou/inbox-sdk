@@ -84,7 +84,7 @@ def handle_line(line: str) -> None:
         return
 
     if "method" not in message:
-        if not common.sampling.dispatch_response(message) and not common.dispatch_storage_response(message):
+        if not common.sampling.dispatch_response(message) and not common.dispatch_storage_response(message) and not common.dispatch_host_upload_response(message):
             log(f"unmatched response id={message.get('id')!r}")
         return
 
