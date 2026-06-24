@@ -136,6 +136,17 @@ function scrollToCard(key: string) {
   });
 }
 
+function triggerDownloadUrl(url: string, filename: string) {
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename || "attachment";
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
 export interface AppActions {
   showToast(message: string): void;
   closeDrawers(): void;
@@ -162,6 +173,7 @@ export interface AppActions {
   loadActiveCards(): Promise<void>;
   loadRunHistory(): Promise<void>;
   loadSelectedEmailBody(): Promise<void>;
+  downloadAttachment(attachmentId: string): Promise<void>;
   loadContactMemories(): Promise<void>;
   openContactMemory(mailbox: string, contactEmail: string): Promise<void>;
   closeContactMemory(): void;
@@ -955,6 +967,25 @@ export function useAppController() {
         setState((s) => ({ ...s, pendingAction: s.pendingAction === `body:${key}` ? "" : s.pendingAction }));
       }
     },
+    async downloadAttachment(attachmentId) {
+      if (!state.selectedCard || !attachmentId) return;
+      const card = state.selectedCard;
+      const key = card.uiKey || cardUiKey(card, state.mailbox);
+      const stateKey = `${key}::${attachmentId}`;
+      if (state.attachmentDownloads[stateKey] === "preparing") return;
+      setState((s) => ({ ...s, attachmentDownloads: { ...s.attachmentDownloads, [stateKey]: "preparing" } }));
+      try {
+        const result = await client.prepareAttachmentDownload(cardMailbox(card, state.mailbox), card.id, attachmentId, state.storageProvider);
+        if (!result.ok || !result.download_url) {
+          throw new Error(result.error || "Attachment download is unavailable in this runtime.");
+        }
+        triggerDownloadUrl(result.download_url, result.filename || "attachment");
+        setState((s) => ({ ...s, attachmentDownloads: { ...s.attachmentDownloads, [stateKey]: "ready" } }));
+      } catch (error) {
+        setState((s) => ({ ...s, attachmentDownloads: { ...s.attachmentDownloads, [stateKey]: "error" } }));
+        showToast(error instanceof Error ? error.message : String(error));
+      }
+    },
     async summarizeSelectedThread() {
       if (!state.selectedCard || state.summarizingThread) return;
       const cardId = state.selectedCard.id;
@@ -1058,7 +1089,7 @@ export function useAppController() {
         for (const mailbox of selected.map(normalizedMailbox).filter(Boolean)) {
           await client.clearActiveCards(mailbox, state.storageProvider);
         }
-        setState((s) => ({ ...s, cards: [], actionCount: 0, scanState: null, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {} }));
+        setState((s) => ({ ...s, cards: [], actionCount: 0, scanState: null, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, attachmentDownloads: {} }));
         showToast("All cards cleared.");
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
@@ -1309,7 +1340,7 @@ export function useAppController() {
       try {
         const result = await client.resetAllData();
         if (result.ok) {
-          setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, askItemActions: {}, askEditDraft: {}, askGapAnswers: {}, askDraftsByKey: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
+          setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, attachmentDownloads: {}, askItemActions: {}, askEditDraft: {}, askGapAnswers: {}, askDraftsByKey: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
           showToast("All data reset. Ready for a fresh start.");
           window.location.reload();
         }
@@ -1338,6 +1369,7 @@ export function useAppController() {
               cleanupBundle: null,
               cleanupReadState: {},
               markingReadIds: {},
+              attachmentDownloads: {},
             };
           });
           await loadMailboxes();

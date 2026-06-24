@@ -250,6 +250,7 @@ def _brief_messages_from_dict(items: list[dict[str, Any]]) -> list[Any]:
             starred=bool(item.get("starred")),
             important=bool(item.get("important")),
             has_attachment=bool(item.get("has_attachment")),
+            attachments=list(item.get("attachments") or []),
             headers=dict(item.get("headers") or {}),
         )
         for item in items

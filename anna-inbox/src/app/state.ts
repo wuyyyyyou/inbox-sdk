@@ -71,6 +71,7 @@ export function createInitialState(): AppState {
     cleanupReadState: {},
     cleanupBundle: null,
     markingReadIds: {},
+    attachmentDownloads: {},
     gmailAuthStatus: { checked: false, authorized: true },
     gmailErrorPopup: null,
     askItemActions: {},

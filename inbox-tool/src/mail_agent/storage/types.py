@@ -166,6 +166,7 @@ class PersistentCard:
     user_action: str = ""        # "reply" | "review" — drives frontend category tabs
     reply_gaps: dict = field(default_factory=dict)  # {needs_user_input, summary, questions: [{id, question, hint, required}]}
     gmail_state: dict = field(default_factory=dict)  # lightweight external Gmail sync state
+    attachments: list = field(default_factory=list)  # lightweight Gmail attachment metadata for UI/download
 
 
 @dataclass

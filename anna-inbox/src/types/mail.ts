@@ -108,6 +108,7 @@ export interface FrontendCard {
   bundledCount?: number;
   replyGaps?: ReplyGaps;
   gmailState?: Record<string, unknown>;
+  attachments?: MailAttachmentMeta[];
 }
 
 export interface CleanupMessage {
@@ -258,6 +259,26 @@ export interface CustomRunResult {
   planner_fallback?: boolean;
 }
 
+export interface MailAttachmentMeta {
+  id: string;
+  message_id: string;
+  filename: string;
+  mime_type: string;
+  size: number;
+  source: "gmail" | string;
+  downloadable: boolean;
+}
+
+export interface AttachmentDownloadPayload {
+  ok?: boolean;
+  filename?: string;
+  mime_type?: string;
+  size?: number;
+  download_url?: string;
+  expires_at?: string;
+  error?: string;
+}
+
 export interface CardDetailPayload {
   card?: FrontendCard;
   thread_context?: Record<string, unknown>;
@@ -265,6 +286,7 @@ export interface CardDetailPayload {
   latest_body?: string;
   latest_body_html?: string;
   body_loaded?: boolean;
+  attachments?: MailAttachmentMeta[];
 }
 
 export interface ContactMemorySummary {
@@ -409,6 +431,7 @@ export interface AppState {
   cleanupReadState: Record<string, { read: boolean; readMsgIndices: number[] }>;
   cleanupBundle: CleanupMessage[] | null;
   markingReadIds: Record<string, boolean>;
+  attachmentDownloads: Record<string, "preparing" | "error" | "ready">;
   gmailAuthStatus: GmailAuthStatus;
   gmailErrorPopup: GmailErrorPopup | null;
   askItemActions: Record<string, { read?: boolean; trashed?: boolean; replied?: boolean; sending?: boolean }>;

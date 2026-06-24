@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "Minimal Anna Executa skeleton for reading Gmail through local token files and DashScope or Anna sampling LLM.",
   "author": "Panwb",
   "host_capabilities": [
@@ -576,6 +576,31 @@
           "type": "boolean",
           "description": "Whether to include the original email body for user display.",
           "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "prepare_attachment_download",
+      "description": "Prepare a short-lived download URL for a Gmail attachment behind a card.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID from get_active_cards.",
+          "required": true
+        },
+        {
+          "name": "attachment_id",
+          "type": "string",
+          "description": "Opaque attachment ID from get_card_detail.",
+          "required": true
         }
       ],
       "timeout": 120

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type MouseEvent } from "react";
 import DOMPurify from "dompurify";
 import { useApp } from "../../app/AppContext";
 import { formatBeijingTimestamp } from "../../shared/format";
@@ -26,6 +26,45 @@ function uniqueLines(lines: string[]): string[] {
     }
   }
   return result;
+}
+
+function formatBytes(value: unknown): string {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function safeExternalUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (!["http:", "https:", "mailto:"].includes(parsed.protocol)) return "";
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+}
+
+function openExternalUrl(url: string) {
+  const safe = safeExternalUrl(url);
+  if (!safe) return;
+  const opened = window.open(safe, "_blank", "noopener,noreferrer");
+  if (opened) return;
+  const link = document.createElement("a");
+  link.href = safe;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+function handleOriginalBodyClick(event: MouseEvent<HTMLDivElement>) {
+  const target = event.target instanceof Element ? event.target.closest("a[href]") : null;
+  if (!target) return;
+  event.preventDefault();
+  openExternalUrl((target as HTMLAnchorElement).href);
 }
 
 function contactContextLines(contactContext: Record<string, unknown>): string[] {
@@ -86,6 +125,7 @@ export function HandleView() {
   const contactContext = detail.contact_context || {};
   const latestBody = detail.latest_body || "";
   const latestBodyHtml = detail.latest_body_html || "";
+  const attachments = Array.isArray(detail.attachments) ? detail.attachments : (Array.isArray(card.attachments) ? card.attachments : []);
   const bodyLoaded = Boolean(detail.body_loaded);
   const summary = state.threadSummaryById[key];
   const draft = state.draftById[key] || "";
@@ -114,6 +154,32 @@ export function HandleView() {
   const bodyTruncated = latestBodyHtml
     ? latestBodyHtml.length > BODY_PREVIEW
     : latestBody.length > BODY_PREVIEW;
+
+  const attachmentsBlock = () => {
+    if (!attachments.length || !bodyVisible) return null;
+    return (
+      <section className="review-block attachment-block">
+        <h3 className="review-block-title">Attachments</h3>
+        <div className="attachment-list">
+          {attachments.map((item) => {
+            const downloadState = state.attachmentDownloads[`${key}::${item.id}`];
+            const meta = [item.mime_type, formatBytes(item.size)].filter(Boolean).join(" · ");
+            return (
+              <div className="attachment-row" key={item.id}>
+                <div className="attachment-main">
+                  <strong>{item.filename || "Attachment"}</strong>
+                  {meta ? <span>{meta}</span> : null}
+                </div>
+                <button className="soft-btn compact" disabled={!item.downloadable || downloadState === "preparing"} onClick={() => void actions.downloadAttachment(item.id)}>
+                  {downloadState === "preparing" ? "Preparing..." : "Download"}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+    );
+  };
 
   const relatedContextBlock = () => {
     if (!relatedContextItems.length) return null;
@@ -176,6 +242,11 @@ export function HandleView() {
         {!bodyVisible ? (
           <section className={`review-block is-quiet${loadingBody ? " is-loading" : ""}`}>
             <p>Original email body is hidden until you choose to view it.</p>
+            {attachments.length ? (
+              <p className="attachment-download-hint">
+                This email has {attachments.length} attachment{attachments.length === 1 ? "" : "s"}. Show full email to download {attachments.length === 1 ? "it" : "them"}.
+              </p>
+            ) : null}
             <div className="proposal-actions">
               <button className="soft-btn compact" disabled={loadingBody} onClick={() => void actions.loadSelectedEmailBody()}>
                 {loadingBody ? "Loading email..." : "Show full email"}
@@ -183,10 +254,11 @@ export function HandleView() {
             </div>
           </section>
         ) : latestBodyHtml ? (
-          <section className="review-block">
+                <section className="review-block">
             <div
               className={`original-body original-body-html${bodyTruncated && !bodyExpanded ? " is-clamped" : ""}`}
               style={{ wordBreak: "break-all", overflowWrap: "break-word" }}
+              onClick={handleOriginalBodyClick}
               dangerouslySetInnerHTML={{
                 __html: DOMPurify.sanitize(latestBodyHtml, {
                   ALLOWED_TAGS: [
@@ -230,6 +302,7 @@ export function HandleView() {
             <p>Full email body is not available for this card.</p>
           </section>
         )}
+        {attachmentsBlock()}
         {relatedContextBlock()}
         {threadSummaryBlock()}
         <section className={`review-block is-composer ${state.generatingDraft ? "is-loading" : ""}`}>

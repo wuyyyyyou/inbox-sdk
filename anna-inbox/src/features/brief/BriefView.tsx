@@ -54,6 +54,33 @@ function CardDetails({ card }: { card: FrontendCard }) {
   );
 }
 
+function attachmentIcon(mimeType: string): string {
+  const text = String(mimeType || "").toLowerCase();
+  if (text.includes("pdf")) return "PDF";
+  if (text.startsWith("image/")) return "IMG";
+  if (text.includes("spreadsheet") || text.includes("excel") || text.includes("csv")) return "XLS";
+  if (text.includes("word") || text.includes("document")) return "DOC";
+  return "FILE";
+}
+
+function AttachmentChips({ card }: { card: FrontendCard }) {
+  const attachments = Array.isArray(card.attachments) ? card.attachments : [];
+  if (!attachments.length) return null;
+  const visible = attachments.slice(0, 3);
+  const remaining = attachments.length - visible.length;
+  return (
+    <div className="attention-attachments" aria-label={`${attachments.length} attachment${attachments.length === 1 ? "" : "s"}`}>
+      {visible.map((item) => (
+        <span className="attachment-chip" key={item.id || item.filename}>
+          <span className="attachment-chip-kind">{attachmentIcon(item.mime_type)}</span>
+          <span className="attachment-chip-name">{item.filename || "Attachment"}</span>
+        </span>
+      ))}
+      {remaining > 0 ? <span className="attachment-chip attachment-chip-more">+{remaining}</span> : null}
+    </div>
+  );
+}
+
 function AttentionCard({ card }: { card: FrontendCard }) {
   const { state, actions } = useApp();
   const key = card.uiKey || card.id;
@@ -81,6 +108,7 @@ function AttentionCard({ card }: { card: FrontendCard }) {
         <button className="card-details-btn" onClick={() => actions.toggleDetails(key)}>{expanded ? "Hide" : "Details"}</button>
       </div>
       <p className="attention-field">{card.summary || ""}</p>
+      <AttachmentChips card={card} />
       <p className="attention-field attention-recommendation">
         <span className="suggested-prefix">Suggested: </span>{recommendation.replace(/^Suggested:\s*/i, "")}
       </p>

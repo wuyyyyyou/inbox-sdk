@@ -1,5 +1,6 @@
 import type {
   ActiveCardsPayload,
+  AttachmentDownloadPayload,
   CardDetailPayload,
   CleanupBundlePayload,
   ContactMemoryDetailPayload,
@@ -153,6 +154,14 @@ export class MailAgentClient {
 
   getCardDetail(mailbox: string, cardId: string, storageProvider: string, includeBody = false) {
     return this.invoke<CardDetailPayload>("get_card_detail", { mailbox, card_id: cardId, storage_provider: storageProvider, include_body: includeBody });
+  }
+
+  prepareAttachmentDownload(mailbox: string, cardId: string, attachmentId: string, storageProvider: string) {
+    return this.invoke<AttachmentDownloadPayload>(
+      "prepare_attachment_download",
+      { mailbox, card_id: cardId, attachment_id: attachmentId, storage_provider: storageProvider },
+      { timeoutMs: 120_000 },
+    );
   }
 
   listContactMemories(mailboxes: string[], storageProvider: string) {

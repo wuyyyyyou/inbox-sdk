@@ -74,6 +74,26 @@ def main() -> None:
     check("table tag is removed", "<table" not in html_text.lower())
     check("display html keeps original table markup", "<table" in display_body["html"].lower())
     check("display html keeps original link markup", "href=\"https://billing.example.com/invoice/123\"" in display_body["html"])
+    links = adapter.extract_external_links_from_message(html_only)
+    check("html link metadata is extracted", any(link["url"] == "https://billing.example.com/invoice/123" for link in links))
+
+    unsafe_links = _message([
+        _part("text/html", '<a href="javascript:alert(1)">bad</a><a href="https://safe.example.com/path">safe</a>'),
+    ])
+    safe_links = adapter.extract_external_links_from_message(unsafe_links)
+    check("unsafe links are filtered", all(not link["url"].startswith("javascript:") for link in safe_links))
+    check("safe links still render", any(link["host"] == "safe.example.com" for link in safe_links))
+
+    attachment_msg = _message([_part("text/plain", "Please review the attachment.")])
+    attachment_msg["attachments"] = [
+        {"filename": "offer.pdf", "mimeType": "application/pdf", "size": 1234, "attachmentId": "att-1"},
+        {"filename": "", "mimeType": "image/png", "size": 10, "attachmentId": "inline"},
+    ]
+    attachments = adapter.attachment_metadata_from_message(attachment_msg)
+    check("attachment metadata filters non-downloadable parts", len(attachments) == 1)
+    check("attachment metadata has opaque id", attachments[0]["id"] and "att-1" not in attachments[0]["id"])
+    found = adapter.find_attachment_for_token(attachment_msg, attachments[0]["id"])
+    check("attachment token resolves to gmail attachment id", found["gmail_attachment_id"] == "att-1")
 
     placeholder_plain = _message([
         _part("text/plain", "View this email in your browser."),

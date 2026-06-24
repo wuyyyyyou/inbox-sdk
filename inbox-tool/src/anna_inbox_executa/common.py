@@ -281,6 +281,15 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "prepare_attachment_download",
+            "description": "Prepare a short-lived download URL for a Gmail attachment behind a card.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "card_id", "type": "string", "description": "Card ID from get_active_cards.", "required": True},
+                {"name": "attachment_id", "type": "string", "description": "Opaque attachment ID from get_card_detail.", "required": True},
+            ],
+        },
+        {
             "name": "summarize_thread",
             "description": "Ask Anna to summarize a thread behind a card.",
             "parameters": [

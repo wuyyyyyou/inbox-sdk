@@ -90,6 +90,7 @@ def build_card(
 
     user_action = fd.user_action or "review"
     item_type = "reply_required" if user_action == "reply" else "account_notice"
+    attachments = list(getattr(message, "attachments", []) or []) if message else []
 
     return PersistentCard(
         card_id=create_card_id(),
@@ -108,6 +109,7 @@ def build_card(
         status="pending",
         user_action=user_action,
         reply_gaps=judgment.mode_judgment.get("reply_gaps") if isinstance(judgment.mode_judgment, dict) else {},
+        attachments=attachments,
     )
 
 
@@ -606,6 +608,8 @@ def cards_to_frontend(cards: ActiveCards) -> list[dict[str, Any]]:
             frontend_card["replyGaps"] = card.reply_gaps
         if card.gmail_state:
             frontend_card["gmailState"] = card.gmail_state
+        if card.attachments:
+            frontend_card["attachments"] = card.attachments
         result.append(frontend_card)
     return result
 

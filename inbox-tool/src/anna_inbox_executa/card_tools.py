@@ -280,7 +280,7 @@ def _serialize_card_for_frontend(card: Any) -> dict[str, Any]:
         text = text.replace("&quot;", '"').replace("&#39;", "'")
         return text
 
-    return {
+    payload = {
         "id": card.card_id,
         "title": card.title,
         "summary": card.summary,
@@ -307,5 +307,9 @@ def _serialize_card_for_frontend(card: Any) -> dict[str, Any]:
         ],
         "status": card.status,
     }
+    attachments = getattr(card, "attachments", None)
+    if attachments:
+        payload["attachments"] = attachments
+    return payload
 
 __all__ = [name for name in globals() if not name.startswith("__")]

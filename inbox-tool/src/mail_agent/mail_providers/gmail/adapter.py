@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import html as html_lib
 from html.parser import HTMLParser
 import json
@@ -744,6 +745,156 @@ def decode_body_for_display(message: dict[str, Any]) -> dict[str, str]:
     return {"html": html_body, "text": text_body}
 
 
+def _safe_external_url(raw_url: str) -> str:
+    url = html_lib.unescape(str(raw_url or "").strip())
+    if not url:
+        return ""
+    parsed = urllib.parse.urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https", "mailto"}:
+        return ""
+    if scheme in {"http", "https"} and not parsed.netloc:
+        return ""
+    return urllib.parse.urlunparse(parsed._replace(scheme=scheme))
+
+
+class _HTMLLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[dict[str, str]] = []
+        self._current_href = ""
+        self._current_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a" or self._current_href:
+            return
+        attr_map = {name.lower(): value or "" for name, value in attrs}
+        href = _safe_external_url(attr_map.get("href", ""))
+        if href:
+            self._current_href = href
+            self._current_text = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or not self._current_href:
+            return
+        self.links.append({"url": self._current_href, "text": _collapse_body_whitespace("".join(self._current_text))})
+        self._current_href = ""
+        self._current_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current_href and data:
+            self._current_text.append(data)
+
+
+_TEXT_URL_RE = re.compile(r"\bhttps?://[^\s<>\"]+|\bmailto:[^\s<>\"]+", re.IGNORECASE)
+
+
+def extract_external_links_from_message(message: dict[str, Any], *, limit: int = 20) -> list[dict[str, str]]:
+    """Return safe external links from display HTML/text as lightweight metadata."""
+    display = decode_body_for_display(message)
+    raw_html = str(display.get("html") or "")
+    raw_text = str(display.get("text") or message.get("body_text") or "")
+    seen: set[str] = set()
+    results: list[dict[str, str]] = []
+
+    def add(url: str, text: str, source: str) -> None:
+        safe_url = _safe_external_url(url)
+        if not safe_url or safe_url in seen or len(results) >= limit:
+            return
+        seen.add(safe_url)
+        parsed = urllib.parse.urlparse(safe_url)
+        host = parsed.netloc or parsed.scheme
+        label = _collapse_body_whitespace(text)[:120] or host or safe_url[:120]
+        digest = hashlib.sha1(safe_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        results.append({
+            "id": f"link_{digest}",
+            "url": safe_url,
+            "text": label,
+            "host": host,
+            "source": source,
+        })
+
+    if raw_html.strip():
+        try:
+            parser = _HTMLLinkParser()
+            parser.feed(raw_html)
+            parser.close()
+            for item in parser.links:
+                add(item.get("url", ""), item.get("text", ""), "html")
+        except Exception:
+            pass
+
+    for match in _TEXT_URL_RE.finditer(raw_text):
+        url = match.group(0).rstrip(").,;!?'\"")
+        add(url, url, "text")
+
+    return results
+
+
+def _attachment_token(message_id: str, attachment_id: str, index: int) -> str:
+    raw = json.dumps({"m": message_id, "a": attachment_id, "i": index}, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_attachment_token(token: str) -> dict[str, Any]:
+    try:
+        raw = base64.urlsafe_b64decode(str(token or "") + "=" * (-len(str(token or "")) % 4))
+        payload = json.loads(raw.decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def attachment_metadata_from_message(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return downloadable Gmail attachment metadata with opaque frontend IDs."""
+    message_id = str(message.get("id") or "")
+    result: list[dict[str, Any]] = []
+    attachments = message.get("attachments") if isinstance(message.get("attachments"), list) else []
+    for index, item in enumerate(attachments):
+        if not isinstance(item, dict):
+            continue
+        filename = str(item.get("filename") or "").strip()
+        attachment_id = str(item.get("attachmentId") or "").strip()
+        if not filename or not attachment_id:
+            continue
+        result.append({
+            "id": _attachment_token(message_id, attachment_id, index),
+            "message_id": message_id,
+            "filename": filename[:240],
+            "mime_type": str(item.get("mimeType") or "application/octet-stream")[:120],
+            "size": int(item.get("size") or 0),
+            "source": "gmail",
+            "downloadable": True,
+        })
+    return result
+
+
+def find_attachment_for_token(message: dict[str, Any], token: str) -> dict[str, Any]:
+    payload = _decode_attachment_token(token)
+    message_id = str(message.get("id") or "")
+    if not payload or str(payload.get("m") or "") != message_id:
+        raise ValueError("Attachment does not belong to this message")
+    attachment_id = str(payload.get("a") or "")
+    for item in attachment_metadata_from_message(message):
+        decoded = _decode_attachment_token(str(item.get("id") or ""))
+        if str(decoded.get("a") or "") == attachment_id:
+            return {**item, "gmail_attachment_id": attachment_id}
+    raise ValueError("Attachment not found")
+
+
+def fetch_attachment_bytes(mailbox: str, message_id: str, gmail_attachment_id: str) -> bytes:
+    """Fetch and decode one Gmail attachment body."""
+    path = (
+        f"/users/me/messages/{urllib.parse.quote(message_id, safe='')}"
+        f"/attachments/{urllib.parse.quote(gmail_attachment_id, safe='')}"
+    )
+    payload = gmail_request(mailbox, path)
+    data = str(payload.get("data") or "")
+    if not data:
+        raise ValueError("Gmail attachment response did not include data")
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
 def _decode_body(message: dict[str, Any]) -> str:
     plain_parts: list[str] = []
     html_parts: list[str] = []
@@ -1072,6 +1223,7 @@ def _to_message_lite(msg: dict[str, Any]) -> MessageLite:
         starred="STARRED" in str(msg.get("label_ids") or "").upper(),
         important="IMPORTANT" in str(msg.get("label_ids") or "").upper(),
         has_attachment=bool(msg.get("attachments") and len(msg.get("attachments") or []) > 0),
+        attachments=attachment_metadata_from_message(msg),
         headers={
             "list_unsubscribe": str(msg.get("raw_headers", {}).get("list-unsubscribe", "")),
             "list_id": str(msg.get("raw_headers", {}).get("list-id", "")),

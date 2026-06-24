@@ -6022,6 +6022,113 @@
   white-space: pre-wrap !important;
 }
 
+.attention-attachments {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  margin: 6px 0 2px;
+  overflow: hidden;
+}
+
+.attachment-chip {
+  display: inline-grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 170px;
+  height: 28px;
+  padding: 0 9px 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.68);
+  color: var(--text-main);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.attachment-chip-kind {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 16px;
+  border-radius: 4px;
+  background: rgba(139, 124, 248, 0.12);
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 750;
+}
+
+.attachment-chip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-chip-more {
+  display: inline-flex;
+  flex: 0 0 auto;
+  max-width: none;
+  grid-template-columns: 1fr;
+  color: var(--text-muted);
+  font-weight: 700;
+}
+
+.attachment-download-hint {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.attachment-list {
+  display: grid;
+  gap: 8px;
+}
+
+.attachment-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.attachment-main {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.attachment-main strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-main);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-main span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ── Original email block inside card details ─────────────────────── */
 
 .original-email-block {

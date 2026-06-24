@@ -144,7 +144,7 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
 
     # ── V2 interaction tools (async → dispatch to event loop) ──
     if tool in (
-        "get_card_detail", "summarize_thread",
+        "get_card_detail", "prepare_attachment_download", "summarize_thread",
         "generate_draft_reply", "generate_ask_draft", "revise_draft", "record_card_decision",
         "clear_active_cards", "mark_cleanup_read", "record_snooze", "restore_card", "record_learning",
         "start_summarize_thread", "start_generate_draft",

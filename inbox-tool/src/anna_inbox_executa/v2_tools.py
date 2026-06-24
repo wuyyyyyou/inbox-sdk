@@ -6,6 +6,74 @@ from anna_inbox_executa.gmail_tools import _dedup_body, _resolve_cid_images, _sa
 from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.storage_tools import *
 
+
+def _safe_attachment_filename(filename: str) -> str:
+    import re
+    name = str(filename or "attachment").strip().replace("\\", "_").replace("/", "_")
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" .")
+    return name[:160] or "attachment"
+
+
+def _put_presigned_url_sync(url: str, headers: dict[str, Any], content: bytes) -> str:
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        data=content,
+        headers={str(k): str(v) for k, v in (headers or {}).items()},
+        method="PUT",
+    )
+    with urllib.request.urlopen(req, timeout=120) as response:
+        return str(response.headers.get("ETag") or "").strip('"')
+
+
+async def _upload_attachment_to_files(mailbox: str, card_id: str, attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
+    """Upload attachment bytes to Anna Files and return a short-lived URL.
+
+    Local development may initialise a storage stub without file methods; in
+    that case this intentionally fails instead of returning attachment bytes
+    through JSON-RPC.
+    """
+    from mail_agent.mail_providers.gmail.adapter import sanitize_mailbox_id
+    from mail_agent.storage.client import get_files
+
+    files = get_files()
+    for method_name in ("upload_begin", "upload_complete", "download_url"):
+        if not hasattr(files, method_name):
+            raise RuntimeError("Attachment download requires Anna Files storage in this runtime.")
+
+    filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
+    mime_type = str(attachment.get("mime_type") or "application/octet-stream")
+    path = (
+        f"anna-inbox/mailbox/{sanitize_mailbox_id(mailbox)}/attachments/"
+        f"{_safe_attachment_filename(card_id)}/{attachment.get('id')}/{filename}"
+    )
+    begin = await files.upload_begin(
+        path=path,
+        size_bytes=len(content),
+        content_type=mime_type,
+        metadata={
+            "mailbox": mailbox,
+            "card_id": card_id,
+            "message_id": str(attachment.get("message_id") or ""),
+            "filename": filename,
+        },
+        scope="user",
+    )
+    put_url = str(begin.get("put_url") or "")
+    if not put_url:
+        raise RuntimeError("Anna Files did not return an upload URL.")
+    etag = await asyncio.to_thread(_put_presigned_url_sync, put_url, begin.get("headers") or {}, content)
+    await files.upload_complete(
+        path=path,
+        etag=etag or None,
+        size_bytes=len(content),
+        content_type=mime_type,
+        scope="user",
+    )
+    return await files.download_url(path=path, expires_in=900, scope="user")
+
+
 def _clamp_int(value: Any, fallback: int, min_value: int, max_value: int) -> int:
     try:
         parsed = int(value)
@@ -107,11 +175,24 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         latest_body = ""
         latest_body_html = ""
         body_loaded = False
+        attachments: list[dict[str, Any]] = []
+        cached_msg: dict[str, Any] | None = None
+        try:
+            from mail_agent.mail_providers.gmail.adapter import (
+                attachment_metadata_from_message,
+                normalize_mailbox,
+                read_message,
+            )
+            cached_msg = read_message(normalize_mailbox(mailbox), card.message_id)
+            if isinstance(cached_msg, dict):
+                attachments = attachment_metadata_from_message(cached_msg)
+        except Exception:
+            cached_msg = None
         if include_body:
             body_loaded = True
             try:
                 from mail_agent.mail_providers.gmail.adapter import decode_body_for_display, normalize_mailbox, read_message
-                msg = read_message(normalize_mailbox(mailbox), card.message_id)
+                msg = cached_msg if isinstance(cached_msg, dict) else read_message(normalize_mailbox(mailbox), card.message_id)
                 if isinstance(msg, dict):
                     display_body = decode_body_for_display(msg)
                     raw_html = str(display_body.get("html") or "")
@@ -161,7 +242,46 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             "latest_body": latest_body,
             "latest_body_html": latest_body_html,
             "body_loaded": body_loaded,
+            "attachments": attachments,
         }
+
+    if tool == "prepare_attachment_download":
+        if not mailbox or not card_id:
+            return {"error": "mailbox and card_id are required"}
+        attachment_id = str(arguments.get("attachment_id", "")).strip()
+        if not attachment_id:
+            return {"error": "attachment_id is required"}
+        cards = await storage_get_cards(mailbox)
+        card = next((c for c in cards.cards if c.card_id == card_id), None)
+        if not card:
+            return {"error": f"Card {card_id} not found"}
+        try:
+            from mail_agent.mail_providers.gmail.adapter import (
+                fetch_attachment_bytes,
+                find_attachment_for_token,
+                normalize_mailbox,
+                read_message,
+            )
+            normalized_mailbox = normalize_mailbox(mailbox)
+            msg = read_message(normalized_mailbox, card.message_id)
+            attachment = find_attachment_for_token(msg, attachment_id)
+            content = await asyncio.to_thread(
+                fetch_attachment_bytes,
+                normalized_mailbox,
+                str(attachment.get("message_id") or card.message_id),
+                str(attachment.get("gmail_attachment_id") or ""),
+            )
+            download = await _upload_attachment_to_files(normalized_mailbox, card_id, attachment, content)
+            return {
+                "ok": True,
+                "filename": attachment.get("filename") or "attachment",
+                "mime_type": attachment.get("mime_type") or "application/octet-stream",
+                "size": len(content),
+                "download_url": download.get("url") or download.get("download_url") or "",
+                "expires_at": download.get("expires_at") or "",
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     # Build sampling for Anna LLM path (same logic as _build_sampling_for_run)
     _sampling = _build_sampling_for_run(arguments, invoke_id)

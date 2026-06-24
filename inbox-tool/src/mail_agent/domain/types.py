@@ -255,6 +255,7 @@ class MessageLite:
     starred: bool = False   # 是否星标
     important: bool = False # 是否重要
     has_attachment: bool = False  # 是否有附件
+    attachments: list[dict[str, Any]] = field(default_factory=list)  # lightweight attachment metadata for UI
     headers: dict[str, str] = field(default_factory=dict)  # 附加头信息（如 List-Unsubscribe）
 
 
