@@ -1,8 +1,9 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
+import { buildDraftPreferencesInstruction, resolveDraftPreferences } from "../features/handle/draftPreferences";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { ActiveCardsPayload, AppState, CleanupMessage, CustomRunResultItem, FrontendCard, GmailErrorPopup, MailboxInfo, RunStatus, ScanPlan, ScanState } from "../types/mail";
+import type { ActiveCardsPayload, AppState, CleanupMessage, CustomRunResultItem, DraftPreferenceField, FrontendCard, GmailErrorPopup, MailboxInfo, RunStatus, ScanPlan, ScanState } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -163,6 +164,7 @@ export interface AppActions {
   setInput(field: "customScanInput", value: string): void;
   setDraft(cardId: string, value: string): void;
   setRevision(cardId: string, value: string): void;
+  setDraftPreference(cardId: string, field: DraftPreferenceField, value: string): void;
   setReplyMode(cardId: string, value: string): void;
   setResultFilter(value: AppState["resultFilter"]): void;
   toggleDetails(cardId: string): void;
@@ -195,7 +197,7 @@ export interface AppActions {
   startScan(reason?: string, mailboxOverride?: string): Promise<void>;
   openCard(cardId: string): Promise<void>;
   summarizeSelectedThread(): Promise<void>;
-  generateDraft(presetRevision?: string): Promise<void>;
+  generateDraft(userAnswers?: Record<string, string>): Promise<void>;
   recordDecision(decision: string, cardId?: string): Promise<void>;
   replyNow(): Promise<void>;
   clearAllCards(): Promise<void>;
@@ -628,6 +630,18 @@ export function useAppController() {
     setRevision(cardId, value) {
       setState((s) => ({ ...s, revisionById: { ...s.revisionById, [cardId]: value } }));
     },
+    setDraftPreference(cardId, field, value) {
+      setState((s) => ({
+        ...s,
+        draftPreferencesById: {
+          ...s.draftPreferencesById,
+          [cardId]: {
+            ...resolveDraftPreferences(s.draftPreferencesById[cardId]),
+            [field]: value,
+          },
+        },
+      }));
+    },
     setReplyMode(cardId, value) {
       setState((s) => ({ ...s, replyModeById: { ...s.replyModeById, [cardId]: value } }));
     },
@@ -1027,12 +1041,14 @@ export function useAppController() {
         setState((s) => ({ ...s, summarizingThread: false }));
       }
     },
-    async generateDraft(presetRevision, userAnswers?: Record<string, string>) {
+    async generateDraft(userAnswers?: Record<string, string>) {
       if (!state.selectedCard || state.generatingDraft) return;
       const cardId = state.selectedCard.id;
       const key = state.selectedCard.uiKey || cardUiKey(state.selectedCard, state.mailbox);
       const currentDraft = state.draftById[key] || "";
-      const revision = presetRevision || state.revisionById[key] || "";
+      const rawRevision = state.revisionById[key] || "";
+      const preferences = resolveDraftPreferences(state.draftPreferencesById[key]);
+      const revision = buildDraftPreferencesInstruction(preferences, rawRevision);
       setState((s) => ({ ...s, generatingDraft: true }));
       try {
         const started = await client.startGenerateDraft({
@@ -1050,7 +1066,6 @@ export function useAppController() {
         setState((s) => ({
           ...s,
           draftById: { ...s.draftById, [key]: resultToDraft(result, currentDraft) },
-          revisionById: revision ? { ...s.revisionById, [key]: revision } : s.revisionById,
         }));
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
@@ -1360,7 +1375,7 @@ export function useAppController() {
       try {
         const result = await client.resetAllData();
         if (result.ok) {
-          setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, attachmentDownloads: {}, askItemActions: {}, askEditDraft: {}, askGapAnswers: {}, askDraftsByKey: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
+          setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, attachmentDownloads: {}, askItemActions: {}, askEditDraft: {}, askGapAnswers: {}, askDraftsByKey: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, draftPreferencesById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
           showToast("All data reset. Ready for a fresh start.");
           window.location.reload();
         }
@@ -1502,7 +1517,7 @@ export function useAppController() {
       setState((s) => ({ ...s, gapAnswersByCard: { ...s.gapAnswersByCard, [cardKey]: answers } }));
     },
     async generateDraftWithAnswers(answers) {
-      await (actions as any).generateDraft(undefined, answers);
+      await (actions as any).generateDraft(answers);
     },
     setAskGapAnswers(actionKey, answers) {
       setState((s) => ({ ...s, askGapAnswers: { ...s.askGapAnswers, [actionKey]: answers } }));

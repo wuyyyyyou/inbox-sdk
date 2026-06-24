@@ -2176,6 +2176,44 @@
       color: var(--text-muted);
     }
 
+    .draft-controls-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .draft-control {
+      min-width: 0;
+      display: grid;
+      gap: 5px;
+    }
+
+    .draft-control-label {
+      color: #6f7285;
+      font-size: 11px;
+      font-weight: 650;
+      line-height: 1.2;
+    }
+
+    .draft-control-select {
+      width: 100%;
+      min-width: 0;
+      min-height: 36px;
+      padding: 0 11px;
+      border-radius: 12px;
+      border: 1px solid rgba(93, 82, 128, 0.12);
+      background: rgba(255,255,255,0.78);
+      color: var(--text-main);
+      font-size: 13px;
+      outline: none;
+      appearance: none;
+    }
+
+    .draft-control-select:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
     .revise-row {
       display: flex;
       gap: 8px;
@@ -2203,6 +2241,23 @@
       font-size: 12px;
       font-weight: 680;
       transition: 0.18s ease;
+    }
+
+    @media (max-width: 900px) {
+      .draft-controls-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 640px) {
+      .draft-controls-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .revise-row {
+        flex-direction: column;
+        align-items: stretch;
+      }
     }
 
     .decision-btn:hover {

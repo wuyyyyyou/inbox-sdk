@@ -48,6 +48,7 @@ export function createInitialState(): AppState {
     selectedCardDetail: null,
     threadSummaryById: {},
     draftById: {},
+    draftPreferencesById: {},
     revisionById: {},
     replyModeById: {},
     threadContextExpanded: {},

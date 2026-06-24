@@ -5,6 +5,29 @@ export type ResultFilter = "all" | "reply" | "review" | "cleanup";
 export type LlmProvider = "anna-llm" | "dashscope";
 export type StorageProvider = "aps" | "local";
 export type LlmStatusValue = "unknown" | "checking" | "connected" | "unavailable" | "error";
+export type DraftLength = "Brief" | "Standard" | "Detailed";
+export type DraftWritingStyle = "Natural" | "Polished" | "Plain-spoken" | "Executive" | "Persuasive";
+export type DraftTone = "Warm" | "Direct" | "Diplomatic" | "Enthusiastic" | "Calm" | "Apologetic";
+export type DraftMood = "Confident" | "Grateful" | "Supportive" | "Neutral" | "Urgent";
+export type DraftPreferenceField = "length" | "writingStyle" | "tone" | "mood";
+
+export interface DraftPreferences {
+  length: DraftLength;
+  writingStyle: DraftWritingStyle;
+  tone: DraftTone;
+  mood: DraftMood;
+}
+
+export const DRAFT_LENGTH_OPTIONS: DraftLength[] = ["Brief", "Standard", "Detailed"];
+export const DRAFT_WRITING_STYLE_OPTIONS: DraftWritingStyle[] = ["Natural", "Polished", "Plain-spoken", "Executive", "Persuasive"];
+export const DRAFT_TONE_OPTIONS: DraftTone[] = ["Warm", "Direct", "Diplomatic", "Enthusiastic", "Calm", "Apologetic"];
+export const DRAFT_MOOD_OPTIONS: DraftMood[] = ["Confident", "Grateful", "Supportive", "Neutral", "Urgent"];
+export const DEFAULT_DRAFT_PREFERENCES: DraftPreferences = {
+  length: "Standard",
+  writingStyle: "Natural",
+  tone: "Warm",
+  mood: "Confident",
+};
 
 export interface LlmStatus {
   status: LlmStatusValue;
@@ -410,6 +433,7 @@ export interface AppState {
   selectedCardDetail: CardDetailPayload | null;
   threadSummaryById: Record<string, Record<string, unknown>>;
   draftById: Record<string, string>;
+  draftPreferencesById: Record<string, DraftPreferences>;
   gapAnswersByCard: Record<string, Record<string, string>>;
   askGapAnswers: Record<string, Record<string, string>>;
   askDraftsByKey: Record<string, string>;

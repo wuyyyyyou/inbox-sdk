@@ -2,6 +2,15 @@ import { useState, type MouseEvent } from "react";
 import DOMPurify from "dompurify";
 import { useApp } from "../../app/AppContext";
 import { formatBeijingTimestamp } from "../../shared/format";
+import {
+  DEFAULT_DRAFT_PREFERENCES,
+  DRAFT_LENGTH_OPTIONS,
+  DRAFT_MOOD_OPTIONS,
+  DRAFT_TONE_OPTIONS,
+  DRAFT_WRITING_STYLE_OPTIONS,
+  type DraftPreferenceField,
+} from "../../types/mail";
+import { DRAFT_PREFERENCE_LABELS, resolveDraftPreferences } from "./draftPreferences";
 import { nextCardId } from "../brief/cardHelpers";
 
 function asString(value: unknown): string {
@@ -75,6 +84,13 @@ function contactContextLines(contactContext: Record<string, unknown>): string[] 
   }).filter(Boolean));
 }
 
+const DRAFT_CONTROL_CONFIG: Array<{ field: DraftPreferenceField; options: string[] }> = [
+  { field: "length", options: DRAFT_LENGTH_OPTIONS },
+  { field: "writingStyle", options: DRAFT_WRITING_STYLE_OPTIONS },
+  { field: "tone", options: DRAFT_TONE_OPTIONS },
+  { field: "mood", options: DRAFT_MOOD_OPTIONS },
+];
+
 function GapForm({ cardKey, gaps, onSubmit, onSkip }: {
   cardKey: string;
   gaps: import("../../types/mail").ReplyGaps;
@@ -129,6 +145,7 @@ export function HandleView() {
   const bodyLoaded = Boolean(detail.body_loaded);
   const summary = state.threadSummaryById[key];
   const draft = state.draftById[key] || "";
+  const draftPreferences = resolveDraftPreferences(state.draftPreferencesById[key] || DEFAULT_DRAFT_PREFERENCES);
   const replyGaps = card.replyGaps;
   const hasGaps = replyGaps?.needs_user_input && Array.isArray(replyGaps?.questions) && replyGaps.questions.length > 0;
   const showGapForm = hasGaps && !draft;
@@ -323,18 +340,26 @@ export function HandleView() {
                 </div>
                 {cc && cc !== "None" ? null : <span className="reply-mode-note">No CC recipients</span>}
               </div>
+              <div className="draft-controls-grid">
+                {DRAFT_CONTROL_CONFIG.map(({ field, options }) => (
+                  <label className="draft-control" key={field}>
+                    <span className="draft-control-label">{DRAFT_PREFERENCE_LABELS[field]}</span>
+                    <select
+                      className="draft-control-select"
+                      value={draftPreferences[field]}
+                      disabled={state.generatingDraft}
+                      onChange={(e) => actions.setDraftPreference(key, field, e.target.value)}
+                    >
+                      {options.map((option) => <option key={option} value={option}>{option}</option>)}
+                    </select>
+                  </label>
+                ))}
+              </div>
               <div className="revise-row">
                 <input type="text" placeholder={draft ? "Tell Anna how to revise this draft..." : "Tell Anna how to write the reply (optional)"} value={state.revisionById[key] || ""} disabled={state.generatingDraft} onChange={(e) => actions.setRevision(key, e.target.value)} />
                 <button className="soft-btn generate-draft-btn is-glow" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>{state.generatingDraft ? "Working..." : draft ? "Ask Anna to revise" : "Generate draft"}</button>
               </div>
               <textarea className={`draft-textarea${state.generatingDraft && !draft ? " is-draft-loading" : ""}`} placeholder="Click 'Generate draft' to have Anna write a reply based on this thread." value={draftDisplay} onChange={(e) => actions.setDraft(key, e.target.value)} />
-              {draft ? (
-                <div className="preset-row">
-                  <button className="preset-chip" disabled={state.generatingDraft} onClick={() => void actions.generateDraft("Make it shorter")}>Shorter</button>
-                  <button className="preset-chip" disabled={state.generatingDraft} onClick={() => void actions.generateDraft("Make it warmer")}>Warmer</button>
-                  <button className="preset-chip" disabled={state.generatingDraft} onClick={() => void actions.generateDraft("Make it more direct")}>More direct</button>
-                </div>
-              ) : null}
             </>
           )}
         </section>
