@@ -10,6 +10,7 @@ export type DraftWritingStyle = "Natural" | "Polished" | "Plain-spoken" | "Execu
 export type DraftTone = "Warm" | "Direct" | "Diplomatic" | "Enthusiastic" | "Calm" | "Apologetic";
 export type DraftMood = "Confident" | "Grateful" | "Supportive" | "Neutral" | "Urgent";
 export type DraftPreferenceField = "length" | "writingStyle" | "tone" | "mood";
+export type DraftReplyGoal = "Accept" | "Decline" | "Ask for info" | "Follow up" | "Schedule";
 
 export interface DraftPreferences {
   length: DraftLength;
@@ -18,10 +19,16 @@ export interface DraftPreferences {
   mood: DraftMood;
 }
 
+export interface DraftReplyIntent {
+  goal?: DraftReplyGoal;
+  userTake?: string;
+}
+
 export const DRAFT_LENGTH_OPTIONS: DraftLength[] = ["Brief", "Standard", "Detailed"];
 export const DRAFT_WRITING_STYLE_OPTIONS: DraftWritingStyle[] = ["Natural", "Polished", "Plain-spoken", "Executive", "Persuasive"];
 export const DRAFT_TONE_OPTIONS: DraftTone[] = ["Warm", "Direct", "Diplomatic", "Enthusiastic", "Calm", "Apologetic"];
 export const DRAFT_MOOD_OPTIONS: DraftMood[] = ["Confident", "Grateful", "Supportive", "Neutral", "Urgent"];
+export const DRAFT_REPLY_GOAL_OPTIONS: DraftReplyGoal[] = ["Accept", "Decline", "Ask for info", "Follow up", "Schedule"];
 export const DEFAULT_DRAFT_PREFERENCES: DraftPreferences = {
   length: "Standard",
   writingStyle: "Natural",
@@ -434,6 +441,7 @@ export interface AppState {
   threadSummaryById: Record<string, Record<string, unknown>>;
   draftById: Record<string, string>;
   draftPreferencesById: Record<string, DraftPreferences>;
+  replyIntentById: Record<string, DraftReplyIntent>;
   gapAnswersByCard: Record<string, Record<string, string>>;
   askGapAnswers: Record<string, Record<string, string>>;
   askDraftsByKey: Record<string, string>;

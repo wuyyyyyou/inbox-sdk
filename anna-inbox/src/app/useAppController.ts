@@ -3,7 +3,7 @@ import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { buildDraftPreferencesInstruction, resolveDraftPreferences } from "../features/handle/draftPreferences";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { ActiveCardsPayload, AppState, CleanupMessage, CustomRunResultItem, DraftPreferenceField, FrontendCard, GmailErrorPopup, MailboxInfo, RunStatus, ScanPlan, ScanState } from "../types/mail";
+import type { ActiveCardsPayload, AppState, CleanupMessage, CustomRunResultItem, DraftPreferenceField, DraftReplyGoal, FrontendCard, GmailErrorPopup, MailboxInfo, RunStatus, ScanPlan, ScanState } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -165,6 +165,8 @@ export interface AppActions {
   setDraft(cardId: string, value: string): void;
   setRevision(cardId: string, value: string): void;
   setDraftPreference(cardId: string, field: DraftPreferenceField, value: string): void;
+  setReplyIntentGoal(cardId: string, value: DraftReplyGoal | ""): void;
+  setReplyIntentText(cardId: string, value: string): void;
   setReplyMode(cardId: string, value: string): void;
   setResultFilter(value: AppState["resultFilter"]): void;
   toggleDetails(cardId: string): void;
@@ -197,7 +199,8 @@ export interface AppActions {
   startScan(reason?: string, mailboxOverride?: string): Promise<void>;
   openCard(cardId: string): Promise<void>;
   summarizeSelectedThread(): Promise<void>;
-  generateDraft(userAnswers?: Record<string, string>): Promise<void>;
+  generateDraft(userAnswers?: Record<string, string>, options?: { ignoreReplyIntent?: boolean }): Promise<void>;
+  clearDraft(cardId?: string): void;
   recordDecision(decision: string, cardId?: string): Promise<void>;
   replyNow(): Promise<void>;
   clearAllCards(): Promise<void>;
@@ -642,6 +645,30 @@ export function useAppController() {
         },
       }));
     },
+    setReplyIntentGoal(cardId, value) {
+      setState((s) => ({
+        ...s,
+        replyIntentById: {
+          ...s.replyIntentById,
+          [cardId]: {
+            ...s.replyIntentById[cardId],
+            goal: value || undefined,
+          },
+        },
+      }));
+    },
+    setReplyIntentText(cardId, value) {
+      setState((s) => ({
+        ...s,
+        replyIntentById: {
+          ...s.replyIntentById,
+          [cardId]: {
+            ...s.replyIntentById[cardId],
+            userTake: value,
+          },
+        },
+      }));
+    },
     setReplyMode(cardId, value) {
       setState((s) => ({ ...s, replyModeById: { ...s.replyModeById, [cardId]: value } }));
     },
@@ -1041,14 +1068,20 @@ export function useAppController() {
         setState((s) => ({ ...s, summarizingThread: false }));
       }
     },
-    async generateDraft(userAnswers?: Record<string, string>) {
+    async generateDraft(userAnswers?: Record<string, string>, options?: { ignoreReplyIntent?: boolean }) {
       if (!state.selectedCard || state.generatingDraft) return;
       const cardId = state.selectedCard.id;
       const key = state.selectedCard.uiKey || cardUiKey(state.selectedCard, state.mailbox);
       const currentDraft = state.draftById[key] || "";
-      const rawRevision = state.revisionById[key] || "";
+      const hasExistingDraft = Boolean(currentDraft.trim());
+      const rawRevision = hasExistingDraft ? (state.revisionById[key] || "") : "";
       const preferences = resolveDraftPreferences(state.draftPreferencesById[key]);
-      const revision = buildDraftPreferencesInstruction(preferences, rawRevision);
+      const replyIntent = options?.ignoreReplyIntent ? undefined : state.replyIntentById[key];
+      const revision = buildDraftPreferencesInstruction(preferences, rawRevision, {
+        replyGoal: hasExistingDraft ? "" : replyIntent?.goal,
+        userTake: hasExistingDraft ? "" : replyIntent?.userTake,
+        hasExistingDraft,
+      });
       setState((s) => ({ ...s, generatingDraft: true }));
       try {
         const started = await client.startGenerateDraft({
@@ -1072,6 +1105,26 @@ export function useAppController() {
       } finally {
         setState((s) => ({ ...s, generatingDraft: false, draftDots: "" }));
       }
+    },
+    clearDraft(cardId) {
+      const card = cardId ? findCard(state.allCards, cardId) || findCard(state.cards, cardId) : state.selectedCard;
+      if (!card) return;
+      const key = card.uiKey || cardUiKey(card, state.mailbox);
+      const clearDraftReply = (item: FrontendCard): FrontendCard => (
+        (item.uiKey || cardUiKey(item, state.mailbox)) === key
+          ? { ...item, draft_reply: "" }
+          : item
+      );
+      setState((s) => ({
+        ...s,
+        draftById: { ...s.draftById, [key]: "" },
+        revisionById: { ...s.revisionById, [key]: "" },
+        allCards: s.allCards.map(clearDraftReply),
+        cards: s.cards.map(clearDraftReply),
+        selectedCard: s.selectedCard && (s.selectedCard.uiKey || cardUiKey(s.selectedCard, s.mailbox)) === key
+          ? { ...s.selectedCard, draft_reply: "" }
+          : s.selectedCard,
+      }));
     },
     async recordDecision(decision, cardId) {
       const card = cardId ? findCard(state.cards, cardId) : state.selectedCard;
@@ -1375,7 +1428,7 @@ export function useAppController() {
       try {
         const result = await client.resetAllData();
         if (result.ok) {
-          setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, attachmentDownloads: {}, askItemActions: {}, askEditDraft: {}, askGapAnswers: {}, askDraftsByKey: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, draftPreferencesById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
+          setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, attachmentDownloads: {}, askItemActions: {}, askEditDraft: {}, askGapAnswers: {}, askDraftsByKey: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, draftPreferencesById: {}, replyIntentById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
           showToast("All data reset. Ready for a fresh start.");
           window.location.reload();
         }

@@ -25,4 +25,28 @@ describe("draft preferences helpers", () => {
       ].join("\n"),
     );
   });
+
+  it("prepends reply intent before draft preferences for new drafts", () => {
+    expect(
+      buildDraftPreferencesInstruction(
+        { tone: "Direct" },
+        "",
+        { replyGoal: "Decline", userTake: "Keep the door open for next month." },
+      ),
+    ).toBe(
+      [
+        "User reply intent:",
+        "- Reply goal: Decline",
+        "- Your take: Keep the door open for next month.",
+        "",
+        "Use these draft preferences:",
+        "- Length: Standard",
+        "- Writing style: Natural",
+        "- Tone: Direct",
+        "- Mood: Confident",
+        "",
+        "Keep the reply natural, specific, and ready to send. Avoid generic AI-sounding phrasing.",
+      ].join("\n"),
+    );
+  });
 });

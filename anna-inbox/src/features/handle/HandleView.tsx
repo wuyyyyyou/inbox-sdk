@@ -6,12 +6,14 @@ import {
   DEFAULT_DRAFT_PREFERENCES,
   DRAFT_LENGTH_OPTIONS,
   DRAFT_MOOD_OPTIONS,
+  DRAFT_REPLY_GOAL_OPTIONS,
   DRAFT_TONE_OPTIONS,
   DRAFT_WRITING_STYLE_OPTIONS,
   type DraftPreferenceField,
 } from "../../types/mail";
 import { DRAFT_PREFERENCE_LABELS, resolveDraftPreferences } from "./draftPreferences";
 import { nextCardId } from "../brief/cardHelpers";
+import { contactContextLines, normalizeEmailSummaryItems, uniqueLines } from "./summaryContent";
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : String(value ?? "");
@@ -21,20 +23,6 @@ function asList(value: unknown): string[] {
   if (Array.isArray(value)) return value.map((item) => asString(item).trim()).filter(Boolean);
   const text = asString(value).trim();
   return text ? [text] : [];
-}
-
-function uniqueLines(lines: string[]): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const line of lines) {
-    const text = line.trim();
-    const key = text.toLowerCase();
-    if (text && !seen.has(key)) {
-      seen.add(key);
-      result.push(text);
-    }
-  }
-  return result;
 }
 
 function formatBytes(value: unknown): string {
@@ -74,14 +62,6 @@ function handleOriginalBodyClick(event: MouseEvent<HTMLDivElement>) {
   if (!target) return;
   event.preventDefault();
   openExternalUrl((target as HTMLAnchorElement).href);
-}
-
-function contactContextLines(contactContext: Record<string, unknown>): string[] {
-  const topics = Array.isArray(contactContext.relevant_topics) ? contactContext.relevant_topics : [];
-  return uniqueLines(topics.map((topic) => {
-    const raw = topic && typeof topic === "object" ? topic as Record<string, unknown> : {};
-    return [raw.title, raw.summary, raw.open_loop].map(asString).filter(Boolean).join(" · ");
-  }).filter(Boolean));
 }
 
 const DRAFT_CONTROL_CONFIG: Array<{ field: DraftPreferenceField; options: string[] }> = [
@@ -146,9 +126,13 @@ export function HandleView() {
   const summary = state.threadSummaryById[key];
   const draft = state.draftById[key] || "";
   const draftPreferences = resolveDraftPreferences(state.draftPreferencesById[key] || DEFAULT_DRAFT_PREFERENCES);
+  const replyIntent = state.replyIntentById[key] || {};
+  const replyGoal = replyIntent.goal || "";
+  const replyIntentText = replyIntent.userTake || "";
   const replyGaps = card.replyGaps;
   const hasGaps = replyGaps?.needs_user_input && Array.isArray(replyGaps?.questions) && replyGaps.questions.length > 0;
   const showGapForm = hasGaps && !draft;
+  const showDecisionBlock = !draft && !showGapForm;
   const replyMode = state.replyModeById[key] || "reply_to_sender";
   const cc = asString(context.cc || original.cc || "None");
   const contextExpanded = Boolean(state.threadContextExpanded[key]);
@@ -160,10 +144,10 @@ export function HandleView() {
   const draftDisplay = state.generatingDraft && !draft ? "Anna is drafting a reply..." : draft;
   const nid = nextCardId(state);
   const relatedContext = contactContextLines(contactContext);
-  const fallbackRelatedContext = uniqueLines([card.summary, card.thread_summary].map(asString).filter(Boolean));
+  const fallbackRelatedContext = uniqueLines(normalizeEmailSummaryItems([card.summary, card.thread_summary]));
   const relatedContextItems = uniqueLines([
     ...relatedContext,
-    ...asList(summary?.related_context),
+    ...normalizeEmailSummaryItems(summary?.related_context),
     ...(relatedContext.length ? [] : fallbackRelatedContext),
   ]);
   const BODY_PREVIEW = 500;
@@ -202,7 +186,7 @@ export function HandleView() {
     if (!relatedContextItems.length) return null;
     return (
       <section className="review-block is-summary">
-        <div className="review-block-kicker">Related context</div>
+        <div className="review-block-kicker">Email summary</div>
         <ul>{relatedContextItems.map((line, i) => <li key={i}>{line}</li>)}</ul>
       </section>
     );
@@ -355,11 +339,58 @@ export function HandleView() {
                   </label>
                 ))}
               </div>
-              <div className="revise-row">
-                <input type="text" placeholder={draft ? "Tell Anna how to revise this draft..." : "Tell Anna how to write the reply (optional)"} value={state.revisionById[key] || ""} disabled={state.generatingDraft} onChange={(e) => actions.setRevision(key, e.target.value)} />
-                <button className="soft-btn generate-draft-btn is-glow" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>{state.generatingDraft ? "Working..." : draft ? "Ask Anna to revise" : "Generate draft"}</button>
-              </div>
-              <textarea className={`draft-textarea${state.generatingDraft && !draft ? " is-draft-loading" : ""}`} placeholder="Click 'Generate draft' to have Anna write a reply based on this thread." value={draftDisplay} onChange={(e) => actions.setDraft(key, e.target.value)} />
+              {showDecisionBlock ? (
+                <div className="reply-intent-block">
+                  <div className="reply-intent-head">
+                    <span className="reply-intent-kicker">Decision needed</span>
+                    <p className="reply-intent-title">Anna needs your decision before drafting.</p>
+                  </div>
+                  <div className="reply-goal-row" role="group" aria-label="Reply goal">
+                    {DRAFT_REPLY_GOAL_OPTIONS.map((option) => {
+                      const active = replyGoal === option;
+                      return (
+                        <button
+                          key={option}
+                          className={`reply-goal-btn ${active ? "is-active" : ""}`}
+                          aria-pressed={active}
+                          disabled={state.generatingDraft}
+                          onClick={() => actions.setReplyIntentGoal(key, active ? "" : option)}
+                        >
+                          {option}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <label className="draft-control">
+                    <span className="draft-control-label">Your take</span>
+                    <input
+                      type="text"
+                      className="reply-intent-input"
+                      placeholder="Tell Anna your take before drafting..."
+                      value={replyIntentText}
+                      disabled={state.generatingDraft}
+                      onChange={(e) => actions.setReplyIntentText(key, e.target.value)}
+                    />
+                  </label>
+                  <div className="reply-intent-actions">
+                    <button className="soft-btn" disabled={state.generatingDraft} onClick={() => void actions.generateDraft(undefined, { ignoreReplyIntent: true })}>
+                      {state.generatingDraft ? "Working..." : "Skip, draft anyway"}
+                    </button>
+                    <button className="primary-btn" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>
+                      {state.generatingDraft ? "Working..." : "Generate draft"}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="revise-row">
+                  <input type="text" placeholder="Tell Anna how to revise this draft..." value={state.revisionById[key] || ""} disabled={state.generatingDraft} onChange={(e) => actions.setRevision(key, e.target.value)} />
+                  <button className="soft-btn" disabled={state.generatingDraft || !draft.trim()} onClick={() => actions.clearDraft()}>
+                    Clear local draft
+                  </button>
+                  <button className="soft-btn generate-draft-btn is-glow" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>{state.generatingDraft ? "Working..." : "Ask Anna to revise"}</button>
+                </div>
+              )}
+              <textarea className={`draft-textarea${state.generatingDraft && !draft ? " is-draft-loading" : ""}`} placeholder="Anna's editable draft will appear here after it is generated." value={draftDisplay} onChange={(e) => actions.setDraft(key, e.target.value)} />
             </>
           )}
         </section>

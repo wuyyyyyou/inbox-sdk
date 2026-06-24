@@ -152,7 +152,7 @@ def _related_context_lines(contact_context: Any) -> list[str]:
     lines: list[str] = []
     for topic in getattr(contact_context, "relevant_topics", []) or []:
         text = " | ".join(part for part in [getattr(topic, "title", ""), getattr(topic, "summary", ""), getattr(topic, "open_loop", "")] if part)
-        if text:
+        if text and not _looks_like_summary_payload(text):
             lines.append(text[:240])
     return _dedupe_lines(lines)[:3]
 
@@ -189,13 +189,36 @@ def _as_list(value: Any) -> list[str]:
     return [text] if text else []
 
 
+def _looks_like_summary_payload(value: str) -> bool:
+    text = str(value or "").strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return False
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    keys = {
+        "thread_kind",
+        "headline",
+        "what_happened",
+        "open_questions",
+        "reply_focus",
+        "related_context",
+        "should_show",
+        "confidence",
+    }
+    return any(key in payload for key in keys)
+
+
 def _dedupe_lines(lines: list[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for line in lines:
         text = _limit_line(line, 240)
         key = text.lower()
-        if text and key not in seen:
+        if text and key not in seen and not _looks_like_summary_payload(text):
             seen.add(key)
             result.append(text)
     return result
@@ -216,16 +239,18 @@ Output a JSON object with:
 - note: a short internal note about what you did (English, <=50 chars)
 
 CRITICAL — Source priority (never violate):
-1. User's explicit answers (highest priority — these are FACTS from the user)
+1. User's explicit answers and current reply intent/instructions (highest priority — these are the user's current direction)
 2. Original email thread content
 3. Contact memory context (for tone, relationship, past context only — NOT for facts)
+4. Draft preferences such as tone, style, mood, and length
 
 - NEVER invent facts, numbers, dates, prices, commitments, or opinions
 - Use the user's OWN WORDS wherever possible — keep their casual/formal level
 - If the user's answers are insufficient to write a meaningful reply, say so in "note" and write a placeholder body asking the user for more details
 - Be concise — reply length proportional to original message
 - Do not include email headers (To, From, CC) in the body
-- If the user provided revision instructions, apply them precisely
+- If the user provided current reply intent or revision instructions, apply them precisely
+- If current user intent conflicts with generic politeness, contact memory, or default style preferences, follow the current user intent
 - CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format."""
 
 
@@ -273,7 +298,8 @@ def _build_draft_prompt(
 
     if has_instruction:
         task = "Revise the existing draft" if has_draft else "Generate a new draft incorporating these instructions"
-        parts.append(f"\nUser instruction:\n{revision_input}")
+        label = "User revision request" if has_draft else "User reply intent and instructions"
+        parts.append(f"\n{label}:\n{revision_input}")
     elif has_answers:
         task = "Draft a reply based on the user's answers above"
     else:

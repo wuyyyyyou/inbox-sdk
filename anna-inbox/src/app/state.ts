@@ -49,6 +49,7 @@ export function createInitialState(): AppState {
     threadSummaryById: {},
     draftById: {},
     draftPreferencesById: {},
+    replyIntentById: {},
     revisionById: {},
     replyModeById: {},
     threadContextExpanded: {},

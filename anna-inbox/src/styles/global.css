@@ -2214,6 +2214,95 @@
       cursor: not-allowed;
     }
 
+    .reply-intent-block {
+      display: grid;
+      gap: 12px;
+      padding: 14px;
+      border-radius: 16px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.82), rgba(247,243,234,0.92));
+      border: 1px solid rgba(188, 156, 92, 0.16);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.72);
+    }
+
+    .reply-intent-head {
+      display: grid;
+      gap: 4px;
+    }
+
+    .reply-intent-kicker {
+      color: #8a6a2f;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+
+    .reply-intent-title {
+      margin: 0;
+      color: #4d4636;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .reply-goal-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .reply-goal-btn {
+      min-height: 32px;
+      padding: 0 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(183, 148, 77, 0.18);
+      background: rgba(255,255,255,0.82);
+      color: #5d523b;
+      font-size: 12px;
+      font-weight: 650;
+      transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+    }
+
+    .reply-goal-btn:hover:not(:disabled) {
+      transform: translateY(-1px);
+      background: rgba(255,255,255,0.96);
+      border-color: rgba(183, 148, 77, 0.32);
+    }
+
+    .reply-goal-btn.is-active {
+      color: #6c4f17;
+      background: rgba(255,245,214,0.96);
+      border-color: rgba(183, 148, 77, 0.42);
+      box-shadow: 0 8px 18px rgba(105, 85, 32, 0.08);
+    }
+
+    .reply-goal-btn:disabled {
+      opacity: 0.58;
+      cursor: not-allowed;
+    }
+
+    .reply-intent-input {
+      width: 100%;
+      min-height: 38px;
+      padding: 0 11px;
+      border-radius: 12px;
+      border: 1px solid rgba(183, 148, 77, 0.18);
+      background: rgba(255,255,255,0.82);
+      color: var(--text-main);
+      font-size: 13px;
+      outline: none;
+    }
+
+    .reply-intent-input:focus {
+      border-color: rgba(183, 148, 77, 0.36);
+    }
+
+    .reply-intent-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
     .revise-row {
       display: flex;
       gap: 8px;
@@ -2255,6 +2344,11 @@
       }
 
       .revise-row {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .reply-intent-actions {
         flex-direction: column;
         align-items: stretch;
       }
