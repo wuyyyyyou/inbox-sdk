@@ -73,7 +73,14 @@ def _render_context_for_prompt(ctx: CandidateContext, owner_email: str = "") -> 
     return "\n".join(parts)
 
 
-def _render_body_and_thread(ctx: CandidateContext, owner_email: str = "") -> str:
+def _render_body_and_thread(
+    ctx: CandidateContext,
+    owner_email: str = "",
+    *,
+    message_body_limit: int = 1200,
+    thread_body_limit: int = 400,
+    thread_visible_limit: int = 10,
+) -> str:
     """只渲染消息体和线程上下文，不含候选元信息。
 
     对于 thread_context：
@@ -83,7 +90,7 @@ def _render_body_and_thread(ctx: CandidateContext, owner_email: str = "") -> str
     parts: list[str] = []
     if ctx.type == "message_detail" and ctx.message:
         parts.append(f"\n--- Full Message Body ---")
-        parts.append(f"Body text: {ctx.message.body_text[:1200]}")
+        parts.append(f"Body text: {ctx.message.body_text[:message_body_limit]}")
     if ctx.type == "thread_context" and ctx.thread:
         msgs = list(ctx.thread.messages)
         owner_lower = (owner_email or "").strip().lower()
@@ -96,14 +103,15 @@ def _render_body_and_thread(ctx: CandidateContext, owner_email: str = "") -> str
                 break
 
         if cut >= 0:
-            visible = msgs[cut:]
-            header = (f"\n--- Thread Context ({len(visible)} of {len(msgs)} messages, "
+            unread_after_reply = msgs[cut + 1:]
+            visible = [msgs[cut], *unread_after_reply[-max(0, thread_visible_limit - 1):]]
+            header = (f"\n--- Thread Context ({len(visible)} of {len(msgs)} messages shown, "
                       f"since your last reply) ---")
             footer = ("\n↑ Messages marked UNREPLIED need your attention. "
                       "Your last reply is provided for context.")
         else:
-            visible = msgs
-            header = (f"\n--- Thread Context ({len(visible)} messages, "
+            visible = msgs[-thread_visible_limit:]
+            header = (f"\n--- Thread Context ({len(visible)} of {len(msgs)} messages shown, "
                       f"no reply from you yet) ---")
             footer = "\n↑ Focus on the most recent messages above."
 
@@ -123,7 +131,7 @@ def _render_body_and_thread(ctx: CandidateContext, owner_email: str = "") -> str
             parts.append(f"  From: {msg.from_addr}")
             parts.append(f"  Date: {_fmt_ts(msg.internal_date)}")
             parts.append(f"  Subject: {msg.subject}")
-            parts.append(f"  Body: {msg.body_text[:400]}")
+            parts.append(f"  Body: {msg.body_text[:thread_body_limit]}")
         parts.append(footer)
     return "\n".join(parts)
 
@@ -507,6 +515,23 @@ def build_anna_single_judgment_prompt(
     c = ctx.candidate
     snooze_text = _render_snooze_prefs_context(snooze_prefs)
     few_shot = _render_few_shot_examples(strategy.judgment_policy.few_shot_examples)
+    body_and_thread = _render_body_and_thread(ctx, mailbox_profile.mailbox_id)
+    reply_gaps_example = json.dumps(
+        {
+            "needs_user_input": True,
+            "summary": "one-sentence summary",
+            "questions": [
+                {
+                    "id": "q1",
+                    "question": "What do you want to reply?",
+                    "hint": "short hint",
+                    "required": True,
+                }
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
     prompt = f"""You are Anna, an executive email assistant. Evaluate exactly ONE email candidate against the strategy below.
 Output ONLY a single JSON object. Do NOT wrap in markdown. Do NOT explain. The very first character you write MUST be `{{`.
@@ -566,7 +591,7 @@ subject: {c.evidence.get('subject', '')}
 snippet: {c.evidence.get('snippet', '')}
 date: {_fmt_ts(str(c.evidence.get('date', '')))}
 context_type: {ctx.type}
-{_render_body_and_thread(ctx, mailbox_profile.mailbox_id)}
+{body_and_thread}
 
 ## User request
 {task_plan.raw_user_request}
@@ -588,7 +613,7 @@ Return exactly this JSON shape:
   "needs": "English ≤4 words label for what the user needs to decide or do.",
   "latest_action": "English ≤8 words. What recently happened — the latest action by a person or service.",
   "latest_actor": "English name or service. Who performed the latest_action.",
-  "reply_gaps": {{"needs_user_input":true, "summary":"one-sentence summary", "questions":[{{"id":"q1", "question":"What do you want to reply?", "hint":"short hint", "required":true}}]}},
+  "reply_gaps": {reply_gaps_example},
   "confidence": 0.85
 }}}}
 
@@ -608,7 +633,7 @@ Allowed action: create_draft, create_reminder, save_note, do_nothing.
 - Before output: re-read your suggestion. If it contains a time constraint, priority MUST NOT be low.
 - CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM". If no date is available, say "recently".
 - If the body mentions a deadline or timeframe ("before this weekend", "by Friday", "next Monday"), quote it verbatim in your output. Do NOT convert relative time to an absolute calendar date. Say "before this weekend", NOT "before Jun 8".
-- reply_gaps (only when user_action="reply"): analyze what key questions the email is asking that need the user's input. needs_user_input=true ONLY for explicit questions. needs_user_input=false for thank-you/FYI. questions: max 3. Refer to contact memory for open loops.
+- reply_gaps: analyze what key questions the email is asking that need the user's input before a reply can be drafted. needs_user_input=true ONLY for explicit questions. needs_user_input=false for thank-you/FYI. questions: max 3. Refer to contact memory for open loops.
 - Output ONLY valid JSON."""
     return prompt
 

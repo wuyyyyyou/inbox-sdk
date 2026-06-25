@@ -1,6 +1,6 @@
 # Brief 扫描性能问题与优化方案
 
-> 更新时间：2026-06-23（北京时间）  
+> 更新时间：2026-06-25（北京时间）
 > 状态：问题记录、实施记录与后续预案。后续优化按优先级逐项落地。  
 > 适用范围：Brief Gmail 扫描、短 invoke 状态机、Phase 1/2、前端扫描体验。
 
@@ -15,7 +15,7 @@
 - Phase 1 Anna Sampling timeout 从 55s 降到 20s，超时或失败时用规则 fallback，不再长期卡在 header/snippet 分类阶段。
 - Phase 1 progress 增加 `phase1_input`、`phase1_prefiltered`、`phase1_rule_candidates`、`phase1_llm_messages`。
 - Phase 2 保留每批 4 个候选并发评估，但改为谁先完成就先更新进度并持久化卡片，避免第一批任一 LLM 慢导致前端长期停在 `Evaluating 0/N`。
-- Phase 2 单项 Anna Sampling timeout 从 55s 降到 25s，`max_tokens` 从 8000 降到 5000。
+- Phase 2 单项 Anna Sampling timeout 从 55s 降到 25s，`max_tokens` 继续保持 8000。
 - 已新增聚焦测试：`tests/test_brief_incremental_scan.py`、`tests/test_phase1_prefilter.py`。
 
 ## 0.1 2026-06-23 第二轮已落地：HTML 正文清洗减轻 Phase 2 输入噪音
@@ -100,7 +100,8 @@ Handle 原文展示与 LLM 正文分离：
 
 Phase 2 可恢复性优化。
 
-- 保留每批 3-5 个候选的并发策略。
+- 保留按 `candidate_id` 可恢复的单候选 judgment，不改成多候选单次批量判断。
+- 保留固定 batch 的单候选 judgment，不改成多候选单次批量判断。
 - 不把已成功完成的 candidate 因为同批慢请求而重复评估。
 - 在 run state 中按 `candidate_id` 识别已完成 judgment；下次 continue 只处理缺失 judgment 的 candidates。
 - 该项能减少 invoke timeout 后的重复 LLM 消耗，但改动面比 HTML 清洗大，建议放在 HTML 清洗之后。
@@ -126,6 +127,145 @@ Phase 2 可恢复性优化。
 - HTML 到文本的 fallback 若过于粗糙，可能丢失链接上下文；安全/账单邮件必须保留 URL。
 - 旧缓存 read-side 重新 decode 要避免大对象写回和重复重算造成额外延迟。
 - 不能在日志中记录清洗前后的正文内容，只记录长度和路径。
+
+## 0.2 2026-06-25 补充：Phase 2 Evaluating 卡顿专项优化
+
+用户反馈：Brief 扫描经常卡在 Phase 2 的 `Evaluating`，当前重点不再扩展新的 LLM 调用接口，而是先把 Phase 2 本身的调度、prompt、上下文读取、持久化和前端轮询打通。
+
+### 当前 Phase 2 代码复核
+
+截至 2026-06-25 前几轮优化后，当前 `_brief_run_phase2_slice()` 的真实形态：
+
+- 每次 slice 从缺失 judgment 的 candidates 中固定取前 `phase2_llm_concurrency = 4` 个，形成一个 batch，符合 README 中 Phase 2 每批 3-5 个候选的 Invoke 约束。
+- 当前 batch 的 `read_candidate_context()` 已并发读取，但下一批 candidate 不会提前进入队列。
+- 进入 evaluate 后，每个 candidate 启一个 async task，并用 `asyncio.as_completed()` 谁先完成谁先持久化卡片和更新进度。
+- 核心剩余瓶颈：虽然 batch 内谁先完成谁先展示，但必须等当前 4 个全部结束后，下一批 candidate 才会启动；如果 3 个很快完成、1 个接近 25s timeout，空出来的并发槽会闲置。
+- `continue_mail_agent_run` 的 invoke budget 约 50s；当前 Phase 2 使用 4 并发、`phase2_sampling_timeout_s = 25`，为持久化和状态返回保留时间。
+- progress 和 debug 日志已经开始记录真实 timeout、`max_tokens=8000`、context read、prompt chars、sampling elapsed、fallback 和 persist 耗时；日志不输出 prompt preview、邮件正文、subject 或用户请求原文。
+- prompt 瘦身已回退；当前仍使用完整 Phase 2 prompt，不在本轮调度优化里改判断语义。
+- `_brief_persist_cards()` 每完成一个 judgment 就读写 active cards；在 APS 较慢时，单项持久化也可能放大整批尾延迟。
+
+### 直接优化方向
+
+P0：把观测修准。
+
+- 修正 progress 中的 `timeout_s`、`max_tokens`、`batch_size`、`phase2_llm_concurrency`，全部以真实代码参数为准。
+- 增加非敏感耗时：
+  - `phase2_context_read_ms`
+  - `phase2_prompt_chars`
+  - `phase2_sampling_first_done_ms`
+  - `phase2_sampling_batch_ms`
+  - `phase2_persist_ms`
+  - `phase2_cards_added`
+  - `phase2_pending_count`
+- 每个 candidate 记录 `candidate_id`、`context_type`、`prompt_chars`、`sampling_elapsed_ms`、`fallback_used`，但不要记录 prompt preview、subject、正文、URL、用户请求原文或凭据。
+
+P0：修正 timeout 与 invoke budget 不一致。
+
+- `continue_mail_agent_run` 当前等待约 50s，Phase 2 单项 sampling timeout 不应大于这个预算。
+- 建议先设：
+  - `phase2_slice_budget_s = 45`
+  - `phase2_sampling_timeout_s = 25`
+  - 持久化与状态返回预留 5-8s
+- progress 里同步展示真实 timeout。
+- 如果 timeout 降低导致 fallback 明显增加，再基于 p95 调整，不要只凭体感加大到 60s。
+
+P1：上下文读取并发化。
+
+- 将当前串行：
+
+```python
+contexts = [await read_candidate_context(mailbox, candidate) for candidate in batch]
+```
+
+改为有界并发：
+
+```python
+contexts = await asyncio.gather(*[
+    read_candidate_context(mailbox, candidate)
+    for candidate in batch
+])
+```
+
+- 初始并发度与 Phase 2 LLM 并发一致，默认 4。
+- 需要记录 context read 单项耗时，确认本地 cache/APS/文件读取是否也是慢点。
+
+P1：保留固定 batch，并完善可恢复性与观测。
+
+- 当前 Phase 2 继续采用固定 batch：每次 `continue` 处理前 4 个未完成 candidate。
+- batch 内保持 `asyncio.as_completed()`，谁先完成谁先持久化和更新 progress。
+- batch 间仍保留边界，不在本轮引入滑动补位队列，避免和短 invoke 预算约束互相打架。
+- `phase2_cursor` 继续表示“按原始顺序连续完成到哪里”。
+- 每次 continue 根据 `candidate_id` 判断哪些 judgment 已完成；下次 continue 只处理剩余 candidate，避免 invoke timeout 后重复评估。
+- 如果需要取消 pending task，要先确认 `SamplingClient` 的 pending future 会被清理；否则优先通过固定 batch + 单候选 timeout 控制风险。
+
+P1：前端轮询与早展示确认。
+
+- 后端已经在 `as_completed()` 中逐个更新 run state 和 `cards_version`，但如果前端等待 `continue_mail_agent_run` 返回后才轮询，用户仍看不到中途进度。
+- 前端扫描页应在 `continue` 请求挂起期间也周期性调用 `get_mail_agent_run`，看到 `cards_version` 增加就刷新 `get_active_cards`。
+- UI 上 `Evaluating x/N` 应显示已完成数量、当前 batch、卡片新增数，而不是只等本次 continue 返回。
+
+P1/P2：Phase 2 prompt 观测，瘦身暂缓。
+
+- prompt 瘦身曾尝试过中等力度方案，但已按产品判断回退。
+- 当前调度优化不改变 prompt 内容，避免把性能变化和判断语义变化混在一起。
+- 继续保留 `phase2_prompt_chars`、timeout、fallback、`prompt_profile` 等观测。
+- 如果后续重新审批 prompt 瘦身，应单独评估安全、账单、等待回复、禁止发送/删除等关键 guardrail，不要和 Phase 2 调度改造混在一起。
+
+P1：规则 fast-exit，减少不必要 Phase 2 LLM。
+
+- Phase 1 已经有规则 fast path，但仍可能有明显自动通知、纯 receipt、明显 cleanup 被带入 Phase 2。
+- 在 Phase 2 前加 conservative fast-exit：
+  - no-reply / notification sender，且无安全/账单风险。
+  - receipt / subscription confirmation，且无付款失败、异常金额、deadline。
+  - newsletter / digest / promotion，且无明确个人请求。
+- fast-exit 直接生成低优先级 review judgment，走同一 card/filter/guardrail 流程。
+- 只允许对“明确低风险”命中；星标、important、已知联系人、附件、问句、安全/账单关键词必须继续 LLM。
+
+P1：持久化节流。
+
+- 当前每个 judgment 完成立即 `_brief_persist_cards()`，优点是早展示，风险是 APS 慢时每项都读写 active cards。
+- 建议策略：
+  - 第一个可展示 card 立即持久化，保证首卡快出现。
+  - 同一 batch 中后续完成项按 2 个或 500-1000ms 合并持久化。
+  - progress 仍逐项更新，但 active cards 写入做轻量 debounce。
+- 需要记录 `phase2_persist_ms`，确认是否值得改。
+
+P2：优先级队列。
+
+- Phase 1 后先排：
+  - security/billing/starred/important。
+  - known contact + possible request。
+  - unread + high confidence reply。
+  - 普通 review。
+- 每个 slice 先评估最可能出主卡的 candidate。
+- 即使总耗时不变，用户会更早看到有价值卡片。
+
+P2：低风险候选 micro-batch 实验。
+
+- 高风险、reply、security/billing 继续单候选 LLM，保证可恢复与准确性。
+- 仅对低风险 review 候选尝试 2-3 个一组的 compact batch judgment。
+- JSON 漏项或解析失败时，只对缺失项回退单候选评估。
+- 该方案可减少 Sampling 调用次数，但风险高于 prompt 瘦身和调度优化，应放后面。
+
+### 建议落地顺序
+
+1. 修正 Phase 2 progress 与真实代码参数不一致的问题。
+2. 加 per-candidate / per-batch 非敏感耗时，先确认慢在 context、sampling 还是 persist。
+3. 并发读取 `read_candidate_context()`。
+4. 按 `candidate_id` 完善 Phase 2 可恢复性，避免 timeout 后重复评估已完成候选。
+5. 保留 README 约束下的固定 batch Phase 2 调度，并继续观察是否仍有明显的慢尾问题。
+6. 调整前端轮询，让 `continue` 挂起期间也能看到 cards/progress 更新。
+7. prompt 瘦身暂缓，保留 prompt chars 和 timeout/fallback 观测，后续单独审批。
+8. 加 Phase 2 前 conservative fast-exit。
+9. 再做优先级队列和低风险 micro-batch 实验。
+
+### 预期收益
+
+- 减少固定 batch 的慢尾阻塞。
+- 在 README 约束的 3-5 候选 batch 内，提高 Phase 2 slice 的可观测性和可恢复性。
+- 候选数量较多、单项耗时差异明显时，预计比固定 6 个一批更快完成同等数量 candidate。
+- 前端 `Evaluating x/N` 和卡片刷新会更连续，不再表现为一批结束后才进入下一批。
 
 ## 1. 背景
 
@@ -486,6 +626,50 @@ run_mail_scan(
 - 用户更快看到主卡片。
 - 例如 80 封新邮件中 40 封为明确低价值批量邮件时，Phase 1 Sampling 调用可从约 10 次降到约 5 次。
 
+### P1c：Phase 2 Evaluating 专项优化
+
+目标：让 Phase 2 首个结果更早出现，避免单个慢请求拖住整批 `Evaluating`。
+
+背景：
+
+- 当前 Phase 2 每个 slice 固定取前 4 个未完成 candidate。
+- 当前 batch 的上下文读取已经并发化，但下一批 candidate 不会提前进入队列。
+- LLM evaluate 已用 `asyncio.create_task()` + `asyncio.as_completed()`，batch 内谁先完成谁先持久化和更新 progress。
+- 剩余瓶颈是 batch 屏障：必须等当前 4 个全部结束，后面的 candidate 才能启动。
+- 当前代码已把 Phase 2 单项 Sampling timeout 控制到约 25s，并预留短 invoke 的持久化和返回时间。
+- Prompt 瘦身已回退，当前仍使用完整 prompt；本轮不把 prompt 语义改动和调度优化混在一起。
+- 每个 judgment 完成后都会触发 active cards 读写，APS 慢时可能放大延迟。
+
+建议：
+
+- 修正 progress 中 `timeout_s` / `max_tokens` / batch size / concurrency，确保与真实代码一致。
+- 增加 Phase 2 耗时指标：context read、prompt chars、sampling first done、sampling batch、persist、fallback。
+- `read_candidate_context()` 改为有界并发读取。
+- Phase 2 保留显式 `phase2_llm_concurrency`，当前默认 4。
+- Phase 2 保留固定 batch：每次 continue 处理前 4 个未完成 candidate。
+- 单次 Sampling timeout 必须小于 invoke slice budget，并预留持久化和返回时间。
+- 按 `candidate_id` 保存完成状态；下次 continue 只处理缺失 judgment 的 candidate。
+- `phase2_cursor` 只表示连续完成进度；继续按 `candidate_id` 恢复，避免重复评估。
+- deadline 不足时停止补新任务，但不能让 `_brief_run_phase2_slice()` 返回后留下未追踪后台 sampling task。
+- 前端在 `continue_mail_agent_run` 挂起期间也轮询 `get_mail_agent_run`，看到 `cards_version` 增加即刷新 cards。
+- prompt 瘦身暂缓，继续观察 `phase2_prompt_chars`、timeout 和 fallback。
+- Phase 2 前增加 conservative fast-exit，明显低风险自动通知/receipt/cleanup 直接生成低优先级 review judgment。
+- 首个可展示 card 立即持久化，后续完成项可按 2 个或 500-1000ms debounce 合并写 active cards。
+
+风险：
+
+- 主动取消 pending Sampling 时要确认 `SamplingClient` 会清理 `_pending`，否则可能留下 orphan pending。
+- 不能因为 timeout 过短而显著增加 fallback judgment；需要基于真实 p95 决定 timeout。
+- 并发度过高可能触发 host `maxCalls`、provider rate limit 或更高失败率。
+- 如果持久化很慢，按“持久化后才补位”会让并发槽短暂空闲；是否改成 debounce 需要另行审批。
+- fast-exit 必须保守，星标、important、已知联系人、附件、问句、安全/账单关键词都不能直接跳过 LLM。
+
+预期收益：
+
+- 首个 judgment/card 更早出现。
+- Phase 2 不再被单个慢尾请求拖住后续 candidate 启动。
+- 重复评估、invoke timeout 后重跑、进度长时间不变的问题减少。
+
 ### P2：Phase 2 优先级队列与早展示
 
 目标：先评估最可能重要的 candidates。
@@ -557,19 +741,28 @@ run_mail_scan(
 1. 补性能观测字段。
 2. 短 invoke 主路径接入 `after_timestamp`。
 3. Phase 1 前增加 conservative low-value prefilter。
-4. 扩展 `test_scan_window.py` 和 Phase 1 prefilter 聚焦测试。
-5. 前端扫描进度展示 scanned/new/skipped/candidates。
+4. 修正 Phase 2 progress 中 `timeout_s`、batch size、并发度等字段，确保和代码真实配置一致。
+5. 增加 Phase 2 per-candidate / per-batch 耗时指标，确认慢在 context、sampling 还是 persist。
+6. 增加 `test_sampling_parallel`，用 synthetic prompt 诊断 Sampling 并发与排队情况。
+7. 扩展 `test_scan_window.py` 和 Phase 1 prefilter 聚焦测试。
+8. 前端扫描进度展示 scanned/new/skipped/candidates，并在 `continue` 挂起期间继续轮询 run state。
 
 第二阶段：减少阻塞和 LLM 调用
 
 1. 扫描阶段拆 cursor。
 2. Gmail metadata-first 扫描。
-3. Phase 2 candidates 排序，优先展示高价值卡片。
+3. Phase 2 上下文读取并发化。
+4. Phase 2 按 `candidate_id` 可恢复，保持固定 batch，不留下未追踪后台 sampling task。
+5. 保留固定 batch 的 Phase 2 调度，并继续观察慢尾与 fallback 分布。
+6. Phase 2 前加 conservative fast-exit，减少明显低风险候选的 LLM 调用。
+7. Phase 2 candidates 排序，优先展示高价值卡片。
+8. prompt 瘦身暂缓，后续如果继续做，需要单独审批判断语义影响。
 
 第三阶段：更大结构优化
 
 1. 多邮箱调度优化。
 2. Gmail History API。
+3. 低风险 review 候选 micro-batch 实验。
 
 ## 7. 需要验证的指标
 
@@ -582,6 +775,15 @@ run_mail_scan(
   - threads.get 次数
 - Phase 1 sampling 调用数。
 - Phase 2 sampling 调用数。
+- Phase 2 并发度：
+  - `phase2_parallel_requested`
+  - `first_done_ms`
+  - `wall_ms`
+  - `sum_call_ms`
+  - `max_call_ms`
+  - `per_call_elapsed_ms`
+  - `timeout_count`
+  - `rate_limit_count`
 - 首张卡片出现时间。
 - 扫描完成时间。
 - scanned/new/skipped_processed/candidates/cards_added。
@@ -600,7 +802,16 @@ uv run python tests/test_cleanup_bundle_thread_messages.py
 
 ```sh
 uv run python tests/test_llm_json_repair.py
+uv run python tests/test_brief_phase2_slice.py
 ```
+
+如果新增 Sampling 并发诊断工具：
+
+```sh
+uv run python tests/test_sampling_parallel.py
+```
+
+真实并发 smoke test 需要 Anna Sampling grant、网络和平台 host 支持；本地单元测试只能覆盖调度、计时字段和不泄露邮件内容。
 
 如果改前端扫描进度或卡片刷新：
 
@@ -622,10 +833,19 @@ npm run build
 - Phase 1/2 分批和早展示。
 - 联系人记忆后置。
 
-当前最可能的性能缺口是：**UI 主路径的扫描阶段还没有真正增量化，也没有可续跑 scan cursor；它仍会在每次扫描时重复拉取最近窗口内的 Gmail full threads。**
+针对当前用户体感最明显的 `Evaluating` 卡顿，最可能的 Phase 2 缺口是：
 
-因此建议下一步先做 P0/P1：
+- Phase 2 已按 README 约束保持 4 并发固定 batch；一个慢请求仍可能拖住整批收尾。
+- Phase 2 上下文读取、真实 timeout/progress、candidate 级日志已经做过第一轮修正，日志不输出 prompt preview 或邮件内容。
+- `continue_mail_agent_run` 内部仍要等当前 slice 收尾，但前端应在请求挂起期间持续轮询 run state。
+- Prompt 偏重仍可能影响单项耗时，但瘦身已回退，后续需要单独审批。
+- 单项持久化 active cards 可能在 APS 较慢时放大尾延迟。
 
-1. 补性能观测。
-2. 把 `after_timestamp` 接入 `_brief_prepare_scan()`。
-3. 为扫描阶段拆 cursor 做设计和小步实现。
+因此建议下一步优先做 Phase 2 P0/P1：
+
+1. 继续保留固定 batch 的 4 并发调度，重点观察慢尾 candidate 分布。
+2. 继续利用 `candidate_id` 可恢复性，减少 invoke timeout 后的重复评估。
+3. 结合 `phase2_prompt_chars`、`phase2_sampling_batch_ms`、`phase2_persist_ms` 判断瓶颈是在 sampling 还是 persist。
+4. 确认前端在 `continue` 挂起期间持续轮询 run state。
+5. 继续观察 persist 耗时，再决定是否单独做 active cards debounce。
+6. prompt 瘦身和 fast-exit 作为后续单独审批项。

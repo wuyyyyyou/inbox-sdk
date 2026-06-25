@@ -123,6 +123,7 @@ fire-and-forget: generate_contact_memories  ← 不阻塞主流程
 - Phase 1 每批 20 封邮件，每 invoke 并行 4 批
 - Phase 2 每批评估 3-5 个候选，完成即持久化卡片
 - 前端看到 `cards_added > 0` 立即刷新展示
+- 调试日志只记录非内容指标，不输出 prompt preview、邮件正文、subject 或用户请求原文
 
 ### Phase 1：批量分类
 

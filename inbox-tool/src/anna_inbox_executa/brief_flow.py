@@ -337,6 +337,55 @@ def _brief_count_judgment_priorities(items: list[Any]) -> dict[str, int]:
     return counts
 
 
+def _brief_count_judgment_fallbacks(items: list[Any]) -> int:
+    count = 0
+    for item in items:
+        mode = {}
+        if isinstance(item, dict):
+            mode = item.get("mode_judgment") if isinstance(item.get("mode_judgment"), dict) else {}
+        else:
+            mode = getattr(item, "mode_judgment", None) if isinstance(getattr(item, "mode_judgment", None), dict) else {}
+        if mode.get("fallback_reason"):
+            count += 1
+    return count
+
+
+def _brief_completed_candidate_ids(items: list[Any]) -> set[str]:
+    completed: set[str] = set()
+    for item in items:
+        if isinstance(item, dict):
+            candidate_id = str(item.get("candidate_id") or "")
+        else:
+            candidate_id = str(getattr(item, "candidate_id", "") or "")
+        if candidate_id:
+            completed.add(candidate_id)
+    return completed
+
+
+def _brief_phase2_contiguous_cursor(candidates: list[Any], completed_ids: set[str]) -> int:
+    cursor = 0
+    for candidate in candidates:
+        candidate_id = str(getattr(candidate, "candidate_id", "") or "")
+        if candidate_id and candidate_id in completed_ids:
+            cursor += 1
+            continue
+        break
+    return cursor
+
+
+def _brief_phase2_prompt_profile(candidate: Any, context_type: str) -> str:
+    phase1_action = str((getattr(candidate, "evidence", {}) or {}).get("user_action") or "").strip().lower()
+    candidate_kind = str(getattr(candidate, "kind", "") or "")
+    priority_hint = str(getattr(candidate, "priority_hint", "") or "")
+    if phase1_action == "review" and candidate_kind in {"safe_account_record", "safe_cleanup_bundle"}:
+        return "compact_review"
+    if phase1_action == "review" and candidate_kind == "account_notice_possible" and priority_hint in {"low", "unknown"}:
+        return "compact_review"
+    if phase1_action == "reply":
+        return f"reply_{context_type or 'unknown'}"
+    return f"full_{context_type or 'unknown'}"
+
+
 def _brief_update_state(run_id: str, *, status: str = "running", stage: str, progress: dict[str, Any], cards_added: int = 0, needs_continue: bool = True) -> None:
     state = MAIL_AGENT_RUNS[run_id]
     state["status"] = status
@@ -643,6 +692,11 @@ async def _brief_run_phase2_slice(run_id: str, sampling_create_message: Any) -> 
     from mail_agent.llm_runtime.service import call_llm_json_safe
     from mail_agent.planning.strategies import get as get_strategy
 
+    phase2_llm_concurrency = 4
+    phase2_slice_budget_s = 45.0
+    phase2_sampling_timeout_s = 60.0
+    phase2_persist_reserve_s = 6.0
+
     state = MAIL_AGENT_RUNS[run_id]
     brief = state.setdefault("brief", {})
     args = (state.get("partial") or {}).get("_args", {})
@@ -662,21 +716,90 @@ async def _brief_run_phase2_slice(run_id: str, sampling_create_message: Any) -> 
         raise ValueError(f"Unknown strategy mode: {task_plan.strategy_mode}")
     profile = MailboxProfile(mailbox_id=mailbox, owner=mailbox)
     candidates = _brief_candidates_from_dict(list(brief.get("candidates") or []))
-    cursor = int(brief.get("phase2_cursor") or 0)
+    existing_judgments = _brief_judgments_from_dict(list(brief.get("judgments") or []))
+    judgments_by_id = {judgment.candidate_id: judgment for judgment in existing_judgments if judgment.candidate_id}
+    completed_ids = _brief_completed_candidate_ids(existing_judgments)
+    cursor = _brief_phase2_contiguous_cursor(candidates, completed_ids)
+    brief["phase2_cursor"] = cursor
     total = len(candidates)
-    if cursor >= total:
+    evaluated_total = len(completed_ids)
+    if evaluated_total >= total:
         brief["stage"] = "finalizing"
-        _brief_update_state(run_id, stage="finalizing", progress={"evaluated": cursor, "total": total})
+        _brief_update_state(run_id, stage="finalizing", progress={"evaluated": evaluated_total, "total": total})
         return
-    # Keep the original Phase 2 throughput, but advance progress as each
-    # candidate finishes so the UI does not sit at "Evaluating 0/N".
-    batch = candidates[cursor:cursor + 4]
-    _brief_update_state(run_id, stage="read_context", progress={"current": cursor, "total": total, "batch": len(batch)})
-    contexts = [await read_candidate_context(mailbox, candidate) for candidate in batch]
 
-    async def _evaluate_one(index: int, ctx: Any) -> Any:
+    slice_started = time.monotonic()
+    pending_candidates = [candidate for candidate in candidates if candidate.candidate_id not in completed_ids]
+    batch = pending_candidates[:phase2_llm_concurrency]
+    _brief_update_state(
+        run_id,
+        stage="read_context",
+        progress={
+            "current": evaluated_total,
+            "total": total,
+            "batch": len(batch),
+            "batch_size": len(batch),
+            "phase2_llm_concurrency": phase2_llm_concurrency,
+            "phase2_sampling_timeout_s": phase2_sampling_timeout_s,
+            "timeout_s": phase2_sampling_timeout_s,
+            "max_tokens": 8000,
+            "phase2_pending_count": len(pending_candidates),
+        },
+    )
+
+    async def _read_one_context(candidate: Any) -> tuple[Any, int]:
+        started = time.monotonic()
+        context = await read_candidate_context(mailbox, candidate)
+        return context, int((time.monotonic() - started) * 1000)
+
+    context_started = time.monotonic()
+    context_results = await asyncio.gather(*[_read_one_context(candidate) for candidate in batch])
+    phase2_context_read_ms = int((time.monotonic() - context_started) * 1000)
+    candidate_metrics = dict(brief.get("phase2_candidate_metrics") or {})
+    contexts: list[Any] = []
+    for context, context_read_ms in context_results:
+        contexts.append(context)
+        candidate_id = str(getattr(getattr(context, "candidate", None), "candidate_id", "") or "")
+        if candidate_id:
+            metric = dict(candidate_metrics.get(candidate_id) or {})
+            metric["context_type"] = str(getattr(context, "type", "") or "")
+            metric["context_read_ms"] = context_read_ms
+            candidate_metrics[candidate_id] = metric
+    brief["phase2_candidate_metrics"] = candidate_metrics
+
+    sampling_timeout_s = phase2_sampling_timeout_s
+
+    async def _evaluate_one(ctx: Any) -> tuple[Any, dict[str, Any]]:
+        candidate_id = str(ctx.candidate.candidate_id or "")
+        prompt = build_anna_single_judgment_prompt(task_plan, strategy, profile, ctx, None)
+        prompt_chars = len(prompt)
+        sampling_started = time.monotonic()
+        metric = dict(candidate_metrics.get(candidate_id) or {})
+        context_type = str(getattr(ctx, "type", "") or "")
+        prompt_profile = _brief_phase2_prompt_profile(ctx.candidate, context_type)
+        metric["context_type"] = context_type
+        metric["prompt_chars"] = prompt_chars
+        metric["prompt_profile"] = prompt_profile
+        log(
+            "phase2 prompt: "
+            + json.dumps(
+                {
+                    "run_id": run_id,
+                    "mailbox": mailbox,
+                    "candidate_id": candidate_id,
+                    "kind": str(getattr(ctx.candidate, "kind", "") or ""),
+                    "priority_hint": str(getattr(ctx.candidate, "priority_hint", "") or ""),
+                    "context_type": context_type,
+                    "prompt_profile": prompt_profile,
+                    "prompt_chars": prompt_chars,
+                    "slice_budget_s": round(phase2_slice_budget_s, 1),
+                    "persist_reserve_s": round(phase2_persist_reserve_s, 1),
+                    "timeout_s": round(sampling_timeout_s, 1),
+                },
+                ensure_ascii=False,
+            )
+        )
         try:
-            prompt = build_anna_single_judgment_prompt(task_plan, strategy, profile, ctx, None)
             result = await call_llm_json_safe(
                 sampling_create_message,
                 system_prompt="You are a strict JSON generator. Output ONLY valid JSON — no explanation, no markdown, no code fences.",
@@ -684,61 +807,147 @@ async def _brief_run_phase2_slice(run_id: str, sampling_create_message: Any) -> 
                 fallback={},
                 temperature=0.1,
                 max_tokens=8000,
-                timeout=60.0,
+                timeout=sampling_timeout_s,
                 metadata={"tool": "evaluate_item_single", "strategy_mode": strategy.id, "candidate_count": "1"},
                 allow_fallback=True,
                 allow_sampling_provider_fallback=False,
                 max_attempts=1,
             )
+            metric["sampling_elapsed_ms"] = int((time.monotonic() - sampling_started) * 1000)
             payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
             if not payload or result.get("fallback_used"):
                 raise ValueError(str(result.get("fallback_reason") or "empty Anna sampling response"))
             payload.setdefault("candidate_id", ctx.candidate.candidate_id)
-            return apply_rule_guards(_parse_compact_batch_item(payload, strategy), strategy)
+            metric["fallback_used"] = False
+            log(
+                "phase2 result: "
+                + json.dumps(
+                    {
+                        "run_id": run_id,
+                        "candidate_id": candidate_id,
+                        "context_type": context_type,
+                        "prompt_profile": prompt_profile,
+                        "prompt_chars": prompt_chars,
+                        "sampling_elapsed_ms": metric["sampling_elapsed_ms"],
+                        "fallback_used": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return apply_rule_guards(_parse_compact_batch_item(payload, strategy), strategy), metric
         except Exception as exc:
-            return create_fallback_judgment(ctx.candidate.candidate_id, strategy, f"evaluation failed: {type(exc).__name__}: {exc}")
+            metric["sampling_elapsed_ms"] = int((time.monotonic() - sampling_started) * 1000)
+            metric["fallback_used"] = True
+            metric["fallback_reason"] = f"{type(exc).__name__}: {exc}"[:200]
+            log(
+                "phase2 result: "
+                + json.dumps(
+                    {
+                        "run_id": run_id,
+                        "candidate_id": candidate_id,
+                        "context_type": context_type,
+                        "prompt_profile": prompt_profile,
+                        "prompt_chars": prompt_chars,
+                        "sampling_elapsed_ms": metric["sampling_elapsed_ms"],
+                        "fallback_used": True,
+                        "fallback_reason": metric["fallback_reason"],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return create_fallback_judgment(ctx.candidate.candidate_id, strategy, f"evaluation failed: {type(exc).__name__}: {exc}"), metric
 
-    _brief_update_state(run_id, stage="evaluate", progress={"evaluated": cursor, "total": total, "batch": len(batch), "sampling_calls_used": len(batch), "timeout_s": 60})
-    judgments = []
-    pending = [
-        asyncio.create_task(_evaluate_one(cursor + offset + 1, ctx))
-        for offset, ctx in enumerate(contexts)
-    ]
+    _brief_update_state(
+        run_id,
+        stage="evaluate",
+        progress={
+            "evaluated": evaluated_total,
+            "total": total,
+            "batch": len(batch),
+            "batch_size": len(batch),
+            "sampling_calls_used": len(batch),
+            "phase2_llm_concurrency": phase2_llm_concurrency,
+            "phase2_context_read_ms": phase2_context_read_ms,
+            "phase2_pending_count": len(pending_candidates),
+            "phase2_sampling_timeout_s": sampling_timeout_s,
+            "timeout_s": sampling_timeout_s,
+            "max_tokens": 8000,
+        },
+    )
+    batch_judgments: list[Any] = []
+    sampling_batch_started = time.monotonic()
+    sampling_first_done_ms = 0
+    persist_total_ms = 0
+    pending = [asyncio.create_task(_evaluate_one(ctx)) for ctx in contexts]
     for task in asyncio.as_completed(pending):
-        judgment = await task
-        judgments.append(judgment)
-        partial_cursor = min(total, cursor + len(judgments))
-        all_judgments = _brief_judgments_from_dict(list(brief.get("judgments") or []))
-        all_judgments.append(judgment)
-        brief["judgments"] = _brief_to_dict_list(all_judgments)
+        judgment, metric = await task
+        batch_judgments.append(judgment)
+        metric_candidate_id = str(judgment.candidate_id or "")
+        if metric_candidate_id:
+            candidate_metrics[metric_candidate_id] = metric
+            brief["phase2_candidate_metrics"] = candidate_metrics
+        judgments_by_id[judgment.candidate_id] = judgment
+        completed_ids.add(judgment.candidate_id)
+        if sampling_first_done_ms <= 0:
+            sampling_first_done_ms = int((time.monotonic() - sampling_batch_started) * 1000)
+        brief["judgments"] = _brief_to_dict_list([judgments_by_id[candidate.candidate_id] for candidate in candidates if candidate.candidate_id in judgments_by_id])
+        persist_started = time.monotonic()
         cards_added_partial = await _brief_persist_cards(run_id, [judgment])
+        persist_elapsed_ms = int((time.monotonic() - persist_started) * 1000)
+        persist_total_ms += persist_elapsed_ms
+        current_evaluated = len(completed_ids)
+        brief["phase2_cursor"] = _brief_phase2_contiguous_cursor(candidates, completed_ids)
         _brief_update_state(
             run_id,
             stage="evaluate",
             progress={
-                "evaluated": partial_cursor,
+                "evaluated": current_evaluated,
                 "total": total,
                 "batch": len(batch),
+                "batch_size": len(batch),
                 "sampling_calls_used": len(batch),
+                "phase2_llm_concurrency": phase2_llm_concurrency,
                 "cards_added": cards_added_partial,
                 "cards_version": int(brief.get("cards_version") or 0),
                 "phase2_priority_distribution": _brief_count_judgment_priorities(brief.get("judgments") or []),
-                "timeout_s": 25,
+                "phase2_context_read_ms": phase2_context_read_ms,
+                "phase2_prompt_chars": sum(int((candidate_metrics.get(candidate.candidate_id) or {}).get("prompt_chars") or 0) for candidate in batch),
+                "phase2_sampling_first_done_ms": sampling_first_done_ms,
+                "phase2_sampling_batch_ms": int((time.monotonic() - sampling_batch_started) * 1000),
+                "phase2_persist_ms": persist_total_ms,
+                "phase2_cards_added": cards_added_partial,
+                "phase2_pending_count": max(0, total - current_evaluated),
+                "fallback": _brief_count_judgment_fallbacks(brief.get("judgments") or []),
+                "phase2_sampling_timeout_s": sampling_timeout_s,
+                "timeout_s": sampling_timeout_s,
+                "max_tokens": 8000,
             },
             cards_added=cards_added_partial,
         )
-    brief["phase2_cursor"] = min(total, cursor + len(judgments))
-    if brief["phase2_cursor"] >= total:
+    brief["phase2_cursor"] = _brief_phase2_contiguous_cursor(candidates, completed_ids)
+    if len(completed_ids) >= total:
         brief["stage"] = "finalizing"
     _brief_update_state(
         run_id,
         stage="evaluate_done" if brief["stage"] != "finalizing" else "finalizing",
         progress={
-            "evaluated": brief["phase2_cursor"],
+            "evaluated": len(completed_ids),
             "total": total,
+            "batch_size": len(batch),
+            "phase2_llm_concurrency": phase2_llm_concurrency,
             "cards_version": int(brief.get("cards_version") or 0),
             "phase2_priority_distribution": _brief_count_judgment_priorities(brief.get("judgments") or []),
-            "timeout_s": 25,
+            "phase2_context_read_ms": phase2_context_read_ms,
+            "phase2_prompt_chars": sum(int((candidate_metrics.get(candidate.candidate_id) or {}).get("prompt_chars") or 0) for candidate in batch),
+            "phase2_sampling_first_done_ms": sampling_first_done_ms,
+            "phase2_sampling_batch_ms": int((time.monotonic() - sampling_batch_started) * 1000),
+            "phase2_persist_ms": persist_total_ms,
+            "phase2_cards_added": sum(1 for judgment in batch_judgments if judgment.final_decision.should_show_in_main_result or judgment.final_decision.should_show_in_lower_priority),
+            "phase2_pending_count": max(0, total - len(completed_ids)),
+            "fallback": _brief_count_judgment_fallbacks(brief.get("judgments") or []),
+            "phase2_sampling_timeout_s": sampling_timeout_s,
+            "timeout_s": sampling_timeout_s,
+            "max_tokens": 8000,
         },
         cards_added=0,
     )
