@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "1.0.15",
+  "version": "1.1.0",
   "description": "Minimal Anna Executa skeleton for reading Gmail through local token files and DashScope or Anna sampling LLM.",
   "author": "Panwb",
   "host_capabilities": [
@@ -819,6 +819,25 @@
           "name": "message_ids",
           "type": "array",
           "description": "Gmail message IDs to mark as read.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "mark_card_read",
+      "description": "Mark a review card's Gmail message as read (remove UNREAD label) and resolve the card locally as read.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID.",
           "required": true
         }
       ],

@@ -12,7 +12,7 @@ import {
   type DraftPreferenceField,
 } from "../../types/mail";
 import { DRAFT_PREFERENCE_LABELS, resolveDraftPreferences } from "./draftPreferences";
-import { nextCardId } from "../brief/cardHelpers";
+import { cardCategory, cardCategoryLabel, nextCardId } from "../brief/cardHelpers";
 import { contactContextLines, normalizeEmailSummaryItems, uniqueLines } from "./summaryContent";
 
 function asString(value: unknown): string {
@@ -80,6 +80,7 @@ function GapForm({ cardKey, gaps, onSubmit, onSkip }: {
   const { state, actions } = useApp();
   const saved = state.gapAnswersByCard[cardKey] || {};
   const [answers, setAnswers] = useState<Record<string, string>>(saved);
+  const isGenerating = state.generatingDraft;
 
   const questions = Array.isArray(gaps.questions) ? gaps.questions : [];
 
@@ -94,6 +95,7 @@ function GapForm({ cardKey, gaps, onSubmit, onSkip }: {
             className="gap-form-input"
             placeholder={q.hint || ""}
             value={answers[q.id] || ""}
+            disabled={isGenerating}
             onChange={(e) => {
               const next = { ...answers, [q.id]: e.target.value };
               setAnswers(next);
@@ -103,8 +105,12 @@ function GapForm({ cardKey, gaps, onSubmit, onSkip }: {
         </div>
       ))}
       <div className="gap-form-actions">
-        <button className="soft-btn" onClick={onSkip}>Skip, generate directly</button>
-        <button className="primary-btn" onClick={() => onSubmit(answers)}>Generate draft</button>
+        <button className="soft-btn" onClick={isGenerating ? actions.stopDraftGeneration : onSkip}>
+          {isGenerating ? "Stop generate" : "Skip, generate directly"}
+        </button>
+        <button className="primary-btn" disabled={isGenerating} onClick={() => onSubmit(answers)}>
+          {isGenerating ? "Generating..." : "Generate draft"}
+        </button>
       </div>
     </div>
   );
@@ -141,6 +147,9 @@ export function HandleView() {
   const senderName = asString(context.from || original.from || "").split("<")[0].trim().replace(/"/g, "") || "Unknown";
   const threadSubject = asString(context.subject || original.thread || card.title || "").slice(0, 80);
   const hasDraft = Boolean(draft);
+  const category = cardCategory(card);
+  const isReviewCard = category === "review";
+  const categoryLabel = hasDraft ? "Reply ready" : cardCategoryLabel(card);
   const draftDisplay = state.generatingDraft && !draft ? "Anna is drafting a reply..." : draft;
   const nid = nextCardId(state);
   const relatedContext = contactContextLines(contactContext);
@@ -238,7 +247,7 @@ export function HandleView() {
             <h2 className="reply-review-title">{card.title || "Email needs review"}</h2>
             <p className="detail-subtitle">{senderName} · {threadSubject}</p>
           </div>
-          <span className={`category-tag ${hasDraft ? "is-ready-state" : ""}`}>{hasDraft ? "Reply ready" : "Needs review"}</span>
+          <span className={`category-tag ${hasDraft ? "is-ready-state" : ""}`}>{categoryLabel}</span>
         </div>
         {!bodyVisible ? (
           <section className={`review-block is-quiet${loadingBody ? " is-loading" : ""}`}>
@@ -373,11 +382,11 @@ export function HandleView() {
                     />
                   </label>
                   <div className="reply-intent-actions">
-                    <button className="soft-btn" disabled={state.generatingDraft} onClick={() => void actions.generateDraft(undefined, { ignoreReplyIntent: true })}>
-                      {state.generatingDraft ? "Working..." : "Skip, draft anyway"}
+                    <button className="soft-btn" onClick={state.generatingDraft ? actions.stopDraftGeneration : () => void actions.generateDraft(undefined, { ignoreReplyIntent: true })}>
+                      {state.generatingDraft ? "Stop generate" : "Skip, draft anyway"}
                     </button>
                     <button className="primary-btn" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>
-                      {state.generatingDraft ? "Working..." : "Generate draft"}
+                      {state.generatingDraft ? "Generating..." : "Generate draft"}
                     </button>
                   </div>
                 </div>
@@ -387,10 +396,10 @@ export function HandleView() {
                   <button className="soft-btn" disabled={state.generatingDraft || !draft.trim()} onClick={() => actions.clearDraft()}>
                     Clear local draft
                   </button>
-                  <button className="soft-btn generate-draft-btn is-glow" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>{state.generatingDraft ? "Working..." : "Ask Anna to revise"}</button>
+                  <button className="soft-btn generate-draft-btn is-glow" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>{state.generatingDraft ? "Generating..." : "Ask Anna to revise"}</button>
                 </div>
               )}
-              <textarea className={`draft-textarea${state.generatingDraft && !draft ? " is-draft-loading" : ""}`} placeholder="Anna's editable draft will appear here after it is generated." value={draftDisplay} onChange={(e) => actions.setDraft(key, e.target.value)} />
+              <textarea className={`draft-textarea${state.generatingDraft && !draft ? " is-draft-loading" : ""}`} placeholder="Anna's editable draft will appear here after it is generated." value={draftDisplay} disabled={state.generatingDraft} onChange={(e) => actions.setDraft(key, e.target.value)} />
             </>
           )}
         </section>
@@ -413,6 +422,7 @@ export function HandleView() {
         </section>
         <div className="decision-row drawer-action-row">
           <button className="primary-btn" disabled={!draft.trim() || !!state.pendingAction} onClick={() => void actions.replyNow()}>Reply now</button>
+          {isReviewCard ? <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.markCardRead()}>Read</button> : null}
           <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.recordDecision("no_action_needed")}>No action needed</button>
           <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.recordDecision("handled_manually")}>Handled manually</button>
           {nid ? <button className="detail-back" style={{ marginLeft: "auto" }} onClick={() => void actions.openCard(nid)}>Next card →</button> : null}

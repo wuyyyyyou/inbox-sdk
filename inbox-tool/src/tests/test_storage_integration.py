@@ -209,6 +209,38 @@ async def main():
     loaded2 = await get_active_cards("test@example.com")
     check("resolved card still in active (until merge)", loaded2.cards[0].status == "resolved")
 
+    print("\n── storage_tools: mark_card_read ──")
+    review_card = PersistentCard(
+        card_id="card_review", message_id="msg_review", thread_id="thread_review",
+        title="Review this notice", status="pending", user_action="review",
+        details=CardDetails(mailbox="test@example.com"),
+    )
+    await set_active_cards("test@example.com", ActiveCards(cards=[review_card]))
+    import anna_inbox_executa.storage_tools as storage_tools
+    init(fake, fake_files, scope="user")  # storage_tools import wires common.py; restore fake singleton
+    original_mark_read = storage_tools._mark_gmail_messages_read
+
+    async def fake_mark_read(mailbox: str, message_ids: list[str]):
+        return {"ok": True, "mailbox": mailbox, "message_ids": message_ids}, "", ""
+
+    storage_tools._mark_gmail_messages_read = fake_mark_read
+    try:
+        result = await storage_tools._handle_mark_card_read({"mailbox": "test@example.com", "card_id": "card_review"})
+        updated_review_cards = await get_active_cards("test@example.com")
+        updated_review = next((c for c in updated_review_cards.cards if c.card_id == "card_review"), None)
+        check("mark_card_read resolves review card", bool(result.get("ok")) and updated_review is not None and updated_review.resolution == "read")
+
+        reply_card = PersistentCard(
+            card_id="card_reply", message_id="msg_reply", thread_id="thread_reply",
+            title="Reply to Alice", status="pending", user_action="reply",
+            details=CardDetails(mailbox="test@example.com"),
+        )
+        await set_active_cards("test@example.com", ActiveCards(cards=[reply_card]))
+        reply_result = await storage_tools._handle_mark_card_read({"mailbox": "test@example.com", "card_id": "card_reply"})
+        check("mark_card_read rejects non-review card", "only supports review cards" in str(reply_result.get("error", "")))
+    finally:
+        storage_tools._mark_gmail_messages_read = original_mark_read
+
     # 7. Test run records
     print("\n── storage_ops: run records ──")
     run = RunRecord(

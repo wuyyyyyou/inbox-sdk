@@ -158,7 +158,7 @@ class PersistentCard:
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
     resolved_at: str = ""
-    resolution: str = ""         # "no_action_needed" | "handled_manually" | "dismissed"
+    resolution: str = ""         # "read" | "no_action_needed" | "handled_manually" | "dismissed"
     # cleanup bundle
     card_type: str = ""          # "cleanup_bundle" for folded low-priority cards
     bundled_messages: list = field(default_factory=list)  # preview: first 3 items
@@ -240,7 +240,7 @@ class RunHistoryEntry:
     entry_type: str = "scan"         # "scan" | "card_action"
     card_id: str = ""
     card_title: str = ""
-    action: str = ""                 # "snooze" | "reply" | "handled_manually" | "no_action_needed" | "cleanup_read" | "restore"
+    action: str = ""                 # "read" | "snooze" | "reply" | "handled_manually" | "no_action_needed" | "cleanup_read" | "restore"
     detail: str = ""
     # card context for rendering history entries without an extra API call
     card_summary: str = ""

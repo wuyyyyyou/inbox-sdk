@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { FrontendCard } from "../../types/mail";
-import { cardCategory, filteredCards, isMainCard, lowerCards, mainCards, resolvedCards, visibleCards } from "./cardHelpers";
+import { cardCategory, cardCategoryLabel, filteredCards, isMainCard, lowerCards, mainCards, resolvedCards, visibleCards } from "./cardHelpers";
 
 const card = (overrides: Partial<FrontendCard>): FrontendCard => ({
   id: overrides.id || "card_1",
@@ -14,6 +14,12 @@ describe("card helpers", () => {
     expect(cardCategory(card({ userAction: "reply", item_type: "account_notice" }))).toBe("reply");
     expect(cardCategory(card({ userAction: "review" }))).toBe("review");
     expect(cardCategory(card({ userAction: "cleanup" }))).toBe("cleanup");
+  });
+
+  it("returns human-friendly category labels", () => {
+    expect(cardCategoryLabel(card({ userAction: "reply" }))).toBe("Needs reply");
+    expect(cardCategoryLabel(card({ userAction: "review" }))).toBe("Needs review");
+    expect(cardCategoryLabel(card({ cardType: "cleanup_bundle" }))).toBe("Cleanup");
   });
 
   it("falls back to cleanup bundle and item type mapping", () => {

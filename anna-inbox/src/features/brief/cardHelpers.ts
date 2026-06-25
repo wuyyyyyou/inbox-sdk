@@ -20,6 +20,14 @@ export function cardCategory(card: FrontendCard): ResultFilter {
   return "review";
 }
 
+export function cardCategoryLabel(card: FrontendCard): string {
+  const category = cardCategory(card);
+  if (category === "reply") return "Needs reply";
+  if (category === "review") return "Needs review";
+  if (category === "cleanup") return "Cleanup";
+  return "Needs review";
+}
+
 export function isMainCard(card: FrontendCard): boolean {
   if (card.displaySection === "lower") return false;
   if (card.displaySection === "main") return true;

@@ -457,6 +457,7 @@ const HISTORY_GROUPS = [
   { key: "brief", label: "Brief scans", icon: "📋" },
   { key: "ask", label: "Ask", icon: "🔍" },
   { key: "reply", label: "Replied", icon: "✉️" },
+  { key: "read", label: "Read", icon: "📖" },
   { key: "handled", label: "Handled manually", icon: "✅" },
   { key: "no_action", label: "No action needed", icon: "✔️" },
   { key: "snooze", label: "Snoozed", icon: "🔕" },
@@ -471,6 +472,7 @@ function classifyEntry(run: RunHistoryEntry): string {
   }
   const action = run.action || "";
   if (action === "reply" || action === "reply_from_ask") return "reply";
+  if (action === "read") return "read";
   if (action === "handled_manually") return "handled";
   if (action === "no_action_needed") return "no_action";
   if (action === "snooze") return "snooze";
@@ -482,13 +484,14 @@ function classifyEntry(run: RunHistoryEntry): string {
 
 const ACTION_TITLES: Record<string, string> = {
   reply: "Replied", reply_from_ask: "Replied (Ask)",
+  read: "Read",
   handled_manually: "Handled", no_action_needed: "No action",
   snooze: "Snoozed", cleanup_read: "Cleanup",
   mark_read_from_ask: "Marked read (Ask)", trash_from_ask: "Trashed (Ask)",
   restore: "Restored",
 };
 
-const RESTORABLE_ACTIONS = new Set(["snooze", "handled_manually", "no_action_needed", "cleanup_read"]);
+const RESTORABLE_ACTIONS = new Set(["read", "snooze", "handled_manually", "no_action_needed", "cleanup_read"]);
 
 function HistoryDrawer() {
   const { state, actions } = useApp();

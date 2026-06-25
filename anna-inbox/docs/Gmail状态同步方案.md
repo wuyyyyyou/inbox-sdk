@@ -137,6 +137,8 @@ Tool action(reply_now / mark_read / handled)
 
 - 成功后更新 cache label_ids，移除 `UNREAD`。
 - 对 cleanup bundle 同步更新 bundled item 的 read state。
+- 对 review 卡的显式 `Read` 动作，按卡片锚点 `message_id` 标记 Gmail 已读，并将该卡片本地 resolve 为 `read`。
+- `mark_card_read` 只允许 `user_action="review"` 的普通卡片使用；`reply` 卡不能因为“已读”而被错误清理。
 - run history 中记录 Gmail write 结果，而不是只记录本地 UI 动作。
 
 ## 6. Gmail -> 工具同步
@@ -161,8 +163,9 @@ await reconcile_active_cards_with_gmail(mailbox, reason="scan_start")
 
 2. Gmail message/thread 不含 `UNREAD`
    - 更新卡片外部状态为 `read`。
-   - 对 cleanup/read 类型卡片可标为已读或从 cleanup bundle 中移除。
-   - 对 reply/review 卡片，仅“已读”不等于“已处理”，不应自动 resolved。
+   - 对 cleanup bundle 可标为已读或从 cleanup bundle 中移除。
+   - 对 `review` 卡，可在同步器中 resolve 为 `read_in_gmail`，表示 Gmail 侧已经读过、Brief 不再继续提醒。
+   - 对 `reply` 卡，仅“已读”不等于“已处理”，不应自动 resolved。
 
 3. Gmail thread 出现新的对方 inbound message，且晚于当前 card anchor
    - 旧卡片应被新扫描结果覆盖或重新打开为 pending。

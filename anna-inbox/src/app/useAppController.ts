@@ -99,6 +99,10 @@ function findCard(cards: FrontendCard[], keyOrId: string): FrontendCard | undefi
   return cards.find((card) => card.uiKey === keyOrId) || cards.find((card) => card.id === keyOrId);
 }
 
+function removeCardFromList(cards: FrontendCard[], key: string, fallbackMailbox: string): FrontendCard[] {
+  return cards.filter((card) => (card.uiKey || cardUiKey(card, fallbackMailbox)) !== key);
+}
+
 function scrollToPageTop() {
   const run = () => {
     const scroller = document.getElementById("appContent");
@@ -200,7 +204,9 @@ export interface AppActions {
   openCard(cardId: string): Promise<void>;
   summarizeSelectedThread(): Promise<void>;
   generateDraft(userAnswers?: Record<string, string>, options?: { ignoreReplyIntent?: boolean }): Promise<void>;
+  stopDraftGeneration(): void;
   clearDraft(cardId?: string): void;
+  markCardRead(cardId?: string): Promise<void>;
   recordDecision(decision: string, cardId?: string): Promise<void>;
   replyNow(): Promise<void>;
   clearAllCards(): Promise<void>;
@@ -237,6 +243,7 @@ export function useAppController() {
   const [toast, setToast] = useState("");
   const toastTimer = useRef<number | null>(null);
   const runtimePromise = useRef<Promise<AppState["runtime"]> | null>(null);
+  const draftGenerationRun = useRef<{ runId: string; cancelled: boolean } | null>(null);
 
   const getRuntime = useCallback(async () => {
     if (!runtimePromise.current) {
@@ -542,6 +549,20 @@ export function useAppController() {
       if (poll === 79) throw new Error("Background task timed out after 200s");
     }
     return {};
+  }, [client]);
+
+  const pollDraftRun = useCallback(async (draftRun: { runId: string; cancelled: boolean }) => {
+    for (let poll = 0; poll < 80; poll += 1) {
+      if (draftRun.cancelled) return null;
+      await sleep(POLL_INTERVAL_MS);
+      if (draftRun.cancelled) return null;
+      const status = await client.getRun(draftRun.runId);
+      if (draftRun.cancelled) return null;
+      if (status.status === "done") return status.result || {};
+      if (status.status === "failed") throw new Error(status.error || "Background task failed");
+      if (poll === 79) throw new Error("Background task timed out after 200s");
+    }
+    return null;
   }, [client]);
 
   const runContactMemoryBackfill = useCallback(async (jobs: Array<Record<string, unknown>>) => {
@@ -1082,6 +1103,7 @@ export function useAppController() {
         userTake: hasExistingDraft ? "" : replyIntent?.userTake,
         hasExistingDraft,
       });
+      let draftRun: { runId: string; cancelled: boolean } | null = null;
       setState((s) => ({ ...s, generatingDraft: true }));
       try {
         const started = await client.startGenerateDraft({
@@ -1095,7 +1117,10 @@ export function useAppController() {
           ai_provider: state.llmProvider,
         });
         if (!started.run_id) throw new Error(started.error || "start_generate_draft did not return a run id");
-        const result = await pollBackgroundRun(started.run_id);
+        draftRun = { runId: started.run_id, cancelled: false };
+        draftGenerationRun.current = draftRun;
+        const result = await pollDraftRun(draftRun);
+        if (!result || draftRun.cancelled) return;
         setState((s) => ({
           ...s,
           draftById: { ...s.draftById, [key]: resultToDraft(result, currentDraft) },
@@ -1103,8 +1128,17 @@ export function useAppController() {
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       } finally {
-        setState((s) => ({ ...s, generatingDraft: false, draftDots: "" }));
+        if (draftRun && draftGenerationRun.current?.runId === draftRun.runId) {
+          draftGenerationRun.current = null;
+          setState((s) => ({ ...s, generatingDraft: false, draftDots: "" }));
+        }
       }
+    },
+    stopDraftGeneration() {
+      if (!draftGenerationRun.current) return;
+      draftGenerationRun.current.cancelled = true;
+      setState((s) => ({ ...s, generatingDraft: false, draftDots: "" }));
+      showToast("Draft generation stopped.");
     },
     clearDraft(cardId) {
       const card = cardId ? findCard(state.allCards, cardId) || findCard(state.cards, cardId) : state.selectedCard;
@@ -1125,6 +1159,35 @@ export function useAppController() {
           ? { ...s.selectedCard, draft_reply: "" }
           : s.selectedCard,
       }));
+    },
+    async markCardRead(cardId) {
+      const card = cardId ? findCard(state.cards, cardId) : state.selectedCard;
+      const cid = card?.id;
+      const key = card?.uiKey || (card ? cardUiKey(card, state.mailbox) : "");
+      if (!card || !cid || state.pendingAction) return;
+      setState((s) => {
+        const nextAllCards = removeCardFromList(s.allCards, key, s.mailbox);
+        const nextCards = removeCardFromList(s.cards, key, s.mailbox);
+        return {
+          ...s,
+          allCards: nextAllCards,
+          cards: nextCards,
+          actionCount: actionCount(nextCards),
+          originalOpen: false,
+          selectedCard: null,
+          lastOpenedCardKey: key,
+          expandedDetails: { ...s.expandedDetails, [key]: false },
+          statusByCardId: { ...s.statusByCardId, [key]: "Read" },
+        };
+      });
+      showToast("Card removed from this briefing.");
+      void client.markCardRead({
+        mailbox: cardMailbox(card, state.mailbox),
+        card_id: cid,
+      }).then(() => loadRunHistory())
+        .catch((error) => {
+          showToast(error instanceof Error ? error.message : String(error));
+        });
     },
     async recordDecision(decision, cardId) {
       const card = cardId ? findCard(state.cards, cardId) : state.selectedCard;

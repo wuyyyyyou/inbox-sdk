@@ -230,7 +230,7 @@ export interface RunHistoryEntry {
   entry_type?: string;       // "scan" | "card_action"
   card_id?: string;
   card_title?: string;
-  action?: string;            // "snooze" | "reply" | "handled_manually" | "no_action_needed" | "cleanup_read" | "restore"
+  action?: string;            // "read" | "snooze" | "reply" | "handled_manually" | "no_action_needed" | "cleanup_read" | "restore"
   detail?: string;
   // card context for rendering history entries
   card_summary?: string;

@@ -5,6 +5,8 @@ import { SCAN_STEPS, scanProgressLabel } from "./runHelpers";
 import type { CleanupMessage, FrontendCard, GmailErrorPopup } from "../../types/mail";
 import { formatBeijingTimestamp } from "../../shared/format";
 import {
+  cardCategory,
+  cardCategoryLabel,
   filteredCards,
   isMainCard,
   lowerCards,
@@ -91,7 +93,9 @@ function AttentionCard({ card }: { card: FrontendCard }) {
   const action = primaryAction(card);
   const recommendation = normalizeRecommendation(card.recommendation);
   const isResolved = card.status === "resolved" || card.status === "snoozed";
-  const resolutionLabel: Record<string, string> = { replied: "Replied", no_action_needed: "No action", handled_manually: "Handled", dismissed: "Dismissed" };
+  const category = cardCategory(card);
+  const categoryLabel = cardCategoryLabel(card);
+  const resolutionLabel: Record<string, string> = { replied: "Replied", read: "Read", no_action_needed: "No action", handled_manually: "Handled", dismissed: "Dismissed" };
   const resolvedLabel = card.status === "snoozed" ? "Snoozed" : (resolutionLabel[card.resolution || ""] || "Resolved");
   return (
     <article
@@ -101,7 +105,11 @@ function AttentionCard({ card }: { card: FrontendCard }) {
       aria-label={card.title || "Attention card"}
     >
       <div className="attention-card-head">
-        <h2 className="attention-title"><span className={`priority-badge priority-${card.priority || "low"}`}>{card.priority || "low"}</span>{card.title || "Email thread needs review"}</h2>
+        <h2 className="attention-title">
+          <span className={`priority-badge priority-${card.priority || "low"}`}>{card.priority || "low"}</span>
+          <span className={`attention-category-badge attention-category-${category}`}>{categoryLabel}</span>
+          <span>{card.title || "Email thread needs review"}</span>
+        </h2>
         {state.selectedMailboxes.length > 1 && mailbox ? (
           <span className="attention-card-mailbox"><span className="mailbox-dot" />{mailbox}</span>
         ) : null}
@@ -550,12 +558,24 @@ export function BriefView() {
             </div>
             {(() => {
               const activeCount = activeFilter === "all" ? (filteredCards(state.cards, "all").length - cleanupCards.length + cleanupCount) : activeFilter === "cleanup" ? cleanupCount : filteredCards(state.cards, activeFilter).length;
-              return activeCount > 0 ? (
-                <button className="category-clear-btn" title={`Clear ${activeFilter}`} onClick={() => setConfirmClear(activeFilter)}>🗑 Clear</button>
-              ) : null;
+              return (
+                <button
+                  className={`category-clear-btn${activeCount > 0 ? "" : " is-placeholder"}`}
+                  title={activeCount > 0 ? `Clear ${activeFilter}` : ""}
+                  disabled={activeCount <= 0}
+                  aria-hidden={activeCount <= 0}
+                  onClick={() => {
+                    if (activeCount > 0) setConfirmClear(activeFilter);
+                  }}
+                >
+                  🗑 Clear
+                </button>
+              );
             })()}
           </div>
-          {!isAll && CATEGORY_NOTE[activeFilter] ? <p className="category-note">{CATEGORY_NOTE[activeFilter]}</p> : null}
+          <p className={`category-note${!isAll && CATEGORY_NOTE[activeFilter] ? "" : " is-placeholder"}`}>
+            {!isAll && CATEGORY_NOTE[activeFilter] ? CATEGORY_NOTE[activeFilter] : " "}
+          </p>
         </>
       ) : null}
       {mainDisplayCards.length ? (

@@ -146,7 +146,7 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     if tool in (
         "get_card_detail", "prepare_attachment_download", "summarize_thread",
         "generate_draft_reply", "generate_ask_draft", "revise_draft", "record_card_decision",
-        "clear_active_cards", "mark_cleanup_read", "record_snooze", "restore_card", "record_learning",
+        "clear_active_cards", "mark_card_read", "mark_cleanup_read", "record_snooze", "restore_card", "record_learning",
         "start_summarize_thread", "start_generate_draft",
         "delete_custom_plan",
         "clear_cards", "clear_history", "reset_all_data", "reset_mailbox_scan_history", "delete_mailbox_data",

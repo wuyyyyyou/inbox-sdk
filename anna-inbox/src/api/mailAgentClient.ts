@@ -212,6 +212,10 @@ export class MailAgentClient {
     return this.invoke<{ ok?: boolean; gmail_error?: string; gmail_code?: string; marked_count?: number }>("mark_cleanup_read", args);
   }
 
+  markCardRead(args: Record<string, unknown>) {
+    return this.invoke<{ ok?: boolean; gmail_error?: string; gmail_code?: string; marked_count?: number }>("mark_card_read", args);
+  }
+
   restoreCard(mailbox: string, cardId: string, storageProvider: string) {
     return this.invoke<{ ok?: boolean }>("restore_card", { mailbox, card_id: cardId, storage_provider: storageProvider });
   }

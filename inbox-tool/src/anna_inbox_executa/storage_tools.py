@@ -2,16 +2,7 @@ from __future__ import annotations
 
 from anna_inbox_executa.common import *
 
-async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Mark cleanup-bundle messages as read in Gmail and update the card in storage."""
-    mailbox = str(arguments.get("mailbox", "")).strip()
-    card_id = str(arguments.get("card_id", "")).strip()
-    raw_ids = arguments.get("message_ids") or []
-    message_ids = [str(mid).strip() for mid in raw_ids if str(mid).strip()] if isinstance(raw_ids, list) else []
-    if not mailbox or not card_id or not message_ids:
-        return {"error": "mailbox, card_id, and message_ids (non-empty array) are required"}
-
-    # 1. Gmail batchModify: remove UNREAD label
+async def _mark_gmail_messages_read(mailbox: str, message_ids: list[str]) -> tuple[dict[str, Any] | None, str, str]:
     gmail_result = None
     gmail_error = ""
     gmail_code = ""
@@ -28,6 +19,20 @@ async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]
                 "Gmail rejected mark-as-read with 403. The current OAuth token likely does not include Gmail modify permission. "
                 "Please re-authorize Gmail with modify scope, then try again."
             )
+    return gmail_result, gmail_error, gmail_code
+
+
+async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Mark cleanup-bundle messages as read in Gmail and update the card in storage."""
+    mailbox = str(arguments.get("mailbox", "")).strip()
+    card_id = str(arguments.get("card_id", "")).strip()
+    raw_ids = arguments.get("message_ids") or []
+    message_ids = [str(mid).strip() for mid in raw_ids if str(mid).strip()] if isinstance(raw_ids, list) else []
+    if not mailbox or not card_id or not message_ids:
+        return {"error": "mailbox, card_id, and message_ids (non-empty array) are required"}
+
+    # 1. Gmail batchModify: remove UNREAD label
+    gmail_result, gmail_error, gmail_code = await _mark_gmail_messages_read(mailbox, message_ids)
 
     # 2. Keep card visible (pending) — read state is tracked frontend-side
     # Write history
@@ -54,6 +59,47 @@ async def _handle_mark_cleanup_read(arguments: dict[str, Any]) -> dict[str, Any]
         "gmail_result": gmail_result,
         "gmail_error": gmail_error,
         "gmail_code": gmail_code,
+    }
+
+
+async def _handle_mark_card_read(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Mark a regular review card's Gmail message as read, then resolve the card locally as read."""
+    mailbox = str(arguments.get("mailbox", "")).strip()
+    card_id = str(arguments.get("card_id", "")).strip()
+    if not mailbox or not card_id:
+        return {"error": "mailbox and card_id are required"}
+
+    from mail_agent.storage.ops import append_card_action, get_active_cards, update_card_status
+
+    cards = await get_active_cards(mailbox)
+    card = next((item for item in cards.cards if item.card_id == card_id), None)
+    if not card:
+        return {"error": f"Card {card_id} not found"}
+    if card.card_type == "cleanup_bundle" or card.user_action != "review":
+        return {"error": f"mark_card_read only supports review cards, got user_action={card.user_action or 'unknown'}"}
+    if not card.message_id:
+        return {"error": f"Card {card_id} does not have a Gmail message_id"}
+
+    message_ids = [card.message_id]
+    gmail_result, gmail_error, gmail_code = await _mark_gmail_messages_read(mailbox, message_ids)
+
+    if not gmail_error:
+        await update_card_status(mailbox, card_id, "resolved", "read")
+        await append_card_action(
+            mailbox,
+            card_id,
+            card.title or card_id,
+            "read",
+            "Marked read in Gmail",
+        )
+
+    return {
+        "ok": gmail_error == "",
+        "marked_count": len(message_ids),
+        "gmail_result": gmail_result,
+        "gmail_error": gmail_error,
+        "gmail_code": gmail_code,
+        "card_id": card_id,
     }
 
 

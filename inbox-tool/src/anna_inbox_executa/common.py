@@ -380,6 +380,14 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "mark_card_read",
+            "description": "Mark a review card's Gmail message as read (remove UNREAD label) and resolve the card locally as read.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "card_id", "type": "string", "description": "Card ID.", "required": True},
+            ],
+        },
+        {
             "name": "record_snooze",
             "description": "Snooze a card (tomorrow, next_week) or record a permanent preference (dont_prioritize).",
             "parameters": [

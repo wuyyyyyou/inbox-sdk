@@ -94,7 +94,8 @@ LLM 输出 action_type (如 create_draft)
 | Draft reply — textarea | ✅ 已实现 | 用户可编辑，`input` 事件实时同步到 `state.draftById` |
 | Draft reply — revise | ✅ 已实现 | 用户输入反馈，LLM 基于当前草稿 + 修改要求重新生成 |
 | Draft reply — generate | ✅ 已实现 | 首次生成 draft，LLM 返回 `subject`/`body`/`tone`/`note` |
-| 底部动作 — Reply now | ⚠️ Stub | 仅 `showToast("Reply now requires final user confirmation in this MVP.")`，无后端工具 |
+| 底部动作 — Reply now | ✅ 已实现 | 调用 `reply_now`，真实发送 Gmail 回复并刷新本地卡片 |
+| 底部动作 — Read | ✅ 已实现 | review 卡显示独立 `Read` 按钮，走 `mark_card_read`，同步 Gmail 已读并本地移除卡片 |
 | 底部动作 — No action needed | ✅ 已实现 | 调用 `record_card_decision("no_action_needed")`，标记卡片为 resolved |
 | 底部动作 — Handled manually | ✅ 已实现 | 调用 `record_card_decision("handled_manually")`，标记卡片为 resolved |
 
@@ -106,8 +107,9 @@ LLM 输出 action_type (如 create_draft)
 | `summarize_thread` | LLM 总结线程 |
 | `generate_draft_reply` | LLM 生成回复草稿 |
 | `revise_draft` | LLM 根据反馈修改草稿 |
+| `mark_card_read` | review 卡标记已读，写 Gmail 并 resolve 本地卡片 |
 | `record_card_decision` | 记录用户处理决定 |
-| `reply_now` | **不存在** |
+| `reply_now` | 发送回复到 Gmail |
 
 ---
 
@@ -147,11 +149,11 @@ LLM 输出 action_type (如 create_draft)
 
 | 差距 | PRD 要求 | 当前状态 | 优先级 |
 |------|---------|---------|--------|
-| Reply now 无后端 | MVP 可 mock | 仅前端 toast | 低（PRD 允许 mock） |
 | No action needed 未记录偏好 | "可记录为用户偏好信号" | 仅标记 resolved，不写 learning | 中 |
 | Reply all 弱化方式 | "弱化展示" | `disabled` 属性完全禁用 | 低 |
 | 草稿编辑保护 | "Anna 修改不能覆盖用户已编辑内容，除非用户明确确认" | 用户编辑随 `input` 事件实时同步到 state，revision 基于当前内容（含用户编辑），未被覆盖 | ✅ 合理 |
 | 抽屉标题 | "Handle thread" | ✅ 与 PRD 一致 |
+| Review 卡 Read 语义 | 显式已读并停止提醒 | 已有独立 `Read` 按钮与 `mark_card_read` 后端链路 | ✅ |
 
 ### 3.4 技术方案上的优化点
 
@@ -276,12 +278,16 @@ def _build_card_actions(fd: Any) -> list[CardAction]:
 
 PRD 说"可记录为用户偏好信号"。当前 `record_card_decision("no_action_needed")` 只标记卡片 resolved。建议在 `_handle_v2_tool("record_card_decision")` 中，当 decision 为 `no_action_needed` 时，顺便调用 `add_snooze_sender()` 和 `add_snooze_thread()`，记录用户对该 sender/thread 的负向偏好。这样下次扫描时该 sender 会被自动降权。
 
-### 4.5 Reply now 的 MVP 实现
+### 4.5 Reply now / Read 的当前实现
 
-PRD 允许 mock，但当前连后端工具都没有。建议：
-1. 新增 `reply_now` JSON-RPC 工具
-2. MVP 阶段：验证 draft 非空，调用 Gmail API 发送（如果需要真实发送）或返回 "Mock: reply would be sent" 的确认
-3. 发送后标记卡片为 resolved
+当前已落地：
+1. `reply_now` JSON-RPC 工具已接入，验证 draft 后真实发送 Gmail 回复。
+2. 发送成功后会刷新本地卡片状态，并在历史中记录回复动作。
+3. review 卡新增独立 `Read` 按钮，调用 `mark_card_read`：
+   - 后端按 `card_id` 找到锚点 `message_id`
+   - 调用 Gmail `batch_mark_read`
+   - 成功后将卡片标记为 `resolved/read`
+4. `mark_card_read` 在后端显式限制为 `user_action="review"`，避免 reply 卡被误清理。
 
 ### 4.6 涉及的文件改动总结
 
@@ -289,6 +295,8 @@ PRD 允许 mock，但当前连后端工具都没有。建议：
 |------|------|
 | `storage_types.py` | `CardAction` 新增 `button_label` 字段 |
 | `card_service.py` | 新增 `_PRIMARY_BUTTON_LABELS`；`_build_card_actions` 简化并填充 `button_label` |
-| `app.js` | `renderAttentionCard` 中按钮文案用 `primaryAction(card).label`；fallback 改为读取 `button_label \|\| label \|\| "Handle"` |
-| `main.py` | `record_card_decision("no_action_needed")` 写入 snooze 偏好；可选新增 `reply_now` 工具 |
-| `handle_service.py` | 可选新增 `reply_now` 的 LLM/发送逻辑 |
+| `HandleView.tsx` | review 卡新增独立 `Read` 按钮；草稿生成中支持 `Stop generate` |
+| `BriefView.tsx` | 卡片头部增加 `Needs reply / Needs review` 标签；标签切换布局防抖 |
+| `useAppController.ts` | 新增 `markCardRead()` optimistic 移除；草稿生成轮询支持取消 |
+| `storage_tools.py` | 新增 `mark_card_read` Gmail 已读链路，并限制只允许 review 卡使用 |
+| `reply_now` / `record_card_decision` | 已有后端链路，保持各自语义：回复、已读、本地无动作、手动处理分离 |

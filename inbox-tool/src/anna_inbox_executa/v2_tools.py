@@ -684,6 +684,9 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         await append_card_action(mailbox, card_id, card_title, decision, "", **_card_context(card) if card else {})
         return {"ok": updated is not None, "card_id": card_id, "decision": decision}
 
+    if tool == "mark_card_read":
+        return await _handle_mark_card_read(arguments)
+
     if tool == "clear_active_cards":
         if not mailbox:
             return {"error": "mailbox is required"}
