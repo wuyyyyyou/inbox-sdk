@@ -14,7 +14,7 @@ import {
 } from "../../types/mail";
 import { DRAFT_PREFERENCE_LABELS, resolveDraftPreferences } from "./draftPreferences";
 import { cardCategory, cardCategoryLabel, nextCardId } from "../brief/cardHelpers";
-import { contactContextLines, normalizeEmailSummaryItems, uniqueLines } from "./summaryContent";
+import { uniqueLines } from "./summaryContent";
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : String(value ?? "");
@@ -64,6 +64,13 @@ function emailAddress(value: unknown): string {
   if (angle?.[1]) return angle[1].trim();
   const email = text.match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
   return email?.[0]?.toLowerCase() || text;
+}
+
+function displayName(value: unknown): string {
+  const text = asString(value).trim();
+  const withoutAngle = text.replace(/<[^>]+>/g, "").replace(/"/g, "").trim();
+  if (withoutAngle) return withoutAngle;
+  return emailAddress(text) || "Unknown";
 }
 
 function messageDirection(message: ThreadContextMessage, ownerEmail: string): "inbound" | "outbound" {
@@ -165,7 +172,6 @@ export function HandleView() {
   const original = card.original || {};
   const detail = state.selectedCardDetail || {};
   const context = detail.thread_context || {};
-  const contactContext = detail.contact_context || {};
   const latestBody = detail.latest_body || "";
   const latestBodyHtml = detail.latest_body_html || "";
   const attachments = Array.isArray(detail.attachments) ? detail.attachments : (Array.isArray(card.attachments) ? card.attachments : []);
@@ -187,21 +193,18 @@ export function HandleView() {
   const contextExpanded = Boolean(state.threadContextExpanded[key]);
   const bodyExpanded = Boolean(state.threadContextExpanded[`${key}_body`]);
   const bodyVisible = bodyLoaded && bodyExpanded;
-  const senderName = asString(context.from || original.from || "").split("<")[0].trim().replace(/"/g, "") || "Unknown";
+  const senderEmail = emailAddress(context.from || original.from || "");
+  const recipientValue = context.to || original.to || "";
+  const toEmail = emailAddress(recipientValue) || asString(recipientValue);
   const threadSubject = asString(context.subject || original.thread || card.title || "").slice(0, 80);
+  const latestTime = context.latest_time || original.time || "";
+  const messageCount = Math.max(1, Number(context.message_count || threadMessages.length || 1));
   const hasDraft = Boolean(draft);
   const category = cardCategory(card);
   const isReviewCard = category === "review";
   const categoryLabel = hasDraft ? "Reply ready" : cardCategoryLabel(card);
   const draftDisplay = state.generatingDraft && !draft ? "Anna is drafting a reply..." : draft;
   const nid = nextCardId(state);
-  const relatedContext = contactContextLines(contactContext);
-  const fallbackRelatedContext = uniqueLines(normalizeEmailSummaryItems([card.summary, card.thread_summary]));
-  const relatedContextItems = uniqueLines([
-    ...relatedContext,
-    ...normalizeEmailSummaryItems(summary?.related_context),
-    ...(relatedContext.length ? [] : fallbackRelatedContext),
-  ]);
   const BODY_PREVIEW = 500;
   const loadingBody = state.pendingAction === `body:${key}`;
   const loadingThreadContext = state.pendingAction === `thread:${key}`;
@@ -242,24 +245,18 @@ export function HandleView() {
     );
   };
 
-  const relatedContextBlock = () => {
-    if (!relatedContextItems.length) return null;
-    return (
-      <section className="review-block is-summary">
-        <div className="review-block-kicker">Email summary</div>
-        <ul>{relatedContextItems.map((line, i) => <li key={i}>{line}</li>)}</ul>
-      </section>
-    );
-  };
-
   const threadSummaryBlock = () => {
     if (state.summarizingThread) {
-      return <section className="review-block is-summary is-loading"><p>Anna is reading the thread and preparing a summary...</p></section>;
+      return (
+        <section className="review-block is-summary is-loading">
+          <p>Anna is reviewing the previous messages so you can quickly remember the context.</p>
+        </section>
+      );
     }
     if (!summary) {
       return (
         <section className="review-block is-summary">
-          <p>Anna can read the full thread and summarize what matters before you draft.</p>
+          <p>Anna can read the thread and pull forward the context that matters before you draft.</p>
           <div className="proposal-actions"><button className="soft-btn" onClick={() => void actions.summarizeSelectedThread()}>Summarize thread</button></div>
         </section>
       );
@@ -380,14 +377,44 @@ export function HandleView() {
       <button className="detail-back" onClick={actions.closeCardDetail}>← Back to brief</button>
       <article className="detail-card">
         <div className="reply-review-head">
-          <div>
-            <h2 className="reply-review-title">{card.title || "Email needs review"}</h2>
-            <p className="detail-subtitle">{senderName} · {threadSubject}</p>
+          <div className="detail-head-main">
+            <h2 className="reply-review-title">{threadSubject || card.title || "Email needs review"}</h2>
+            {card.title && threadSubject && card.title !== threadSubject ? (
+              <p className="detail-subtitle">{card.title}</p>
+            ) : null}
+            <div className="detail-mail-header" aria-label="Email metadata">
+              <div className="detail-mail-route">
+                <span className="detail-mail-from">{displayName(context.from || original.from || "")}</span>
+                {senderEmail ? <span className="detail-mail-address">&lt;{senderEmail}&gt;</span> : null}
+                <span className="detail-mail-sep">to</span>
+                <span className="detail-mail-to">{toEmail || ownerEmail || "Unknown recipient"}</span>
+              </div>
+              {latestTime ? <span className="detail-mail-time">{formatBeijingTimestamp(latestTime)}</span> : null}
+            </div>
           </div>
           <span className={`category-tag ${hasDraft ? "is-ready-state" : ""}`}>{categoryLabel}</span>
         </div>
         <div className="detail-workbench">
           <div className="detail-context-column">
+            {threadSummaryBlock()}
+            <section className="review-block is-quiet is-thread-context">
+              <button className="thread-context-toggle" aria-expanded={contextExpanded} onClick={() => actions.toggleThreadContext(key)}>
+                <strong>Thread context · {messageCount} message{messageCount === 1 ? "" : "s"}</strong>
+                <span>{contextExpanded ? "Collapse" : "Expand"}</span>
+              </button>
+              {contextExpanded ? (
+                <>
+                  <div className="thread-context-grid">
+                    <div className="thread-context-row"><span>From</span><strong>{asString(context.from || original.from || "")}</strong></div>
+                    <div className="thread-context-row"><span>To</span><strong>{asString(context.to || original.to || "")}</strong></div>
+                    <div className="thread-context-row"><span>CC</span><strong>{cc || "None"}</strong></div>
+                    <div className="thread-context-row"><span>Thread</span><strong>{threadSubject}</strong></div>
+                    <div className="thread-context-row"><span>Latest</span><strong>{formatBeijingTimestamp(latestTime)}</strong></div>
+                  </div>
+                  {threadContextMessagesBlock()}
+                </>
+              ) : null}
+            </section>
             {!bodyVisible ? (
               <section className={`review-block is-quiet is-disclosure${loadingBody ? " is-loading" : ""}`}>
                 <div>
@@ -452,26 +479,6 @@ export function HandleView() {
               </section>
             )}
             {attachmentsBlock()}
-            {relatedContextBlock()}
-            <section className="review-block is-quiet is-thread-context">
-              <button className="thread-context-toggle" aria-expanded={contextExpanded} onClick={() => actions.toggleThreadContext(key)}>
-                <strong>Thread context · {senderName} · {formatBeijingTimestamp(context.latest_time || original.time)} · {asString(context.message_count || 1)} message{Number(context.message_count || 1) === 1 ? "" : "s"}</strong>
-                <span>{contextExpanded ? "Collapse" : "Expand"}</span>
-              </button>
-              {contextExpanded ? (
-                <>
-                  <div className="thread-context-grid">
-                    <div className="thread-context-row"><span>From</span><strong>{asString(context.from || original.from || "")}</strong></div>
-                    <div className="thread-context-row"><span>To</span><strong>{asString(context.to || original.to || "")}</strong></div>
-                    <div className="thread-context-row"><span>CC</span><strong>{cc || "None"}</strong></div>
-                    <div className="thread-context-row"><span>Thread</span><strong>{threadSubject}</strong></div>
-                    <div className="thread-context-row"><span>Latest</span><strong>{formatBeijingTimestamp(context.latest_time || original.time)}</strong></div>
-                  </div>
-                  {threadContextMessagesBlock()}
-                </>
-              ) : null}
-            </section>
-            {threadSummaryBlock()}
           </div>
           <aside className="detail-action-column" aria-label="Reply composer">
             <section className={`review-block is-composer ${state.generatingDraft ? "is-loading" : ""}`}>

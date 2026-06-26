@@ -19,7 +19,8 @@
 
 当前仍保留为后续打磨项的内容：
 
-- 评估是否合并 `Email summary` 和 `Anna noticed` 为统一 `Insight` 区域。
+- Header 继续向真实邮件头信息靠拢，优先展示发件人与收件关系、时间。
+- 左侧摘要区收敛为单一 `Anna noticed` 模块，不再并列保留 `Email summary`。
 - 继续微调视觉层级、块间距和桌面/移动端细节。
 
 ## 一、问题判断
@@ -96,7 +97,7 @@ Draft reply
 
 - Header 横跨两栏。
 - 标题保持为最大文本层级。
-- 第二行显示发件人、邮件主题、时间、message count、mailbox。
+- 第二行显示发件人名称、发件人邮箱、`to`、收件人名称、收件人邮箱，时间右对齐并弱化。
 - 状态 badge 固定在右上角，例如 `Needs reply`、`Needs review`、`Reply ready`。
 
 验收标准：
@@ -127,11 +128,10 @@ Draft reply
 
 建议：
 
-- 第一阶段先保留两个模块，只调整层级。
-- 后续可合并为一个 `Insight` 区域：
-  - 上半部分展示邮件事实摘要。
-  - 下半部分展示 Anna 的判断和 reply focus。
-- Bullet 样式收敛，减少重复的 AI avatar 或装饰。
+- 删除独立的 `Email summary` 模块，左侧摘要统一收敛为 `Anna noticed`。
+- `Anna noticed` 只在线程总结已经生成后显示；未生成时仅展示轻量说明与 CTA。
+- 生成后展示 Anna 的总结与 reply focus。
+- Bullet 样式收敛，减少重复装饰。
 
 验收标准：
 
@@ -144,7 +144,7 @@ Draft reply
 
 建议：
 
-- 默认折叠为一行：`Thread context · sender · time · N messages`。
+- 默认折叠为一行：`Thread context · N messages`。
 - 展开后左侧内部滚动，不推动整个详情页。
 - 多消息时保留现有 hidden messages loader。
 - metadata grid 用紧凑行距，减少“表格式大卡片”的占位。

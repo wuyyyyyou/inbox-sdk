@@ -10,6 +10,7 @@ Build the Anna Inbox Executa binary for the current platform and package it.
 Supported platforms:
   darwin-arm64
   darwin-x86_64
+  linux-x86_64
   windows-x86_64
 
 Options:
@@ -103,6 +104,12 @@ detect_platform() {
         *) echo "Unsupported Windows architecture: $arch_name" >&2; return 1 ;;
       esac
       ;;
+    Linux)
+      case "$arch_name" in
+        x86_64|amd64) echo "linux-x86_64" ;;
+        *) echo "Unsupported Linux architecture: $arch_name" >&2; return 1 ;;
+      esac
+      ;;
     *)
       echo "Unsupported platform: $os_name $arch_name" >&2
       return 1
@@ -175,7 +182,7 @@ PYINSTALLER_ARGS=(
   --add-data "$SOURCE_MANIFEST_ARG${ADD_DATA_SEP}."
 )
 
-if [ "$IS_WINDOWS" -eq 0 ]; then
+if [[ "$PLATFORM" == linux-* ]]; then
   PYINSTALLER_ARGS+=(--strip)
 fi
 
@@ -196,6 +203,7 @@ if [ "$IS_WINDOWS" -eq 0 ]; then
   chmod 755 "$PACKAGE_DIR/bin/$BINARY_NAME"
   if command -v codesign >/dev/null 2>&1; then
     codesign --force --sign - "$PACKAGE_DIR/bin/$BINARY_NAME" >/dev/null
+    codesign --verify --verbose=2 "$PACKAGE_DIR/bin/$BINARY_NAME" >/dev/null
   fi
 fi
 
@@ -215,6 +223,9 @@ package_manifest = {
         "binary": {
             "entrypoint": {
                 "default": "bin/inbox-tool",
+                "darwin-arm64": "bin/inbox-tool",
+                "darwin-x86_64": "bin/inbox-tool",
+                "linux-x86_64": "bin/inbox-tool",
                 "windows-x86_64": "bin/inbox-tool.exe",
                 "windows-arm64": "bin/inbox-tool.exe",
             },
