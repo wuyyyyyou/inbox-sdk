@@ -1,4 +1,4 @@
-import { Fragment, useState, type MouseEvent } from "react";
+import { Fragment, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
 import DOMPurify from "dompurify";
 import { useApp } from "../../app/AppContext";
 import { formatBeijingTimestamp } from "../../shared/format";
@@ -160,6 +160,7 @@ export function HandleView() {
   const { state, actions } = useApp();
   const card = state.selectedCard;
   if (!card) return null;
+  const draftTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const key = card.uiKey || card.id;
   const original = card.original || {};
   const detail = state.selectedCardDetail || {};
@@ -207,6 +208,13 @@ export function HandleView() {
   const bodyTruncated = latestBodyHtml
     ? latestBodyHtml.length > BODY_PREVIEW
     : latestBody.length > BODY_PREVIEW;
+
+  useLayoutEffect(() => {
+    const textarea = draftTextareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${textarea.scrollHeight}px`;
+  }, [draftDisplay, key]);
 
   const attachmentsBlock = () => {
     if (!attachments.length || !bodyVisible) return null;
@@ -378,184 +386,190 @@ export function HandleView() {
           </div>
           <span className={`category-tag ${hasDraft ? "is-ready-state" : ""}`}>{categoryLabel}</span>
         </div>
-        {!bodyVisible ? (
-          <section className={`review-block is-quiet${loadingBody ? " is-loading" : ""}`}>
-            <p>Original email body is hidden until you choose to view it.</p>
-            {attachments.length ? (
-              <p className="attachment-download-hint">
-                This email has {attachments.length} attachment{attachments.length === 1 ? "" : "s"}. Show full email to download {attachments.length === 1 ? "it" : "them"}.
-              </p>
-            ) : null}
-            <div className="proposal-actions">
-              <button className="soft-btn compact" disabled={loadingBody} onClick={() => void actions.loadSelectedEmailBody()}>
-                {loadingBody ? "Loading email..." : "Show full email"}
+        <div className="detail-workbench">
+          <div className="detail-context-column">
+            {!bodyVisible ? (
+              <section className={`review-block is-quiet is-disclosure${loadingBody ? " is-loading" : ""}`}>
+                <div>
+                  <p>Original email body is hidden until you choose to view it.</p>
+                  {attachments.length ? (
+                    <p className="attachment-download-hint">
+                      This email has {attachments.length} attachment{attachments.length === 1 ? "" : "s"}. Show full email to download {attachments.length === 1 ? "it" : "them"}.
+                    </p>
+                  ) : null}
+                </div>
+                <button className="soft-btn compact" disabled={loadingBody} onClick={() => void actions.loadSelectedEmailBody()}>
+                  {loadingBody ? "Loading email..." : "Show full email"}
+                </button>
+              </section>
+            ) : latestBodyHtml ? (
+              <section className="review-block is-original-body">
+                <div
+                  className={`original-body original-body-html${bodyTruncated && !bodyExpanded ? " is-clamped" : ""}`}
+                  style={{ wordBreak: "break-all", overflowWrap: "break-word" }}
+                  onClick={handleOriginalBodyClick}
+                  dangerouslySetInnerHTML={{
+                    __html: DOMPurify.sanitize(latestBodyHtml, {
+                      ALLOWED_TAGS: [
+                        "a", "abbr", "b", "blockquote", "br", "caption", "center",
+                        "cite", "code", "col", "colgroup", "dd", "del", "details",
+                        "dfn", "div", "dl", "dt", "em", "figcaption", "figure",
+                        "font", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i",
+                        "img", "ins", "kbd", "li", "map", "area", "mark", "ol",
+                        "p", "pre", "q", "s", "samp", "small", "span", "strike",
+                        "strong", "sub", "summary", "sup", "table", "tbody", "td",
+                        "tfoot", "th", "thead", "time", "tr", "u", "ul", "var",
+                      ],
+                      ALLOWED_ATTR: [
+                        "alt", "align", "bgcolor", "border", "cellpadding",
+                        "cellspacing", "class", "color", "colspan", "face",
+                        "height", "href", "hspace", "id", "loading", "name",
+                        "nowrap", "referrerpolicy", "rel", "rowspan", "size",
+                        "src", "style", "target", "title", "valign", "vspace",
+                        "width",
+                      ],
+                      ALLOW_DATA_ATTR: false,
+                      ALLOWED_URI_REGEXP: /^(?:(?:https?|ftp|mailto|data|cid):|[^/]+\/[^/]+)/i,
+                    }),
+                  }}
+                />
+                <button className="soft-btn compact" style={{ marginTop: 6 }} onClick={() => actions.toggleThreadContext(`${key}_body`)}>
+                  Show less
+                </button>
+              </section>
+            ) : latestBody ? (
+              <section className="review-block is-original-body">
+                <div className="original-body" style={{ whiteSpace: "pre-wrap", wordBreak: "break-all", overflowWrap: "break-word" }}>
+                  {bodyTruncated && !bodyExpanded ? latestBody.slice(0, BODY_PREVIEW) + "…" : latestBody}
+                </div>
+                <button className="soft-btn compact" style={{ marginTop: 6 }} onClick={() => actions.toggleThreadContext(`${key}_body`)}>
+                  Show less
+                </button>
+              </section>
+            ) : (
+              <section className="review-block is-quiet is-disclosure">
+                <p>Full email body is not available for this card.</p>
+              </section>
+            )}
+            {attachmentsBlock()}
+            {relatedContextBlock()}
+            <section className="review-block is-quiet is-thread-context">
+              <button className="thread-context-toggle" aria-expanded={contextExpanded} onClick={() => actions.toggleThreadContext(key)}>
+                <strong>Thread context · {senderName} · {formatBeijingTimestamp(context.latest_time || original.time)} · {asString(context.message_count || 1)} message{Number(context.message_count || 1) === 1 ? "" : "s"}</strong>
+                <span>{contextExpanded ? "Collapse" : "Expand"}</span>
               </button>
-            </div>
-          </section>
-        ) : latestBodyHtml ? (
-                <section className="review-block">
-            <div
-              className={`original-body original-body-html${bodyTruncated && !bodyExpanded ? " is-clamped" : ""}`}
-              style={{ wordBreak: "break-all", overflowWrap: "break-word" }}
-              onClick={handleOriginalBodyClick}
-              dangerouslySetInnerHTML={{
-                __html: DOMPurify.sanitize(latestBodyHtml, {
-                  ALLOWED_TAGS: [
-                    "a", "abbr", "b", "blockquote", "br", "caption", "center",
-                    "cite", "code", "col", "colgroup", "dd", "del", "details",
-                    "dfn", "div", "dl", "dt", "em", "figcaption", "figure",
-                    "font", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i",
-                    "img", "ins", "kbd", "li", "map", "area", "mark", "ol",
-                    "p", "pre", "q", "s", "samp", "small", "span", "strike",
-                    "strong", "sub", "summary", "sup", "table", "tbody", "td",
-                    "tfoot", "th", "thead", "time", "tr", "u", "ul", "var",
-                  ],
-                  ALLOWED_ATTR: [
-                    "alt", "align", "bgcolor", "border", "cellpadding",
-                    "cellspacing", "class", "color", "colspan", "face",
-                    "height", "href", "hspace", "id", "loading", "name",
-                    "nowrap", "referrerpolicy", "rel", "rowspan", "size",
-                    "src", "style", "target", "title", "valign", "vspace",
-                    "width",
-                  ],
-                  ALLOW_DATA_ATTR: false,
-                  ALLOWED_URI_REGEXP: /^(?:(?:https?|ftp|mailto|data|cid):|[^/]+\/[^/]+)/i,
-                }),
-              }}
-            />
-            <button className="soft-btn compact" style={{ marginTop: 6 }} onClick={() => actions.toggleThreadContext(`${key}_body`)}>
-              Show less
-            </button>
-          </section>
-        ) : latestBody ? (
-          <section className="review-block">
-            <div className="original-body" style={{ whiteSpace: "pre-wrap", wordBreak: "break-all", overflowWrap: "break-word" }}>
-              {bodyTruncated && !bodyExpanded ? latestBody.slice(0, BODY_PREVIEW) + "…" : latestBody}
-            </div>
-            <button className="soft-btn compact" style={{ marginTop: 6 }} onClick={() => actions.toggleThreadContext(`${key}_body`)}>
-              Show less
-            </button>
-          </section>
-        ) : (
-          <section className="review-block is-quiet">
-            <p>Full email body is not available for this card.</p>
-          </section>
-        )}
-        {attachmentsBlock()}
-        {relatedContextBlock()}
-        <section className="review-block is-quiet">
-          <button className="thread-context-toggle" aria-expanded={contextExpanded} onClick={() => actions.toggleThreadContext(key)}>
-            <strong>Thread context · {senderName} · {formatBeijingTimestamp(context.latest_time || original.time)} · {asString(context.message_count || 1)} message{Number(context.message_count || 1) === 1 ? "" : "s"}</strong>
-            <span>{contextExpanded ? "Collapse" : "Expand"}</span>
-          </button>
-          {contextExpanded ? (
-            <>
-              <div className="thread-context-grid">
-                <div className="thread-context-row"><span>From</span><strong>{asString(context.from || original.from || "")}</strong></div>
-                <div className="thread-context-row"><span>To</span><strong>{asString(context.to || original.to || "")}</strong></div>
-                <div className="thread-context-row"><span>CC</span><strong>{cc || "None"}</strong></div>
-                <div className="thread-context-row"><span>Thread</span><strong>{threadSubject}</strong></div>
-                <div className="thread-context-row"><span>Latest</span><strong>{formatBeijingTimestamp(context.latest_time || original.time)}</strong></div>
-              </div>
-              {threadContextMessagesBlock()}
-            </>
-          ) : null}
-        </section>
-        {threadSummaryBlock()}
-        <section className={`review-block is-composer ${state.generatingDraft ? "is-loading" : ""}`}>
-          <h3 className="review-block-title">Draft reply</h3>
-          {showGapForm ? (
-            <GapForm
-              cardKey={key}
-              gaps={replyGaps}
-              onSubmit={(answers) => void actions.generateDraftWithAnswers(answers)}
-              onSkip={() => void actions.generateDraft()}
-            />
-          ) : (
-            <>
-              <div className="reply-mode-row">
-                <div className="reply-mode-control" role="group" aria-label="Reply mode">
-                  <button className={`reply-mode-btn ${replyMode === "reply_to_sender" ? "is-active" : ""}`} onClick={() => actions.setReplyMode(key, "reply_to_sender")}>Reply to sender</button>
-                  <button className={`reply-mode-btn ${replyMode === "reply_all" ? "is-active" : ""}`} disabled={!cc || cc === "None"} onClick={() => actions.setReplyMode(key, "reply_all")}>Reply all</button>
-                </div>
-                {cc && cc !== "None" ? null : <span className="reply-mode-note">No CC recipients</span>}
-              </div>
-              <div className="draft-controls-grid">
-                {DRAFT_CONTROL_CONFIG.map(({ field, options }) => (
-                  <label className="draft-control" key={field}>
-                    <span className="draft-control-label">{DRAFT_PREFERENCE_LABELS[field]}</span>
-                    <select
-                      className="draft-control-select"
-                      value={draftPreferences[field]}
-                      disabled={state.generatingDraft}
-                      onChange={(e) => actions.setDraftPreference(key, field, e.target.value)}
-                    >
-                      {options.map((option) => <option key={option} value={option}>{option}</option>)}
-                    </select>
-                  </label>
-                ))}
-              </div>
-              {showDecisionBlock ? (
-                <div className="reply-intent-block">
-                  <div className="reply-intent-head">
-                    <span className="reply-intent-kicker">Decision needed</span>
-                    <p className="reply-intent-title">Anna needs your decision before drafting.</p>
+              {contextExpanded ? (
+                <>
+                  <div className="thread-context-grid">
+                    <div className="thread-context-row"><span>From</span><strong>{asString(context.from || original.from || "")}</strong></div>
+                    <div className="thread-context-row"><span>To</span><strong>{asString(context.to || original.to || "")}</strong></div>
+                    <div className="thread-context-row"><span>CC</span><strong>{cc || "None"}</strong></div>
+                    <div className="thread-context-row"><span>Thread</span><strong>{threadSubject}</strong></div>
+                    <div className="thread-context-row"><span>Latest</span><strong>{formatBeijingTimestamp(context.latest_time || original.time)}</strong></div>
                   </div>
-                  <div className="reply-goal-row" role="group" aria-label="Reply goal">
-                    {DRAFT_REPLY_GOAL_OPTIONS.map((option) => {
-                      const active = replyGoal === option;
-                      return (
-                        <button
-                          key={option}
-                          className={`reply-goal-btn ${active ? "is-active" : ""}`}
-                          aria-pressed={active}
-                          disabled={state.generatingDraft}
-                          onClick={() => actions.setReplyIntentGoal(key, active ? "" : option)}
-                        >
-                          {option}
-                        </button>
-                      );
-                    })}
-                  </div>
-                  <label className="draft-control">
-                    <span className="draft-control-label">Your take</span>
-                    <input
-                      type="text"
-                      className="reply-intent-input"
-                      placeholder="Tell Anna your take before drafting..."
-                      value={replyIntentText}
-                      disabled={state.generatingDraft}
-                      onChange={(e) => actions.setReplyIntentText(key, e.target.value)}
-                    />
-                  </label>
-                  <div className="reply-intent-actions">
-                    <button className="soft-btn" onClick={state.generatingDraft ? actions.stopDraftGeneration : () => void actions.generateDraft(undefined, { ignoreReplyIntent: true })}>
-                      {state.generatingDraft ? "Stop generate" : "Skip, draft anyway"}
-                    </button>
-                    <button className="primary-btn" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>
-                      {state.generatingDraft ? "Generating..." : "Generate draft"}
-                    </button>
-                  </div>
-                </div>
+                  {threadContextMessagesBlock()}
+                </>
+              ) : null}
+            </section>
+            {threadSummaryBlock()}
+          </div>
+          <aside className="detail-action-column" aria-label="Reply composer">
+            <section className={`review-block is-composer ${state.generatingDraft ? "is-loading" : ""}`}>
+              <h3 className="review-block-title">Draft reply</h3>
+              {showGapForm ? (
+                <GapForm
+                  cardKey={key}
+                  gaps={replyGaps}
+                  onSubmit={(answers) => void actions.generateDraftWithAnswers(answers)}
+                  onSkip={() => void actions.generateDraft()}
+                />
               ) : (
-                <div className="revise-row">
-                  <input type="text" placeholder="Tell Anna how to revise this draft..." value={state.revisionById[key] || ""} disabled={state.generatingDraft} onChange={(e) => actions.setRevision(key, e.target.value)} />
-                  <button className="soft-btn" disabled={state.generatingDraft || !draft.trim()} onClick={() => actions.clearDraft()}>
-                    Clear local draft
-                  </button>
-                  <button className="soft-btn generate-draft-btn is-glow" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>{state.generatingDraft ? "Generating..." : "Ask Anna to revise"}</button>
-                </div>
+                <>
+                  <div className="reply-mode-row">
+                    <div className="reply-mode-control" role="group" aria-label="Reply mode">
+                      <button className={`reply-mode-btn ${replyMode === "reply_to_sender" ? "is-active" : ""}`} onClick={() => actions.setReplyMode(key, "reply_to_sender")}>Reply to sender</button>
+                      <button className={`reply-mode-btn ${replyMode === "reply_all" ? "is-active" : ""}`} disabled={!cc || cc === "None"} onClick={() => actions.setReplyMode(key, "reply_all")}>Reply all</button>
+                    </div>
+                    {cc && cc !== "None" ? null : <span className="reply-mode-note">No CC recipients</span>}
+                  </div>
+                  <div className="draft-controls-grid">
+                    {DRAFT_CONTROL_CONFIG.map(({ field, options }) => (
+                      <label className="draft-control" key={field}>
+                        <span className="draft-control-label">{DRAFT_PREFERENCE_LABELS[field]}</span>
+                        <select
+                          className="draft-control-select"
+                          value={draftPreferences[field]}
+                          disabled={state.generatingDraft}
+                          onChange={(e) => actions.setDraftPreference(key, field, e.target.value)}
+                        >
+                          {options.map((option) => <option key={option} value={option}>{option}</option>)}
+                        </select>
+                      </label>
+                    ))}
+                  </div>
+                  {showDecisionBlock ? (
+                    <div className="reply-intent-block">
+                      <div className="reply-intent-head">
+                        <span className="reply-intent-kicker">Decision needed</span>
+                        <p className="reply-intent-title">Anna needs your decision before drafting.</p>
+                      </div>
+                      <div className="reply-goal-row" role="group" aria-label="Reply goal">
+                        {DRAFT_REPLY_GOAL_OPTIONS.map((option) => {
+                          const active = replyGoal === option;
+                          return (
+                            <button
+                              key={option}
+                              className={`reply-goal-btn ${active ? "is-active" : ""}`}
+                              aria-pressed={active}
+                              disabled={state.generatingDraft}
+                              onClick={() => actions.setReplyIntentGoal(key, active ? "" : option)}
+                            >
+                              {option}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <label className="draft-control">
+                        <span className="draft-control-label">Your take</span>
+                        <input
+                          type="text"
+                          className="reply-intent-input"
+                          placeholder="Tell Anna your take before drafting..."
+                          value={replyIntentText}
+                          disabled={state.generatingDraft}
+                          onChange={(e) => actions.setReplyIntentText(key, e.target.value)}
+                        />
+                      </label>
+                      <div className="reply-intent-actions">
+                        <button className="soft-btn" onClick={state.generatingDraft ? actions.stopDraftGeneration : () => void actions.generateDraft(undefined, { ignoreReplyIntent: true })}>
+                          {state.generatingDraft ? "Stop generate" : "Skip, draft anyway"}
+                        </button>
+                        <button className="primary-btn" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>
+                          {state.generatingDraft ? "Generating..." : "Generate draft"}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="revise-row">
+                      <input type="text" placeholder="Tell Anna how to revise this draft..." value={state.revisionById[key] || ""} disabled={state.generatingDraft} onChange={(e) => actions.setRevision(key, e.target.value)} />
+                      <button className="soft-btn" disabled={state.generatingDraft || !draft.trim()} onClick={() => actions.clearDraft()}>
+                        Clear local draft
+                      </button>
+                      <button className="soft-btn generate-draft-btn is-glow" disabled={state.generatingDraft} onClick={() => void actions.generateDraft()}>{state.generatingDraft ? "Generating..." : "Ask Anna to revise"}</button>
+                    </div>
+                  )}
+                  <textarea ref={draftTextareaRef} className={`draft-textarea${state.generatingDraft && !draft ? " is-draft-loading" : ""}`} placeholder="Anna's editable draft will appear here after it is generated." value={draftDisplay} disabled={state.generatingDraft} onChange={(e) => actions.setDraft(key, e.target.value)} />
+                </>
               )}
-              <textarea className={`draft-textarea${state.generatingDraft && !draft ? " is-draft-loading" : ""}`} placeholder="Anna's editable draft will appear here after it is generated." value={draftDisplay} disabled={state.generatingDraft} onChange={(e) => actions.setDraft(key, e.target.value)} />
-            </>
-          )}
-        </section>
-        <div className="decision-row drawer-action-row">
-          <button className="primary-btn" disabled={!draft.trim() || !!state.pendingAction} onClick={() => void actions.replyNow()}>Reply now</button>
-          {isReviewCard ? <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.markCardRead()}>Read</button> : null}
-          <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.recordDecision("no_action_needed")}>No action needed</button>
-          <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.recordDecision("handled_manually")}>Handled manually</button>
-          {nid ? <button className="detail-back" style={{ marginLeft: "auto" }} onClick={() => void actions.openCard(nid)}>Next card →</button> : null}
+            </section>
+            <div className="decision-row drawer-action-row">
+              <button className="primary-btn" disabled={!draft.trim() || !!state.pendingAction} onClick={() => void actions.replyNow()}>Reply now</button>
+              {isReviewCard ? <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.markCardRead()}>Read</button> : null}
+              <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.recordDecision("no_action_needed")}>No action needed</button>
+              <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.recordDecision("handled_manually")}>Handled manually</button>
+              {nid ? <button className="detail-back" style={{ marginLeft: "auto" }} onClick={() => void actions.openCard(nid)}>Next card →</button> : null}
+            </div>
+          </aside>
         </div>
       </article>
     </section>

@@ -13,6 +13,7 @@ export function App() {
   const controller = useAppController();
   const { state, actions, toast, initialize } = controller;
   const showScanningView = state.view === "start" && (state.isPreparingScan || (state.isScanning && state.cards.length === 0));
+  const isDetailView = state.view === "start" && state.originalOpen;
 
   useEffect(() => {
     void initialize();
@@ -72,7 +73,7 @@ export function App() {
             </div>
           </header>
 
-          <section className="app-content" id="appContent" style={state.snoozeReasonsKey ? { overflow: "hidden" } : undefined}>
+          <section className={`app-content ${isDetailView ? "is-detail-view" : ""}`} id="appContent" style={state.snoozeReasonsKey ? { overflow: "hidden" } : undefined}>
             {state.view === "start" && state.originalOpen ? <HandleView /> : null}
             {state.view === "start" && !state.originalOpen && !showScanningView ? <BriefView /> : null}
             {showScanningView ? <ScanningView /> : null}

@@ -4,6 +4,7 @@ import { visibleCards } from "./cardHelpers";
 
 export function BottomBar() {
   const { state, actions } = useApp();
+  if (state.view === "start" && state.originalOpen) return null;
   const cards = visibleCards(state.cards);
   if (state.isScanning) {
     const step = SCAN_STEPS[Math.min(state.scanStepIndex, SCAN_STEPS.length - 1)] || SCAN_STEPS[0];
