@@ -548,7 +548,7 @@ export function BriefView() {
                 {CATEGORY_TABS.map((tab) => {
                   const count = tab.id === "all" ? (filteredCards(state.cards, "all").length - cleanupCards.length + cleanupCount) : tab.id === "cleanup" ? cleanupCount : filteredCards(state.cards, tab.id).length;
                   return (
-                    <button key={tab.id} className={`category-tab ${activeFilter === tab.id ? "is-active" : ""}`} role="tab" aria-selected={activeFilter === tab.id} onClick={() => actions.setResultFilter(tab.id)}>
+                    <button key={tab.id} className={`category-tab category-tab-${tab.id} ${activeFilter === tab.id ? "is-active" : ""}`} role="tab" aria-selected={activeFilter === tab.id} onClick={() => actions.setResultFilter(tab.id)}>
                       {tab.label}&nbsp;{count}
                     </button>
                   );

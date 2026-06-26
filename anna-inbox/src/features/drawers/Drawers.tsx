@@ -38,8 +38,10 @@ function PerMailboxConfig() {
   const [customMax, setCustomMax] = useState(isCustomMax ? String(maxMsgs) : "");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmFreshScan, setConfirmFreshScan] = useState(false);
+  const [busyAction, setBusyAction] = useState<"" | "continue" | "reset" | "delete">("");
   const save = actions.saveScanPlanField;
   const mailboxEmail = state.configMailbox || state.mailbox;
+  const buttonsDisabled = Boolean(busyAction || state.isScanning || state.isPreparingScan || !state.runtime.connected);
   const clampInt = (value: number, min: number, max: number) => Math.min(max, Math.max(min, Math.round(value)));
   const saveWindowDays = (value: number) => {
     const next = clampInt(value, 1, 90);
@@ -77,7 +79,7 @@ function PerMailboxConfig() {
         <div className="mailbox-scan-action-row">
           <button
             className="soft-btn compact danger mailbox-scan-action"
-            disabled={state.isScanning || !state.runtime.connected}
+            disabled={buttonsDisabled}
             title="Delete Brief history for this mailbox and scan from scratch."
             aria-label="Delete history and scan again"
             onClick={() => setConfirmFreshScan(true)}
@@ -86,17 +88,22 @@ function PerMailboxConfig() {
           </button>
           <button
             className="primary-btn mailbox-scan-action"
-            disabled={state.isScanning || !state.runtime.connected}
+            disabled={buttonsDisabled}
             title="Keep existing records and continue scanning new mail."
             aria-label="Keep current records and continue scanning"
-            onClick={() => void actions.startScan("continue", mailboxEmail)}
+            onClick={() => {
+              setBusyAction("continue");
+              void actions.startScan("continue", mailboxEmail).finally(() => setBusyAction(""));
+            }}
           >
             Continue Scan
           </button>
         </div>
       </div>
       <div style={{ marginTop: 12 }}>
-        <button className="danger-btn" style={{ fontSize: 12, padding: "6px 14px", borderRadius: 8 }} onClick={() => setConfirmDelete(true)}>Delete mailbox data</button>
+        <div style={{ display: "flex", justifyContent: "center" }}>
+          <button className="danger-btn" style={{ fontSize: 12, padding: "6px 14px", borderRadius: 8 }} disabled={buttonsDisabled} onClick={() => setConfirmDelete(true)}>Delete mailbox data</button>
+        </div>
         <p className="drawer-copy" style={{ marginTop: 4 }}>Clears all cards, cache, contact memory, and scan history for this mailbox only.</p>
       </div>
       {confirmFreshScan ? (
@@ -104,8 +111,18 @@ function PerMailboxConfig() {
           <div className="confirm-dialog" onClick={(e) => e.stopPropagation()}>
             <p>This clears Brief cards, scan history, and processed markers for <strong>{mailboxEmail}</strong>, then starts a fresh scan. Scan settings, cache, and contact memory stay intact.</p>
             <div className="confirm-actions">
-              <button className="soft-btn" onClick={() => setConfirmFreshScan(false)}>Cancel</button>
-              <button className="primary-btn danger-btn" onClick={async () => { setConfirmFreshScan(false); await actions.resetMailboxScanHistory(mailboxEmail); await actions.startScan("reset", mailboxEmail); }}>Reset &amp; Scan</button>
+              <button className="soft-btn" disabled={busyAction === "reset"} onClick={() => setConfirmFreshScan(false)}>Cancel</button>
+              <button
+                className="primary-btn danger-btn"
+                disabled={busyAction === "reset"}
+                onClick={() => {
+                  setConfirmFreshScan(false);
+                  setBusyAction("reset");
+                  void actions.resetAndStartScan(mailboxEmail).finally(() => setBusyAction(""));
+                }}
+              >
+                Reset &amp; Scan
+              </button>
             </div>
           </div>
         </div>
@@ -115,8 +132,18 @@ function PerMailboxConfig() {
           <div className="confirm-dialog" onClick={(e) => e.stopPropagation()}>
             <p>This will delete all data for <strong>{mailboxEmail}</strong>, including cards, cached emails, contact memory, scan history, and run records. Other mailboxes will not be affected. <strong>This cannot be undone.</strong></p>
             <div className="confirm-actions">
-              <button className="soft-btn" onClick={() => setConfirmDelete(false)}>Cancel</button>
-              <button className="primary-btn danger-btn" onClick={() => { setConfirmDelete(false); void actions.deleteMailboxData(mailboxEmail); }}>Delete mailbox data</button>
+              <button className="soft-btn" disabled={busyAction === "delete"} onClick={() => setConfirmDelete(false)}>Cancel</button>
+              <button
+                className="primary-btn danger-btn"
+                disabled={busyAction === "delete"}
+                onClick={() => {
+                  setConfirmDelete(false);
+                  setBusyAction("delete");
+                  void actions.deleteMailboxData(mailboxEmail).finally(() => setBusyAction(""));
+                }}
+              >
+                Delete mailbox data
+              </button>
             </div>
           </div>
         </div>

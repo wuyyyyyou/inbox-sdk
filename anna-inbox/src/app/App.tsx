@@ -12,6 +12,7 @@ import { useAppController } from "./useAppController";
 export function App() {
   const controller = useAppController();
   const { state, actions, toast, initialize } = controller;
+  const showScanningView = state.view === "start" && (state.isPreparingScan || (state.isScanning && state.cards.length === 0));
 
   useEffect(() => {
     void initialize();
@@ -61,8 +62,8 @@ export function App() {
             </div>
             <div className="top-actions">
               <div className="top-segment" aria-label="Main view">
-                <button className={`ghost-btn ${state.view === "start" ? "is-active" : ""}`} title="Today's brief" onClick={() => actions.setView("start")}>Brief</button>
-                <button className={`ghost-btn ${state.view === "ask" ? "is-active" : ""}`} title="Run a custom scan" onClick={() => actions.setView("ask")}>Ask</button>
+                <button className={`ghost-btn top-segment-btn is-brief ${state.view === "start" ? "is-active" : ""}`} title="Today's brief" onClick={() => actions.setView("start")}>Brief</button>
+                <button className={`ghost-btn top-segment-btn is-ask ${state.view === "ask" ? "is-active" : ""}`} title="Run a custom scan" onClick={() => actions.setView("ask")}>Ask</button>
               </div>
               <button className="icon-btn" title="Sources" aria-label="Sources" onClick={() => actions.setDrawer("sources", true)}>S</button>
               <button className="icon-btn" title="Memory" aria-label="Memory" onClick={() => actions.setDrawer("memory", true)}>M</button>
@@ -73,8 +74,8 @@ export function App() {
 
           <section className="app-content" id="appContent" style={state.snoozeReasonsKey ? { overflow: "hidden" } : undefined}>
             {state.view === "start" && state.originalOpen ? <HandleView /> : null}
-            {state.view === "start" && !state.originalOpen && (state.cards.length > 0 || !state.isScanning) ? <BriefView /> : null}
-            {state.view === "start" && state.isScanning && state.cards.length === 0 ? <ScanningView /> : null}
+            {state.view === "start" && !state.originalOpen && !showScanningView ? <BriefView /> : null}
+            {showScanningView ? <ScanningView /> : null}
             {state.view === "ask" ? <AskView /> : null}
           </section>
           <BottomBar />

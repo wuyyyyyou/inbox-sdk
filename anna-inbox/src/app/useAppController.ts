@@ -247,6 +247,7 @@ export interface AppActions {
   clearHistory(): Promise<void>;
   resetAllData(): Promise<void>;
   resetMailboxScanHistory(mailbox: string): Promise<void>;
+  resetAndStartScan(mailbox: string): Promise<void>;
   deleteMailboxData(mailbox: string): Promise<void>;
   handleAskMarkRead(actionKey: string, messageId: string, mailbox?: string): Promise<void>;
   handleAskTrash(actionKey: string, messageId: string, mailbox?: string): Promise<void>;
@@ -533,6 +534,159 @@ export function useAppController() {
     setState((s) => ({ ...s, scanError: status.message ? `${message}\n${status.message}` : message }));
     return false;
   }, [refreshSamplingStatus, showToast, state.llmProvider]);
+
+  const resolveScanRequest = useCallback(async (mailboxOverride?: string): Promise<{ mailboxesToScan: string[]; scanMode: string } | null> => {
+    if (!state.runtime.connected || state.isScanning || state.isPreparingScan) return null;
+    const mailboxesToScan = (mailboxOverride ? [mailboxOverride] : (state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox])).map(normalizedMailbox).filter(Boolean);
+    if (!mailboxesToScan.length) {
+      showToast("Select at least one mailbox.");
+      return null;
+    }
+    if (!(await ensureSamplingAvailable())) return null;
+    return {
+      mailboxesToScan,
+      scanMode: state.strategyMode || DEFAULT_MODE,
+    };
+  }, [ensureSamplingAvailable, showToast, state.isPreparingScan, state.isScanning, state.mailbox, state.runtime.connected, state.selectedMailboxes, state.strategyMode]);
+
+  const runBriefScan = useCallback(async (scanRequest: { mailboxesToScan: string[]; scanMode: string }, reason = "manual") => {
+    const { mailboxesToScan, scanMode } = scanRequest;
+    setState((s) => ({
+      ...s,
+      isPreparingScan: false,
+      isScanning: true,
+      scanError: "",
+      scanStatus: "",
+      scanStepIndex: 0,
+      scanStage: "scan",
+      scanProgress: {},
+      resultFilter: "all",
+    }));
+    const contactMemoryJobs: Array<Record<string, unknown>> = [];
+    try {
+      const failures: string[] = [];
+      for (let index = 0; index < mailboxesToScan.length; index += 1) {
+        const mailbox = mailboxesToScan[index];
+        const runScanPlan = await loadScanPlanForRun(mailbox);
+        const runId = `bg_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+        // 先创建可轮询的 run；真实扫描和 LLM 进度由 continue 调用写入。
+        const started = await client.startBriefRun({
+          user_request: requestForMode(scanMode),
+          mailbox,
+          mode: scanMode,
+          primary_count: runScanPlan.max_messages,
+          max_messages: runScanPlan.max_messages,
+          scan_window_days: runScanPlan.scan_window_days,
+          ai_provider: state.llmProvider,
+          storage_provider: state.storageProvider,
+          reason,
+          run_id: runId,
+        });
+        const applyBriefStatus = (status: RunStatus) => {
+          setState((s) => ({
+            ...s,
+            scanStepIndex: stageToStep(status.stage || ""),
+            scanStage: status.stage || "",
+            scanProgress: status.progress || {},
+            scanStatus: scanProgressLabel(status.stage, status.progress) || scanStageLabel(status.stage, status.progress),
+          }));
+        };
+        const refreshBriefStatus = async () => {
+          try {
+            applyBriefStatus(await client.getRun(runId));
+          } catch {
+          }
+        };
+        await refreshBriefStatus();
+        // 轮询同一个 run_id，真实进度由 continue_mail_agent_run 所在 invoke 写入。
+        const pollTimer = window.setInterval(() => {
+          void refreshBriefStatus();
+        }, 1500);
+        let result: RunStatus = started;
+        let cardsVersion = 0;
+        const collectWarnings = (status: RunStatus) => {
+          const ws = status.warnings;
+          if (!ws || !ws.length) return;
+          for (const w of ws) {
+            const detail = w.detail || {};
+            const errs = Array.isArray(detail.errors) ? detail.errors : [];
+            const apsErrs = Array.isArray(detail.aps_cache_errors) ? detail.aps_cache_errors : [];
+            for (const e of [...errs, ...apsErrs.map((e: string) => `[APS cache] ${e}`)]) {
+              if (e && !failures.includes(e)) failures.push(`${mailbox}: ${e}`);
+            }
+          }
+        };
+        try {
+          for (let step = 0; step < POLL_LIMIT; step += 1) {
+            // 每次 continue 都是短 invoke，只推进 Brief 状态机的一小段。
+            result = await client.continueBriefRun({
+              run_id: runId,
+              user_request: requestForMode(scanMode),
+              mailbox,
+              mode: scanMode,
+              primary_count: runScanPlan.max_messages,
+              max_messages: runScanPlan.max_messages,
+              scan_window_days: runScanPlan.scan_window_days,
+              ai_provider: state.llmProvider,
+              storage_provider: state.storageProvider,
+            });
+            applyBriefStatus(result);
+            collectWarnings(result);
+            const nextCardsVersion = Number(result.cards_version || 0);
+            if (Number(result.cards_added || 0) > 0 || nextCardsVersion > cardsVersion) {
+              cardsVersion = nextCardsVersion;
+              void loadActiveCards(undefined, "all", { timeoutMs: 55_000 });
+            }
+            if (result.status === "done" || result.status === "failed" || result.needs_continue === false) {
+              break;
+            }
+          }
+        } finally {
+          window.clearInterval(pollTimer);
+          await refreshBriefStatus();
+        }
+        if (result.status === "failed" || result.error) {
+          failures.push(`${mailbox}: ${result.error || "Scan failed"}`);
+          continue;
+        }
+        if (result.status !== "done") {
+          failures.push(`${mailbox}: Scan paused before completion`);
+        }
+        void loadActiveCards(undefined, "all", { timeoutMs: 55_000 });
+        // 卡片刷新到界面后，只记录联系人记忆补写任务；扫描主流程结束后再后台续跑。
+        contactMemoryJobs.push({
+          mailbox,
+          since: started.started_at || result.started_at || "",
+          ai_provider: state.llmProvider,
+          storage_provider: state.storageProvider,
+        });
+      }
+      const statusText = failures.length
+        ? `Scan complete with ${failures.length} issue${failures.length === 1 ? "" : "s"}.`
+        : "Scan complete. Showing persisted attention cards.";
+      setState((s) => ({ ...s, scanStatus: statusText, scanError: s.scanError || failures.join("\n") }));
+      showToast(failures.length ? statusText : "Scan complete.");
+      window.setTimeout(() => {
+        void loadActiveCards(undefined, "all", { timeoutMs: 55_000 });
+        void loadRunHistory();
+        if (contactMemoryJobs.length) {
+          void runContactMemoryBackfill(contactMemoryJobs);
+        }
+      }, 0);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setState((s) => ({ ...s, scanError: message, scanStatus: "", isPreparingScan: false }));
+      // Show popup for Gmail connectivity errors so users know to re-authorize
+      if (message.toLowerCase().includes("gmail connection failed")) {
+        const lastMailbox = mailboxesToScan.length > 0 ? mailboxesToScan[mailboxesToScan.length - 1] : state.mailbox;
+        const popup: GmailErrorPopup = { mailbox: normalizedMailbox(lastMailbox) || state.mailbox, message };
+        setState((s) => ({ ...s, gmailErrorPopup: popup }));
+      }
+      showToast(message);
+    } finally {
+      setState((s) => ({ ...s, isPreparingScan: false, isScanning: false }));
+    }
+  }, [client, loadActiveCards, loadRunHistory, loadScanPlanForRun, showToast, state.llmProvider, state.mailbox, state.storageProvider]);
 
   const loadMailboxes = useCallback(async (storageOverride?: string): Promise<{ mailboxes: MailboxInfo[]; selected: string[]; primary: string }> => {
     const provider = storageOverride ?? state.storageProvider;
@@ -856,139 +1010,9 @@ export function useAppController() {
       await loadScanPlan(mailbox || undefined);
     },
     async startScan(reason = "manual", mailboxOverride?: string) {
-      if (!state.runtime.connected || state.isScanning) return;
-      const mailboxesToScan = (mailboxOverride ? [mailboxOverride] : (state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox])).map(normalizedMailbox).filter(Boolean);
-      const scanMode = state.strategyMode || DEFAULT_MODE;
-      if (!mailboxesToScan.length) {
-        showToast("Select at least one mailbox.");
-        return;
-      }
-      if (!(await ensureSamplingAvailable())) return;
-      setState((s) => ({ ...s, isScanning: true, scanError: "", scanStatus: "", scanStepIndex: 0, scanStage: "scan", scanProgress: {}, resultFilter: "all" }));
-      const contactMemoryJobs: Array<Record<string, unknown>> = [];
-      try {
-        const failures: string[] = [];
-        for (let index = 0; index < mailboxesToScan.length; index += 1) {
-          const mailbox = mailboxesToScan[index];
-          const runScanPlan = await loadScanPlanForRun(mailbox);
-          const runId = `bg_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
-          // 先创建可轮询的 run；真实扫描和 LLM 进度由 continue 调用写入。
-          const started = await client.startBriefRun({
-            user_request: requestForMode(scanMode),
-            mailbox,
-            mode: scanMode,
-            primary_count: runScanPlan.max_messages,
-            max_messages: runScanPlan.max_messages,
-            scan_window_days: runScanPlan.scan_window_days,
-            ai_provider: state.llmProvider,
-            storage_provider: state.storageProvider,
-            reason,
-            run_id: runId,
-          });
-          const applyBriefStatus = (status: RunStatus) => {
-            setState((s) => ({
-              ...s,
-              scanStepIndex: stageToStep(status.stage || ""),
-              scanStage: status.stage || "",
-              scanProgress: status.progress || {},
-              scanStatus: scanProgressLabel(status.stage, status.progress) || scanStageLabel(status.stage, status.progress),
-            }));
-          };
-          const refreshBriefStatus = async () => {
-            try {
-              applyBriefStatus(await client.getRun(runId));
-            } catch {
-            }
-          };
-          await refreshBriefStatus();
-          // 轮询同一个 run_id，真实进度由 continue_mail_agent_run 所在 invoke 写入。
-          const pollTimer = window.setInterval(() => {
-            void refreshBriefStatus();
-          }, 1500);
-          let result: RunStatus = started;
-          let cardsVersion = 0;
-          const collectWarnings = (status: RunStatus) => {
-            const ws = status.warnings;
-            if (!ws || !ws.length) return;
-            for (const w of ws) {
-              const detail = w.detail || {};
-              const errs = Array.isArray(detail.errors) ? detail.errors : [];
-              const apsErrs = Array.isArray(detail.aps_cache_errors) ? detail.aps_cache_errors : [];
-              for (const e of [...errs, ...apsErrs.map((e: string) => `[APS cache] ${e}`)]) {
-                if (e && !failures.includes(e)) failures.push(`${mailbox}: ${e}`);
-              }
-            }
-          };
-          try {
-            for (let step = 0; step < POLL_LIMIT; step += 1) {
-              // 每次 continue 都是短 invoke，只推进 Brief 状态机的一小段。
-              result = await client.continueBriefRun({
-                run_id: runId,
-                user_request: requestForMode(scanMode),
-                mailbox,
-                mode: scanMode,
-                primary_count: runScanPlan.max_messages,
-                max_messages: runScanPlan.max_messages,
-                scan_window_days: runScanPlan.scan_window_days,
-                ai_provider: state.llmProvider,
-                storage_provider: state.storageProvider,
-              });
-              applyBriefStatus(result);
-              collectWarnings(result);
-              const nextCardsVersion = Number(result.cards_version || 0);
-              if (Number(result.cards_added || 0) > 0 || nextCardsVersion > cardsVersion) {
-                cardsVersion = nextCardsVersion;
-                void loadActiveCards(undefined, "all", { timeoutMs: 55_000 });
-              }
-              if (result.status === "done" || result.status === "failed" || result.needs_continue === false) {
-                break;
-              }
-            }
-          } finally {
-            window.clearInterval(pollTimer);
-            await refreshBriefStatus();
-          }
-          if (result.status === "failed" || result.error) {
-            failures.push(`${mailbox}: ${result.error || "Scan failed"}`);
-            continue;
-          }
-          if (result.status !== "done") {
-            failures.push(`${mailbox}: Scan paused before completion`);
-          }
-          void loadActiveCards(undefined, "all", { timeoutMs: 55_000 });
-          // 卡片刷新到界面后，只记录联系人记忆补写任务；扫描主流程结束后再后台续跑。
-          contactMemoryJobs.push({
-            mailbox,
-            since: started.started_at || result.started_at || "",
-            ai_provider: state.llmProvider,
-            storage_provider: state.storageProvider,
-          });
-        }
-        const statusText = failures.length
-          ? `Scan complete with ${failures.length} issue${failures.length === 1 ? "" : "s"}.`
-          : "Scan complete. Showing persisted attention cards.";
-        setState((s) => ({ ...s, scanStatus: statusText, scanError: s.scanError || failures.join("\n") }));
-        showToast(failures.length ? statusText : "Scan complete.");
-        window.setTimeout(() => {
-          void loadActiveCards(undefined, "all", { timeoutMs: 55_000 });
-          void loadRunHistory();
-          if (contactMemoryJobs.length) {
-            void runContactMemoryBackfill(contactMemoryJobs);
-          }
-        }, 0);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        setState((s) => ({ ...s, scanError: message, scanStatus: "" }));
-        // Show popup for Gmail connectivity errors so users know to re-authorize
-        if (message.toLowerCase().includes("gmail connection failed")) {
-          const lastMailbox = mailboxesToScan.length > 0 ? mailboxesToScan[mailboxesToScan.length - 1] : state.mailbox;
-          const popup: GmailErrorPopup = { mailbox: normalizedMailbox(lastMailbox) || state.mailbox, message };
-          setState((s) => ({ ...s, gmailErrorPopup: popup }));
-        }
-        showToast(message);
-      } finally {
-        setState((s) => ({ ...s, isScanning: false }));
-      }
+      const scanRequest = await resolveScanRequest(mailboxOverride);
+      if (!scanRequest) return;
+      await runBriefScan(scanRequest, reason);
     },
     async openCard(cardId) {
       const card = findCard(state.cards, cardId);
@@ -1596,6 +1620,30 @@ export function useAppController() {
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       }
+    },
+    async resetAndStartScan(mailbox) {
+      const normalized = normalizedMailbox(mailbox);
+      if (!normalized) return;
+      const scanRequest = await resolveScanRequest(normalized);
+      if (!scanRequest) return;
+      setState((s) => ({
+        ...s,
+        isPreparingScan: true,
+        isScanning: false,
+        scanError: "",
+        scanStatus: "Preparing fresh scan...",
+        scanStepIndex: 0,
+        scanStage: "scan",
+        scanProgress: {},
+        resultFilter: "all",
+      }));
+      try {
+        await actions.resetMailboxScanHistory(normalized);
+      } catch (error) {
+        setState((s) => ({ ...s, isPreparingScan: false }));
+        throw error;
+      }
+      await runBriefScan(scanRequest, "reset");
     },
     async deleteMailboxData(mailbox) {
       try {

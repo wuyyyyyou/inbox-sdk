@@ -21,6 +21,7 @@ export function createInitialState(): AppState {
     scanError: "",
     pendingAction: "",
     isScanning: false,
+    isPreparingScan: false,
     restoredCardIds: new Set<string>(),
     isCustomScanning: false,
     scanStepIndex: 0,

@@ -438,6 +438,7 @@ export interface AppState {
   restoredCardIds: Set<string>;
   pendingAction: string;
   isScanning: boolean;
+  isPreparingScan: boolean;
   isCustomScanning: boolean;
   scanStepIndex: number;
   scanStage: string;
