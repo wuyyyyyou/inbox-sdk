@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 from ..domain.types import CandidateItem, MailboxProfile, MailStrategy
@@ -17,23 +18,145 @@ from ..storage.types import PersistentCard
 
 # ── Thread context fetch ────────────────────────────────────────────
 
+_ON_WROTE_RE = re.compile(r"^\s*On\s+(.{1,700}?)\s+wrote:\s*$", re.IGNORECASE)
+_CHINESE_WROTE_RE = re.compile(r"^\s*(?:在\s*)?.{1,700}?写道[:：]\s*$")
+_ORIGINAL_MESSAGE_RE = re.compile(r"^\s*-{2,}\s*Original Message\s*-{2,}\s*$", re.IGNORECASE)
+_FORWARDED_MESSAGE_RE = re.compile(r"^\s*-{2,}\s*Forwarded message\s*-{2,}\s*$", re.IGNORECASE)
+_OUTLOOK_FROM_RE = re.compile(r"^\s*From:\s+.+", re.IGNORECASE)
+_OUTLOOK_SENT_RE = re.compile(r"^\s*Sent:\s+.+", re.IGNORECASE)
+_QUOTE_DATE_OR_ADDR_RE = re.compile(
+    r"(@|<[^>]+@[^>]+>|\b\d{4}\b|\b\d{1,2}:\d{2}\b|"
+    r"\b(?:mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|"
+    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|"
+    r"january|february|march|april|june|july|august|september|october|november|december)\b)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_quote_header(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if _ORIGINAL_MESSAGE_RE.match(stripped) or _FORWARDED_MESSAGE_RE.match(stripped):
+        return True
+    if _CHINESE_WROTE_RE.match(stripped):
+        return stripped.startswith("在") or bool(_QUOTE_DATE_OR_ADDR_RE.search(stripped))
+    match = _ON_WROTE_RE.match(stripped)
+    if not match:
+        return False
+    # Avoid cutting normal prose such as "On the proposal, Alice wrote:".
+    return bool(_QUOTE_DATE_OR_ADDR_RE.search(match.group(1)))
+
+
+def _looks_like_outlook_header(lines: list[str], index: int) -> bool:
+    if not _OUTLOOK_FROM_RE.match(lines[index].strip()):
+        return False
+    lookahead = lines[index + 1:index + 4]
+    return any(_OUTLOOK_SENT_RE.match(item.strip()) for item in lookahead)
+
+
+def _strip_quoted_reply(text: str) -> str:
+    """Keep the newly written part of an email body for thread-history display."""
+    if not text:
+        return ""
+
+    kept: list[str] = []
+    seen_content = False
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if _looks_like_quote_header(stripped) or _looks_like_outlook_header(lines, index):
+            break
+
+        if stripped:
+            seen_content = True
+        kept.append(line.rstrip())
+
+    cleaned = "\n".join(kept).strip()
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned
+
+
+_THREAD_CONTEXT_PAGE_SIZE = 5
+_THREAD_CONTEXT_MAX_PAGE_SIZE = 50
+
+
+def _clamp_thread_page_limit(value: int | None) -> int:
+    try:
+        raw = int(value or _THREAD_CONTEXT_PAGE_SIZE)
+    except Exception:
+        raw = _THREAD_CONTEXT_PAGE_SIZE
+    return max(1, min(_THREAD_CONTEXT_MAX_PAGE_SIZE, raw))
+
+
+def _summary_time(summary: dict[str, Any]) -> int:
+    try:
+        return int(summary.get("internal_date") or 0)
+    except Exception:
+        return 0
+
+
+def _thread_summaries(mailbox: str, thread_id: str) -> list[dict[str, Any]]:
+    from ..mail_providers.gmail.adapter import list_messages
+
+    summaries = [
+        item for item in list_messages(mailbox)
+        if str(item.get("thread_id") or "") == str(thread_id or "")
+    ]
+    summaries.sort(key=_summary_time)
+    return summaries
+
+
+def _message_from_summary(mailbox: str, summary: dict[str, Any]) -> Any:
+    from ..mail_providers.gmail.adapter import get_message_detail
+
+    message_id = str(summary.get("id") or "")
+    if not message_id:
+        return None
+    try:
+        return get_message_detail(mailbox, message_id)
+    except Exception:
+        return None
+
+
+def _serialize_thread_message(message: Any, summary: dict[str, Any]) -> dict[str, Any]:
+    if message:
+        return {
+            "message_id": message.message_id,
+            "from": message.from_addr,
+            "to": message.to_addr,
+            "cc": message.cc or "",
+            "date": message.internal_date,
+            "subject": message.subject,
+            "body": _strip_quoted_reply(message.body_text or "")[:2000],
+        }
+    return {
+        "message_id": str(summary.get("id") or ""),
+        "from": str(summary.get("from") or ""),
+        "to": str(summary.get("to") or ""),
+        "cc": str(summary.get("cc") or ""),
+        "date": str(summary.get("internal_date") or ""),
+        "subject": str(summary.get("subject") or ""),
+        "body": "",
+    }
+
+
 def _fetch_thread_context_sync(
     mailbox: str,
     card: PersistentCard,
+    *,
+    before_index: int | None = None,
+    page_limit: int = _THREAD_CONTEXT_PAGE_SIZE,
+    preview_edges: bool = False,
 ) -> dict[str, Any]:
-    """Fetch full thread messages for a card (sync, using cached Gmail data).
-
-    Returns structured thread data for the Handle Panel header.
-    """
-    from ..mail_providers.gmail.adapter import get_thread_context
-
+    """Fetch one bounded page of thread messages for the Handle Panel."""
     try:
-        thread = get_thread_context(mailbox, card.thread_id, max_messages=10)
-        messages = thread.messages if thread else []
+        summaries = _thread_summaries(mailbox, card.thread_id)
     except Exception:
-        messages = []
+        summaries = []
 
-    if not messages:
+    if not summaries:
         return {
             "thread_id": card.thread_id,
             "message_count": 0,
@@ -43,28 +166,57 @@ def _fetch_thread_context_sync(
             "subject": card.original.thread,
             "latest_time": card.original.time,
             "messages": [],
+            "returned_count": 0,
+            "has_more_messages": False,
+            "next_before_index": None,
         }
 
-    latest = messages[-1]
+    total = len(summaries)
+    latest = summaries[-1]
+    if preview_edges and before_index is None:
+        page = [summaries[0], summaries[-1]] if total > 1 else [summaries[0]]
+        messages = [
+            _serialize_thread_message(_message_from_summary(mailbox, summary), summary)
+            for summary in page
+        ]
+        return {
+            "thread_id": card.thread_id,
+            "message_count": total,
+            "from": str(latest.get("from") or ""),
+            "to": str(latest.get("to") or ""),
+            "cc": str(latest.get("cc") or ""),
+            "subject": card.original.thread,
+            "latest_time": str(latest.get("internal_date") or ""),
+            "messages": messages,
+            "returned_count": len(messages),
+            "has_more_messages": total > 2,
+            "next_before_index": total - 1 if total > 2 else None,
+        }
+
+    limit = _clamp_thread_page_limit(page_limit)
+    try:
+        end_index = int(before_index) if before_index is not None else total
+    except Exception:
+        end_index = total
+    end_index = max(0, min(total, end_index))
+    start_index = max(0, end_index - limit)
+    page = summaries[start_index:end_index]
+    messages = [
+        _serialize_thread_message(_message_from_summary(mailbox, summary), summary)
+        for summary in page
+    ]
     return {
         "thread_id": card.thread_id,
-        "message_count": len(messages),
-        "from": latest.from_addr or "",
-        "to": latest.to_addr or "",
-        "cc": latest.cc or "",
+        "message_count": total,
+        "from": str(latest.get("from") or ""),
+        "to": str(latest.get("to") or ""),
+        "cc": str(latest.get("cc") or ""),
         "subject": card.original.thread,
-        "latest_time": latest.internal_date or "",
-        "messages": [
-            {
-                "from": m.from_addr,
-                "to": m.to_addr,
-                "cc": m.cc or "",
-                "date": m.internal_date,
-                "subject": m.subject,
-                "body": (m.body_text or "")[:2000],
-            }
-            for m in messages[-5:]
-        ],
+        "latest_time": str(latest.get("internal_date") or ""),
+        "messages": messages,
+        "returned_count": len(messages),
+        "has_more_messages": start_index > 0,
+        "next_before_index": start_index if start_index > 0 else None,
     }
 
 

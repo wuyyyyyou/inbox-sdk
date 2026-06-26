@@ -1,4 +1,4 @@
-import { useState, type MouseEvent } from "react";
+import { Fragment, useState, type MouseEvent } from "react";
 import DOMPurify from "dompurify";
 import { useApp } from "../../app/AppContext";
 import { formatBeijingTimestamp } from "../../shared/format";
@@ -10,6 +10,7 @@ import {
   DRAFT_TONE_OPTIONS,
   DRAFT_WRITING_STYLE_OPTIONS,
   type DraftPreferenceField,
+  type ThreadContextMessage,
 } from "../../types/mail";
 import { DRAFT_PREFERENCE_LABELS, resolveDraftPreferences } from "./draftPreferences";
 import { cardCategory, cardCategoryLabel, nextCardId } from "../brief/cardHelpers";
@@ -55,6 +56,45 @@ function openExternalUrl(url: string) {
   document.body.appendChild(link);
   link.click();
   link.remove();
+}
+
+function emailAddress(value: unknown): string {
+  const text = asString(value).trim().toLowerCase();
+  const angle = text.match(/<([^>]+)>/);
+  if (angle?.[1]) return angle[1].trim();
+  const email = text.match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
+  return email?.[0]?.toLowerCase() || text;
+}
+
+function messageDirection(message: ThreadContextMessage, ownerEmail: string): "inbound" | "outbound" {
+  const owner = emailAddress(ownerEmail);
+  return owner && emailAddress(message.from).includes(owner) ? "outbound" : "inbound";
+}
+
+function threadBodyBlocks(value: unknown): string[] {
+  const text = asString(value).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  if (!text) return [];
+  const lines = text.split("\n");
+  const blocks: string[] = [];
+  let current: string[] = [];
+
+  const flush = () => {
+    const block = current.join(" ").replace(/\s+/g, " ").trim();
+    if (block) blocks.push(block);
+    current = [];
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flush();
+      continue;
+    }
+    if (/^([-*]|\d+[.)])\s+/.test(trimmed) && current.length) flush();
+    current.push(trimmed);
+  }
+  flush();
+  return blocks;
 }
 
 function handleOriginalBodyClick(event: MouseEvent<HTMLDivElement>) {
@@ -129,6 +169,8 @@ export function HandleView() {
   const latestBodyHtml = detail.latest_body_html || "";
   const attachments = Array.isArray(detail.attachments) ? detail.attachments : (Array.isArray(card.attachments) ? card.attachments : []);
   const bodyLoaded = Boolean(detail.body_loaded);
+  const threadMessages = Array.isArray(context.messages) ? context.messages : [];
+  const ownerEmail = asString(card.details?.mailbox || state.mailbox);
   const summary = state.threadSummaryById[key];
   const draft = state.draftById[key] || "";
   const draftPreferences = resolveDraftPreferences(state.draftPreferencesById[key] || DEFAULT_DRAFT_PREFERENCES);
@@ -161,6 +203,7 @@ export function HandleView() {
   ]);
   const BODY_PREVIEW = 500;
   const loadingBody = state.pendingAction === `body:${key}`;
+  const loadingThreadContext = state.pendingAction === `thread:${key}`;
   const bodyTruncated = latestBodyHtml
     ? latestBodyHtml.length > BODY_PREVIEW
     : latestBody.length > BODY_PREVIEW;
@@ -238,9 +281,95 @@ export function HandleView() {
     );
   };
 
+  const threadContextMessagesBlock = () => {
+    if (!contextExpanded) return null;
+    if (!threadMessages.length) {
+      return <p className="thread-context-empty">No messages available in this thread.</p>;
+    }
+    const totalMessages = Number(context.message_count || threadMessages.length);
+    const hiddenMessageCount = Math.max(0, totalMessages - threadMessages.length);
+    const showHiddenLoader = loadingThreadContext && hiddenMessageCount > 0;
+    const messagesToRender = hiddenMessageCount > 0 && threadMessages.length > 1
+      ? [threadMessages[0], threadMessages[threadMessages.length - 1]]
+      : threadMessages;
+
+    const messageCard = (message: ThreadContextMessage, index: number) => {
+      const direction = messageDirection(message, ownerEmail);
+      const bodyBlocks = threadBodyBlocks(message.body);
+      const messageKey = `${key}_message_${message.message_id || message.date || index}`;
+      const expanded = Boolean(state.threadContextExpanded[messageKey]);
+      const preview = bodyBlocks[0] || "No message body available.";
+      const toggle = () => actions.toggleThreadContext(messageKey);
+      return (
+        <article
+          className={`thread-context-message is-${direction} ${expanded ? "is-open" : "is-collapsed"}`}
+          key={message.message_id || `${message.date || ""}-${index}`}
+          role="button"
+          tabIndex={0}
+          aria-expanded={expanded}
+          onClick={toggle}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              toggle();
+            }
+          }}
+        >
+          <span className="thread-context-message-meta">
+            {direction} at {formatBeijingTimestamp(message.date || "")}
+          </span>
+          <div className="thread-context-message-head">
+            <strong>{asString(message.from || "Unknown sender")}</strong>
+            {message.to ? <span>to {asString(message.to)}</span> : null}
+          </div>
+          {message.subject && message.subject !== threadSubject ? <div className="thread-context-message-subject">{asString(message.subject)}</div> : null}
+          {expanded ? (
+            bodyBlocks.length ? (
+              <div className="thread-context-message-body">
+                {bodyBlocks.map((block, blockIndex) => <p key={blockIndex}>{block}</p>)}
+              </div>
+            ) : (
+              <p className="thread-context-message-empty">No message body available.</p>
+            )
+          ) : (
+            <p className="thread-context-message-preview">{preview}</p>
+          )}
+        </article>
+      );
+    };
+
+    return (
+      <div className="thread-context-message-list">
+        {messagesToRender.map((message, index) => (
+          <Fragment key={message.message_id || `${message.date || ""}-${index}`}>
+            {index === 1 && hiddenMessageCount > 0 ? (
+              <button
+                className={`thread-context-gap ${showHiddenLoader ? "is-loading" : ""}`}
+                disabled={loadingThreadContext}
+                aria-label={`Load ${hiddenMessageCount} hidden messages`}
+                onClick={() => void actions.loadMoreThreadContext()}
+              >
+                <span>{showHiddenLoader ? "" : hiddenMessageCount}</span>
+                {showHiddenLoader ? <em>Loading hidden messages...</em> : null}
+              </button>
+            ) : null}
+            {messageCard(message, index === 0 ? 0 : threadMessages.length - 1)}
+          </Fragment>
+        ))}
+        {showHiddenLoader ? (
+          <div className="thread-context-loading" aria-live="polite">
+            <span />
+            <span />
+            <span />
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
   return (
     <section className="detail-shell">
-      <button className="detail-back" onClick={actions.closeDrawers}>← Back to brief</button>
+      <button className="detail-back" onClick={actions.closeCardDetail}>← Back to brief</button>
       <article className="detail-card">
         <div className="reply-review-head">
           <div>
@@ -314,6 +443,24 @@ export function HandleView() {
         )}
         {attachmentsBlock()}
         {relatedContextBlock()}
+        <section className="review-block is-quiet">
+          <button className="thread-context-toggle" aria-expanded={contextExpanded} onClick={() => actions.toggleThreadContext(key)}>
+            <strong>Thread context · {senderName} · {formatBeijingTimestamp(context.latest_time || original.time)} · {asString(context.message_count || 1)} message{Number(context.message_count || 1) === 1 ? "" : "s"}</strong>
+            <span>{contextExpanded ? "Collapse" : "Expand"}</span>
+          </button>
+          {contextExpanded ? (
+            <>
+              <div className="thread-context-grid">
+                <div className="thread-context-row"><span>From</span><strong>{asString(context.from || original.from || "")}</strong></div>
+                <div className="thread-context-row"><span>To</span><strong>{asString(context.to || original.to || "")}</strong></div>
+                <div className="thread-context-row"><span>CC</span><strong>{cc || "None"}</strong></div>
+                <div className="thread-context-row"><span>Thread</span><strong>{threadSubject}</strong></div>
+                <div className="thread-context-row"><span>Latest</span><strong>{formatBeijingTimestamp(context.latest_time || original.time)}</strong></div>
+              </div>
+              {threadContextMessagesBlock()}
+            </>
+          ) : null}
+        </section>
         {threadSummaryBlock()}
         <section className={`review-block is-composer ${state.generatingDraft ? "is-loading" : ""}`}>
           <h3 className="review-block-title">Draft reply</h3>
@@ -402,23 +549,6 @@ export function HandleView() {
               <textarea className={`draft-textarea${state.generatingDraft && !draft ? " is-draft-loading" : ""}`} placeholder="Anna's editable draft will appear here after it is generated." value={draftDisplay} disabled={state.generatingDraft} onChange={(e) => actions.setDraft(key, e.target.value)} />
             </>
           )}
-        </section>
-        <section className="review-block is-quiet">
-          <button className="thread-context-toggle" aria-expanded={contextExpanded} onClick={() => actions.toggleThreadContext(key)}>
-            <strong>Thread context · {senderName} · {formatBeijingTimestamp(context.latest_time || original.time)} · {asString(context.message_count || 1)} message{Number(context.message_count || 1) === 1 ? "" : "s"}</strong>
-            <span>{contextExpanded ? "Collapse" : "Expand"}</span>
-          </button>
-          {contextExpanded ? (
-            <>
-              <div className="thread-context-grid">
-                <div className="thread-context-row"><span>From</span><strong>{asString(context.from || original.from || "")}</strong></div>
-                <div className="thread-context-row"><span>To</span><strong>{asString(context.to || original.to || "")}</strong></div>
-                <div className="thread-context-row"><span>CC</span><strong>{cc || "None"}</strong></div>
-                <div className="thread-context-row"><span>Thread</span><strong>{threadSubject}</strong></div>
-                <div className="thread-context-row"><span>Latest</span><strong>{formatBeijingTimestamp(context.latest_time || original.time)}</strong></div>
-              </div>
-            </>
-          ) : null}
         </section>
         <div className="decision-row drawer-action-row">
           <button className="primary-btn" disabled={!draft.trim() || !!state.pendingAction} onClick={() => void actions.replyNow()}>Reply now</button>

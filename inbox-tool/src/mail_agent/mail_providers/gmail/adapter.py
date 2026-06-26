@@ -1320,7 +1320,7 @@ def get_thread_context(mailbox: str, thread_id: str, max_messages: int = 10) -> 
             detail = get_message_detail(mailbox, str(summary.get("id") or ""))
             if detail:
                 thread_msgs.append(detail)
-        if len(thread_msgs) >= max_messages:
+        if len(thread_msgs) >= max(1, max_messages):
             break
 
     thread_msgs.sort(key=lambda m: m.internal_date)
@@ -1339,7 +1339,7 @@ async def get_thread_context_async(mailbox: str, thread_id: str, max_messages: i
             detail = await get_message_detail_async(mailbox, str(summary.get("id") or ""))
             if detail:
                 thread_msgs.append(detail)
-        if len(thread_msgs) >= max_messages:
+        if len(thread_msgs) >= max(1, max_messages):
             break
 
     thread_msgs.sort(key=lambda m: m.internal_date)

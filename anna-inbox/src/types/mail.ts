@@ -311,9 +311,33 @@ export interface AttachmentDownloadPayload {
   error?: string;
 }
 
+export interface ThreadContextMessage {
+  message_id?: string;
+  from?: string;
+  to?: string;
+  cc?: string;
+  date?: string;
+  subject?: string;
+  body?: string;
+}
+
+export interface ThreadContextPayload {
+  thread_id?: string;
+  message_count?: number;
+  from?: string;
+  to?: string;
+  cc?: string;
+  subject?: string;
+  latest_time?: string;
+  messages?: ThreadContextMessage[];
+  returned_count?: number;
+  has_more_messages?: boolean;
+  next_before_index?: number | null;
+}
+
 export interface CardDetailPayload {
   card?: FrontendCard;
-  thread_context?: Record<string, unknown>;
+  thread_context?: ThreadContextPayload;
   contact_context?: Record<string, unknown>;
   latest_body?: string;
   latest_body_html?: string;

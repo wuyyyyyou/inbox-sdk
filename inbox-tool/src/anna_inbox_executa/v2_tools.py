@@ -14,6 +14,147 @@ _DOWNLOAD_TOKENS: dict[str, dict[str, Any]] = {}
 _DOWNLOAD_TOKEN_TTL_SECONDS = 15 * 60
 
 
+def _strip_quoted_reply_html(html: str) -> str:
+    """Remove common quoted-reply blocks from display HTML while preserving new content."""
+    from html import escape as _html_escape
+    from html import unescape as _html_unescape
+    from html.parser import HTMLParser as _HTMLParser
+    import re as _re
+
+    raw_html = str(html or "")
+    if not raw_html.strip():
+        return ""
+
+    quote_container_classes = {"gmail_quote", "yahoo_quoted", "protonmail_quote"}
+    quote_boundary_classes = {"gmail_attr", "moz-cite-prefix"}
+    quote_boundary_ids = {"divrplyfwdmsg"}
+    void_tags = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
+    on_wrote_re = _re.compile(r"\bOn\s+(.{1,700}?)\s+wrote:\s*$", _re.IGNORECASE | _re.DOTALL)
+    chinese_wrote_re = _re.compile(r"(?:在\s*)?.{1,700}?写道[:：]\s*$", _re.DOTALL)
+    original_message_re = _re.compile(r"-{2,}\s*Original Message\s*-{2,}\s*$", _re.IGNORECASE)
+    forwarded_message_re = _re.compile(r"-{2,}\s*Forwarded message\s*-{2,}\s*$", _re.IGNORECASE)
+    quote_date_or_addr_re = _re.compile(
+        r"(@|<[^>]+@[^>]+>|\b\d{4}\b|\b\d{1,2}:\d{2}\b|"
+        r"\b(?:mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|"
+        r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|"
+        r"january|february|march|april|june|july|august|september|october|november|december)\b)",
+        _re.IGNORECASE,
+    )
+
+    def _text_from_html(fragment: str) -> str:
+        text = _re.sub(r"<[^>]+>", " ", fragment)
+        return _re.sub(r"\s+", " ", _html_unescape(text)).strip()
+
+    def _looks_like_quote_header_text(text: str) -> bool:
+        normalized = _re.sub(r"\s+", " ", str(text or "")).strip()
+        if not normalized:
+            return False
+        if original_message_re.search(normalized) or forwarded_message_re.search(normalized):
+            return True
+        if chinese_wrote_re.search(normalized):
+            return normalized.startswith("在") or bool(quote_date_or_addr_re.search(normalized))
+        match = on_wrote_re.search(normalized)
+        if not match:
+            return False
+        return bool(quote_date_or_addr_re.search(match.group(1)))
+
+    class _QuotedReplyHTMLStripper(_HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.parts: list[str] = []
+            self.skip_depth = 0
+            self.done = False
+
+        def _quote_action(self, attrs: list[tuple[str, str | None]]) -> str:
+            for name, value in attrs:
+                normalized = name.lower()
+                if normalized == "class":
+                    classes = {part.strip().lower() for part in str(value or "").split()}
+                    if classes & quote_boundary_classes:
+                        return "stop"
+                    if classes & quote_container_classes:
+                        return "skip"
+                if normalized == "id" and str(value or "").strip().lower() in quote_boundary_ids:
+                    return "stop"
+            return ""
+
+        def _attrs_html(self, attrs: list[tuple[str, str | None]]) -> str:
+            rendered: list[str] = []
+            for name, value in attrs:
+                if value is None:
+                    rendered.append(f" {name}")
+                else:
+                    rendered.append(f' {name}="{_html_escape(str(value), quote=True)}"')
+            return "".join(rendered)
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if self.done:
+                return
+            normalized = tag.lower()
+            if self.skip_depth:
+                self.skip_depth += 1
+                return
+            action = self._quote_action(attrs)
+            if action == "stop":
+                self.done = True
+                return
+            if action == "skip":
+                self.skip_depth = 1
+                return
+            self.parts.append(f"<{tag}{self._attrs_html(attrs)}>")
+
+        def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if self.done or self.skip_depth or self._quote_action(attrs):
+                return
+            self.parts.append(f"<{tag}{self._attrs_html(attrs)} />")
+
+        def handle_endtag(self, tag: str) -> None:
+            if self.done:
+                return
+            if self.skip_depth:
+                self.skip_depth -= 1
+                return
+            if tag.lower() not in void_tags:
+                self.parts.append(f"</{tag}>")
+
+        def handle_data(self, data: str) -> None:
+            if not self.done and not self.skip_depth:
+                self.parts.append(_html_escape(data, quote=False))
+
+        def handle_entityref(self, name: str) -> None:
+            if not self.done and not self.skip_depth:
+                self.parts.append(f"&{name};")
+
+        def handle_charref(self, name: str) -> None:
+            if not self.done and not self.skip_depth:
+                self.parts.append(f"&#{name};")
+
+    parser = _QuotedReplyHTMLStripper()
+    try:
+        parser.feed(raw_html)
+        parser.close()
+        cleaned = "".join(parser.parts)
+    except Exception:
+        cleaned = raw_html
+
+    boundary_re = _re.compile(
+        r"(?P<prefix>^|<br\s*/?>\s*|</(?:p|div|li|tr|table|blockquote|section|article|h[1-6])>\s*)"
+        r"(?P<open>(?:<(?:p|div|span|font|blockquote|section|article|li|td|th|center)\b[^>]*>\s*)*)"
+        r"(?P<header>(?:On\s+.{1,700}?\s+wrote:|(?:在\s*)?.{1,700}?写道[:：]|-{2,}\s*(?:Original Message|Forwarded message)\s*-{2,}))",
+        _re.IGNORECASE | _re.DOTALL,
+    )
+
+    for match in boundary_re.finditer(cleaned):
+        header_text = _text_from_html(match.group("header"))
+        if not _looks_like_quote_header_text(header_text):
+            continue
+        cut_at = match.start("open") if match.group("open") else match.start("prefix")
+        return cleaned[:cut_at].strip()
+
+    return cleaned.strip()
+
+
 def _attachment_download_mode() -> str:
     raw = str(os.environ.get("ANNA_INBOX_ATTACHMENT_DOWNLOAD_MODE") or "").strip().lower()
     if raw in {"host", "host_preferred", "upload"}:
@@ -404,7 +545,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         card = next((c for c in cards.cards if c.card_id == card_id), None)
         if not card:
             return {"error": f"Card {card_id} not found"}
-        thread_ctx = await asyncio.to_thread(_fetch_thread_context_sync, mailbox, card)
+        thread_ctx = await asyncio.to_thread(_fetch_thread_context_sync, mailbox, card, preview_edges=True)
 
         latest_body = ""
         latest_body_html = ""
@@ -425,6 +566,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if include_body:
             body_loaded = True
             try:
+                from mail_agent.actions.service import _strip_quoted_reply
                 from mail_agent.mail_providers.gmail.adapter import decode_body_for_display, normalize_mailbox, read_message
                 msg = cached_msg if isinstance(cached_msg, dict) else read_message(normalize_mailbox(mailbox), card.message_id)
                 if isinstance(msg, dict):
@@ -433,14 +575,15 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                     raw_text = str(display_body.get("text") or "")
                     payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
                     if raw_html.strip():
-                        latest_body_html = _sanitize_email_html(raw_html[:8000])
+                        latest_body_html = _sanitize_email_html(_strip_quoted_reply_html(raw_html)[:8000])
                         latest_body_html = _resolve_cid_images(latest_body_html, payload)
                     if raw_text.strip():
-                        latest_body = raw_text[:8000]
+                        latest_body = _strip_quoted_reply(raw_text)[:8000]
                     elif not latest_body_html:
-                        latest_body = _dedup_body(str(msg.get("body_text") or card.original.body or ""))[:8000]
+                        latest_body = _strip_quoted_reply(_dedup_body(str(msg.get("body_text") or card.original.body or "")))[:8000]
             except Exception:
-                latest_body = _dedup_body(str(card.original.body or ""))[:8000]
+                from mail_agent.actions.service import _strip_quoted_reply
+                latest_body = _strip_quoted_reply(_dedup_body(str(card.original.body or "")))[:8000]
 
         contact_ctx = {}
         try:
@@ -478,6 +621,30 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             "body_loaded": body_loaded,
             "attachments": attachments,
         }
+
+    if tool == "get_thread_context_page":
+        if not mailbox or not card_id:
+            return {"error": "mailbox and card_id are required"}
+        cards = await storage_get_cards(mailbox)
+        card = next((c for c in cards.cards if c.card_id == card_id), None)
+        if not card:
+            return {"error": f"Card {card_id} not found"}
+        before_raw = arguments.get("before_index")
+        try:
+            before_index = int(before_raw) if before_raw is not None else None
+        except Exception:
+            before_index = None
+        try:
+            page_limit = int(arguments.get("limit") or 5)
+        except Exception:
+            page_limit = 5
+        return await asyncio.to_thread(
+            _fetch_thread_context_sync,
+            mailbox,
+            card,
+            before_index=before_index,
+            page_limit=page_limit,
+        )
 
     if tool == "prepare_attachment_download":
         if not mailbox or not card_id:

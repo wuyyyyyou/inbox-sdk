@@ -203,7 +203,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' \
 
 ## 发布与打包
 
-- 当前 Executa 版本是 `1.0.2`。
+- 当前 Executa 版本是 `1.1.0`。
 - `executa.json` 声明二进制分发元数据和本地开发命令。
 - `manifest.json` 声明 Executa 工具和凭据。
 - 修改二进制打包前先读 `anna-inbox/docs/PyInstaller二进制打包指南.md`。

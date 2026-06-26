@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Minimal Anna Executa skeleton for reading Gmail through local token files and DashScope or Anna sampling LLM.",
   "author": "Panwb",
   "host_capabilities": [
@@ -575,6 +575,43 @@
           "name": "include_body",
           "type": "boolean",
           "description": "Whether to include the original email body for user display.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "get_thread_context_page",
+      "description": "Load one bounded page of earlier thread-context messages for a card.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "card_id",
+          "type": "string",
+          "description": "Card ID from get_active_cards.",
+          "required": true
+        },
+        {
+          "name": "before_index",
+          "type": "integer",
+          "description": "Cursor returned by thread_context.next_before_index.",
+          "required": false
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Maximum messages to return in this page. Defaults to 5 and is capped by the Executa.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage provider: local or aps.",
           "required": false
         }
       ],

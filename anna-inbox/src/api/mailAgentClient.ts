@@ -156,6 +156,13 @@ export class MailAgentClient {
     return this.invoke<CardDetailPayload>("get_card_detail", { mailbox, card_id: cardId, storage_provider: storageProvider, include_body: includeBody });
   }
 
+  getThreadContextPage(mailbox: string, cardId: string, storageProvider: string, beforeIndex?: number | null, limit = 50) {
+    return this.invoke<CardDetailPayload["thread_context"]>(
+      "get_thread_context_page",
+      { mailbox, card_id: cardId, storage_provider: storageProvider, before_index: beforeIndex, limit },
+    );
+  }
+
   prepareAttachmentDownload(mailbox: string, cardId: string, attachmentId: string, storageProvider: string) {
     return this.invoke<AttachmentDownloadPayload>(
       "prepare_attachment_download",

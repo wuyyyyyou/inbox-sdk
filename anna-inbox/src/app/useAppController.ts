@@ -3,7 +3,7 @@ import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { buildDraftPreferencesInstruction, resolveDraftPreferences } from "../features/handle/draftPreferences";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { ActiveCardsPayload, AppState, CleanupMessage, CustomRunResultItem, DraftPreferenceField, DraftReplyGoal, FrontendCard, GmailErrorPopup, MailboxInfo, RunStatus, ScanPlan, ScanState } from "../types/mail";
+import type { ActiveCardsPayload, AppState, CleanupMessage, CustomRunResultItem, DraftPreferenceField, DraftReplyGoal, FrontendCard, GmailErrorPopup, MailboxInfo, RunStatus, ScanPlan, ScanState, ThreadContextPayload } from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -63,6 +63,28 @@ function cardMailbox(card: FrontendCard | null | undefined, fallback = ""): stri
 
 function cardUiKey(card: FrontendCard, fallbackMailbox = ""): string {
   return `${cardMailbox(card, fallbackMailbox)}::${card.id}`;
+}
+
+function mergeThreadContext(existing: ThreadContextPayload | undefined, incoming: ThreadContextPayload | undefined): ThreadContextPayload | undefined {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  const seen = new Set<string>();
+  const messages = [...(incoming.messages || []), ...(existing.messages || [])].filter((message) => {
+    const key = message.message_id || `${message.date || ""}:${message.from || ""}:${message.subject || ""}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).sort((a, b) => {
+    const at = Number(a.date || 0);
+    const bt = Number(b.date || 0);
+    if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return at - bt;
+    return String(a.date || "").localeCompare(String(b.date || ""));
+  });
+  return {
+    ...existing,
+    ...incoming,
+    messages,
+  };
 }
 
 function withCardKeys(cards: FrontendCard[], fallbackMailbox = ""): FrontendCard[] {
@@ -164,6 +186,7 @@ function base64ToBlobUrl(contentB64: string, mimeType: string) {
 export interface AppActions {
   showToast(message: string): void;
   closeDrawers(): void;
+  closeCardDetail(): void;
   setView(view: "start" | "ask"): void;
   setInput(field: "customScanInput", value: string): void;
   setDraft(cardId: string, value: string): void;
@@ -190,6 +213,7 @@ export interface AppActions {
   loadActiveCards(): Promise<void>;
   loadRunHistory(): Promise<void>;
   loadSelectedEmailBody(): Promise<void>;
+  loadMoreThreadContext(): Promise<void>;
   downloadAttachment(attachmentId: string): Promise<void>;
   loadContactMemories(): Promise<void>;
   openContactMemory(mailbox: string, contactEmail: string): Promise<void>;
@@ -637,6 +661,9 @@ export function useAppController() {
   const actions: AppActions = {
     showToast,
     closeDrawers() {
+      setState((s) => ({ ...s, sourcesOpen: false, historyOpen: false, memoryOpen: false, scanPlanOpen: false, expandAllConfigs: false }));
+    },
+    closeCardDetail() {
       const key = state.selectedCard?.uiKey || state.lastOpenedCardKey;
       setState((s) => ({ ...s, sourcesOpen: false, historyOpen: false, memoryOpen: false, originalOpen: false, scanPlanOpen: false, selectedCard: null, expandAllConfigs: false }));
       scrollToCard(key);
@@ -740,7 +767,6 @@ export function useAppController() {
         historyOpen: drawer === "history" ? open : false,
         memoryOpen: drawer === "memory" ? open : false,
         scanPlanOpen: drawer === "scanPlan" ? open : false,
-        originalOpen: false,
       }));
       if (drawer === "scanPlan" && open) void loadScanPlan();
       if (drawer === "memory" && open) void loadContactMemories();
@@ -1025,7 +1051,7 @@ export function useAppController() {
             selectedCardDetail: {
               ...(s.selectedCardDetail || {}),
               ...detail,
-              thread_context: detail.thread_context || s.selectedCardDetail?.thread_context,
+              thread_context: s.selectedCardDetail?.thread_context || detail.thread_context,
               contact_context: detail.contact_context || s.selectedCardDetail?.contact_context,
               body_loaded: true,
             },
@@ -1036,6 +1062,44 @@ export function useAppController() {
         showToast(error instanceof Error ? error.message : String(error));
       } finally {
         setState((s) => ({ ...s, pendingAction: s.pendingAction === `body:${key}` ? "" : s.pendingAction }));
+      }
+    },
+    async loadMoreThreadContext() {
+      if (!state.selectedCard || !state.selectedCardDetail?.thread_context?.has_more_messages) return;
+      const card = state.selectedCard;
+      const key = card.uiKey || cardUiKey(card, state.mailbox);
+      const actionKey = `thread:${key}`;
+      if (state.pendingAction === actionKey) return;
+      let beforeIndex = state.selectedCardDetail.thread_context.next_before_index;
+      setState((s) => ({ ...s, pendingAction: actionKey }));
+      try {
+        let merged = state.selectedCardDetail.thread_context;
+        const MAX_PAGES = 20;
+        for (let pageIndex = 0; pageIndex < MAX_PAGES && beforeIndex !== null && beforeIndex !== undefined; pageIndex += 1) {
+          const page = await client.getThreadContextPage(cardMailbox(card, state.mailbox), card.id, state.storageProvider, beforeIndex, 50);
+          if (!page) break;
+          merged = mergeThreadContext(merged, page) || page;
+          if (!page.has_more_messages) break;
+          beforeIndex = page.next_before_index;
+        }
+        setState((s) => {
+          const selectedKey = s.selectedCard ? s.selectedCard.uiKey || cardUiKey(s.selectedCard, s.mailbox) : "";
+          if (selectedKey !== key || !s.selectedCardDetail) return s;
+          return {
+            ...s,
+            selectedCardDetail: {
+              ...s.selectedCardDetail,
+              thread_context: {
+                ...(merged || s.selectedCardDetail.thread_context),
+                has_more_messages: Boolean(merged?.has_more_messages && merged.next_before_index !== null && merged.next_before_index !== undefined),
+              },
+            },
+          };
+        });
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+      } finally {
+        setState((s) => ({ ...s, pendingAction: s.pendingAction === actionKey ? "" : s.pendingAction }));
       }
     },
     async downloadAttachment(attachmentId) {
