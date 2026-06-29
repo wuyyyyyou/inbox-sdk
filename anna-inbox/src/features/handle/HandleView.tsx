@@ -194,6 +194,7 @@ export function HandleView() {
   const bodyExpanded = Boolean(state.threadContextExpanded[`${key}_body`]);
   const bodyVisible = bodyLoaded && bodyExpanded;
   const senderEmail = emailAddress(context.from || original.from || "");
+  const senderName = displayName(context.from || original.from || "");
   const recipientValue = context.to || original.to || "";
   const toEmail = emailAddress(recipientValue) || asString(recipientValue);
   const threadSubject = asString(context.subject || original.thread || card.title || "").slice(0, 80);
@@ -374,25 +375,40 @@ export function HandleView() {
 
   return (
     <section className="detail-shell">
-      <button className="detail-back" onClick={actions.closeCardDetail}>← Back to brief</button>
+      <div className="handle-nav-row">
+        <button className="detail-back" onClick={actions.closeCardDetail}>
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.5 3.5 6 8l4.5 4.5M6.5 8H14" /></svg>
+          Back to Brief
+        </button>
+        {nid ? (
+          <button className="handle-next-link" onClick={() => void actions.openCard(nid)}>
+            Next item
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 3.5 10 8l-4.5 4.5M2 8h8" /></svg>
+          </button>
+        ) : null}
+      </div>
       <article className="detail-card">
         <div className="reply-review-head">
           <div className="detail-head-main">
+            <span className="handle-eyebrow">Handle</span>
             <h2 className="reply-review-title">{threadSubject || card.title || "Email needs review"}</h2>
             {card.title && threadSubject && card.title !== threadSubject ? (
               <p className="detail-subtitle">{card.title}</p>
             ) : null}
-            <div className="detail-mail-header" aria-label="Email metadata">
-              <div className="detail-mail-route">
-                <span className="detail-mail-from">{displayName(context.from || original.from || "")}</span>
-                {senderEmail ? <span className="detail-mail-address">&lt;{senderEmail}&gt;</span> : null}
-                <span className="detail-mail-sep">to</span>
-                <span className="detail-mail-to">{toEmail || ownerEmail || "Unknown recipient"}</span>
+            <div className="detail-mail-line">
+              <span className="detail-mail-avatar" aria-hidden="true">{senderName.charAt(0).toUpperCase()}</span>
+              <div className="detail-mail-header" aria-label="Email metadata">
+                <div className="detail-mail-route">
+                  <span className="detail-mail-from">{senderName}</span>
+                  {senderEmail ? <span className="detail-mail-address">&lt;{senderEmail}&gt;</span> : null}
+                  <span className="detail-mail-sep">to</span>
+                  <span className="detail-mail-to">{toEmail || ownerEmail || "Unknown recipient"}</span>
+                </div>
+                {latestTime ? <span className="detail-mail-time">{formatBeijingTimestamp(latestTime)}</span> : null}
               </div>
-              {latestTime ? <span className="detail-mail-time">{formatBeijingTimestamp(latestTime)}</span> : null}
             </div>
           </div>
-          <span className={`category-tag ${hasDraft ? "is-ready-state" : ""}`}>{categoryLabel}</span>
+          <span className={`category-tag ${hasDraft ? "is-ready-state" : ""}`}><span className="category-tag-dot" />{categoryLabel}</span>
         </div>
         <div className="detail-workbench">
           <div className="detail-context-column">
@@ -569,12 +585,17 @@ export function HandleView() {
                 </>
               )}
             </section>
-            <div className="decision-row drawer-action-row">
-              <button className="primary-btn" disabled={!draft.trim() || !!state.pendingAction} onClick={() => void actions.replyNow()}>Reply now</button>
-              {isReviewCard ? <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.markCardRead()}>Read</button> : null}
-              <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.recordDecision("no_action_needed")}>No action needed</button>
-              <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.recordDecision("handled_manually")}>Handled manually</button>
-              {nid ? <button className="detail-back" style={{ marginLeft: "auto" }} onClick={() => void actions.openCard(nid)}>Next card →</button> : null}
+            <div className="handle-finish-panel">
+              <div className="handle-finish-head">
+                <span>Finish this item</span>
+                <span>{hasDraft ? "Draft ready" : "Choose an outcome"}</span>
+              </div>
+              <button className="primary-btn handle-reply-now" disabled={!draft.trim() || !!state.pendingAction} onClick={() => void actions.replyNow()}>Reply now</button>
+              <div className="handle-finish-secondary">
+                {isReviewCard ? <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.markCardRead()}>Read</button> : null}
+                <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.recordDecision("no_action_needed")}>No action needed</button>
+                <button className="soft-btn" disabled={!!state.pendingAction} onClick={() => void actions.recordDecision("handled_manually")}>Handled manually</button>
+              </div>
             </div>
           </aside>
         </div>

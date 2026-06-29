@@ -4,17 +4,24 @@ import { visibleCards } from "./cardHelpers";
 
 export function BottomBar() {
   const { state, actions } = useApp();
-  if (state.view === "start" && state.originalOpen) return null;
+  if (state.view === "ask" || (state.view === "start" && state.originalOpen)) return null;
   const cards = visibleCards(state.cards);
-  if (state.isScanning) {
+  const scanInProgress = state.isScanning || state.isPreparingScan;
+  if (scanInProgress) {
     const step = SCAN_STEPS[Math.min(state.scanStepIndex, SCAN_STEPS.length - 1)] || SCAN_STEPS[0];
     return (
       <footer className="bottom-bar">
-        <div>
+        <div className="bar-status">
+          <span className="bar-status-dot is-scanning" />
+          <div>
           <p className="bar-title">Anna is scanning your inbox.</p>
           <p className="bar-copy">{step.title} · {scanProgressLabel(state.scanStage, state.scanProgress) || "Starting..."}</p>
+          </div>
         </div>
-        <div className="bar-actions"><button className="soft-btn" disabled>Scanning...</button></div>
+        <div className="bar-actions">
+          <button className="soft-btn" disabled>Scanning...</button>
+          <button className="soft-btn scan-settings-btn" disabled>Scan Settings</button>
+        </div>
       </footer>
     );
   }
@@ -22,12 +29,16 @@ export function BottomBar() {
   const scanButtonLabel = hasScanned ? "Continue Scan" : "Scan now";
   return (
     <footer className="bottom-bar">
-      <div>
-        <p className="bar-title">{cards.length} active attention card{cards.length === 1 ? "" : "s"}.</p>
+      <div className="bar-status">
+        <span className="bar-status-dot" />
+        <div>
+        <p className="bar-title">{cards.length} active item{cards.length === 1 ? "" : "s"}</p>
         <p className="bar-copy">{state.loading ? "Connecting to Anna runtime..." : "Ready."}</p>
+        </div>
       </div>
       <div className="bar-actions">
-        <button className="primary-btn" disabled={state.isScanning || !state.runtime.connected} onClick={() => void actions.startScan("manual")}>{scanButtonLabel}</button>
+        <button className="primary-btn" disabled={scanInProgress || !state.runtime.connected} onClick={() => void actions.startScan("manual")}>{scanButtonLabel}</button>
+        <button className="soft-btn scan-settings-btn" disabled={scanInProgress || !state.runtime.connected} onClick={actions.openSourcesWithConfig}>Scan Settings</button>
       </div>
     </footer>
   );

@@ -41,7 +41,8 @@ function PerMailboxConfig() {
   const [busyAction, setBusyAction] = useState<"" | "continue" | "reset" | "delete">("");
   const save = actions.saveScanPlanField;
   const mailboxEmail = state.configMailbox || state.mailbox;
-  const buttonsDisabled = Boolean(busyAction || state.isScanning || state.isPreparingScan || !state.runtime.connected);
+  const scanInProgress = state.isScanning || state.isPreparingScan;
+  const buttonsDisabled = Boolean(busyAction || scanInProgress || !state.runtime.connected);
   const clampInt = (value: number, min: number, max: number) => Math.min(max, Math.max(min, Math.round(value)));
   const saveWindowDays = (value: number) => {
     const next = clampInt(value, 1, 90);
@@ -80,29 +81,31 @@ function PerMailboxConfig() {
           <button
             className="soft-btn compact danger mailbox-scan-action"
             disabled={buttonsDisabled}
-            title="Delete Brief history for this mailbox and scan from scratch."
-            aria-label="Delete history and scan again"
+            title={scanInProgress ? "A mailbox scan is already in progress." : "Delete Brief history for this mailbox and scan from scratch."}
+            aria-label={scanInProgress ? "Scanning" : "Delete history and scan again"}
+            aria-busy={scanInProgress}
             onClick={() => setConfirmFreshScan(true)}
           >
-            Reset &amp; Scan
+            {scanInProgress ? "Scanning…" : "Reset & Scan"}
           </button>
           <button
             className="primary-btn mailbox-scan-action"
             disabled={buttonsDisabled}
-            title="Keep existing records and continue scanning new mail."
-            aria-label="Keep current records and continue scanning"
+            title={scanInProgress ? "A mailbox scan is already in progress." : "Keep existing records and continue scanning new mail."}
+            aria-label={scanInProgress ? "Scanning" : "Keep current records and continue scanning"}
+            aria-busy={scanInProgress}
             onClick={() => {
               setBusyAction("continue");
               void actions.startScan("continue", mailboxEmail).finally(() => setBusyAction(""));
             }}
           >
-            Continue Scan
+            {scanInProgress ? "Scanning…" : "Continue Scan"}
           </button>
         </div>
       </div>
       <div style={{ marginTop: 12 }}>
         <div style={{ display: "flex", justifyContent: "center" }}>
-          <button className="danger-btn" style={{ fontSize: 12, padding: "6px 14px", borderRadius: 8 }} disabled={buttonsDisabled} onClick={() => setConfirmDelete(true)}>Delete mailbox data</button>
+          <button className="danger-btn mailbox-delete-data-btn" style={{ fontSize: 12, padding: "6px 14px", borderRadius: 8 }} disabled={buttonsDisabled} onClick={() => setConfirmDelete(true)}>Delete mailbox data</button>
         </div>
         <p className="drawer-copy" style={{ marginTop: 4 }}>Clears all cards, cache, contact memory, and scan history for this mailbox only.</p>
       </div>

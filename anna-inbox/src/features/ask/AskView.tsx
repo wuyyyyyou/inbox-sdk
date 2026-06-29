@@ -4,6 +4,26 @@ import type { AskHistoryEntry, CustomPlanQuery, CustomRunResult, CustomRunResult
 import { formatBeijingTimestamp, normalizeSubject } from "../../shared/format";
 import { CUSTOM_PROGRESS_STEPS, customStageCopy } from "../brief/runHelpers";
 
+const ASK_STARTERS = [
+  "What needs my reply?",
+  "Show deadlines this week",
+  "Find unanswered follow-ups",
+  "Summarize unread email",
+];
+
+function AskSparkleIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M10 2.5c.45 3.7 2.3 5.55 6 6-3.7.45-5.55 2.3-6 6-.45-3.7-2.3-5.55-6-6 3.7-.45 5.55-2.3 6-6Z" />
+      <path d="M15.5 2.5c.16 1.32.83 1.99 2.15 2.15-1.32.16-1.99.83-2.15 2.15-.16-1.32-.83-1.99-2.15-2.15 1.32-.16 1.99-.83 2.15-2.15Z" />
+    </svg>
+  );
+}
+
+function AskArrowIcon() {
+  return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" /></svg>;
+}
+
 function asQueries(value: unknown): CustomPlanQuery[] {
   return Array.isArray(value) ? value as CustomPlanQuery[] : [];
 }
@@ -205,14 +225,18 @@ function CustomTrace({ result }: { result: CustomRunResult }) {
   );
 }
 
-function CustomRunResultCard({ result }: { result: CustomRunResult }) {
+function CustomRunResultCard({ result, timestamp }: { result: CustomRunResult; timestamp?: string }) {
   const { state } = useApp();
   const sections = Array.isArray(result.sections) ? result.sections : [];
   return (
     <section className="custom-result-card">
       <div className="custom-result-head">
-        <div><p className="custom-result-title">{result.title || result.plan_title || "Scan result"}</p><p className="assistant-copy">{result.summary || ""}</p></div>
-        <span className="attention-pill is-depth">Custom scan</span>
+        <div className="custom-result-head-main">
+          <div className="custom-result-eyebrow"><AskSparkleIcon /><span>Latest answer</span>{timestamp ? <time>{formatBeijingTimestamp(timestamp)}</time> : null}</div>
+          <p className="custom-result-title">{result.title || result.plan_title || "Scan result"}</p>
+          <p className="assistant-copy">{result.summary || ""}</p>
+        </div>
+        <span className="custom-result-badge">Custom scan</span>
       </div>
       {result.planner_fallback ? <div className="ask-plan-fallback">Anna could not generate a smart scan plan this time, so a rule-based fallback was used. The answer may be less precise.</div> : null}
       {sections.map((sec, i) => (
@@ -322,17 +346,24 @@ function AskHistoryEntryRow({ entry, index }: { entry: AskHistoryEntry; index: n
 
 export function AskView() {
   const { state, actions } = useApp();
+  const [libraryTab, setLibraryTab] = useState<"history" | "plans">(state.askHistory.length > 1 ? "history" : "plans");
   const latest = state.askHistory.length > 0 ? state.askHistory[0] : null;
   const older = state.askHistory.length > 1 ? state.askHistory.slice(1) : [];
   const isRunning = state.isCustomScanning || !!(state.customRunProgress && state.customRunProgress.status !== "failed");
   const mailboxLabel = state.selectedMailboxes.length > 1 ? `${state.selectedMailboxes.length} selected mailboxes` : state.selectedMailboxes[0] || state.mailbox;
+  const hasLibrary = older.length > 0 || state.customPlans.length > 0;
+  const activeLibraryTab = libraryTab === "history" && !older.length && state.customPlans.length
+    ? "plans"
+    : libraryTab === "plans" && !state.customPlans.length && older.length
+      ? "history"
+      : libraryTab;
 
   return (
     <div className="ask-layout">
-      <section className="assistant-card">
-        <div className="assistant-kicker">Custom scan</div>
-        <h1 className="assistant-says">Ask Anna to do a custom scan</h1>
-        <p className="assistant-copy">Describe what you need in natural language. Anna will scan {mailboxLabel} based on your request without changing your default daily briefing.</p>
+      <section className="ask-hero">
+        <div className="ask-hero-eyebrow"><AskSparkleIcon /><span>Ask your inbox</span>{mailboxLabel ? <span className="ask-scope-chip">{mailboxLabel}</span> : null}</div>
+        <h1>What can Anna find for you?</h1>
+        <p>Ask about decisions, follow-ups, deadlines, or anything buried in your email.</p>
       </section>
       <section className="ask-composer" aria-label="Custom scan prompt">
         <textarea
@@ -343,62 +374,84 @@ export function AskView() {
           value={state.customScanInput}
           onChange={(e) => actions.setInput("customScanInput", e.target.value)}
           onInput={(e) => { const t = e.currentTarget; t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 160) + "px"; }}
+          onKeyDown={(e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && !isRunning) {
+              e.preventDefault();
+              void actions.startCustomScan();
+            }
+          }}
         />
         <div className="ask-composer-footer">
-          <span className="ask-composer-hint">{isRunning ? "Anna is scanning" : "Custom mailbox scan"}</span>
-          <button className="ask-run-btn" disabled={isRunning} onClick={() => void actions.startCustomScan()} aria-label="Run custom scan">{isRunning ? "..." : "Run"}</button>
+          <div className="ask-composer-context">
+            <span className={`ask-context-dot ${isRunning ? "is-running" : ""}`} />
+            {isRunning ? <span>Anna is scanning</span> : mailboxLabel ? <><span>{mailboxLabel}</span><span className="ask-context-separator" /></> : null}
+            <span>Daily brief unchanged</span>
+          </div>
+          <div className="ask-composer-actions">
+            <kbd>{navigator.platform?.toLowerCase().includes("mac") ? "⌘" : "Ctrl"} ↵</kbd>
+            <button className="ask-run-btn" disabled={isRunning} onClick={() => void actions.startCustomScan()} aria-label="Ask Anna">
+              <span>{isRunning ? "Working" : "Ask Anna"}</span><AskArrowIcon />
+            </button>
+          </div>
         </div>
       </section>
+      {!latest && !isRunning ? (
+        <div className="ask-starters" aria-label="Suggested questions">
+          <span>Try asking</span>
+          <div className="ask-starter-list">
+            {ASK_STARTERS.map((starter) => (
+              <button key={starter} onClick={() => actions.setInput("customScanInput", starter)}>{starter}</button>
+            ))}
+          </div>
+        </div>
+      ) : null}
       {isRunning && state.customRunProgress ? <AskProgress /> : null}
       {state.scanError && !isRunning ? <section className="custom-error-card">{state.scanError}</section> : null}
 
-      {latest ? <CustomRunResultCard result={latest.result} /> : null}
+      {latest ? <CustomRunResultCard result={latest.result} timestamp={latest.timestamp} /> : null}
 
-      {older.length ? (
-        <section className="ask-history-section">
+      {hasLibrary ? (
+        <section className="ask-library-section">
           <div className="ask-section-head">
             <div>
-              <h2>Past runs</h2>
-              <p>Recent custom scans, kept compact so the latest answer stays in focus.</p>
+              <h2>Library</h2>
+              <p>Return to an answer or run a saved scan again.</p>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <button className="history-clear-btn" title="Clear history" onClick={() => void actions.clearHistory()}>🗑 Clear</button>
-              <span>{older.length} saved</span>
+            <div className="ask-library-tabs" role="tablist" aria-label="Ask library">
+              <button className={activeLibraryTab === "history" ? "is-active" : ""} role="tab" aria-selected={activeLibraryTab === "history"} disabled={!older.length} onClick={() => setLibraryTab("history")}>Past runs <span>{older.length}</span></button>
+              <button className={activeLibraryTab === "plans" ? "is-active" : ""} role="tab" aria-selected={activeLibraryTab === "plans"} disabled={!state.customPlans.length} onClick={() => setLibraryTab("plans")}>Saved scans <span>{state.customPlans.length}</span></button>
             </div>
           </div>
-          {older.map((entry, idx) => <AskHistoryEntryRow key={idx} entry={entry} index={idx + 1} />)}
-        </section>
-      ) : null}
-
-      {state.customPlans.length ? (
-        <section className="ask-plans-section">
-          <div className="ask-section-head">
-            <div>
-              <h2>Saved scan plans</h2>
-              <p>Reusable scans for the currently selected mailboxes.</p>
+          {activeLibraryTab === "history" ? (
+            <div className="ask-library-panel" role="tabpanel">
+              <div className="ask-library-panel-head"><span>Recent custom scans</span><button className="history-clear-btn" title="Clear history" onClick={() => void actions.clearHistory()}>Clear history</button></div>
+              {older.map((entry, idx) => <AskHistoryEntryRow key={idx} entry={entry} index={idx + 1} />)}
             </div>
-            <span>{state.customPlans.length} plan{state.customPlans.length === 1 ? "" : "s"}</span>
-          </div>
-          <div className="history-list">
-            {state.customPlans.map((plan) => {
-              const timestampLabel = plan.last_used_at ? `Last run ${formatBeijingTimestamp(plan.last_used_at)}` : `Created ${formatBeijingTimestamp(plan.created_at || "")}`;
-              return (
-                <div className="custom-plan-row" key={plan.plan_id}>
-                  <div className="history-row">
-                    <div className="custom-plan-head">
-                      <strong>{plan.title || plan.user_request?.slice(0, 60) || "Custom scan"}</strong>
-                      <span className="custom-plan-delete" role="button" aria-label="Delete plan" onClick={() => void actions.deleteCustomPlan(plan.plan_id)}>Delete</span>
+          ) : (
+            <div className="ask-library-panel" role="tabpanel">
+              <div className="ask-library-panel-head"><span>Reusable scans for the selected mailboxes</span></div>
+              <div className="history-list">
+                {state.customPlans.map((plan) => {
+                  const timestampLabel = plan.last_used_at ? `Last run ${formatBeijingTimestamp(plan.last_used_at)}` : `Created ${formatBeijingTimestamp(plan.created_at || "")}`;
+                  return (
+                    <div className="custom-plan-row" key={plan.plan_id}>
+                      <div className="history-row">
+                        <div className="custom-plan-head">
+                          <strong>{plan.title || plan.user_request?.slice(0, 60) || "Custom scan"}</strong>
+                          <button className="custom-plan-delete" aria-label="Delete plan" onClick={() => void actions.deleteCustomPlan(plan.plan_id)}>Delete</button>
+                        </div>
+                        <span className="custom-plan-meta">{plan.user_request?.slice(0, 100) || ""}{plan.use_count ? ` · Used ${plan.use_count} time${plan.use_count === 1 ? "" : "s"}` : ""}{timestampLabel ? ` · ${timestampLabel}` : ""}</span>
+                        {plan.last_result_summary ? <span className="custom-plan-result">{plan.last_result_summary}</span> : null}
+                        <span className="custom-plan-actions">
+                          <button className="custom-plan-run" disabled={state.isCustomScanning} onClick={() => void actions.reRunCustomPlan(plan.plan_id)}>Run scan <AskArrowIcon /></button>
+                        </span>
+                      </div>
                     </div>
-                    <span className="custom-plan-meta">{plan.user_request?.slice(0, 100) || ""}{plan.use_count ? ` · Used ${plan.use_count} time${plan.use_count === 1 ? "" : "s"}` : ""}{timestampLabel ? ` · ${timestampLabel}` : ""}</span>
-                    {plan.last_result_summary ? <span className="custom-plan-result">{plan.last_result_summary}</span> : null}
-                    <span className="custom-plan-actions">
-                      <button className="custom-plan-run" disabled={state.isCustomScanning} onClick={() => void actions.reRunCustomPlan(plan.plan_id)}>Run</button>
-                    </span>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </section>
       ) : null}
     </div>
