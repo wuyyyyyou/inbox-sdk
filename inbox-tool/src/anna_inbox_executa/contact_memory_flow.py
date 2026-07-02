@@ -23,6 +23,25 @@ def _memory_mailboxes(arguments: dict[str, Any]) -> list[str]:
     return sorted(dict.fromkeys(str(item.get("email", "")).strip().lower() for item in discovered if str(item.get("email", "")).strip()))
 
 
+async def _memory_mailboxes_async(arguments: dict[str, Any]) -> list[str]:
+    raw_mailboxes = arguments.get("mailboxes")
+    if isinstance(raw_mailboxes, list):
+        mailboxes = [str(item).strip().lower() for item in raw_mailboxes if str(item).strip()]
+        if mailboxes:
+            return sorted(dict.fromkeys(mailboxes))
+    mailbox = str(arguments.get("mailbox", "")).strip().lower()
+    if mailbox and mailbox != "all":
+        return [mailbox]
+    from mail_agent.storage.ops import get_mailbox_registry
+
+    registry = await get_mailbox_registry()
+    selected = [entry.email for entry in getattr(registry, "mailboxes", []) if getattr(entry, "selected", False)]
+    if selected:
+        return sorted(dict.fromkeys(str(item).strip().lower() for item in selected if str(item).strip()))
+    discovered = _discover_mailboxes()
+    return sorted(dict.fromkeys(str(item.get("email", "")).strip().lower() for item in discovered if str(item.get("email", "")).strip()))
+
+
 def _sync_list_contact_memories(arguments: dict[str, Any]) -> dict[str, Any]:
     from mail_agent.contact_memory.manager import list_memory_summaries
 
@@ -102,7 +121,7 @@ async def _prepare_contact_memory_run(run_id: str, arguments: dict[str, Any]) ->
     since_dt = _parse_contact_memory_dt(str(arguments.get("since") or ""))
     items: list[dict[str, Any]] = []
     skipped_old = 0
-    for mailbox in _memory_mailboxes(arguments):
+    for mailbox in await _memory_mailboxes_async(arguments):
         active = await get_active_cards(mailbox)
         for card in active.cards:
             if getattr(card, "card_type", "") == "cleanup_bundle":

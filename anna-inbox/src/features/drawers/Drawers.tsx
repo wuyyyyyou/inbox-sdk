@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { modeLabel } from "../../app/constants";
 import { useApp } from "../../app/AppContext";
 import { formatBeijingTimestamp } from "../../shared/format";
@@ -176,18 +176,14 @@ function SourcesDrawer() {
           <div className="mailbox-list">
             {mailboxes.map((mailbox) => {
               const email = mailbox.email;
-              const selected = state.selectedMailboxes.includes(email) || Boolean(mailbox.selected && !state.selectedMailboxes.length);
+              const selected = normalizeMailbox(state.mailbox) === normalizeMailbox(email);
               const initials = (email || "A").charAt(0).toUpperCase();
               const isExpanded = expanded === email;
               return (
-                <>
+                <Fragment key={email}>
                   <article key={email} className={`source-card mailbox-card ${selected ? "is-selected" : ""}`}>
-                    <div className="mailbox-source-row" style={{ cursor: "pointer" }} onClick={(e) => {
-                      if ((e.target as HTMLElement).tagName === "INPUT") return;
-                      const next = isExpanded ? "" : email;
-                      void actions.setConfigMailbox(next);
-                    }}>
-                      <input type="checkbox" checked={selected} onChange={(event) => { void actions.setMailboxSelected(email, event.target.checked); }} />
+                    <div className="mailbox-source-row" style={{ cursor: "pointer" }} onClick={() => { void actions.switchMailbox(email); }}>
+                      <span className={`source-account-radio ${selected ? "is-selected" : ""}`} aria-hidden="true">{selected ? "✓" : ""}</span>
                       <span className="source-icon">{initials}</span>
                       <span className="mailbox-source-main">
                         <span className="source-name">{email}</span>
@@ -200,15 +196,18 @@ function SourcesDrawer() {
                         </span>
                         {mailbox.last_error ? <span className="source-meta is-error">{mailbox.last_error}</span> : null}
                       </span>
-                      <span className="mailbox-config-arrow">{isExpanded ? "▼" : "◀"}</span>
+                      <button className="mailbox-config-arrow" title="Account settings" onClick={(event) => {
+                        event.stopPropagation();
+                        const next = isExpanded ? "" : email;
+                        void actions.setConfigMailbox(next);
+                      }}>{isExpanded ? "▼" : "◀"}</button>
                     </div>
                   </article>
                   {isExpanded ? <PerMailboxConfig /> : null}
-                </>
+                </Fragment>
               );
             })}
           </div>
-          {!state.selectedMailboxes.length ? <p className="assistant-copy is-error">Select at least one mailbox to run Brief.</p> : null}
         </section>
         <section className="config-block">
           <h3>Storage</h3>

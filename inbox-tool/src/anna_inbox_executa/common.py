@@ -61,6 +61,7 @@ STDOUT_LOCK = threading.Lock()
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 MAX_STDIO_MESSAGE_BYTES = 512 * 1024
+MAX_INBOX_THREAD_RESPONSE_BYTES = 256 * 1024
 
 DEFAULT_MANIFEST = {
     "name": DEFAULT_TOOL_ID,
@@ -155,15 +156,29 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "list_inbox_emails",
+            "description": "List compact Gmail inbox messages from a recent day window without running Brief or an LLM.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
+                {"name": "days", "type": "integer", "description": "Recent day window, from 1 to 30.", "required": False},
+                {"name": "limit", "type": "integer", "description": "Maximum messages to return, from 1 to 500.", "required": False},
+                {"name": "category", "type": "string", "description": "Inbox category: inbox, todos, starred, snoozed, done, drafts, sent, trash, spam, or all.", "required": False},
+                {"name": "clear_cache", "type": "boolean", "description": "Clear this mailbox's Gmail cache before fetching a fresh snapshot.", "required": False},
+            ],
+        },
+        {
             "name": "list_cached_emails",
             "description": "List compact local Gmail message summaries for one mailbox.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
+                {"name": "days", "type": "integer", "description": "Recent day window to filter cached mail, from 1 to 30.", "required": False},
+                {"name": "limit", "type": "integer", "description": "Maximum cached messages to return, from 1 to 500.", "required": False},
+                {"name": "category", "type": "string", "description": "Cached category filter: inbox, todos, starred, snoozed, done, drafts, sent, trash, spam, or all.", "required": False},
             ],
         },
         {
             "name": "get_cached_email",
-            "description": "Read one full locally cached Gmail message JSON by message id.",
+            "description": "Read one full Gmail message by id, fetching and caching it when the body is not cached yet.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
                 {"name": "message_id", "type": "string", "description": "Gmail message id.", "required": True},
@@ -245,6 +260,11 @@ DEFAULT_MANIFEST = {
             "parameters": [],
         },
         {
+            "name": "get_mailbox_registry",
+            "description": "Read the persisted mailbox registry without triggering Gmail or avatar discovery.",
+            "parameters": [],
+        },
+        {
             "name": "set_mailbox_selected",
             "description": "Set whether a mailbox participates in Brief scans and card display.",
             "parameters": [
@@ -283,6 +303,44 @@ DEFAULT_MANIFEST = {
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
                 {"name": "card_id", "type": "string", "description": "Card ID from get_active_cards.", "required": True},
                 {"name": "include_body", "type": "boolean", "description": "Whether to include the original email body for user display.", "required": False},
+            ],
+        },
+        {
+            "name": "get_inbox_thread_page",
+            "description": "Get one page of an Inbox Gmail thread with bounded display bodies and attachment metadata.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "thread_id", "type": "string", "description": "Gmail thread ID.", "required": True},
+                {"name": "anchor_message_id", "type": "string", "description": "Message initially opened from the Inbox list.", "required": False},
+                {"name": "before_index", "type": "integer", "description": "Exclusive thread index boundary for older-page pagination.", "required": False},
+                {"name": "limit", "type": "integer", "description": "Maximum messages to return in this page. Defaults to 5.", "required": False},
+                {"name": "include_display_body", "type": "boolean", "description": "Whether to include bounded display HTML/text for each message.", "required": False},
+            ],
+        },
+        {
+            "name": "get_inbox_message_display_body",
+            "description": "Get the full display body for one Inbox message when the thread page returned a truncated body.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "message_id", "type": "string", "description": "Gmail message ID.", "required": True},
+            ],
+        },
+        {
+            "name": "resolve_contact_avatars",
+            "description": "Resolve saved Google Contact avatar URLs for email addresses. Returns permission_required when Contacts scope is unavailable.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
+                {"name": "emails", "type": "array", "description": "Contact email addresses.", "required": True},
+            ],
+        },
+        {
+            "name": "prepare_inbox_attachment_access",
+            "description": "Prepare short-lived preview or download access for an Inbox attachment.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "message_id", "type": "string", "description": "Gmail message ID owning the attachment.", "required": True},
+                {"name": "attachment_id", "type": "string", "description": "Opaque attachment token from Inbox thread DTO.", "required": True},
+                {"name": "mode", "type": "string", "description": "preview or download.", "required": False},
             ],
         },
         {
@@ -343,6 +401,17 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "start_inbox_thread_assist",
+            "description": "Start AI overview and quick-reply generation for an Inbox thread. Returns run_id immediately; poll with get_mail_agent_run.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "thread_id", "type": "string", "description": "Gmail thread ID.", "required": True},
+                {"name": "latest_message_id", "type": "string", "description": "Latest message ID used for cache invalidation.", "required": True},
+                {"name": "anchor_message_id", "type": "string", "description": "Message initially opened from the Inbox list.", "required": False},
+                {"name": "ai_provider", "type": "string", "description": "LLM provider.", "required": False},
+            ],
+        },
+        {
             "name": "start_generate_draft",
             "description": "Start background draft generation or revision. If current_draft is provided, revises it. Returns run_id immediately. Poll with get_mail_agent_run.",
             "parameters": [
@@ -352,6 +421,46 @@ DEFAULT_MANIFEST = {
                 {"name": "current_draft", "type": "string", "description": "Existing draft to revise (optional).", "required": False},
                 {"name": "revision_input", "type": "string", "description": "User instructions for generation or revision (optional).", "required": False},
                 {"name": "ai_provider", "type": "string", "description": "LLM provider.", "required": False},
+            ],
+        },
+        {
+            "name": "start_inbox_mail_prompt",
+            "description": "Start a mail-context AI prompt from the left Anna sidebar and optionally return a draft-reply artifact.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "thread_id", "type": "string", "description": "Gmail thread ID.", "required": True},
+                {"name": "anchor_message_id", "type": "string", "description": "Message initially opened from the Inbox list.", "required": True},
+                {"name": "latest_message_id", "type": "string", "description": "Latest thread message ID.", "required": True},
+                {"name": "visible_prompt", "type": "string", "description": "Prompt visible in the left Anna sidebar.", "required": True},
+                {"name": "expected_artifact", "type": "string", "description": "Expected artifact type, such as draft_reply.", "required": False},
+                {"name": "user_answers", "type": "object", "description": "Optional answers to reply-gap questions.", "required": False},
+                {"name": "ai_provider", "type": "string", "description": "LLM provider.", "required": False},
+            ],
+        },
+        {
+            "name": "get_inbox_thread_draft",
+            "description": "Read a persisted Inbox thread draft from mailbox-scoped storage.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "thread_id", "type": "string", "description": "Gmail thread ID.", "required": True},
+            ],
+        },
+        {
+            "name": "save_inbox_thread_draft",
+            "description": "Persist an Inbox thread draft body to mailbox-scoped storage.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "thread_id", "type": "string", "description": "Gmail thread ID.", "required": True},
+                {"name": "body", "type": "string", "description": "Draft body text.", "required": True},
+                {"name": "if_match", "type": "string", "description": "Optional etag for optimistic concurrency.", "required": False},
+            ],
+        },
+        {
+            "name": "delete_inbox_thread_draft",
+            "description": "Delete a persisted Inbox thread draft from mailbox-scoped storage.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "thread_id", "type": "string", "description": "Gmail thread ID.", "required": True},
             ],
         },
         {
@@ -474,6 +583,34 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "modify_message_labels",
+            "description": "Modify a bounded allowlist of Gmail system labels for Inbox detail actions.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "message_ids", "type": "array", "description": "Gmail message IDs to modify.", "required": True},
+                {"name": "add_label_ids", "type": "array", "description": "System label IDs to add. Allowlist: UNREAD, IMPORTANT.", "required": False},
+                {"name": "remove_label_ids", "type": "array", "description": "System label IDs to remove. Allowlist: UNREAD, IMPORTANT.", "required": False},
+            ],
+        },
+        {
+            "name": "set_message_starred",
+            "description": "Add or remove Gmail's STARRED label for one message.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "message_id", "type": "string", "description": "Gmail message ID.", "required": True},
+                {"name": "starred", "type": "boolean", "description": "Whether the message should be starred.", "required": True},
+            ],
+        },
+        {
+            "name": "update_inbox_thread_state",
+            "description": "Apply a guarded Gmail read, star, importance, or trash transition to an entire thread.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "thread_id", "type": "string", "description": "Gmail thread ID.", "required": True},
+                {"name": "operation", "type": "string", "description": "mark_read | mark_unread | star | unstar | mark_important | mark_not_important | trash | untrash.", "required": True},
+            ],
+        },
+        {
             "name": "trash_from_ask",
             "description": "Move Gmail messages to trash for Ask results.",
             "parameters": [
@@ -496,7 +633,10 @@ DEFAULT_MANIFEST = {
                 {"name": "max_messages", "type": "integer", "description": "Maximum messages to scan.", "required": False},
                 {"name": "primary_count", "type": "integer", "description": "How many recent Primary emails to fetch first.", "required": False},
                 {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
+                {"name": "storage_provider", "type": "string", "description": "Storage provider: local or aps.", "required": False},
+                {"name": "wait_timeout_seconds", "type": "integer", "description": "How long this invoke should wait before returning a pollable running state.", "required": False},
             ],
+            "timeout": 600,
         },
         {
             "name": "re_run_custom_scan",
@@ -508,7 +648,10 @@ DEFAULT_MANIFEST = {
                 {"name": "max_messages", "type": "integer", "description": "Maximum messages to scan.", "required": False},
                 {"name": "primary_count", "type": "integer", "description": "How many recent Primary emails to fetch first.", "required": False},
                 {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
+                {"name": "storage_provider", "type": "string", "description": "Storage provider: local or aps.", "required": False},
+                {"name": "wait_timeout_seconds", "type": "integer", "description": "How long this invoke should wait before returning a pollable running state.", "required": False},
             ],
+            "timeout": 600,
         },
         {
             "name": "get_authorized_email",
@@ -673,7 +816,76 @@ def _sampling_result_shape(result: Any) -> str:
     return f"keys={','.join(sorted(str(k) for k in result.keys()))}; content={content_shape}"
 
 
+def _encoded_frame_size(message: dict[str, Any]) -> int:
+    return len(json.dumps(message, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _limit_inbox_thread_response_frame(message: dict[str, Any]) -> dict[str, Any]:
+    """Final guard: never emit a thread-page JSON-RPC frame over 256 KiB."""
+    result = message.get("result") if isinstance(message.get("result"), dict) else None
+    if not result or result.get("tool") != "get_inbox_thread_page":
+        return message
+    data = result.get("data") if isinstance(result.get("data"), dict) else None
+    messages = data.get("messages") if isinstance(data, dict) and isinstance(data.get("messages"), list) else None
+    if messages is None or _encoded_frame_size(message) <= MAX_INBOX_THREAD_RESPONSE_BYTES:
+        return message
+
+    # The page builder already applies progressive budgets. This is an exact
+    # frame-level safety net for unusually long request IDs or metadata.
+    while _encoded_frame_size(message) > MAX_INBOX_THREAD_RESPONSE_BYTES:
+        changed = False
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            body_text = item.get("body_text")
+            if isinstance(body_text, str) and body_text:
+                if len(body_text) > 320:
+                    item["body_text"] = body_text[: max(320, len(body_text) // 2)].rstrip()
+                else:
+                    item.pop("body_text", None)
+                item["body_truncated"] = True
+                changed = True
+            elif item.get("body_html"):
+                # Never return partial HTML; remove it and let the client use
+                # the on-demand display-body tool.
+                item.pop("body_html", None)
+                item["body_truncated"] = True
+                changed = True
+        if changed:
+            continue
+        if len(messages) > 1:
+            messages.pop(0)
+            previous_cursor = int(data.get("next_before_index") or 0)
+            data["next_before_index"] = previous_cursor + 1
+            data["has_earlier"] = True
+            data["returned_count"] = len(messages)
+            continue
+
+        data.update({
+            "messages": [],
+            "returned_count": 0,
+            "has_earlier": True,
+            "error": "Thread metadata exceeds the 256 KiB response limit.",
+        })
+        messages = data["messages"]
+        if _encoded_frame_size(message) > MAX_INBOX_THREAD_RESPONSE_BYTES:
+            # Keep only the fields required for a bounded, actionable error.
+            result["data"] = {
+                "mailbox": str(data.get("mailbox") or ""),
+                "thread_id": str(data.get("thread_id") or ""),
+                "messages": [],
+                "returned_count": 0,
+                "has_earlier": True,
+                "next_before_index": data.get("next_before_index"),
+                "latest_message_id": str(data.get("latest_message_id") or ""),
+                "error": "Thread response exceeds the 256 KiB limit.",
+            }
+        break
+    return message
+
+
 def write_frame(message: dict[str, Any]) -> None:
+    message = _limit_inbox_thread_response_frame(message)
     # Keep stdio frames ASCII-only. JSON escapes preserve the original Unicode
     # after parsing, and avoid GBK pipe/logging crashes in Windows hosts.
     payload = json.dumps(message, ensure_ascii=True, separators=(",", ":"))
@@ -830,11 +1042,13 @@ def _compact_run_payload(value: Any, *, text_limit: int = 1200) -> Any:
     if isinstance(value, list):
         return [_compact_run_payload(item, text_limit=text_limit) for item in value]
     if isinstance(value, dict):
+        is_draft_artifact = str(value.get("type") or "") == "draft_reply"
         compact: dict[str, Any] = {}
         for key, item in value.items():
             if key in {"body", "body_text", "body_html", "raw", "raw_message"} and isinstance(item, str):
-                compact[key] = item[:text_limit]
-                if len(item) > text_limit:
+                field_limit = 12000 if is_draft_artifact and key == "body" else text_limit
+                compact[key] = item[:field_limit]
+                if len(item) > field_limit:
                     compact[f"{key}_truncated"] = True
                 continue
             compact[key] = _compact_run_payload(item, text_limit=text_limit)
@@ -920,26 +1134,55 @@ def read_credentials(context: dict[str, Any]) -> dict[str, str]:
     }
 
 
+_BASE_ENV_CREDENTIALS = {
+    name: os.environ.get(name)
+    for name in ("DASHSCOPE_API_KEY", "DASHSCOPE_MODEL", "GMAIL_ACCESS_TOKEN", "GOOGLE_ACCESS_TOKEN")
+}
+_RUNTIME_INJECTED_CREDENTIALS: set[str] = set()
+_RUNTIME_CREDENTIAL_LOCK = threading.RLock()
+
+
 def apply_runtime_credentials(context: dict[str, Any]) -> None:
     raw_credentials = context.get("credentials") if isinstance(context, dict) else {}
     credentials = raw_credentials if isinstance(raw_credentials, dict) else {}
-    for name in ("DASHSCOPE_API_KEY", "DASHSCOPE_MODEL", "GMAIL_ACCESS_TOKEN", "GOOGLE_ACCESS_TOKEN"):
-        value = credentials.get(name) or os.environ.get(name)
-        if value:
-            os.environ[name] = str(value)
+    with _RUNTIME_CREDENTIAL_LOCK:
+        # 缺失字段表示本次 invoke 不更新该凭据；显式空值才恢复启动环境。
+        for name in _BASE_ENV_CREDENTIALS:
+            if name not in credentials:
+                continue
+            value = credentials.get(name)
+            if value:
+                os.environ[name] = str(value)
+                _RUNTIME_INJECTED_CREDENTIALS.add(name)
+            elif name in _RUNTIME_INJECTED_CREDENTIALS:
+                original = _BASE_ENV_CREDENTIALS.get(name)
+                if original is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = original
+                _RUNTIME_INJECTED_CREDENTIALS.discard(name)
 
-    # 多 token 凭证：解析 JSON → 合并进 APS 工作副本 → 加载到内存
-    multi_raw = credentials.get("GMAIL_MULTI_TOKENS", "")
-    if multi_raw and multi_raw.strip():
+        # 多账号绑定是进程内共享快照：缺失字段不更新，显式 [] 才解绑全部。
+        if "GMAIL_MULTI_TOKENS" not in credentials:
+            return
+        multi_raw = credentials.get("GMAIL_MULTI_TOKENS")
         try:
-            tokens = json.loads(multi_raw)
-            if isinstance(tokens, list) and len(tokens) > 0:
-                _run_storage_query(_merge_multi_tokens_seed(tokens), timeout=10.0)
-                all_tokens = _run_storage_query(_get_all_multi_tokens(), timeout=10.0)
-                from mail_agent.mail_providers.gmail.adapter import set_multi_tokens
-                set_multi_tokens(all_tokens)
-        except (json.JSONDecodeError, Exception):
-            pass
+            tokens = multi_raw if isinstance(multi_raw, list) else json.loads(str(multi_raw))
+            if not isinstance(tokens, list):
+                log("ignored invalid GMAIL_MULTI_TOKENS snapshot: expected a JSON array")
+                return
+        except (json.JSONDecodeError, TypeError):
+            log("ignored invalid GMAIL_MULTI_TOKENS snapshot: malformed JSON")
+            return
+        try:
+            from anna_inbox_executa.mailbox_tools import _get_all_multi_tokens, _merge_multi_tokens_seed
+            _run_storage_query(_merge_multi_tokens_seed(tokens), timeout=10.0)
+            all_tokens = _run_storage_query(_get_all_multi_tokens(), timeout=10.0)
+            from mail_agent.mail_providers.gmail.adapter import set_multi_tokens
+            set_multi_tokens(all_tokens)
+        except Exception as exc:
+            # 更新失败时保留上一份已生效快照，避免半更新状态。
+            log(f"ignored GMAIL_MULTI_TOKENS snapshot update: {type(exc).__name__}")
 
 
 def check_google_oauth(context: dict[str, Any]) -> dict[str, Any]:

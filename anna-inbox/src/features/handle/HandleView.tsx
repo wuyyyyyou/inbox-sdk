@@ -1,7 +1,7 @@
-import { Fragment, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
-import DOMPurify from "dompurify";
+import { Fragment, useLayoutEffect, useRef, useState } from "react";
 import { useApp } from "../../app/AppContext";
 import { formatBeijingTimestamp } from "../../shared/format";
+import { SafeEmailHtml, SafeEmailText } from "../../shared/SafeEmailHtml";
 import {
   DEFAULT_DRAFT_PREFERENCES,
   DRAFT_LENGTH_OPTIONS,
@@ -32,30 +32,6 @@ function formatBytes(value: unknown): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function safeExternalUrl(url: string): string {
-  try {
-    const parsed = new URL(url);
-    if (!["http:", "https:", "mailto:"].includes(parsed.protocol)) return "";
-    return parsed.toString();
-  } catch {
-    return "";
-  }
-}
-
-function openExternalUrl(url: string) {
-  const safe = safeExternalUrl(url);
-  if (!safe) return;
-  const opened = window.open(safe, "_blank", "noopener,noreferrer");
-  if (opened) return;
-  const link = document.createElement("a");
-  link.href = safe;
-  link.target = "_blank";
-  link.rel = "noopener noreferrer";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
 }
 
 function emailAddress(value: unknown): string {
@@ -102,13 +78,6 @@ function threadBodyBlocks(value: unknown): string[] {
   }
   flush();
   return blocks;
-}
-
-function handleOriginalBodyClick(event: MouseEvent<HTMLDivElement>) {
-  const target = event.target instanceof Element ? event.target.closest("a[href]") : null;
-  if (!target) return;
-  event.preventDefault();
-  openExternalUrl((target as HTMLAnchorElement).href);
 }
 
 const DRAFT_CONTROL_CONFIG: Array<{ field: DraftPreferenceField; options: string[] }> = [
@@ -191,8 +160,7 @@ export function HandleView() {
   const replyMode = state.replyModeById[key] || "reply_to_sender";
   const cc = asString(context.cc || original.cc || "None");
   const contextExpanded = Boolean(state.threadContextExpanded[key]);
-  const bodyExpanded = Boolean(state.threadContextExpanded[`${key}_body`]);
-  const bodyVisible = bodyLoaded && bodyExpanded;
+  const bodyVisible = bodyLoaded;
   const senderEmail = emailAddress(context.from || original.from || "");
   const senderName = displayName(context.from || original.from || "");
   const recipientValue = context.to || original.to || "";
@@ -206,12 +174,8 @@ export function HandleView() {
   const categoryLabel = hasDraft ? "Reply ready" : cardCategoryLabel(card);
   const draftDisplay = state.generatingDraft && !draft ? "Anna is drafting a reply..." : draft;
   const nid = nextCardId(state);
-  const BODY_PREVIEW = 500;
   const loadingBody = state.pendingAction === `body:${key}`;
   const loadingThreadContext = state.pendingAction === `thread:${key}`;
-  const bodyTruncated = latestBodyHtml
-    ? latestBodyHtml.length > BODY_PREVIEW
-    : latestBody.length > BODY_PREVIEW;
 
   useLayoutEffect(() => {
     const textarea = draftTextareaRef.current;
@@ -434,60 +398,21 @@ export function HandleView() {
             {!bodyVisible ? (
               <section className={`review-block is-quiet is-disclosure${loadingBody ? " is-loading" : ""}`}>
                 <div>
-                  <p>Original email body is hidden until you choose to view it.</p>
+                  <p>{loadingBody || !state.selectedCardDetail ? "Loading email..." : "Full email body is not available for this card."}</p>
                   {attachments.length ? (
                     <p className="attachment-download-hint">
-                      This email has {attachments.length} attachment{attachments.length === 1 ? "" : "s"}. Show full email to download {attachments.length === 1 ? "it" : "them"}.
+                      This email has {attachments.length} attachment{attachments.length === 1 ? "" : "s"}.
                     </p>
                   ) : null}
                 </div>
-                <button className="soft-btn compact" disabled={loadingBody} onClick={() => void actions.loadSelectedEmailBody()}>
-                  {loadingBody ? "Loading email..." : "Show full email"}
-                </button>
               </section>
             ) : latestBodyHtml ? (
               <section className="review-block is-original-body">
-                <div
-                  className={`original-body original-body-html${bodyTruncated && !bodyExpanded ? " is-clamped" : ""}`}
-                  style={{ wordBreak: "break-all", overflowWrap: "break-word" }}
-                  onClick={handleOriginalBodyClick}
-                  dangerouslySetInnerHTML={{
-                    __html: DOMPurify.sanitize(latestBodyHtml, {
-                      ALLOWED_TAGS: [
-                        "a", "abbr", "b", "blockquote", "br", "caption", "center",
-                        "cite", "code", "col", "colgroup", "dd", "del", "details",
-                        "dfn", "div", "dl", "dt", "em", "figcaption", "figure",
-                        "font", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i",
-                        "img", "ins", "kbd", "li", "map", "area", "mark", "ol",
-                        "p", "pre", "q", "s", "samp", "small", "span", "strike",
-                        "strong", "sub", "summary", "sup", "table", "tbody", "td",
-                        "tfoot", "th", "thead", "time", "tr", "u", "ul", "var",
-                      ],
-                      ALLOWED_ATTR: [
-                        "alt", "align", "bgcolor", "border", "cellpadding",
-                        "cellspacing", "class", "color", "colspan", "face",
-                        "height", "href", "hspace", "id", "loading", "name",
-                        "nowrap", "referrerpolicy", "rel", "rowspan", "size",
-                        "src", "style", "target", "title", "valign", "vspace",
-                        "width",
-                      ],
-                      ALLOW_DATA_ATTR: false,
-                      ALLOWED_URI_REGEXP: /^(?:(?:https?|ftp|mailto|data|cid):|[^/]+\/[^/]+)/i,
-                    }),
-                  }}
-                />
-                <button className="soft-btn compact" style={{ marginTop: 6 }} onClick={() => actions.toggleThreadContext(`${key}_body`)}>
-                  Show less
-                </button>
+                <SafeEmailHtml className="original-body original-body-html" html={latestBodyHtml} scaleToFit />
               </section>
             ) : latestBody ? (
               <section className="review-block is-original-body">
-                <div className="original-body" style={{ whiteSpace: "pre-wrap", wordBreak: "break-all", overflowWrap: "break-word" }}>
-                  {bodyTruncated && !bodyExpanded ? latestBody.slice(0, BODY_PREVIEW) + "…" : latestBody}
-                </div>
-                <button className="soft-btn compact" style={{ marginTop: 6 }} onClick={() => actions.toggleThreadContext(`${key}_body`)}>
-                  Show less
-                </button>
+                <SafeEmailText className="original-body" text={latestBody} />
               </section>
             ) : (
               <section className="review-block is-quiet is-disclosure">

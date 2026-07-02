@@ -475,14 +475,184 @@ def read_primary_emails(mailbox_arg: str, limit_arg: Any) -> dict[str, Any]:
     }
 
 
-def list_cached_emails(mailbox_arg: str) -> dict[str, Any]:
-    from mail_agent.mail_providers.gmail.adapter import cache_debug_info, list_messages, read_cache as adapter_read_cache, normalize_mailbox as adapter_normalize_mailbox
+def _compact_inbox_message(item: dict[str, Any], mailbox: str) -> dict[str, Any]:
+    labels = [str(label) for label in (item.get("label_ids") or [])]
+    attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
+    return {
+        "id": item.get("id"),
+        "thread_id": item.get("thread_id"),
+        "mailbox": mailbox,
+        "internal_date": item.get("internal_date"),
+        "date": item.get("date"),
+        "from": item.get("from"),
+        "to": item.get("to"),
+        "subject": item.get("subject"),
+        "snippet": item.get("snippet"),
+        "body_preview": str(item.get("body_preview") or "")[:240],
+        "label_ids": labels,
+        "unread": "UNREAD" in labels,
+        "important": "IMPORTANT" in labels,
+        "starred": "STARRED" in labels,
+        "has_attachment": bool(attachments),
+        "attachment_count": len(attachments),
+        "body_cached": bool(item.get("body_cached")),
+    }
+
+
+def _normalize_inbox_category(category_arg: Any) -> str:
+    category = str(category_arg or "all").strip().lower()
+    category_queries = {
+        "inbox": "in:inbox",
+        "todos": "in:inbox",
+        "snoozed": "in:inbox",
+        "done": "in:inbox",
+        "starred": "is:starred",
+        "drafts": "in:drafts",
+        "sent": "in:sent",
+        "trash": "in:trash",
+        "spam": "in:spam",
+        "all": "in:anywhere -in:chats",
+    }
+    if category not in category_queries:
+        return "all"
+    return category
+
+
+def _matches_cached_category(item: dict[str, Any], category: str) -> bool:
+    labels = {str(label).upper() for label in (item.get("label_ids") or [])}
+    if category in {"all", "todos", "snoozed", "done"}:
+        return True
+    if category == "inbox":
+        return "INBOX" in labels
+    if category == "starred":
+        return "STARRED" in labels
+    if category == "drafts":
+        return "DRAFT" in labels
+    if category == "sent":
+        return "SENT" in labels
+    if category == "trash":
+        return "TRASH" in labels
+    if category == "spam":
+        return "SPAM" in labels
+    return True
+
+
+def list_inbox_emails(
+    mailbox_arg: str,
+    days_arg: Any = 7,
+    limit_arg: Any = 100,
+    category_arg: Any = "inbox",
+    clear_cache_arg: Any = False,
+) -> dict[str, Any]:
+    """Return a compact, LLM-free Gmail inbox feed for the home screen."""
+    from mail_agent.mail_providers.gmail.adapter import (
+        clear_mailbox_cache,
+        live_search_metadata_and_cache,
+        list_messages,
+        gmail_request,
+        normalize_mailbox as adapter_normalize_mailbox,
+    )
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
-    cached = adapter_read_cache(mailbox)
-    messages = sorted(list_messages(mailbox), key=lambda item: int(item.get("internal_date") or 0), reverse=True)
+    profile = gmail_request(mailbox, "/users/me/profile", {"fields": "emailAddress"})
+    authorized_email = str(profile.get("emailAddress") or "").strip().lower()
+    if authorized_email and authorized_email != mailbox:
+        raise ValueError(f"Gmail credential mismatch: selected {mailbox}, authorized {authorized_email}")
+    cache_reset = clear_mailbox_cache(mailbox) if clear_cache_arg is True else None
+    days = max(1, min(int(days_arg or 7), 30))
+    limit = max(1, min(int(limit_arg or 100), 500))
+    category = str(category_arg or "inbox").strip().lower()
+    category_queries = {
+        "inbox": "in:inbox",
+        "todos": "in:inbox",
+        "snoozed": "in:inbox",
+        "done": "in:inbox",
+        "starred": "is:starred",
+        "drafts": "in:drafts",
+        "sent": "in:sent",
+        "trash": "in:trash",
+        "spam": "in:spam",
+        "all": "in:anywhere -in:chats",
+    }
+    if category not in category_queries:
+        category = "inbox"
+    query = f"{category_queries[category]} newer_than:{days}d"
+    matched_ids = live_search_metadata_and_cache(mailbox, query, limit)
+    by_id = {
+        str(item.get("id") or ""): item
+        for item in list_messages(mailbox)
+        if isinstance(item, dict) and item.get("id")
+    }
+
+    messages: list[dict[str, Any]] = []
+    for message_id in matched_ids:
+        item = by_id.get(str(message_id))
+        if not item:
+            continue
+        messages.append(_compact_inbox_message(item, mailbox))
+
     return {
         "mailbox": mailbox,
+        "days": days,
+        "category": category,
+        "query": query,
+        "count": len(messages),
+        "messages": messages,
+        "updated_at": beijing_now(),
+        "cache_reset": cache_reset,
+    }
+
+
+def resolve_contact_avatars(mailbox_arg: str, emails_arg: Any) -> dict[str, Any]:
+    from mail_agent.mail_providers.gmail.adapter import normalize_mailbox as adapter_normalize_mailbox, resolve_contact_avatar_urls
+
+    mailbox = adapter_normalize_mailbox(mailbox_arg)
+    emails = [str(item) for item in emails_arg] if isinstance(emails_arg, list) else []
+    return {"mailbox": mailbox, **resolve_contact_avatar_urls(mailbox, emails)}
+
+
+def list_cached_emails(mailbox_arg: str, days_arg: Any = 7, limit_arg: Any = 100, category_arg: Any = "all") -> dict[str, Any]:
+    from mail_agent.mail_providers.gmail.adapter import cache_debug_info, read_cache as adapter_read_cache, normalize_mailbox as adapter_normalize_mailbox
+
+    mailbox = adapter_normalize_mailbox(mailbox_arg)
+    days = max(1, min(int(days_arg or 7), 30))
+    limit = max(1, min(int(limit_arg or 100), 500))
+    category = _normalize_inbox_category(category_arg)
+    started_at = time.perf_counter()
+    cached = adapter_read_cache(mailbox)
+    raw_messages = cached.get("messages") if isinstance(cached, dict) else []
+    cached_messages = sorted(
+        [item for item in raw_messages if isinstance(item, dict) and item.get("id")],
+        key=lambda item: int(item.get("internal_date") or 0),
+        reverse=True,
+    )
+    cutoff = int((time.time() - days * 24 * 60 * 60) * 1000)
+    messages = [
+        _compact_inbox_message(item, mailbox)
+        for item in cached_messages
+        if int(item.get("internal_date") or 0) >= cutoff and _matches_cached_category(item, category)
+    ][:limit]
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
+    print(
+        json.dumps(
+            {
+                "scope": "gmail_feed_cache",
+                "mailbox": mailbox,
+                "days": days,
+                "limit": limit,
+                "category": category,
+                "cache_messages": len(cached_messages),
+                "returned_messages": len(messages),
+                "elapsed_ms": elapsed_ms,
+            },
+            ensure_ascii=False,
+        ),
+        file=sys.stderr,
+    )
+    return {
+        "mailbox": mailbox,
+        "days": days,
+        "category": category,
         "cache": cache_debug_info(mailbox),
         "updated_at": cached.get("updated_at"),
         "count": len(messages),
@@ -491,11 +661,16 @@ def list_cached_emails(mailbox_arg: str) -> dict[str, Any]:
 
 
 def get_cached_email(mailbox_arg: str, message_id: str) -> dict[str, Any]:
-    from mail_agent.mail_providers.gmail.adapter import cache_debug_info, read_message as adapter_read_message, normalize_mailbox as adapter_normalize_mailbox
+    from mail_agent.mail_providers.gmail.adapter import cache_debug_info, fetch_and_cache_message, read_message as adapter_read_message, normalize_mailbox as adapter_normalize_mailbox
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
     msg_id = str(message_id or "")
-    message = adapter_read_message(mailbox, msg_id)
+    try:
+        message = adapter_read_message(mailbox, msg_id)
+    except ValueError:
+        message = fetch_and_cache_message(mailbox, msg_id)
+        if not message:
+            raise ValueError(f"Gmail message not found: {msg_id}")
     return {
         "mailbox": mailbox,
         "cache": cache_debug_info(mailbox),

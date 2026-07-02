@@ -1,6 +1,7 @@
 export type RuntimeMode = "connecting" | "live" | "mock";
 export type MainView = "start" | "ask";
 export type CardStatus = "pending" | "snoozed" | "resolved" | "dismissed" | string;
+export type InboxThreadStateOperation = "mark_read" | "mark_unread" | "star" | "unstar" | "mark_important" | "mark_not_important" | "trash" | "untrash";
 export type ResultFilter = "all" | "reply" | "review" | "cleanup";
 export type LlmProvider = "anna-llm" | "dashscope";
 export type StorageProvider = "aps" | "local";
@@ -45,6 +46,7 @@ export interface LlmStatus {
 
 export interface MailboxInfo {
   email: string;
+  avatar_url?: string;
   provider?: "gmail" | "outlook" | string;
   auth_source?: string;
   authorized?: boolean;
@@ -64,9 +66,10 @@ export interface RuntimeState {
 }
 
 export interface AnnaRuntimeClient {
-  tools?: { invoke?: (args: ToolInvokeArgs, options?: { timeoutMs?: number }) => Promise<unknown> };
+  tools?: { invoke?: (args: ToolInvokeArgs, options?: { timeoutMs?: number; signal?: AbortSignal }) => Promise<unknown> };
+  llm?: { complete?: (args: unknown, options?: { timeoutMs?: number; signal?: AbortSignal }) => Promise<unknown> };
   window?: { set_title?: (args: { title: string }) => Promise<unknown> };
-  call?: (ns: string, method: string, args?: unknown, options?: { timeout?: number; timeoutMs?: number }) => Promise<unknown>;
+  call?: (ns: string, method: string, args?: unknown, options?: { timeout?: number; timeoutMs?: number; signal?: AbortSignal }) => Promise<unknown>;
 }
 
 export interface ToolInvokeArgs {
@@ -139,6 +142,49 @@ export interface FrontendCard {
   replyGaps?: ReplyGaps;
   gmailState?: Record<string, unknown>;
   attachments?: MailAttachmentMeta[];
+}
+
+export interface InboxMessage {
+  id: string;
+  thread_id?: string;
+  mailbox?: string;
+  internal_date?: string;
+  date?: string | null;
+  from?: string | null;
+  to?: string | null;
+  subject?: string | null;
+  snippet?: string | null;
+  body_preview?: string | null;
+  label_ids?: string[];
+  unread?: boolean;
+  important?: boolean;
+  starred?: boolean;
+  has_attachment?: boolean;
+  attachment_count?: number;
+  body_cached?: boolean;
+}
+
+export interface InboxEmailDetailPayload {
+  mailbox?: string;
+  message?: InboxMessage & { body_text?: string | null };
+}
+
+export interface InboxFeedPayload {
+  mailbox?: string;
+  days?: number;
+  category?: string;
+  query?: string;
+  count?: number;
+  messages: InboxMessage[];
+  updated_at?: string;
+}
+
+export interface ContactAvatarPayload {
+  mailbox?: string;
+  avatars: Record<string, string>;
+  permission_required?: boolean;
+  required_scope?: string;
+  warning?: string;
 }
 
 export interface CleanupMessage {
@@ -302,13 +348,17 @@ export interface MailAttachmentMeta {
 export interface AttachmentDownloadPayload {
   ok?: boolean;
   delivery?: "url" | "inline" | string;
+  mode?: "preview" | "download" | string;
   filename?: string;
   mime_type?: string;
   size?: number;
   download_url?: string;
+  preview_url?: string;
   content_b64?: string;
   expires_at?: string;
   error?: string;
+  message_id?: string;
+  attachment_id?: string;
 }
 
 export interface ThreadContextMessage {
@@ -343,6 +393,103 @@ export interface CardDetailPayload {
   latest_body_html?: string;
   body_loaded?: boolean;
   attachments?: MailAttachmentMeta[];
+}
+
+export interface InboxThreadMessage {
+  id: string;
+  thread_id: string;
+  internal_date: string;
+  from: string;
+  to: string;
+  cc?: string;
+  bcc?: string;
+  subject: string;
+  label_ids: string[];
+  body_text?: string;
+  body_html?: string;
+  body_truncated?: boolean;
+  attachments: MailAttachmentMeta[];
+}
+
+export interface InboxThreadPagePayload {
+  mailbox: string;
+  thread_id: string;
+  subject: string;
+  messages: InboxThreadMessage[];
+  returned_count: number;
+  has_earlier: boolean;
+  next_before_index: number | null;
+  latest_message_id: string;
+}
+
+export interface InboxMessageDisplayBodyPayload {
+  mailbox: string;
+  message_id: string;
+  thread_id: string;
+  body_text?: string;
+  body_html?: string;
+  body_truncated?: boolean;
+}
+
+export interface QuickReplySuggestion {
+  id: string;
+  label: string;
+  intent: string;
+}
+
+export interface InboxThreadAssistPayload {
+  thread_id: string;
+  latest_message_id: string;
+  overview: string;
+  quick_replies: QuickReplySuggestion[];
+  summary?: Record<string, unknown>;
+  related_context?: string[];
+  cached?: boolean;
+  fallback_used?: boolean;
+}
+
+export interface AiMailContextRef {
+  kind: "gmail_thread";
+  mailbox: string;
+  thread_id: string;
+  anchor_message_id: string;
+  latest_message_id: string;
+}
+
+export interface SubmitMailPromptRequest {
+  visiblePrompt: string;
+  context: AiMailContextRef;
+  expectedArtifact?: "draft_reply";
+  userAnswers?: Record<string, string>;
+}
+
+export interface DraftReplyArtifact {
+  type: "draft_reply";
+  mailbox: string;
+  thread_id: string;
+  body: string;
+  source_prompt: string;
+}
+
+export interface MailPromptRunResult {
+  mailbox: string;
+  thread_id: string;
+  anchor_message_id: string;
+  latest_message_id: string;
+  visible_prompt: string;
+  assistant_text: string;
+  artifact?: DraftReplyArtifact | null;
+  reply_gaps?: ReplyGaps;
+  fallback_used?: boolean;
+}
+
+export interface InboxThreadDraftPayload {
+  mailbox: string;
+  thread_id: string;
+  exists: boolean;
+  etag?: string;
+  body: string;
+  updated_at?: string;
 }
 
 export interface ContactMemorySummary {
@@ -447,6 +594,9 @@ export interface AppState {
   customScanInput: string;
   customRunResult: CustomRunResult | null;
   customRunProgress: CustomRunProgress | null;
+  aiChatMessages: AiChatMessage[];
+  aiChatConversationId: string;
+  aiChatLoading: boolean;
   customTraceOpen: boolean;
   sourcesOpen: boolean;
   historyOpen: boolean;
@@ -493,6 +643,13 @@ export interface AppState {
   attachmentDownloads: Record<string, "preparing" | "error" | "ready">;
   gmailAuthStatus: GmailAuthStatus;
   gmailErrorPopup: GmailErrorPopup | null;
+  inboxMessages: InboxMessage[];
+  inboxSnapshotMessages: InboxMessage[];
+  inboxSnapshotLoading: boolean;
+  inboxSnapshotComplete: boolean;
+  inboxLoading: boolean;
+  inboxError: string;
+  inboxUpdatedAt: string;
   askItemActions: Record<string, { read?: boolean; trashed?: boolean; replied?: boolean; sending?: boolean }>;
   askEditDraft: Record<string, string>;
   askHistory: AskHistoryEntry[];
@@ -508,5 +665,23 @@ export interface AskHistoryEntry {
   query: string;
   result: CustomRunResult;
   timestamp: string;
+  conversationId?: string;
+  kind?: "chat" | "scan";
+  messages?: AiChatMessage[];
+}
+
+export interface AiChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  timestamp: string;
+  kind?: "chat" | "scan" | "status" | "error" | "stopped";
+  result?: CustomRunResult | null;
+  pending?: boolean;
+  artifact?: DraftReplyArtifact | null;
+  replyGaps?: ReplyGaps;
+  mailContext?: AiMailContextRef;
+  fallbackUsed?: boolean;
+  sourcePrompt?: string;
 }
 

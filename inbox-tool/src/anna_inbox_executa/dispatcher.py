@@ -53,10 +53,29 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "tool": tool, "data": future.result(timeout=60.0)}
     if tool == "read_primary_emails":
         return {"success": True, "tool": tool, "data": read_primary_emails(arguments.get("mailbox", ""), arguments.get("limit", 5))}
+    if tool == "list_inbox_emails":
+        return {"success": True, "tool": tool, "data": list_inbox_emails(
+            arguments.get("mailbox", ""),
+            arguments.get("days", 7),
+            arguments.get("limit", 100),
+            arguments.get("category", "inbox"),
+            arguments.get("clear_cache", False),
+        )}
     if tool == "list_cached_emails":
-        return {"success": True, "tool": tool, "data": list_cached_emails(arguments.get("mailbox", ""))}
+        return {
+            "success": True,
+            "tool": tool,
+            "data": list_cached_emails(
+                arguments.get("mailbox", ""),
+                arguments.get("days", 7),
+                arguments.get("limit", 100),
+                arguments.get("category", "all"),
+            ),
+        }
     if tool == "get_cached_email":
         return {"success": True, "tool": tool, "data": get_cached_email(arguments.get("mailbox", ""), arguments.get("message_id", ""))}
+    if tool == "resolve_contact_avatars":
+        return {"success": True, "tool": tool, "data": resolve_contact_avatars(arguments.get("mailbox", ""), arguments.get("emails", []))}
     if tool == "check_gmail_auth":
         return {"success": True, "tool": tool, "data": _check_gmail_auth(arguments.get("mailbox", ""))}
     if tool == "check_sampling_status":
@@ -135,6 +154,8 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "tool": tool, "data": _sync_get_cleanup_bundle_page(arguments)}
     if tool == "list_mailboxes":
         return {"success": True, "tool": tool, "data": _sync_list_mailboxes()}
+    if tool == "get_mailbox_registry":
+        return {"success": True, "tool": tool, "data": _sync_get_mailbox_registry()}
     if tool == "set_mailbox_selected":
         return {"success": True, "tool": tool, "data": _sync_set_mailbox_selected(arguments)}
     if tool == "remove_mailbox":
@@ -144,14 +165,17 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
 
     # ── V2 interaction tools (async → dispatch to event loop) ──
     if tool in (
-        "get_card_detail", "get_thread_context_page", "prepare_attachment_download", "summarize_thread",
+        "get_card_detail", "get_inbox_thread_page", "get_inbox_message_display_body", "get_thread_context_page",
+        "prepare_inbox_attachment_access", "prepare_attachment_download", "summarize_thread",
         "generate_draft_reply", "generate_ask_draft", "revise_draft", "record_card_decision",
         "clear_active_cards", "mark_card_read", "mark_cleanup_read", "record_snooze", "restore_card", "record_learning",
-        "start_summarize_thread", "start_generate_draft",
+        "start_summarize_thread", "start_inbox_thread_assist", "start_generate_draft", "start_inbox_mail_prompt",
         "delete_custom_plan",
         "clear_cards", "clear_history", "reset_all_data", "reset_mailbox_scan_history", "delete_mailbox_data",
         "get_scan_plan", "set_scan_plan",
-        "reply_now", "reply_from_ask", "mark_read_from_ask", "trash_from_ask",
+        "reply_now", "reply_from_ask", "mark_read_from_ask", "trash_from_ask", "get_inbox_thread_draft",
+        "save_inbox_thread_draft", "delete_inbox_thread_draft", "modify_message_labels", "set_message_starred",
+        "update_inbox_thread_state",
     ):
         future = asyncio.run_coroutine_threadsafe(
             _handle_v2_tool(tool, arguments, invoke_id),

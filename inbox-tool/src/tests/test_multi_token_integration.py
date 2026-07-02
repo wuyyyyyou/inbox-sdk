@@ -7,9 +7,13 @@ Run:  PYTHONPATH=src python src/tests/test_multi_token_integration.py
 from __future__ import annotations
 
 import json
+import io
 import os
+import ssl
 import sys
+import threading
 import time
+import urllib.error
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -127,7 +131,12 @@ class TestMultiTokenIntegration:
         self.test_mixed_platform_and_multi()
         self.test_dedup_platform_in_multi()
         self.test_malformed_json_graceful_degrade()
+        self.test_removed_token_is_pruned()
+        self.test_missing_snapshot_does_not_unbind()
+        self.test_concurrent_snapshot_reads_are_atomic()
         self.test_token_refresh_updates_map()
+        self.test_concurrent_refresh_runs_once()
+        self.test_unbind_during_refresh_does_not_restore_account()
         self.test_check_gmail_auth_all_sources()
         self.test_discover_mailboxes_merges_all()
         self.test_get_authorized_email_tool()
@@ -149,14 +158,14 @@ class TestMultiTokenIntegration:
 
         with _patch("mail_agent.mail_providers.gmail.adapter.get_authorized_email", return_value="primary@gmail.com"), \
              _patch("mail_agent.mail_providers.gmail.adapter.list_available_mailboxes_from_tokens", return_value=[]):
-            from anna_inbox_executa.main import _discover_mailboxes
+            from anna_inbox_executa.mailbox_tools import _discover_mailboxes
 
             discovered = _discover_mailboxes()
             check("discovered count", len(discovered), 1)
             check("email", discovered[0]["email"], "primary@gmail.com")
             check("auth_source", discovered[0]["auth_source"], "platform")
 
-            from anna_inbox_executa.main import _check_gmail_auth
+            from anna_inbox_executa.gmail_tools import _check_gmail_auth
 
             auth = _check_gmail_auth("primary@gmail.com")
             check("auth authorized", auth["authorized"], True)
@@ -252,11 +261,11 @@ class TestMultiTokenIntegration:
         ])
 
         from unittest.mock import patch as _patch
-        from anna_inbox_executa.main import beijing_now
+        from anna_inbox_executa.common import beijing_now
 
         with _patch.object(adapter, "get_authorized_email", return_value="primary@gmail.com"), \
              _patch.object(adapter, "list_available_mailboxes_from_tokens", return_value=[]):
-            from anna_inbox_executa.main import _discover_mailboxes
+            from anna_inbox_executa.mailbox_tools import _discover_mailboxes
 
             discovered = _discover_mailboxes()
             emails = [d["email"] for d in discovered]
@@ -278,14 +287,15 @@ class TestMultiTokenIntegration:
         clear_adapter_state()
 
         from mail_agent.mail_providers.gmail import adapter
-        from anna_inbox_executa.main import apply_runtime_credentials
+        from anna_inbox_executa.common import apply_runtime_credentials
 
-        # Simulate bad JSON in credential
+        adapter.set_multi_tokens([{"email": "keep@gmail.com", "access_token": "keep"}])
+
+        # Invalid input must retain the last valid binding snapshot.
         context = {"credentials": {"GMAIL_MULTI_TOKENS": "not valid json {{{"}}
         apply_runtime_credentials(context)
 
-        # Should NOT crash; multi_token_map should remain empty
-        check("map empty after bad json", adapter.get_multi_token_emails(), [])
+        check("bad json retains snapshot", adapter.get_multi_token_emails(), ["keep@gmail.com"])
 
         # Simulate valid but empty list
         context2 = {"credentials": {"GMAIL_MULTI_TOKENS": "[]"}}
@@ -293,6 +303,78 @@ class TestMultiTokenIntegration:
         check("map empty after empty list", adapter.get_multi_token_emails(), [])
 
         clear_env()
+
+    def test_removed_token_is_pruned(self):
+        section("6. Removed credential token is pruned")
+        clear_env()
+        clear_adapter_state()
+        self._store._store.clear()
+
+        from anna_inbox_executa.common import apply_runtime_credentials
+        from mail_agent.mail_providers.gmail import adapter
+        from mail_agent.storage import client as storage_client
+        storage_client._storage = self._store
+
+        apply_runtime_credentials({"credentials": {"GMAIL_MULTI_TOKENS": json.dumps([
+            {"email": "keep@gmail.com", "access_token": "keep"},
+            {"email": "xin@anna.partners", "access_token": "removed"},
+        ])}})
+        check("both tokens initially present", adapter.get_multi_token_emails(), ["keep@gmail.com", "xin@anna.partners"])
+
+        apply_runtime_credentials({"credentials": {"GMAIL_MULTI_TOKENS": json.dumps([
+            {"email": "keep@gmail.com", "access_token": "keep"},
+        ])}})
+        check("removed token pruned", adapter.get_multi_token_emails(), ["keep@gmail.com"])
+
+        apply_runtime_credentials({"credentials": {}})
+        check("missing credential retains snapshot", adapter.get_multi_token_emails(), ["keep@gmail.com"])
+        clear_adapter_state()
+
+    def test_missing_snapshot_does_not_unbind(self):
+        section("6a. Missing credential field does not change bindings")
+        clear_env()
+        clear_adapter_state()
+
+        from anna_inbox_executa.common import apply_runtime_credentials
+        from mail_agent.mail_providers.gmail import adapter
+
+        adapter.set_multi_tokens([{"email": "bound@gmail.com", "access_token": "bound"}])
+        apply_runtime_credentials({"credentials": {"DASHSCOPE_MODEL": "qwen-plus"}})
+        check("unrelated credential retains binding", adapter.get_multi_token_emails(), ["bound@gmail.com"])
+
+    def test_concurrent_snapshot_reads_are_atomic(self):
+        section("6b. Concurrent binding updates expose complete snapshots")
+        clear_env()
+        clear_adapter_state()
+
+        from mail_agent.mail_providers.gmail import adapter
+
+        first = [
+            {"email": "a@gmail.com", "access_token": "a"},
+            {"email": "b@gmail.com", "access_token": "b"},
+        ]
+        second = [
+            {"email": "c@gmail.com", "access_token": "c"},
+            {"email": "d@gmail.com", "access_token": "d"},
+        ]
+        allowed = {("a@gmail.com", "b@gmail.com"), ("c@gmail.com", "d@gmail.com")}
+        observed: list[tuple[str, ...]] = []
+
+        def writer() -> None:
+            for index in range(500):
+                adapter.set_multi_tokens(first if index % 2 == 0 else second)
+
+        def reader() -> None:
+            for _ in range(1000):
+                observed.append(tuple(adapter.get_multi_token_emails()))
+
+        adapter.set_multi_tokens(first)
+        threads = [threading.Thread(target=writer), threading.Thread(target=reader), threading.Thread(target=reader)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        check("all observed snapshots are complete", all(snapshot in allowed for snapshot in observed), True)
 
     # ── 6. Token refresh updates map ───────────────────────────
 
@@ -310,7 +392,6 @@ class TestMultiTokenIntegration:
 
         # Mock the HTTP refresh call
         import json as _json
-        import io
         from unittest.mock import patch
 
         mock_response_data = _json.dumps({"access_token": "NEW_REFRESHED_TOKEN", "expires_in": 3600}).encode()
@@ -321,6 +402,114 @@ class TestMultiTokenIntegration:
             check("refreshed token", tok, "NEW_REFRESHED_TOKEN")
             check("map updated", adapter._multi_token_map["refresh_test@gmail.com"]["access_token"], "NEW_REFRESHED_TOKEN")
 
+    def test_concurrent_refresh_runs_once(self):
+        section("6c. Concurrent reads share one token refresh")
+        clear_env()
+        clear_adapter_state()
+
+        from mail_agent.mail_providers.gmail import adapter
+
+        adapter.set_multi_tokens([{
+            "email": "concurrent@gmail.com", "access_token": "old", "refresh_token": "r",
+            "client_id": "c", "client_secret": "s", "expires_at": time.time() - 10,
+        }])
+        results: list[str] = []
+
+        def response(*_args: Any, **_kwargs: Any) -> io.BytesIO:
+            return io.BytesIO(json.dumps({"access_token": "fresh", "expires_in": 3600}).encode())
+
+        def reader() -> None:
+            results.append(adapter.get_access_token("concurrent@gmail.com"))
+
+        with patch("urllib.request.urlopen", side_effect=response) as mocked_urlopen:
+            threads = [threading.Thread(target=reader), threading.Thread(target=reader)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        check("both readers receive refreshed token", sorted(results), ["fresh", "fresh"])
+        check("refresh request count", mocked_urlopen.call_count, 1)
+
+    def test_unbind_during_refresh_does_not_restore_account(self):
+        section("6d. Unbinding during refresh cannot resurrect a mailbox")
+        clear_env()
+        clear_adapter_state()
+
+        from mail_agent.mail_providers.gmail import adapter
+
+        adapter.set_multi_tokens([{
+            "email": "remove@gmail.com", "access_token": "old", "refresh_token": "r",
+            "client_id": "c", "client_secret": "s", "expires_at": time.time() - 10,
+        }])
+        refresh_started = threading.Event()
+        allow_refresh_to_finish = threading.Event()
+        errors: list[str] = []
+
+        def delayed_response(*_args: Any, **_kwargs: Any) -> io.BytesIO:
+            refresh_started.set()
+            allow_refresh_to_finish.wait(timeout=2)
+            return io.BytesIO(json.dumps({"access_token": "fresh", "expires_in": 3600}).encode())
+
+        def reader() -> None:
+            try:
+                adapter.get_access_token("remove@gmail.com")
+            except ValueError as exc:
+                errors.append(str(exc))
+
+        with patch("urllib.request.urlopen", side_effect=delayed_response):
+            thread = threading.Thread(target=reader)
+            thread.start()
+            check("refresh started", refresh_started.wait(timeout=2), True)
+            adapter.set_multi_tokens([])
+            allow_refresh_to_finish.set()
+            thread.join(timeout=2)
+
+        check("mailbox remains unbound", adapter.get_multi_token_emails(), [])
+        check("in-flight caller sees unbind", len(errors), 1)
+
+    def test_token_refresh_retries_then_succeeds(self):
+        section("6b. Token refresh retries transient network errors")
+        clear_env()
+        clear_adapter_state()
+
+        from mail_agent.mail_providers.gmail import adapter
+
+        adapter.set_multi_tokens([
+            {"email": "retry_test@gmail.com", "access_token": "old_retry_token", "refresh_token": "r", "client_id": "c", "client_secret": "s", "expires_at": time.time() - 10},
+        ])
+
+        mock_response = io.BytesIO(json.dumps({"access_token": "RETRIED_TOKEN", "expires_in": 3600}).encode())
+        transient_error = urllib.error.URLError(ssl.SSLError("UNEXPECTED_EOF_WHILE_READING"))
+
+        with (
+            patch("urllib.request.urlopen", side_effect=[transient_error, mock_response]) as mocked_urlopen,
+            patch("time.sleep", return_value=None),
+        ):
+            tok = adapter.get_access_token("retry_test@gmail.com")
+            check("retried token", tok, "RETRIED_TOKEN")
+            check("retry count", mocked_urlopen.call_count, 2)
+
+    def test_token_refresh_urlerror_falls_back_to_existing_token(self):
+        section("6c. Token refresh URL error falls back to current token")
+        clear_env()
+        clear_adapter_state()
+
+        from mail_agent.mail_providers.gmail import adapter
+
+        adapter.set_multi_tokens([
+            {"email": "fallback_test@gmail.com", "access_token": "still_usable_token", "refresh_token": "r", "client_id": "c", "client_secret": "s", "expires_at": time.time() - 10},
+        ])
+
+        transient_error = urllib.error.URLError(ssl.SSLError("UNEXPECTED_EOF_WHILE_READING"))
+
+        with (
+            patch("urllib.request.urlopen", side_effect=[transient_error, transient_error, transient_error]),
+            patch("time.sleep", return_value=None),
+        ):
+            tok = adapter.get_access_token("fallback_test@gmail.com")
+            check("fallback token", tok, "still_usable_token")
+
     # ── 7. _check_gmail_auth all sources ───────────────────────
 
     def test_check_gmail_auth_all_sources(self):
@@ -329,7 +518,7 @@ class TestMultiTokenIntegration:
         clear_adapter_state()
 
         from mail_agent.mail_providers.gmail import adapter
-        from anna_inbox_executa.main import _check_gmail_auth
+        from anna_inbox_executa.gmail_tools import _check_gmail_auth
 
         # Case A: platform
         os.environ["GMAIL_ACCESS_TOKEN"] = "plat"
@@ -374,7 +563,7 @@ class TestMultiTokenIntegration:
         from unittest.mock import patch
 
         with patch.object(adapter, "get_authorized_email", return_value="primary@gmail.com"), patch.object(adapter, "list_available_mailboxes_from_tokens", return_value=[{"email": "local@gmail.com", "provider": "gmail", "auth_source": "local_file", "authorized": True}]):
-            from anna_inbox_executa.main import _discover_mailboxes
+            from anna_inbox_executa.mailbox_tools import _discover_mailboxes
 
             discovered = _discover_mailboxes()
             emails = [d["email"] for d in discovered]
@@ -405,7 +594,7 @@ class TestMultiTokenIntegration:
 
         with patch.object(adapter, "get_authorized_email", return_value="primary@gmail.com"), \
              patch.object(adapter, "list_available_mailboxes_from_tokens", return_value=[]):
-            from anna_inbox_executa.main import _discover_mailboxes
+            from anna_inbox_executa.mailbox_tools import _discover_mailboxes
 
             discovered = _discover_mailboxes()
             authorized = [d["email"] for d in discovered if d.get("authorized")]

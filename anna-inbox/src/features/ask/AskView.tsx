@@ -322,9 +322,18 @@ function AskHistoryEntryRow({ entry, index }: { entry: AskHistoryEntry; index: n
   const title = entry.result.plan_title || entry.result.title || entry.query || "Custom scan";
   const summary = entry.result.summary || entry.result.plan_description || "";
   const readLabel = meta.readTotal ? `${meta.readCurrent}/${meta.readTotal} read` : "read depth";
+  const canContinueConversation = Array.isArray(entry.messages) && entry.messages.length > 0;
   return (
     <div className={`ask-history-entry ${expanded ? "is-expanded" : ""}`}>
-      <button className="ask-history-row" onClick={() => actions.toggleAskHistory(index)} aria-expanded={expanded}>
+      <button className="ask-history-row" onClick={() => {
+        if (canContinueConversation) {
+          // 中文注释：带 messages 的历史记录代表一段可继续的侧栏对话，点击时恢复会话而不是只展开扫描预览。
+          actions.openAiConversation(index);
+          actions.setView("start");
+          return;
+        }
+        actions.toggleAskHistory(index);
+      }} aria-expanded={expanded}>
         <span className="ask-history-index">{String(index + 1).padStart(2, "0")}</span>
         <span className="ask-history-main">
           <strong>{title}</strong>
@@ -336,7 +345,7 @@ function AskHistoryEntryRow({ entry, index }: { entry: AskHistoryEntry; index: n
         </span>
         <span className="ask-history-side">
           <time>{formatBeijingTimestamp(entry.timestamp)}</time>
-          <span className="ask-history-toggle">{expanded ? "Hide" : "Open"}</span>
+          <span className="ask-history-toggle">{canContinueConversation ? "Continue" : expanded ? "Hide" : "Open"}</span>
         </span>
       </button>
       {expanded ? <CustomRunPreview result={entry.result} /> : null}

@@ -400,11 +400,12 @@ def _ensure_loopback_download_server() -> str:
                     return
                 filename = _safe_attachment_filename(str(meta.get("filename") or "attachment"))
                 mime_type = str(meta.get("mime_type") or "application/octet-stream")
+                disposition = "inline" if str(meta.get("disposition") or "").lower() == "inline" else "attachment"
                 data = file_path.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", mime_type)
                 self.send_header("Content-Length", str(len(data)))
-                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Disposition", f'{disposition}; filename="{filename}"')
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(data)
@@ -423,7 +424,12 @@ def _ensure_loopback_download_server() -> str:
         return f"http://127.0.0.1:{_DOWNLOAD_SERVER.server_address[1]}"
 
 
-def _loopback_attachment_download_payload(attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
+def _loopback_attachment_download_payload(
+    attachment: dict[str, Any],
+    content: bytes,
+    *,
+    disposition: str = "attachment",
+) -> dict[str, Any]:
     _cleanup_expired_download_tokens()
     filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
     mime_type = str(attachment.get("mime_type") or "application/octet-stream")
@@ -435,6 +441,7 @@ def _loopback_attachment_download_payload(attachment: dict[str, Any], content: b
         "path": str(file_path),
         "filename": filename,
         "mime_type": mime_type,
+        "disposition": "inline" if disposition == "inline" else "attachment",
         "expires_at_ts": expires_at_ts,
     }
     base_url = _ensure_loopback_download_server()
@@ -455,6 +462,681 @@ def _clamp_int(value: Any, fallback: int, min_value: int, max_value: int) -> int
     except (TypeError, ValueError):
         parsed = fallback
     return min(max_value, max(min_value, parsed))
+
+
+INBOX_THREAD_PAGE_SIZE = 5
+INBOX_THREAD_PAGE_MAX = 50
+INBOX_FULL_BODY_LIMIT = 200000
+INBOX_PAGE_BODY_LIMIT = INBOX_FULL_BODY_LIMIT
+INBOX_THREAD_RESPONSE_MAX_BYTES = 256 * 1024
+INBOX_PAGE_BODY_LIMIT_STEPS = (200000, 120000, 80000, 48000, 24000, 12000, 6000, 3000, 1500, 750, 320)
+INBOX_PROMPT_MESSAGE_LIMIT = 8
+INBOX_PROMPT_BODY_LIMIT = 1200
+
+THREAD_ASSIST_SYSTEM = """You are Anna's inbox thread assistant.
+
+Return JSON only:
+{
+  "overview": "1-2 factual sentences that do not repeat the subject",
+  "quick_replies": [
+    {"id": "short_id", "label": "2-4 words", "intent": "one short sentence"}
+  ]
+}
+
+Rules:
+- Use the full thread context, not just the latest snippet.
+- quick_replies: at most 3 items.
+- Keep labels short and action-oriented.
+- Do not invent facts or user commitments.
+- If there is little to say, leave overview empty and quick_replies empty.
+- Never include HTML.
+"""
+
+MAIL_PROMPT_SYSTEM = """You are Anna, an executive email assistant working with a Gmail thread.
+
+Return JSON only:
+{
+  "assistant_text": "short assistant response for the sidebar",
+  "draft_reply": {"body": "plain text reply body"} | null,
+  "reply_gaps": {
+    "needs_user_input": true | false,
+    "summary": "one short sentence",
+    "questions": [
+      {"id": "q1", "question": "specific question", "hint": "short hint", "required": true}
+    ]
+  }
+}
+
+Rules:
+- draft_reply and reply_gaps.needs_user_input=true are mutually exclusive.
+- If the user prompt requires information that only the user would know, do not guess.
+- In that case, omit draft_reply and return 1-3 specific reply_gaps questions.
+- If enough information is available, return a concise plain-text draft_reply.body.
+- assistant_text should explain what you did or what is needed next.
+- Do not include email headers in the draft body.
+- Do not invent dates, commitments, prices, or factual claims.
+- Never include HTML.
+"""
+
+
+def _inbox_sort_key(message: dict[str, Any]) -> tuple[int, str]:
+    try:
+        internal_date = int(message.get("internal_date") or 0)
+    except Exception:
+        internal_date = 0
+    return (internal_date, str(message.get("id") or ""))
+
+
+def _normalize_label_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(label).strip().upper() for label in value if str(label).strip()]
+
+
+def _compact_body_text(text: str, *, limit: int) -> tuple[str, bool]:
+    body = str(text or "").strip()
+    if len(body) <= limit:
+        return body, False
+    return body[:limit].rstrip(), True
+
+
+def _display_body_payload(message: dict[str, Any], *, limit: int, prefer_html: bool = True) -> dict[str, Any]:
+    from mail_agent.actions.service import _strip_quoted_reply
+    from mail_agent.mail_providers.gmail.adapter import decode_body_for_display
+
+    display = decode_body_for_display(message)
+    raw_html = str(display.get("html") or "")
+    raw_text = str(display.get("text") or "")
+    payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+
+    if prefer_html and raw_html.strip():
+        sanitized_html = _sanitize_email_html(_strip_quoted_reply_html(raw_html))
+        sanitized_html = _resolve_cid_images(sanitized_html, payload)
+        if len(sanitized_html) <= limit:
+            return {
+                "body_html": sanitized_html,
+                "body_truncated": False,
+            }
+
+    if raw_text.strip():
+        compact_text, text_truncated = _compact_body_text(_strip_quoted_reply(raw_text), limit=limit)
+        return {
+            "body_text": compact_text,
+            "body_truncated": text_truncated,
+        }
+
+    fallback_text = _strip_quoted_reply(_dedup_body(str(message.get("body_text") or "")))
+    compact_text, text_truncated = _compact_body_text(fallback_text, limit=limit)
+    return {
+        "body_text": compact_text,
+        "body_truncated": text_truncated,
+    }
+
+
+def _serialize_inbox_thread_message(message: dict[str, Any], *, include_display_body: bool, body_limit: int) -> dict[str, Any]:
+    payload = {
+        "id": str(message.get("id") or ""),
+        "thread_id": str(message.get("thread_id") or ""),
+        "internal_date": str(message.get("internal_date") or ""),
+        "from": str(message.get("from") or ""),
+        "to": str(message.get("to") or ""),
+        "cc": str(message.get("cc") or ""),
+        "bcc": str(message.get("bcc") or ""),
+        "subject": str(message.get("subject") or ""),
+        "label_ids": _normalize_label_ids(message.get("label_ids")),
+        "attachments": list(message.get("attachments") or []),
+    }
+    if include_display_body:
+        payload.update(_display_body_payload(message, limit=body_limit))
+    return payload
+
+
+def _inbox_thread_rpc_frame_size(data: dict[str, Any]) -> int:
+    """Measure the complete JSON-RPC frame with a conservative request-id reserve."""
+    frame = {
+        "jsonrpc": JSONRPC_VERSION,
+        "id": "x" * 128,
+        "result": {"success": True, "tool": "get_inbox_thread_page", "data": data},
+    }
+    return len(json.dumps(frame, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _inbox_message_display_rpc_frame_size(data: dict[str, Any]) -> int:
+    frame = {
+        "jsonrpc": JSONRPC_VERSION,
+        "id": "x" * 128,
+        "result": {"success": True, "tool": "get_inbox_message_display_body", "data": data},
+    }
+    return len(json.dumps(frame, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _build_inbox_message_display_response(mailbox: str, message: dict[str, Any]) -> dict[str, Any]:
+    base = {
+        "mailbox": mailbox,
+        "message_id": str(message.get("id") or ""),
+        "thread_id": str(message.get("thread_id") or ""),
+    }
+    for body_limit in INBOX_PAGE_BODY_LIMIT_STEPS:
+        data = {**base, **_display_body_payload(message, limit=body_limit)}
+        if _inbox_message_display_rpc_frame_size(data) <= INBOX_THREAD_RESPONSE_MAX_BYTES:
+            return data
+    return {
+        **base,
+        "body_text": "",
+        "body_truncated": True,
+        "error": "Message body exceeds the 256 KiB response limit.",
+    }
+
+
+def _inbox_thread_page_payload(
+    *,
+    mailbox: str,
+    thread_id: str,
+    subject: str,
+    messages: list[dict[str, Any]],
+    start_index: int,
+    latest_message_id: str,
+    include_display_body: bool,
+    body_limit: int,
+) -> dict[str, Any]:
+    return {
+        "mailbox": mailbox,
+        "thread_id": thread_id,
+        "subject": subject,
+        "messages": [
+            _serialize_inbox_thread_message(
+                message,
+                include_display_body=include_display_body,
+                body_limit=body_limit,
+            )
+            for message in messages
+        ],
+        "returned_count": len(messages),
+        "has_earlier": start_index > 0,
+        "next_before_index": start_index if start_index > 0 else None,
+        "latest_message_id": latest_message_id,
+    }
+
+
+def _read_cached_thread_messages(mailbox: str, thread_id: str) -> list[dict[str, Any]]:
+    from mail_agent.mail_providers.gmail.adapter import list_messages, normalize_mailbox, read_message
+
+    normalized_mailbox = normalize_mailbox(mailbox)
+    summaries = [
+        item for item in list_messages(normalized_mailbox)
+        if str(item.get("thread_id") or "") == str(thread_id or "")
+    ]
+    messages: list[dict[str, Any]] = []
+    for summary in summaries:
+        message_id = str(summary.get("id") or "")
+        if not message_id:
+            continue
+        try:
+            cached = read_message(normalized_mailbox, message_id)
+        except Exception:
+            cached = None
+        if isinstance(cached, dict):
+            messages.append(cached)
+    messages.sort(key=_inbox_sort_key)
+    return messages
+
+
+def _load_thread_messages(mailbox: str, thread_id: str) -> list[dict[str, Any]]:
+    from mail_agent.mail_providers.gmail.adapter import refresh_thread_cache
+
+    try:
+        messages = refresh_thread_cache(mailbox, thread_id)
+        if messages:
+            messages.sort(key=_inbox_sort_key)
+            return messages
+    except Exception as exc:
+        log(f"refresh_thread_cache failed for {thread_id}: {type(exc).__name__}: {exc}")
+    return _read_cached_thread_messages(mailbox, thread_id)
+
+
+def _build_inbox_thread_page(
+    mailbox: str,
+    thread_id: str,
+    *,
+    before_index: int | None = None,
+    limit: int = INBOX_THREAD_PAGE_SIZE,
+    include_display_body: bool = True,
+) -> dict[str, Any]:
+    messages = _load_thread_messages(mailbox, thread_id)
+    if not messages:
+        return {
+            "mailbox": mailbox,
+            "thread_id": thread_id,
+            "subject": "",
+            "messages": [],
+            "returned_count": 0,
+            "has_earlier": False,
+            "next_before_index": None,
+            "latest_message_id": "",
+        }
+
+    total = len(messages)
+    page_limit = _clamp_int(limit, INBOX_THREAD_PAGE_SIZE, 1, INBOX_THREAD_PAGE_MAX)
+    end_index = total if before_index is None else _clamp_int(before_index, total, 0, total)
+    start_index = max(0, end_index - page_limit)
+    latest = messages[-1]
+    subject = str(latest.get("subject") or "") or "(no subject)"
+    latest_message_id = str(latest.get("id") or "")
+    if end_index <= 0:
+        return {
+            "mailbox": mailbox,
+            "thread_id": thread_id,
+            "subject": subject,
+            "messages": [],
+            "returned_count": 0,
+            "has_earlier": False,
+            "next_before_index": None,
+            "latest_message_id": latest_message_id,
+        }
+
+    # First reduce every body progressively. Only after the smallest body
+    # budget still exceeds the frame cap do we move the oldest message to the
+    # previous page. This preserves the newest context and pagination cursor.
+    for fitted_start in range(start_index, end_index):
+        fitted_messages = messages[fitted_start:end_index]
+        body_limits = INBOX_PAGE_BODY_LIMIT_STEPS if include_display_body else (0,)
+        for body_limit in body_limits:
+            data = _inbox_thread_page_payload(
+                mailbox=mailbox,
+                thread_id=thread_id,
+                subject=subject,
+                messages=fitted_messages,
+                start_index=fitted_start,
+                latest_message_id=latest_message_id,
+                include_display_body=include_display_body,
+                body_limit=body_limit,
+            )
+            if _inbox_thread_rpc_frame_size(data) <= INBOX_THREAD_RESPONSE_MAX_BYTES:
+                return data
+
+    # A single message with pathological metadata can still exceed the cap.
+    # Return a bounded, actionable page instead of falling through to stdio
+    # file transport or allowing the host to terminate the tool process.
+    return {
+        "mailbox": mailbox,
+        "thread_id": thread_id,
+        "subject": subject,
+        "messages": [],
+        "returned_count": 0,
+        "has_earlier": True,
+        "next_before_index": end_index,
+        "latest_message_id": latest_message_id,
+        "error": "Thread metadata exceeds the 256 KiB response limit.",
+    }
+
+
+def _find_thread_message(messages: list[dict[str, Any]], message_id: str) -> dict[str, Any] | None:
+    target = str(message_id or "")
+    for message in messages:
+        if str(message.get("id") or "") == target:
+            return message
+    return None
+
+
+def _thread_prompt_excerpt(messages: list[dict[str, Any]], *, max_messages: int = INBOX_PROMPT_MESSAGE_LIMIT) -> str:
+    excerpt = messages[-max_messages:] if len(messages) > max_messages else messages
+    parts: list[str] = []
+    for index, message in enumerate(excerpt, start=1):
+        display = _display_body_payload(message, limit=INBOX_PROMPT_BODY_LIMIT, prefer_html=False)
+        body = str(display.get("body_text") or "").strip()
+        if not body and str(display.get("body_html") or "").strip():
+            body = _dedup_body(str(display.get("body_html") or ""))
+        parts.append(
+            "\n".join(
+                [
+                    f"Message {index}",
+                    f"From: {message.get('from', '')}",
+                    f"To: {message.get('to', '')}",
+                    f"Date: {message.get('internal_date', '')}",
+                    f"Subject: {message.get('subject', '')}",
+                    f"Body: {body[:INBOX_PROMPT_BODY_LIMIT]}",
+                ]
+            )
+        )
+    return "\n\n---\n\n".join(parts)
+
+
+async def _load_contact_context_for_thread(
+    *,
+    mailbox: str,
+    thread_id: str,
+    subject: str,
+    latest_from: str,
+    latest_body: str,
+    purpose: str,
+    sampling_create_message: Any,
+) -> tuple[str, list[str]]:
+    from mail_agent.contact_memory.retriever import (
+        contact_email_from_header,
+        format_contact_context_for_prompt,
+        retrieve_contact_context,
+    )
+    from mail_agent.contact_memory.types import ContactMemoryQuery
+
+    contact_email = contact_email_from_header(latest_from)
+    if not contact_email:
+        return "No relevant contact memory.", []
+
+    try:
+        contact_context = await retrieve_contact_context(
+            ContactMemoryQuery(
+                mailbox=mailbox,
+                contact_email=contact_email,
+                current_subject=subject,
+                current_body=latest_body,
+                current_thread_id=thread_id,
+                purpose=purpose,
+            ),
+            sampling_create_message=sampling_create_message,
+        )
+    except Exception:
+        return "No relevant contact memory.", []
+
+    related_lines: list[str] = []
+    for topic in getattr(contact_context, "relevant_topics", []) or []:
+        text = " | ".join(
+            part for part in [
+                getattr(topic, "title", ""),
+                getattr(topic, "summary", ""),
+                getattr(topic, "open_loop", ""),
+            ] if part
+        ).strip()
+        if text and text not in related_lines:
+            related_lines.append(text[:240])
+    return format_contact_context_for_prompt(contact_context), related_lines[:3]
+
+
+def _thread_participants(messages: list[dict[str, Any]]) -> list[str]:
+    seen: list[str] = []
+    for message in messages:
+        for key in ("from", "to", "cc", "bcc"):
+            value = str(message.get(key) or "").strip()
+            if value and value not in seen:
+                seen.append(value)
+    return seen
+
+
+def _build_pseudo_card_for_thread(mailbox: str, thread_id: str, messages: list[dict[str, Any]], anchor_message_id: str = "") -> Any:
+    from mail_agent.storage.types import CardDetails, OriginalEmail, PersistentCard
+
+    if not messages:
+        raise ValueError("Thread messages are unavailable")
+    latest = messages[-1]
+    anchor_message = _find_thread_message(messages, anchor_message_id) if anchor_message_id else None
+    target = anchor_message or latest
+    latest_body = _display_body_payload(target, limit=INBOX_PROMPT_BODY_LIMIT, prefer_html=False).get("body_text") or str(target.get("snippet") or "")
+    participants = _thread_participants(messages)
+    title = str(latest.get("subject") or "") or "(no subject)"
+    summary = str(target.get("snippet") or latest_body or "")[:220]
+    recommendation = f"Reply with context from {len(participants)} participant(s)." if participants else "Reply with context from the thread."
+    return PersistentCard(
+        card_id=f"inbox-thread-{thread_id}",
+        message_id=str(target.get("id") or ""),
+        thread_id=thread_id,
+        title=title,
+        summary=summary,
+        recommendation=recommendation,
+        label="inbox_thread",
+        priority="medium",
+        details=CardDetails(
+            needs="Reply or review this thread.",
+            latest_activity=str(latest.get("internal_date") or ""),
+            reviewed=f"{len(messages)} message(s) in thread",
+            mailbox=mailbox,
+        ),
+        original=OriginalEmail(
+            thread=title,
+            from_addr=str(target.get("from") or ""),
+            to_addr=str(target.get("to") or ""),
+            time=str(target.get("internal_date") or ""),
+            body=str(latest_body or ""),
+        ),
+        attachments=list(target.get("attachments") or []),
+        user_action="reply",
+    )
+
+
+async def _generate_thread_assist_result(
+    mailbox: str,
+    thread_id: str,
+    latest_message_id: str,
+    anchor_message_id: str,
+    sampling_create_message: Any,
+) -> dict[str, Any]:
+    from mail_agent.actions.service import summarize_thread
+    from mail_agent.llm_runtime.service import call_llm_json_safe
+
+    messages = _load_thread_messages(mailbox, thread_id)
+    if not messages:
+        raise ValueError(f"Thread {thread_id} not found")
+    pseudo_card = _build_pseudo_card_for_thread(mailbox, thread_id, messages, anchor_message_id)
+    summary_result = await summarize_thread(pseudo_card, mailbox, sampling_create_message=sampling_create_message)
+    summary = summary_result.get("summary") if isinstance(summary_result, dict) else {}
+    overview_parts = [
+        str(summary.get("headline") or "").strip(),
+        str(summary.get("reply_focus") or "").strip(),
+    ]
+    fallback_overview = " ".join(part for part in overview_parts if part).strip()
+    latest_display = _display_body_payload(messages[-1], limit=INBOX_PROMPT_BODY_LIMIT, prefer_html=False)
+    contact_context_text, related_lines = await _load_contact_context_for_thread(
+        mailbox=mailbox,
+        thread_id=thread_id,
+        subject=str(messages[-1].get("subject") or ""),
+        latest_from=str(messages[-1].get("from") or ""),
+        latest_body=str(latest_display.get("body_text") or ""),
+        purpose="thread_summary",
+        sampling_create_message=sampling_create_message,
+    )
+
+    quick_result = await call_llm_json_safe(
+        sampling_create_message,
+        system_prompt=THREAD_ASSIST_SYSTEM,
+        user_message=(
+            f"Subject: {messages[-1].get('subject', '')}\n"
+            f"Participants: {'; '.join(_thread_participants(messages))}\n"
+            f"Latest summary: {fallback_overview}\n"
+            f"Related contact context: {contact_context_text}\n"
+            f"Thread messages:\n{_thread_prompt_excerpt(messages)}\n"
+        ),
+        fallback={"overview": fallback_overview, "quick_replies": []},
+        temperature=0.2,
+        max_tokens=700,
+        timeout=120.0,
+        metadata={"tool": "inbox_thread_assist", "thread_id": thread_id},
+    )
+    payload = quick_result.get("payload") if isinstance(quick_result.get("payload"), dict) else {}
+    overview = str(payload.get("overview") or fallback_overview).strip()
+    quick_replies_raw = payload.get("quick_replies") if isinstance(payload.get("quick_replies"), list) else []
+    quick_replies: list[dict[str, Any]] = []
+    for index, item in enumerate(quick_replies_raw[:3], start=1):
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        intent = str(item.get("intent") or "").strip()
+        if not label or not intent:
+            continue
+        quick_replies.append({
+            "id": str(item.get("id") or f"reply_{index}").strip() or f"reply_{index}",
+            "label": label[:40],
+            "intent": intent[:200],
+        })
+
+    return {
+        "thread_id": thread_id,
+        "latest_message_id": latest_message_id,
+        "overview": overview,
+        "quick_replies": quick_replies,
+        "summary": summary,
+        "related_context": related_lines,
+        "fallback_used": bool(summary_result.get("fallback_used")) or bool(quick_result.get("fallback_used")),
+    }
+
+
+async def _generate_mail_prompt_result(
+    *,
+    mailbox: str,
+    thread_id: str,
+    anchor_message_id: str,
+    latest_message_id: str,
+    visible_prompt: str,
+    expected_artifact: str,
+    user_answers: dict[str, str] | None,
+    sampling_create_message: Any,
+) -> dict[str, Any]:
+    from mail_agent.llm_runtime.service import call_llm_json_safe
+
+    messages = _load_thread_messages(mailbox, thread_id)
+    if not messages:
+        raise ValueError(f"Thread {thread_id} not found")
+    latest = messages[-1]
+    latest_display = _display_body_payload(latest, limit=INBOX_PROMPT_BODY_LIMIT, prefer_html=False)
+    contact_context_text, _ = await _load_contact_context_for_thread(
+        mailbox=mailbox,
+        thread_id=thread_id,
+        subject=str(latest.get("subject") or ""),
+        latest_from=str(latest.get("from") or ""),
+        latest_body=str(latest_display.get("body_text") or ""),
+        purpose="draft_generation",
+        sampling_create_message=sampling_create_message,
+    )
+    answers_text = "\n".join(
+        f"- {key}: {value}"
+        for key, value in (user_answers or {}).items()
+        if str(value).strip()
+    ) or "None"
+    fallback_assistant = "I drafted a reply for this thread." if expected_artifact == "draft_reply" else "I reviewed the thread."
+    result = await call_llm_json_safe(
+        sampling_create_message,
+        system_prompt=MAIL_PROMPT_SYSTEM,
+        user_message=(
+            f"Visible prompt: {visible_prompt}\n"
+            f"Expected artifact: {expected_artifact or 'none'}\n"
+            f"Mailbox: {mailbox}\n"
+            f"Thread ID: {thread_id}\n"
+            f"Anchor message ID: {anchor_message_id}\n"
+            f"Latest message ID: {latest_message_id}\n"
+            f"Contact context: {contact_context_text}\n"
+            f"User answers:\n{answers_text}\n\n"
+            f"Thread messages:\n{_thread_prompt_excerpt(messages)}\n"
+        ),
+        fallback={
+            "assistant_text": fallback_assistant,
+            "draft_reply": {"body": ""},
+            "reply_gaps": {"needs_user_input": False, "summary": "", "questions": []},
+        },
+        temperature=0.3,
+        max_tokens=2400,
+        timeout=150.0,
+        metadata={"tool": "inbox_mail_prompt", "thread_id": thread_id},
+    )
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    raw_gaps = payload.get("reply_gaps") if isinstance(payload.get("reply_gaps"), dict) else {}
+    needs_user_input = bool(raw_gaps.get("needs_user_input"))
+    questions_raw = raw_gaps.get("questions") if isinstance(raw_gaps.get("questions"), list) else []
+    questions: list[dict[str, Any]] = []
+    for index, item in enumerate(questions_raw[:3], start=1):
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question") or "").strip()
+        if not question:
+            continue
+        questions.append({
+            "id": str(item.get("id") or f"q{index}").strip() or f"q{index}",
+            "question": question[:240],
+            "hint": str(item.get("hint") or "").strip()[:120],
+            "required": bool(item.get("required", True)),
+        })
+
+    draft_payload = payload.get("draft_reply") if isinstance(payload.get("draft_reply"), dict) else {}
+    draft_body = str(draft_payload.get("body") or "").strip()
+    artifact = None
+    if expected_artifact == "draft_reply" and draft_body and not needs_user_input:
+        artifact = {
+            "type": "draft_reply",
+            "mailbox": mailbox,
+            "thread_id": thread_id,
+            "body": draft_body,
+            "source_prompt": visible_prompt,
+        }
+
+    return {
+        "mailbox": mailbox,
+        "thread_id": thread_id,
+        "anchor_message_id": anchor_message_id,
+        "latest_message_id": latest_message_id,
+        "visible_prompt": visible_prompt,
+        "assistant_text": str(payload.get("assistant_text") or fallback_assistant).strip(),
+        "artifact": artifact,
+        "reply_gaps": {
+            "needs_user_input": needs_user_input,
+            "summary": str(raw_gaps.get("summary") or "").strip(),
+            "questions": questions,
+        },
+        "fallback_used": bool(result.get("fallback_used")),
+    }
+
+
+async def _handle_inbox_thread_assist_background(run_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
+    from mail_agent.storage.ops import get_inbox_thread_assist, set_inbox_thread_assist
+
+    MAIL_AGENT_RUNS[run_id]["status"] = "running"
+    _save_run_checkpoint(run_id)
+
+    mailbox = str(arguments.get("mailbox", "")).strip()
+    thread_id = str(arguments.get("thread_id", "")).strip()
+    latest_message_id = str(arguments.get("latest_message_id", "")).strip()
+    anchor_message_id = str(arguments.get("anchor_message_id", "")).strip()
+    try:
+        cached = await get_inbox_thread_assist(mailbox, thread_id, latest_message_id)
+        if cached.get("exists") and isinstance(cached.get("value"), dict) and cached.get("value"):
+            MAIL_AGENT_RUNS[run_id].update(
+                status="done",
+                result={**cached.get("value"), "cached": True},
+                updated_at=beijing_now(),
+            )
+            _save_run_checkpoint(run_id)
+            return
+        sampling = _build_sampling_for_run(arguments, invoke_id)
+        result = await _generate_thread_assist_result(mailbox, thread_id, latest_message_id, anchor_message_id, sampling)
+        await set_inbox_thread_assist(mailbox, thread_id, latest_message_id, result)
+        MAIL_AGENT_RUNS[run_id].update(status="done", result=result, updated_at=beijing_now())
+    except Exception as exc:
+        MAIL_AGENT_RUNS[run_id].update(status="failed", error=str(exc), updated_at=beijing_now())
+    _save_run_checkpoint(run_id)
+
+
+async def _handle_inbox_mail_prompt_background(run_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
+    MAIL_AGENT_RUNS[run_id]["status"] = "running"
+    _save_run_checkpoint(run_id)
+
+    mailbox = str(arguments.get("mailbox", "")).strip()
+    thread_id = str(arguments.get("thread_id", "")).strip()
+    anchor_message_id = str(arguments.get("anchor_message_id", "")).strip()
+    latest_message_id = str(arguments.get("latest_message_id", "")).strip()
+    visible_prompt = str(arguments.get("visible_prompt", "")).strip()
+    expected_artifact = str(arguments.get("expected_artifact", "")).strip()
+    user_answers = arguments.get("user_answers") if isinstance(arguments.get("user_answers"), dict) else None
+    try:
+        sampling = _build_sampling_for_run(arguments, invoke_id)
+        result = await _generate_mail_prompt_result(
+            mailbox=mailbox,
+            thread_id=thread_id,
+            anchor_message_id=anchor_message_id,
+            latest_message_id=latest_message_id,
+            visible_prompt=visible_prompt,
+            expected_artifact=expected_artifact,
+            user_answers=user_answers,
+            sampling_create_message=sampling,
+        )
+        MAIL_AGENT_RUNS[run_id].update(status="done", result=result, updated_at=beijing_now())
+    except Exception as exc:
+        MAIL_AGENT_RUNS[run_id].update(status="failed", error=str(exc), updated_at=beijing_now())
+    _save_run_checkpoint(run_id)
 
 
 def _card_context(card: Any) -> dict[str, str]:
@@ -537,6 +1219,47 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             await set_scan_plan(mb, plan)
         return {"ok": True, "mailbox": mailbox or "all", "targets": targets}
 
+    if tool == "get_inbox_thread_page":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        thread_id = str(arguments.get("thread_id", "")).strip()
+        if not thread_id:
+            return {"error": "thread_id is required"}
+        before_raw = arguments.get("before_index")
+        try:
+            before_index = int(before_raw) if before_raw is not None else None
+        except Exception:
+            before_index = None
+        include_display_body = bool(arguments.get("include_display_body", True))
+        limit = _clamp_int(arguments.get("limit"), INBOX_THREAD_PAGE_SIZE, 1, INBOX_THREAD_PAGE_MAX)
+        return await asyncio.to_thread(
+            _build_inbox_thread_page,
+            mailbox,
+            thread_id,
+            before_index=before_index,
+            limit=limit,
+            include_display_body=include_display_body,
+        )
+
+    if tool == "get_inbox_message_display_body":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        message_id = str(arguments.get("message_id", "")).strip()
+        if not message_id:
+            return {"error": "message_id is required"}
+        try:
+            from mail_agent.mail_providers.gmail.adapter import fetch_and_cache_message, normalize_mailbox, read_message
+            normalized_mailbox = normalize_mailbox(mailbox)
+            try:
+                message = read_message(normalized_mailbox, message_id)
+            except Exception:
+                message = fetch_and_cache_message(normalized_mailbox, message_id)
+        except Exception as exc:
+            return {"error": str(exc)}
+        if not isinstance(message, dict):
+            return {"error": f"Message {message_id} not found"}
+        return _build_inbox_message_display_response(mailbox, message)
+
     if tool == "get_card_detail":
         if not mailbox or not card_id:
             return {"error": "mailbox and card_id are required"}
@@ -566,24 +1289,15 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if include_body:
             body_loaded = True
             try:
-                from mail_agent.actions.service import _strip_quoted_reply
-                from mail_agent.mail_providers.gmail.adapter import decode_body_for_display, normalize_mailbox, read_message
+                from mail_agent.mail_providers.gmail.adapter import normalize_mailbox, read_message
                 msg = cached_msg if isinstance(cached_msg, dict) else read_message(normalize_mailbox(mailbox), card.message_id)
                 if isinstance(msg, dict):
-                    display_body = decode_body_for_display(msg)
-                    raw_html = str(display_body.get("html") or "")
-                    raw_text = str(display_body.get("text") or "")
-                    payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
-                    if raw_html.strip():
-                        latest_body_html = _sanitize_email_html(_strip_quoted_reply_html(raw_html)[:8000])
-                        latest_body_html = _resolve_cid_images(latest_body_html, payload)
-                    if raw_text.strip():
-                        latest_body = _strip_quoted_reply(raw_text)[:8000]
-                    elif not latest_body_html:
-                        latest_body = _strip_quoted_reply(_dedup_body(str(msg.get("body_text") or card.original.body or "")))[:8000]
+                    display_payload = _display_body_payload(msg, limit=INBOX_FULL_BODY_LIMIT)
+                    latest_body_html = str(display_payload.get("body_html") or "")
+                    latest_body = str(display_payload.get("body_text") or "")
             except Exception:
                 from mail_agent.actions.service import _strip_quoted_reply
-                latest_body = _strip_quoted_reply(_dedup_body(str(card.original.body or "")))[:8000]
+                latest_body = _strip_quoted_reply(_dedup_body(str(card.original.body or "")))[:INBOX_FULL_BODY_LIMIT]
 
         contact_ctx = {}
         try:
@@ -705,6 +1419,66 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    if tool == "prepare_inbox_attachment_access":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        message_id = str(arguments.get("message_id", "")).strip()
+        attachment_id = str(arguments.get("attachment_id", "")).strip()
+        mode = str(arguments.get("mode", "download")).strip().lower() or "download"
+        if not message_id or not attachment_id:
+            return {"error": "message_id and attachment_id are required"}
+        if mode not in {"preview", "download"}:
+            return {"error": "mode must be preview or download"}
+        try:
+            from mail_agent.mail_providers.gmail.adapter import (
+                fetch_attachment_bytes,
+                find_attachment_for_token,
+                normalize_mailbox,
+                read_message,
+            )
+            normalized_mailbox = normalize_mailbox(mailbox)
+            message = read_message(normalized_mailbox, message_id)
+            attachment = find_attachment_for_token(message, attachment_id)
+            content = await asyncio.to_thread(
+                fetch_attachment_bytes,
+                normalized_mailbox,
+                str(attachment.get("message_id") or message_id),
+                str(attachment.get("gmail_attachment_id") or ""),
+            )
+            if mode == "preview":
+                preview = _loopback_attachment_download_payload(attachment, content, disposition="inline")
+                return {
+                    **preview,
+                    "mode": mode,
+                    "message_id": message_id,
+                    "attachment_id": attachment_id,
+                    "preview_url": preview.get("download_url") or "",
+                }
+            download_mode = _attachment_download_mode()
+            if not _should_use_aps_storage() or download_mode == "loopback":
+                download = _loopback_attachment_download_payload(attachment, content, disposition="attachment")
+                return {**download, "mode": mode, "message_id": message_id, "attachment_id": attachment_id}
+            try:
+                uploaded = await _upload_attachment_for_download(normalized_mailbox, message_id, attachment, content)
+                return {
+                    "ok": True,
+                    "delivery": "url",
+                    "mode": mode,
+                    "message_id": message_id,
+                    "attachment_id": attachment_id,
+                    "filename": attachment.get("filename") or "attachment",
+                    "mime_type": attachment.get("mime_type") or "application/octet-stream",
+                    "size": len(content),
+                    "download_url": uploaded.get("url") or uploaded.get("download_url") or "",
+                    "expires_at": uploaded.get("expires_at") or "",
+                }
+            except Exception as upload_exc:
+                log(f"inbox attachment upload fallback: {type(upload_exc).__name__}: {upload_exc}")
+                download = _loopback_attachment_download_payload(attachment, content, disposition="attachment")
+                return {**download, "mode": mode, "message_id": message_id, "attachment_id": attachment_id}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     # Build sampling for Anna LLM path (same logic as _build_sampling_for_run)
     _sampling = _build_sampling_for_run(arguments, invoke_id)
 
@@ -725,6 +1499,30 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         MAIL_AGENT_RUNS[run_id] = {"run_id": run_id, "status": "queued", "stage": "generate_draft_reply", "progress": {}, "warnings": [], "started_at": beijing_now(), "updated_at": beijing_now(), "result": None, "error": "", "partial": {}}
         _save_run_checkpoint(run_id)
         asyncio.ensure_future(_handle_generate_draft_background(run_id, arguments, invoke_id))
+        return {"success": True, "run_id": run_id, "status": "queued"}
+
+    if tool == "start_inbox_thread_assist":
+        thread_id = str(arguments.get("thread_id", "")).strip()
+        latest_message_id = str(arguments.get("latest_message_id", "")).strip()
+        if not mailbox or not thread_id or not latest_message_id:
+            return {"error": "mailbox, thread_id, and latest_message_id are required"}
+        run_id = f"bg_{uuid.uuid4().hex[:12]}"
+        MAIL_AGENT_RUNS[run_id] = {"run_id": run_id, "status": "queued", "stage": "inbox_thread_assist", "progress": {}, "warnings": [], "started_at": beijing_now(), "updated_at": beijing_now(), "result": None, "error": "", "partial": {}}
+        _save_run_checkpoint(run_id)
+        asyncio.ensure_future(_handle_inbox_thread_assist_background(run_id, arguments, invoke_id))
+        return {"success": True, "run_id": run_id, "status": "queued"}
+
+    if tool == "start_inbox_mail_prompt":
+        thread_id = str(arguments.get("thread_id", "")).strip()
+        anchor_message_id = str(arguments.get("anchor_message_id", "")).strip()
+        latest_message_id = str(arguments.get("latest_message_id", "")).strip()
+        visible_prompt = str(arguments.get("visible_prompt", "")).strip()
+        if not mailbox or not thread_id or not anchor_message_id or not latest_message_id or not visible_prompt:
+            return {"error": "mailbox, thread_id, anchor_message_id, latest_message_id, and visible_prompt are required"}
+        run_id = f"bg_{uuid.uuid4().hex[:12]}"
+        MAIL_AGENT_RUNS[run_id] = {"run_id": run_id, "status": "queued", "stage": "inbox_mail_prompt", "progress": {}, "warnings": [], "started_at": beijing_now(), "updated_at": beijing_now(), "result": None, "error": "", "partial": {}}
+        _save_run_checkpoint(run_id)
+        asyncio.ensure_future(_handle_inbox_mail_prompt_background(run_id, arguments, invoke_id))
         return {"success": True, "run_id": run_id, "status": "queued"}
 
     if tool == "summarize_thread":
@@ -1121,6 +1919,61 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    if tool == "set_message_starred":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        message_id = str(arguments.get("message_id", "")).strip()
+        starred = arguments.get("starred", True)
+        if not message_id or not isinstance(starred, bool):
+            return {"error": "message_id and boolean starred are required"}
+        from mail_agent.mail_providers.gmail.adapter import set_message_starred
+        import asyncio as _asyncio
+        try:
+            result = await _asyncio.to_thread(set_message_starred, mailbox, message_id, starred)
+            return {"ok": True, "message_id": message_id, "starred": starred, "result": result}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    if tool == "modify_message_labels":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        raw_message_ids = arguments.get("message_ids") or []
+        add_label_ids = arguments.get("add_label_ids") or []
+        remove_label_ids = arguments.get("remove_label_ids") or []
+        message_ids = [str(mid).strip() for mid in raw_message_ids if str(mid).strip()] if isinstance(raw_message_ids, list) else []
+        add_labels = [str(label).strip().upper() for label in add_label_ids if str(label).strip()] if isinstance(add_label_ids, list) else []
+        remove_labels = [str(label).strip().upper() for label in remove_label_ids if str(label).strip()] if isinstance(remove_label_ids, list) else []
+        if not message_ids:
+            return {"error": "message_ids (non-empty array) is required"}
+        from mail_agent.mail_providers.gmail.adapter import modify_message_labels
+        import asyncio as _asyncio
+        try:
+            result = await _asyncio.to_thread(
+                modify_message_labels,
+                mailbox,
+                message_ids,
+                add_label_ids=add_labels,
+                remove_label_ids=remove_labels,
+            )
+            return {"ok": True, **result}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    if tool == "update_inbox_thread_state":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        thread_id = str(arguments.get("thread_id", "")).strip()
+        operation = str(arguments.get("operation", "")).strip().lower()
+        if not thread_id or not operation:
+            return {"error": "thread_id and operation are required"}
+        from mail_agent.mail_providers.gmail.adapter import update_thread_state
+        import asyncio as _asyncio
+        try:
+            result = await _asyncio.to_thread(update_thread_state, mailbox, thread_id, operation)
+            return {"ok": True, **result}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     if tool == "trash_from_ask":
         if not mailbox:
             return {"error": "mailbox is required"}
@@ -1141,6 +1994,46 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if errors:
             return {"ok": False, "trashed": len(message_ids) - len(errors), "errors": errors}
         return {"ok": True, "trashed": len(message_ids)}
+
+    if tool == "get_inbox_thread_draft":
+        thread_id = str(arguments.get("thread_id", "")).strip()
+        if not mailbox or not thread_id:
+            return {"error": "mailbox and thread_id are required"}
+        from mail_agent.storage.ops import get_inbox_thread_draft
+        draft = await get_inbox_thread_draft(mailbox, thread_id)
+        value = draft.get("value") if isinstance(draft.get("value"), dict) else {}
+        return {
+            "mailbox": mailbox,
+            "thread_id": thread_id,
+            "exists": bool(draft.get("exists")),
+            "etag": str(draft.get("etag") or ""),
+            "body": str(value.get("body") or ""),
+            "updated_at": str(value.get("updated_at") or ""),
+        }
+
+    if tool == "save_inbox_thread_draft":
+        thread_id = str(arguments.get("thread_id", "")).strip()
+        body = str(arguments.get("body", ""))
+        if_match = str(arguments.get("if_match", "")).strip() or None
+        if not mailbox or not thread_id:
+            return {"error": "mailbox and thread_id are required"}
+        from mail_agent.storage.ops import set_inbox_thread_draft
+        result = await set_inbox_thread_draft(mailbox, thread_id, body, if_match=if_match)
+        return {
+            "ok": True,
+            "mailbox": mailbox,
+            "thread_id": thread_id,
+            "etag": str(result.get("etag") or ""),
+            "updated": bool(result.get("ok", True)),
+        }
+
+    if tool == "delete_inbox_thread_draft":
+        thread_id = str(arguments.get("thread_id", "")).strip()
+        if not mailbox or not thread_id:
+            return {"error": "mailbox and thread_id are required"}
+        from mail_agent.storage.ops import delete_inbox_thread_draft
+        result = await delete_inbox_thread_draft(mailbox, thread_id)
+        return {"ok": True, "mailbox": mailbox, "thread_id": thread_id, "result": result}
 
     if tool == "record_learning":
         pattern = str(arguments.get("pattern", "")).strip()

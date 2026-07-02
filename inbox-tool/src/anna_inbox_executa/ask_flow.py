@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from anna_inbox_executa.common import *
 from anna_inbox_executa.sampling_tools import *
-from anna_inbox_executa.contact_memory_flow import _memory_mailboxes
+from anna_inbox_executa.contact_memory_flow import _memory_mailboxes, _memory_mailboxes_async
 from anna_inbox_executa.brief_flow import _merge_partial
 
 async def run_custom_scan_background(run_id: str, plan: Any, arguments: dict[str, Any], invoke_id: str) -> None:
@@ -129,7 +129,16 @@ def start_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, An
         loop,
     )
     wait_timeout = int(arguments.get("wait_timeout_seconds", 600))
-    future.result(timeout=wait_timeout)
+    try:
+        future.result(timeout=wait_timeout)
+    except FutureTimeoutError:
+        # 中文注释：Ask 扫描可能超过 Anna 单次工具调用预算；超时不取消后台任务，
+        # 先把当前 run 状态返回给前端，前端用 get_mail_agent_run 继续轮询。
+        state = MAIL_AGENT_RUNS[run_id]
+        state["status"] = "running"
+        state["needs_continue"] = True
+        state["updated_at"] = beijing_now()
+        _save_run_checkpoint(run_id)
     return {
         "success": MAIL_AGENT_RUNS[run_id].get("status") == "done",
         "run_id": run_id,
@@ -158,7 +167,7 @@ async def _start_custom_scan_async(run_id: str, arguments: dict[str, Any], invok
 
         sampling = _build_sampling_for_run(arguments, invoke_id)
         user_request = str(arguments.get("user_request", "")).strip()
-        mailboxes = _memory_mailboxes(arguments)
+        mailboxes = await _memory_mailboxes_async(arguments)
 
         def _update_progress(stage: str, progress: dict[str, Any]) -> None:
             partial_update = progress.pop("partial", None)
@@ -307,7 +316,15 @@ def re_run_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, A
         loop,
     )
     wait_timeout = int(arguments.get("wait_timeout_seconds", 600))
-    future.result(timeout=wait_timeout)
+    try:
+        future.result(timeout=wait_timeout)
+    except FutureTimeoutError:
+        # 中文注释：复跑保存计划同样可能耗时较长；保留后台任务并交给前端轮询。
+        state = MAIL_AGENT_RUNS[run_id]
+        state["status"] = "running"
+        state["needs_continue"] = True
+        state["updated_at"] = beijing_now()
+        _save_run_checkpoint(run_id)
     return {
         "success": MAIL_AGENT_RUNS[run_id].get("status") == "done",
         "run_id": run_id,
@@ -349,7 +366,7 @@ async def _re_run_custom_scan_async(run_id: str, plan_id: str, arguments: dict[s
             from mail_agent.storage.types import RunHistoryEntry, _now
 
             sampling = _build_sampling_for_run(arguments, invoke_id)
-            mailboxes = _memory_mailboxes(arguments)
+            mailboxes = await _memory_mailboxes_async(arguments)
 
             ask_plan = AskPlan(
                 plan_id=plan_id,

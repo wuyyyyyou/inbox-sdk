@@ -1,7 +1,7 @@
 const RPC_TIMEOUT_MS = 30000;
 const HEARTBEAT_MS = 10000;
 const wid = new URLSearchParams(window.location.search).get("wid") || "";
-const pending = new Map<string, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void; timer: number }>();
+const pending = new Map<string, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void; cleanup: () => void }>();
 const eventHandlers = new Map<string, Set<(payload: unknown) => void>>();
 let requestSeq = 0;
 
@@ -35,7 +35,7 @@ window.addEventListener("message", (event) => {
     const slot = pending.get(message.id);
     if (!slot) return;
     pending.delete(message.id);
-    window.clearTimeout(slot.timer);
+    slot.cleanup();
     if (message.error) slot.reject(new AnnaAppRpcError(message.error));
     else slot.resolve(message.result);
     return;
@@ -46,15 +46,30 @@ window.addEventListener("message", (event) => {
   }
 });
 
-function call(ns: string, method: string, args: unknown = {}, options: { timeout?: number; timeoutMs?: number } = {}) {
+function call(ns: string, method: string, args: unknown = {}, options: { timeout?: number; timeoutMs?: number; signal?: AbortSignal } = {}) {
   const id = `anna-app-${Date.now()}-${++requestSeq}`;
   const timeout = Number(options.timeout || options.timeoutMs || RPC_TIMEOUT_MS);
   return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(new DOMException("The request was aborted.", "AbortError"));
+      return;
+    }
+    const onAbort = () => {
+      pending.delete(id);
+      cleanup();
+      reject(new DOMException("The request was aborted.", "AbortError"));
+    };
     const timer = window.setTimeout(() => {
       pending.delete(id);
+      cleanup();
       reject(new AnnaAppRpcError({ code: "timeout", message: `${ns}.${method} timed out` }));
     }, timeout);
-    pending.set(id, { resolve, reject, timer });
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onAbort);
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    pending.set(id, { resolve, reject, cleanup });
     window.parent.postMessage({ kind: "req", id, wid, ns, method, args }, "*");
   });
 }
@@ -62,7 +77,7 @@ function call(ns: string, method: string, args: unknown = {}, options: { timeout
 function namespaceProxy(ns: string) {
   return new Proxy({}, {
     get(_target, method) {
-      return (args = {}) => call(ns, String(method), args);
+      return (args = {}, options = {}) => call(ns, String(method), args, options);
     },
   });
 }

@@ -3,7 +3,33 @@ import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { buildDraftPreferencesInstruction, resolveDraftPreferences } from "../features/handle/draftPreferences";
 import { connectRuntime } from "../runtime/runtimeLoader";
-import type { ActiveCardsPayload, AppState, CleanupMessage, CustomRunResultItem, DraftPreferenceField, DraftReplyGoal, FrontendCard, GmailErrorPopup, MailboxInfo, RunStatus, ScanPlan, ScanState, ThreadContextPayload } from "../types/mail";
+import type {
+  ActiveCardsPayload,
+  AiChatMessage,
+  AppState,
+  AskHistoryEntry,
+  AttachmentDownloadPayload,
+  CleanupMessage,
+  CustomRunResult,
+  CustomRunResultItem,
+  DraftPreferenceField,
+  DraftReplyGoal,
+  FrontendCard,
+  GmailErrorPopup,
+  InboxFeedPayload,
+  InboxMessageDisplayBodyPayload,
+  InboxThreadAssistPayload,
+  InboxThreadDraftPayload,
+  InboxThreadPagePayload,
+  InboxThreadStateOperation,
+  MailPromptRunResult,
+  MailboxInfo,
+  RunStatus,
+  ScanPlan,
+  ScanState,
+  SubmitMailPromptRequest,
+  ThreadContextPayload,
+} from "../types/mail";
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
@@ -15,6 +41,28 @@ import { createInitialState } from "./state";
 
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function abortableSleep(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("The request was aborted.", "AbortError"));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      reject(new DOMException("The request was aborted.", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
@@ -117,6 +165,125 @@ function selectedOrPrimary(mailboxes: string[], fallback: string): string {
   return normalizedMailbox(mailboxes[0] || fallback);
 }
 
+function patchInboxMessageList(messages: InboxFeedPayload["messages"], messageIds: string[], updater: (message: InboxFeedPayload["messages"][number]) => InboxFeedPayload["messages"][number] | null) {
+  const targets = new Set(messageIds.map((value) => String(value).trim()).filter(Boolean));
+  return messages
+    .map((message) => {
+      if (!targets.has(message.id)) return message;
+      return updater(message);
+    })
+    .filter((message): message is InboxFeedPayload["messages"][number] => Boolean(message));
+}
+
+const AI_ASK_HISTORY_STORAGE_KEY = "anna-inbox:ai-ask-history:v1";
+const CHAT_INTENT_PATTERNS = [
+  /^(你|您)?好[啊呀]?[!.。！\s]*$/i,
+  /^(hi|hello|hey|哈喽|嗨)[!.。！\s]*$/i,
+  /^(在吗|在不在|谢谢|多谢|thanks|thank you)[!.。！\s]*$/i,
+  /^(你是谁|你能做什么|你可以做什么|介绍一下你自己|help|帮助)[?？!.。！\s]*$/i,
+];
+const MAIL_TASK_KEYWORDS = [
+  "邮件", "邮箱", "收件箱", "发件", "回复", "未读", "已读", "紧急", "账单", "发票", "会议", "日程", "附件",
+  "email", "mail", "inbox", "reply", "replied", "unread", "urgent", "invoice", "bill", "attachment", "meeting",
+];
+
+function createId(prefix: string) {
+  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+}
+
+function shouldRouteToChat(input: string) {
+  const text = input.trim();
+  const lower = text.toLowerCase();
+  if (!text) return false;
+  if (MAIL_TASK_KEYWORDS.some((keyword) => lower.includes(keyword.toLowerCase()))) return false;
+  // 中文注释：只有非常明确的寒暄/能力询问才走普通聊天；其余模糊输入按用户要求默认当作邮箱任务。
+  return CHAT_INTENT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function prefersChinese(input: string) {
+  return /[\u3400-\u9fff]/.test(input);
+}
+
+function scanPendingText(input: string) {
+  return prefersChinese(input)
+    ? "我会搜索你的邮箱，找出和这个问题最相关的邮件。"
+    : "I'll search your inbox for emails that are relevant to this question.";
+}
+
+function chatPendingText(input: string) {
+  return prefersChinese(input)
+    ? "thinking"
+    : "thinking";
+}
+
+function sanitizeToolError(error: unknown, input: string) {
+  const raw = error instanceof Error ? error.message : String(error);
+  if (raw.includes("executa process exited") || raw.includes("[tool_failed]")) {
+    return prefersChinese(input)
+      ? "邮箱扫描进程中断了。我已经保留了这次问题，你可以稍后重试。"
+      : "The inbox scan was interrupted. I kept this question here so you can retry in a moment.";
+  }
+  return raw.replace(/^\[tool:[^\]]+\]\s*/i, "").trim();
+}
+
+function persistAskHistory(history: AskHistoryEntry[]) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(AI_ASK_HISTORY_STORAGE_KEY, JSON.stringify(history.slice(0, 30)));
+  } catch {
+    // 中文注释：localStorage 写入失败不影响主流程，最多只是刷新后不能恢复侧栏对话。
+  }
+}
+
+function syntheticChatResult(messages: AiChatMessage[]): CustomRunResult {
+  const firstUser = messages.find((message) => message.role === "user")?.content || "Chat with Anna";
+  const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant" && !message.pending)?.content || "";
+  return {
+    title: firstUser.slice(0, 80),
+    summary: lastAssistant.slice(0, 220),
+    sections: [],
+  };
+}
+
+async function waitForCustomScanResult(
+  client: MailAgentClient,
+  runId: string,
+  onStatus: (status: RunStatus) => void,
+  signal?: AbortSignal,
+): Promise<RunStatus> {
+  // 中文注释：Ask 扫描可能超过单次工具调用预算；前端用 run_id 轮询，避免长时间阻塞导致 Executa 被 host 杀掉。
+  for (let attempt = 0; attempt < POLL_LIMIT; attempt += 1) {
+    if (signal) await abortableSleep(POLL_INTERVAL_MS, signal);
+    else await sleep(POLL_INTERVAL_MS);
+    const status = await client.getRun(runId);
+    if (signal?.aborted) throw new DOMException("The request was aborted.", "AbortError");
+    onStatus(status);
+    if (status.status === "done" || status.status === "failed" || status.error) {
+      return status;
+    }
+  }
+  throw new Error("Custom scan timed out while waiting for the run to finish.");
+}
+
+async function waitForToolRunResult(
+  client: MailAgentClient,
+  runId: string,
+  onStatus?: (status: RunStatus) => void,
+  signal?: AbortSignal,
+): Promise<RunStatus> {
+  for (let attempt = 0; attempt < POLL_LIMIT; attempt += 1) {
+    if (signal) await abortableSleep(POLL_INTERVAL_MS, signal);
+    else await sleep(POLL_INTERVAL_MS);
+    const status = await client.getRun(runId);
+    if (signal?.aborted) throw new DOMException("The request was aborted.", "AbortError");
+    onStatus?.(status);
+    if (status.status === "done" || status.status === "failed" || status.error) {
+      return status;
+    }
+  }
+  throw new Error("Tool run timed out while waiting for the run to finish.");
+}
+
 function findCard(cards: FrontendCard[], keyOrId: string): FrontendCard | undefined {
   return cards.find((card) => card.uiKey === keyOrId) || cards.find((card) => card.id === keyOrId);
 }
@@ -183,8 +350,15 @@ function base64ToBlobUrl(contentB64: string, mimeType: string) {
   return URL.createObjectURL(new Blob([bytes], { type: mimeType || "application/octet-stream" }));
 }
 
+type ToastOptions = {
+  actionLabel?: string;
+  onAction?: () => void;
+  secondaryActionLabel?: string;
+  onSecondaryAction?: () => void;
+};
+
 export interface AppActions {
-  showToast(message: string): void;
+  showToast(message: string, options?: ToastOptions): void;
   closeDrawers(): void;
   closeCardDetail(): void;
   setView(view: "start" | "ask"): void;
@@ -208,9 +382,33 @@ export interface AppActions {
   checkAnyGmailAuth(): Promise<{ authorized: boolean; source: string }>;
   closeGmailErrorPopup(): void;
   loadMailboxes(): Promise<void>;
-  setMailboxSelected(mailbox: string, selected: boolean): Promise<void>;
+  switchMailbox(mailbox: string): Promise<void>;
   setBriefMailboxFilter(mailboxes: string[]): void;
   loadActiveCards(): Promise<void>;
+  loadInboxEmails(category?: string, days?: number, force?: boolean): Promise<void>;
+  refreshInboxEmails(days?: number): Promise<void>;
+  preloadMailboxSnapshot(force?: boolean): Promise<boolean>;
+  loadInboxEmailBody(messageId: string, mailbox?: string): Promise<string>;
+  loadInboxThreadPage(mailbox: string, threadId: string, options?: {
+    anchorMessageId?: string;
+    beforeIndex?: number | null;
+    limit?: number;
+    includeDisplayBody?: boolean;
+  }): Promise<InboxThreadPagePayload>;
+  loadInboxMessageDisplayBody(mailbox: string, messageId: string): Promise<InboxMessageDisplayBodyPayload>;
+  loadInboxThreadAssist(mailbox: string, threadId: string, latestMessageId: string, anchorMessageId?: string): Promise<InboxThreadAssistPayload>;
+  getInboxThreadDraft(mailbox: string, threadId: string): Promise<InboxThreadDraftPayload>;
+  saveInboxThreadDraft(mailbox: string, threadId: string, body: string, ifMatch?: string): Promise<{ ok?: boolean; etag?: string; updated?: boolean }>;
+  deleteInboxThreadDraft(mailbox: string, threadId: string): Promise<{ ok?: boolean }>;
+  prepareInboxAttachmentAccess(mailbox: string, messageId: string, attachmentId: string, mode: "preview" | "download"): Promise<AttachmentDownloadPayload>;
+  modifyInboxMessageLabels(mailbox: string, messageIds: string[], addLabelIds?: string[], removeLabelIds?: string[]): Promise<void>;
+  updateInboxThreadState(mailbox: string, threadId: string, operation: InboxThreadStateOperation): Promise<void>;
+  submitMailContextPrompt(request: SubmitMailPromptRequest): Promise<MailPromptRunResult | null>;
+  sendInboxThreadReply(args: { mailbox: string; threadId: string; to: string; body: string; replyMode?: string; dryRun?: boolean }): Promise<{ ok?: boolean; dry_run?: boolean; error?: string }>;
+  loadContactAvatars(emails: string[], mailbox?: string): Promise<{ avatars: Record<string, string>; permissionRequired: boolean }>;
+  setInboxStarred(messageId: string, starred: boolean): Promise<void>;
+  markInboxRead(messageId: string): Promise<void>;
+  trashInboxMessage(messageId: string): Promise<void>;
   loadRunHistory(): Promise<void>;
   loadSelectedEmailBody(): Promise<void>;
   loadMoreThreadContext(): Promise<void>;
@@ -240,6 +438,10 @@ export interface AppActions {
   openSnoozeReasons(cardId: string): void;
   closeSnoozeReasons(): void;
   openSourcesWithConfig(): void;
+  sendAiChatMessage(): Promise<void>;
+  stopAiGeneration(): void;
+  startNewAiConversation(): void;
+  openAiConversation(index: number): void;
   startCustomScan(): Promise<void>;
   reRunCustomPlan(planId: string): Promise<void>;
   deleteCustomPlan(planId: string): Promise<void>;
@@ -265,10 +467,19 @@ export interface AppActions {
 
 export function useAppController() {
   const [state, setState] = useState<AppState>(() => createInitialState());
-  const [toast, setToast] = useState("");
+  const [toast, setToast] = useState<({ message: string } & ToastOptions) | null>(null);
+  const [accountSwitchNotice, setAccountSwitchNotice] = useState<{ email: string; avatarUrl?: string } | null>(null);
+  const [accountSwitchNoticeVisible, setAccountSwitchNoticeVisible] = useState(false);
   const toastTimer = useRef<number | null>(null);
+  const accountSwitchTimer = useRef<number | null>(null);
+  const accountSwitchDismissTimer = useRef<number | null>(null);
   const runtimePromise = useRef<Promise<AppState["runtime"]> | null>(null);
   const draftGenerationRun = useRef<{ runId: string; cancelled: boolean } | null>(null);
+  const aiGenerationRun = useRef<{ runId: string; cancelled: boolean; controller: AbortController } | null>(null);
+  const inboxFeedCache = useRef(new Map<string, { payload: InboxFeedPayload; loadedAt: number }>());
+  const inboxRequestSequence = useRef(0);
+  const snapshotRequestMailbox = useRef("");
+  const snapshotPromise = useRef<Promise<boolean> | null>(null);
 
   const getRuntime = useCallback(async () => {
     if (!runtimePromise.current) {
@@ -279,10 +490,127 @@ export function useAppController() {
 
   const client = useMemo(() => new MailAgentClient(getRuntime), [getRuntime]);
 
-  const showToast = useCallback((message: string) => {
-    setToast(message);
+  const showToast = useCallback((message: string, options?: ToastOptions) => {
+    setToast({ message, ...options });
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToast(""), 2200);
+    toastTimer.current = window.setTimeout(() => setToast(null), 3200);
+  }, []);
+
+  const dismissToast = useCallback(() => {
+    if (toastTimer.current) {
+      window.clearTimeout(toastTimer.current);
+      toastTimer.current = null;
+    }
+    setToast(null);
+  }, []);
+
+  const applyInboxSnapshotPayload = useCallback((payload: InboxFeedPayload, options: { error?: string } = {}) => {
+    const snapshotMessages = Array.isArray(payload.messages) ? payload.messages : [];
+    const visibleMessages = snapshotMessages.filter((message) => (message.label_ids || []).includes("INBOX"));
+    setState((s) => ({
+      ...s,
+      inboxMessages: visibleMessages,
+      inboxSnapshotMessages: snapshotMessages,
+      inboxUpdatedAt: String(payload.updated_at || ""),
+      inboxLoading: false,
+      inboxError: options.error || "",
+      inboxSnapshotComplete: true,
+    }));
+  }, []);
+
+  const preloadMailboxSnapshot = useCallback(async (mailboxOverride?: string, days = 7, force = false) => {
+    const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
+    if (!mailbox || mailbox === "all") return false;
+    if (!force && snapshotPromise.current && snapshotRequestMailbox.current === mailbox) return snapshotPromise.current;
+    snapshotRequestMailbox.current = mailbox;
+    const run = (async () => {
+      const startedAt = performance.now();
+      setState((s) => ({ ...s, inboxSnapshotLoading: true }));
+      try {
+        const cached = await client.listCachedEmails(mailbox, days, 500, "all");
+        if (snapshotRequestMailbox.current !== mailbox) return false;
+        applyInboxSnapshotPayload(cached);
+        setState((s) => ({ ...s, inboxSnapshotLoading: false }));
+        const messageCount = Array.isArray(cached.messages) ? cached.messages.length : 0;
+        console.info(`[inbox-startup] cache-only mailbox=${mailbox} messages=${messageCount} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
+        return messageCount > 0;
+      } catch {
+        if (snapshotRequestMailbox.current !== mailbox) return false;
+        setState((s) => ({
+          ...s,
+          inboxSnapshotLoading: false,
+          inboxLoading: false,
+          inboxSnapshotComplete: true,
+          inboxError: "",
+        }));
+        return false;
+      }
+    })();
+    snapshotPromise.current = run.finally(() => {
+      if (snapshotRequestMailbox.current === mailbox) snapshotPromise.current = null;
+    });
+    return snapshotPromise.current;
+  }, [applyInboxSnapshotPayload, client, state.mailbox, state.selectedMailboxes]);
+
+  const completeAiChat = useCallback(async (messages: AiChatMessage[], signal: AbortSignal): Promise<string> => {
+    if (signal.aborted) throw new DOMException("The request was aborted.", "AbortError");
+    const runtime = await getRuntime();
+    if (signal.aborted) throw new DOMException("The request was aborted.", "AbortError");
+    const llmPayload = {
+      messages: messages.slice(-10).map((message) => ({
+        role: message.role,
+        content: { type: "text", text: message.content },
+      })),
+      systemPrompt: [
+        "You are Anna, a concise and helpful inbox assistant.",
+        "Answer in the same language as the user's latest message.",
+        "For greetings, capability questions, and ordinary chat, answer naturally without claiming that you scanned email.",
+        "If the user asks for inbox-specific work, tell them you can search the inbox when they ask a concrete mail task.",
+      ].join("\n"),
+      maxTokens: 500,
+      temperature: 0.4,
+      metadata: { tool: "ai_sidebar_chat" },
+    };
+    try {
+      const result = runtime.client?.llm && typeof runtime.client.llm.complete === "function"
+        ? await runtime.client.llm.complete(llmPayload, { timeoutMs: 60_000, signal })
+        : await runtime.client?.call?.("llm", "complete", llmPayload, { timeout: 60_000, timeoutMs: 60_000, signal });
+      const content = result && typeof result === "object" ? (result as { content?: { text?: unknown }; text?: unknown }).content : null;
+      const text = content && typeof content === "object"
+        ? String((content as { text?: unknown }).text || "")
+        : String((result as { text?: unknown } | undefined)?.text || "");
+      return text.trim() || "你好，我在。你可以直接和我聊天，也可以让我帮你查找、整理或总结邮件。";
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) throw error;
+      // 中文注释：普通聊天依赖 Anna Host LLM；失败时不应该退化成邮箱扫描，避免再次打扰用户邮箱。
+      const latestUser = [...messages].reverse().find((message) => message.role === "user")?.content || "";
+      return prefersChinese(latestUser)
+        ? "你好，我在。现在普通聊天模型暂时不可用，但你仍然可以让我帮你查找、整理或总结邮件。"
+        : "Hi, I'm here. The chat model is temporarily unavailable, but you can still ask me to find, organize, or summarize email.";
+    }
+  }, [getRuntime]);
+
+  const upsertAiConversationHistory = useCallback((
+    conversationId: string,
+    messages: AiChatMessage[],
+    options: { kind: "chat" | "scan"; query: string; result?: CustomRunResult },
+  ) => {
+    setState((s) => {
+      const result = options.result || syntheticChatResult(messages);
+      const timestamp = new Date().toISOString();
+      const entry: AskHistoryEntry = {
+        conversationId,
+        kind: options.kind,
+        query: options.query,
+        result,
+        timestamp,
+        messages,
+      };
+      const nextHistory = [entry, ...s.askHistory.filter((item) => item.conversationId !== conversationId)].slice(0, 30);
+      persistAskHistory(nextHistory);
+      // 中文注释：Ask history 是“会话索引”；点击历史恢复 messages 后，用户可以继续在同一 conversationId 里追问。
+      return { ...s, askHistory: nextHistory, aiChatMessages: messages, aiChatConversationId: conversationId };
+    });
   }, []);
 
   const refreshStoredCardFields = useCallback((cards: FrontendCard[]) => {
@@ -304,6 +632,119 @@ export function useAppController() {
       return { ...s, draftById, threadSummaryById, expandedDetails };
     });
   }, []);
+
+  const showAccountSwitchNotice = useCallback((email: string, avatarUrl?: string) => {
+    if (accountSwitchDismissTimer.current) window.clearTimeout(accountSwitchDismissTimer.current);
+    setAccountSwitchNotice({ email, avatarUrl });
+    setAccountSwitchNoticeVisible(false);
+    window.setTimeout(() => setAccountSwitchNoticeVisible(true), 0);
+    if (accountSwitchTimer.current) window.clearTimeout(accountSwitchTimer.current);
+    accountSwitchTimer.current = window.setTimeout(() => {
+      setAccountSwitchNoticeVisible(false);
+      accountSwitchDismissTimer.current = window.setTimeout(() => {
+        setAccountSwitchNotice(null);
+        accountSwitchDismissTimer.current = null;
+      }, 220);
+    }, 3200);
+  }, []);
+
+  const closeAccountSwitchNotice = useCallback(() => {
+    if (accountSwitchTimer.current) window.clearTimeout(accountSwitchTimer.current);
+    accountSwitchTimer.current = null;
+    setAccountSwitchNoticeVisible(false);
+    if (accountSwitchDismissTimer.current) window.clearTimeout(accountSwitchDismissTimer.current);
+    accountSwitchDismissTimer.current = window.setTimeout(() => {
+      setAccountSwitchNotice(null);
+      accountSwitchDismissTimer.current = null;
+    }, 220);
+  }, []);
+
+  const loadInboxEmails = useCallback(async (mailboxOverride?: string, category = "inbox", days = 7, force = false) => {
+    const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
+    const requestId = ++inboxRequestSequence.current;
+    if (!mailbox || mailbox === "all") {
+      setState((s) => ({ ...s, inboxMessages: [], inboxLoading: false, inboxError: "Connect a Gmail mailbox to load your inbox." }));
+      return;
+    }
+    const cacheKey = `${mailbox}|${category}|${days}`;
+    const cached = inboxFeedCache.current.get(cacheKey);
+    if (cached) {
+      setState((s) => ({
+        ...s,
+        inboxMessages: cached.payload.messages,
+        inboxUpdatedAt: String(cached.payload.updated_at || ""),
+        inboxLoading: false,
+        inboxError: "",
+      }));
+      if (!force && Date.now() - cached.loadedAt < 60_000) return;
+    }
+    setState((s) => ({ ...s, inboxLoading: true, inboxError: "" }));
+    try {
+      const payload = await client.listInboxEmails(mailbox, days, 100, category);
+      inboxFeedCache.current.set(cacheKey, { payload, loadedAt: Date.now() });
+      if (requestId !== inboxRequestSequence.current) return;
+      setState((s) => ({
+        ...s,
+        inboxMessages: Array.isArray(payload.messages) ? payload.messages : [],
+        inboxUpdatedAt: String(payload.updated_at || ""),
+        inboxLoading: false,
+        inboxError: "",
+      }));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error("[loadInboxEmails] failed:", detail, error);
+      if (requestId !== inboxRequestSequence.current) return;
+      setState((s) => ({ ...s, inboxLoading: false, inboxError: detail }));
+    }
+  }, [client, state.mailbox, state.selectedMailboxes]);
+
+  const refreshInboxEmails = useCallback(async (days = 7) => {
+    const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
+    if (!mailbox || mailbox === "all") {
+      setState((s) => ({ ...s, inboxMessages: [], inboxSnapshotMessages: [], inboxLoading: false, inboxSnapshotLoading: false, inboxError: "Connect a Gmail mailbox to load your inbox." }));
+      return;
+    }
+
+    const requestKey = `${mailbox}#refresh:${++inboxRequestSequence.current}`;
+    snapshotRequestMailbox.current = requestKey;
+    snapshotPromise.current = null;
+    for (const key of inboxFeedCache.current.keys()) {
+      if (key.startsWith(`${mailbox}|`)) inboxFeedCache.current.delete(key);
+    }
+    setState((s) => ({
+      ...s,
+      inboxMessages: [],
+      inboxSnapshotMessages: [],
+      inboxUpdatedAt: "",
+      inboxLoading: true,
+      inboxSnapshotLoading: true,
+      inboxSnapshotComplete: false,
+      inboxError: "",
+    }));
+
+    try {
+      const payload = await client.listInboxEmails(mailbox, days, 500, "all", true);
+      if (snapshotRequestMailbox.current !== requestKey) return;
+      inboxFeedCache.current.set(`${mailbox}|all|${days}`, { payload, loadedAt: Date.now() });
+      applyInboxSnapshotPayload(payload);
+    } catch (error) {
+      if (snapshotRequestMailbox.current !== requestKey) return;
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error("[refreshInboxEmails] failed:", detail, error);
+      setState((s) => ({
+        ...s,
+        inboxMessages: [],
+        inboxSnapshotMessages: [],
+        inboxLoading: false,
+        inboxSnapshotComplete: true,
+        inboxError: detail,
+      }));
+    } finally {
+      if (snapshotRequestMailbox.current === requestKey) {
+        setState((s) => ({ ...s, inboxSnapshotLoading: false }));
+      }
+    }
+  }, [applyInboxSnapshotPayload, client, state.mailbox, state.selectedMailboxes]);
 
   const loadActiveCards = useCallback(async (storageOverride?: string, mailboxOverride?: string, options: { timeoutMs?: number } = {}) => {
     const provider = storageOverride ?? state.storageProvider;
@@ -693,15 +1134,28 @@ export function useAppController() {
     try {
       const payload = await client.listMailboxes(provider);
       const mailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : [];
-      const selected = (Array.isArray(payload.selected) && payload.selected.length
+      const selectedCandidates = (Array.isArray(payload.selected) && payload.selected.length
         ? payload.selected
         : mailboxes.filter((item) => item.selected !== false).map((item) => item.email)
       ).map(normalizedMailbox).filter(Boolean)
         .filter((email) => mailboxes.find((m) => m.email === email)?.authorized !== false);
-      const primary = selectedOrPrimary(selected, mailboxes[0]?.email || state.mailbox);
+      const primary = selectedOrPrimary(selectedCandidates, mailboxes.find((item) => item.authorized !== false)?.email || state.mailbox);
+      const selected = primary ? [primary] : [];
+      const normalizedMailboxes = mailboxes.map((item) => ({ ...item, selected: normalizedMailbox(item.email) === primary }));
+      if (selectedCandidates.length !== selected.length || selectedCandidates[0] !== primary) {
+        for (const item of mailboxes) {
+          const shouldSelect = normalizedMailbox(item.email) === primary;
+          if (Boolean(item.selected) === shouldSelect) continue;
+          try {
+            await client.setMailboxSelected(item.email, shouldSelect, provider);
+          } catch {
+            // Keep the UI single-account even if registry cleanup is temporarily unavailable.
+          }
+        }
+      }
       setState((s) => ({
         ...s,
-        mailboxes,
+        mailboxes: normalizedMailboxes,
         selectedMailboxes: selected,
         briefMailboxFilter: selected,
         mailbox: primary || s.mailbox,
@@ -711,9 +1165,35 @@ export function useAppController() {
           source: mailboxes.find((item) => item.email === primary)?.auth_source || s.gmailAuthStatus.source,
         },
       }));
-      return { mailboxes, selected, primary };
+      return { mailboxes: normalizedMailboxes, selected, primary };
     } catch {
       // 注册表不可用时回退到原来的单邮箱行为。
+      return { mailboxes: [], selected: state.mailbox ? [state.mailbox] : [], primary: state.mailbox };
+    }
+  }, [client, state.mailbox, state.storageProvider]);
+
+  const loadMailboxRegistry = useCallback(async (storageOverride?: string): Promise<{ mailboxes: MailboxInfo[]; selected: string[]; primary: string }> => {
+    const provider = storageOverride ?? state.storageProvider;
+    try {
+      const payload = await client.getMailboxRegistry(provider);
+      const mailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : [];
+      const selectedCandidates = (Array.isArray(payload.selected) && payload.selected.length
+        ? payload.selected
+        : mailboxes.filter((item) => item.selected !== false).map((item) => item.email)
+      ).map(normalizedMailbox).filter(Boolean)
+        .filter((email) => mailboxes.find((m) => m.email === email)?.authorized !== false);
+      const primary = selectedOrPrimary(selectedCandidates, mailboxes.find((item) => item.authorized !== false)?.email || state.mailbox);
+      const selected = primary ? [primary] : [];
+      const normalizedMailboxes = mailboxes.map((item) => ({ ...item, selected: normalizedMailbox(item.email) === primary }));
+      setState((s) => ({
+        ...s,
+        mailboxes: normalizedMailboxes.length ? normalizedMailboxes : s.mailboxes,
+        selectedMailboxes: selected.length ? selected : s.selectedMailboxes,
+        briefMailboxFilter: selected.length ? selected : s.briefMailboxFilter,
+        mailbox: primary || s.mailbox,
+      }));
+      return { mailboxes: normalizedMailboxes, selected, primary };
+    } catch {
       return { mailboxes: [], selected: state.mailbox ? [state.mailbox] : [], primary: state.mailbox };
     }
   }, [client, state.mailbox, state.storageProvider]);
@@ -781,36 +1261,56 @@ export function useAppController() {
 
   const initialize = useCallback(async () => {
     try {
+      const startedAt = performance.now();
       const runtime = await getRuntime();
       setState((s) => ({ ...s, runtime, loading: runtime.connected ? s.loading : false }));
-      const mailboxState = await loadMailboxes();
-      let currentMailbox = mailboxState.primary;
-      if (!currentMailbox) {
-        const mailbox = await discoverMailbox();
-        currentMailbox = mailbox || state.mailbox;
-      }
-      const authResult = await client.checkAnyGmailAuth();
-      const systemAuthorized = Boolean(authResult?.authorized);
-      const authWarning = (authResult as Record<string, unknown> | null | undefined)?.warning as string | undefined;
-      setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: systemAuthorized, source: authResult?.source || "none" } }));
-      if (authWarning) showToast(`Auth notice: ${authWarning}`);
       if (runtime.connected) {
         void refreshSamplingStatus();
+        const bootMailbox = normalizedMailbox(state.mailbox);
+        let inboxAvailable = bootMailbox ? await preloadMailboxSnapshot(bootMailbox, 7) : false;
+        const mailboxState = await loadMailboxRegistry();
+        let currentMailbox = mailboxState.primary || bootMailbox;
+        if (!currentMailbox) {
+          const mailbox = await discoverMailbox();
+          currentMailbox = mailbox || state.mailbox;
+        }
+        if (currentMailbox && currentMailbox !== bootMailbox) {
+          inboxAvailable = await preloadMailboxSnapshot(currentMailbox, 7, true);
+        }
+        void loadMailboxes().then((discoveredState) => {
+          const discoveredPrimary = normalizedMailbox(discoveredState.primary);
+          if (!discoveredPrimary || discoveredPrimary === currentMailbox) return;
+          void preloadMailboxSnapshot(discoveredPrimary, 7, true);
+          void loadScanPlan(discoveredPrimary);
+        }).catch(() => undefined);
+        const authResult = await client.checkAnyGmailAuth();
+        const systemAuthorized = Boolean(authResult?.authorized);
+        const authWarning = (authResult as Record<string, unknown> | null | undefined)?.warning as string | undefined;
+        setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: systemAuthorized, source: authResult?.source || "none" } }));
+        if (authWarning) showToast(`Auth notice: ${authWarning}`);
         if (!systemAuthorized) {
-          setState((s) => ({ ...s, loading: false }));
+          setState((s) => ({
+            ...s,
+            loading: false,
+            inboxLoading: false,
+            inboxError: inboxAvailable ? "" : "Connect Gmail to load the last 7 days of email.",
+          }));
           return;
         }
-        await loadRunHistory();
-        await loadCustomPlans();
-        await loadScanPlan(currentMailbox);
-        await loadActiveCards(undefined, "all");
+        await Promise.all([
+          loadRunHistory(),
+          loadCustomPlans(),
+          loadScanPlan(currentMailbox),
+          loadActiveCards(undefined, "all"),
+        ]);
+        console.info(`[inbox-startup] initialize elapsed_ms=${Math.round(performance.now() - startedAt)} mailbox=${currentMailbox || ""}`);
       }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       showToast(`Init failed: ${msg}`);
-      setState((s) => ({ ...s, loading: false }));
+      setState((s) => ({ ...s, loading: false, inboxLoading: false, inboxError: msg }));
     }
-  }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadMailboxes, loadRunHistory, loadScanPlan, refreshSamplingStatus, showToast, state.mailbox]);
+  }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshSamplingStatus, showToast, state.mailbox]);
 
   const actions: AppActions = {
     showToast,
@@ -943,24 +1443,88 @@ export function useAppController() {
     async loadMailboxes() {
       await loadMailboxes();
     },
-    async setMailboxSelected(mailbox, selected) {
+    async switchMailbox(mailbox) {
+      const primary = normalizedMailbox(mailbox);
+      const previousMailbox = normalizedMailbox(state.mailbox);
+      if (!primary || primary === normalizedMailbox(state.mailbox)) {
+        setState((s) => ({ ...s, selectedMailboxes: primary ? [primary] : s.selectedMailboxes, briefMailboxFilter: primary ? [primary] : s.briefMailboxFilter }));
+        return;
+      }
+      snapshotRequestMailbox.current = primary;
+      const target = state.mailboxes.find((item) => normalizedMailbox(item.email) === primary);
+      showAccountSwitchNotice(primary, target?.avatar_url);
+      setState((s) => {
+        const visibleCards = filterCardsByMailboxes(s.allCards, [primary]);
+        return {
+          ...s,
+          mailbox: primary,
+          mailboxes: s.mailboxes.map((item) => ({ ...item, selected: normalizedMailbox(item.email) === primary })),
+          selectedMailboxes: [primary],
+          briefMailboxFilter: [primary],
+          configMailbox: s.configMailbox ? primary : "",
+          cards: visibleCards,
+          actionCount: actionCount(visibleCards),
+          inboxLoading: true,
+          inboxError: "",
+          inboxMessages: [],
+          inboxSnapshotMessages: [],
+          inboxSnapshotComplete: false,
+        };
+      });
       try {
-        const payload = await client.setMailboxSelected(mailbox, selected, state.storageProvider);
-        const mailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : state.mailboxes.map((item) => item.email === mailbox ? { ...item, selected } : item);
-        const selectedMailboxes = (Array.isArray(payload.selected) ? payload.selected : mailboxes.filter((item) => item.selected !== false).map((item) => item.email)).map(normalizedMailbox).filter(Boolean);
-        const primary = selectedOrPrimary(selectedMailboxes, state.mailbox);
+        for (const item of state.mailboxes) {
+          if (normalizedMailbox(item.email) === primary || item.selected === false) continue;
+          await client.setMailboxSelected(item.email, false, state.storageProvider);
+        }
+        const payload = await client.setMailboxSelected(primary, true, state.storageProvider);
+        const returnedMailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : state.mailboxes;
+        const mailboxes = returnedMailboxes.map((item) => ({ ...item, selected: normalizedMailbox(item.email) === primary }));
+        const visibleCards = filterCardsByMailboxes(state.allCards, [primary]);
         setState((s) => ({
           ...s,
           mailboxes,
-          selectedMailboxes,
-          briefMailboxFilter: selectedMailboxes,
-          mailbox: primary || s.mailbox,
-          cards: filterCardsByMailboxes(s.allCards, selectedMailboxes),
-          actionCount: actionCount(filterCardsByMailboxes(s.allCards, selectedMailboxes)),
+          selectedMailboxes: [primary],
+          briefMailboxFilter: [primary],
+          mailbox: primary,
+          configMailbox: s.configMailbox ? primary : "",
+          cards: visibleCards,
+          actionCount: actionCount(visibleCards),
+          inboxLoading: true,
         }));
-        await loadActiveCards();
+        await preloadMailboxSnapshot(primary, 7, true);
+        await loadScanPlan(primary);
       } catch (error) {
-        showToast(error instanceof Error ? error.message : String(error));
+        closeAccountSwitchNotice();
+        const message = error instanceof Error ? error.message : String(error);
+        const authFailed = /401|invalid credentials|expired|revoked|unauthenticated/i.test(message);
+        setState((s) => {
+          const rollbackCards = previousMailbox ? filterCardsByMailboxes(s.allCards, [previousMailbox]) : [];
+          return {
+            ...s,
+            mailbox: previousMailbox || s.mailbox,
+            selectedMailboxes: previousMailbox ? [previousMailbox] : [],
+            briefMailboxFilter: previousMailbox ? [previousMailbox] : [],
+            cards: rollbackCards,
+            actionCount: actionCount(rollbackCards),
+            inboxLoading: false,
+            inboxError: message,
+            mailboxes: s.mailboxes.map((item) => ({
+              ...item,
+              selected: normalizedMailbox(item.email) === previousMailbox,
+              ...(normalizedMailbox(item.email) === primary && authFailed ? { authorized: false, last_error: "Reconnect Gmail to continue." } : {}),
+            })),
+          };
+        });
+        if (previousMailbox && previousMailbox !== primary) {
+          try {
+            await client.setMailboxSelected(primary, false, state.storageProvider);
+            await client.setMailboxSelected(previousMailbox, true, state.storageProvider);
+            await loadInboxEmails(previousMailbox);
+          } catch {
+            // Keep the original error visible if rollback also fails.
+          }
+        }
+        showToast(authFailed ? "This Gmail authorization expired. Reconnect the account and try again." : message);
       }
     },
     setBriefMailboxFilter(mailboxes) {
@@ -979,6 +1543,310 @@ export function useAppController() {
       });
     },
     loadActiveCards,
+    async loadInboxEmails(category = "inbox", days = 7, force = false) {
+      if (force && (category === "inbox" || category === "all")) {
+        await preloadMailboxSnapshot(undefined, days, true);
+        return;
+      }
+      await loadInboxEmails(undefined, category, days, force);
+    },
+    refreshInboxEmails,
+    preloadMailboxSnapshot: (force = false) => preloadMailboxSnapshot(undefined, 7, force),
+    async loadInboxEmailBody(messageId, mailboxOverride) {
+      const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
+      if (!messageId || !mailbox) return "";
+      const payload = await client.getInboxEmail(mailbox, messageId);
+      return String(payload.message?.body_text || payload.message?.body_preview || payload.message?.snippet || "");
+    },
+    async loadInboxThreadPage(mailbox, threadId, options = {}) {
+      return client.getInboxThreadPage(normalizedMailbox(mailbox), threadId, options);
+    },
+    async loadInboxMessageDisplayBody(mailbox, messageId) {
+      return client.getInboxMessageDisplayBody(normalizedMailbox(mailbox), messageId);
+    },
+    async loadInboxThreadAssist(mailbox, threadId, latestMessageId, anchorMessageId) {
+      const started = await client.startInboxThreadAssist({
+        mailbox: normalizedMailbox(mailbox),
+        thread_id: threadId,
+        latest_message_id: latestMessageId,
+        anchor_message_id: anchorMessageId,
+        ai_provider: state.llmProvider,
+        storage_provider: state.storageProvider,
+      });
+      if (started.status === "done" && started.result) {
+        return started.result as unknown as InboxThreadAssistPayload;
+      }
+      if (!started.run_id) {
+        throw new Error(started.error || "Inbox thread assist did not return a run id.");
+      }
+      const completed = await waitForToolRunResult(client, started.run_id);
+      if (completed.status === "failed" || completed.error) {
+        throw new Error(completed.error || "Inbox thread assist failed.");
+      }
+      return (completed.result || {}) as unknown as InboxThreadAssistPayload;
+    },
+    async getInboxThreadDraft(mailbox, threadId) {
+      return client.getInboxThreadDraft(normalizedMailbox(mailbox), threadId);
+    },
+    async saveInboxThreadDraft(mailbox, threadId, body, ifMatch) {
+      return client.saveInboxThreadDraft(normalizedMailbox(mailbox), threadId, body, ifMatch);
+    },
+    async deleteInboxThreadDraft(mailbox, threadId) {
+      return client.deleteInboxThreadDraft(normalizedMailbox(mailbox), threadId);
+    },
+    async prepareInboxAttachmentAccess(mailbox, messageId, attachmentId, mode) {
+      return client.prepareInboxAttachmentAccess(normalizedMailbox(mailbox), messageId, attachmentId, mode);
+    },
+    async modifyInboxMessageLabels(mailbox, messageIds, addLabelIds = [], removeLabelIds = []) {
+      const normalized = normalizedMailbox(mailbox);
+      if (!normalized || !messageIds.length) return;
+      const prevInboxMessages = state.inboxMessages;
+      const prevSnapshotMessages = state.inboxSnapshotMessages;
+      const addSet = new Set(addLabelIds.map((label) => label.toUpperCase()));
+      const removeSet = new Set(removeLabelIds.map((label) => label.toUpperCase()));
+      const patchMessage = (message: InboxFeedPayload["messages"][number]) => {
+        const labels = new Set((message.label_ids || []).map((label) => label.toUpperCase()));
+        addSet.forEach((label) => labels.add(label));
+        removeSet.forEach((label) => labels.delete(label));
+        return {
+          ...message,
+          label_ids: [...labels],
+          unread: labels.has("UNREAD"),
+          important: labels.has("IMPORTANT"),
+        };
+      };
+      setState((s) => ({
+        ...s,
+        inboxMessages: patchInboxMessageList(s.inboxMessages, messageIds, patchMessage),
+        inboxSnapshotMessages: patchInboxMessageList(s.inboxSnapshotMessages, messageIds, patchMessage),
+      }));
+      try {
+        const result = await client.modifyMessageLabels(normalized, messageIds, addLabelIds, removeLabelIds);
+        if (!result.ok) throw new Error(result.error || "Failed to modify message labels");
+      } catch (error) {
+        setState((s) => ({ ...s, inboxMessages: prevInboxMessages, inboxSnapshotMessages: prevSnapshotMessages }));
+        throw error;
+      }
+    },
+    async updateInboxThreadState(mailbox, threadId, operation) {
+      const normalized = normalizedMailbox(mailbox);
+      if (!normalized || !threadId) return;
+      const result = await client.updateInboxThreadState(normalized, threadId, operation);
+      if (!result.ok) throw new Error(result.error || "Failed to update thread");
+
+      const patchMessage = (message: InboxFeedPayload["messages"][number]) => {
+        if ((message.thread_id || message.id) !== threadId) return message;
+        const labels = new Set((message.label_ids || []).map((label) => label.toUpperCase()));
+        if (operation === "mark_read") labels.delete("UNREAD");
+        if (operation === "mark_unread") labels.add("UNREAD");
+        if (operation === "star") labels.add("STARRED");
+        if (operation === "unstar") labels.delete("STARRED");
+        if (operation === "mark_important") labels.add("IMPORTANT");
+        if (operation === "mark_not_important") labels.delete("IMPORTANT");
+        if (operation === "trash") {
+          labels.delete("INBOX");
+          labels.add("TRASH");
+        }
+        if (operation === "untrash") {
+          labels.delete("TRASH");
+          labels.add("INBOX");
+        }
+        return {
+          ...message,
+          label_ids: [...labels],
+          unread: labels.has("UNREAD"),
+          important: labels.has("IMPORTANT"),
+          starred: labels.has("STARRED"),
+        };
+      };
+      setState((s) => ({
+        ...s,
+        inboxMessages: s.inboxMessages.map(patchMessage),
+        inboxSnapshotMessages: s.inboxSnapshotMessages.map(patchMessage),
+      }));
+    },
+    async submitMailContextPrompt(request) {
+      const context = request.context;
+      if (!context?.mailbox || !context.thread_id || !request.visiblePrompt.trim() || aiGenerationRun.current) return null;
+      const generationRun = {
+        runId: createId("generation"),
+        cancelled: false,
+        controller: new AbortController(),
+      };
+      aiGenerationRun.current = generationRun;
+      const isCurrentGeneration = () => aiGenerationRun.current === generationRun && !generationRun.cancelled;
+      const conversationId = state.aiChatConversationId || createId("chat");
+      const userMessage: AiChatMessage = {
+        id: createId("msg"),
+        role: "user",
+        content: request.visiblePrompt,
+        timestamp: new Date().toISOString(),
+        kind: "chat",
+        mailContext: context,
+        sourcePrompt: request.visiblePrompt,
+      };
+      const baseMessages = state.aiChatConversationId === conversationId ? state.aiChatMessages : [];
+      const messagesWithUser = [...baseMessages, userMessage];
+      const pendingMessage: AiChatMessage = {
+        id: createId("msg"),
+        role: "assistant",
+        content: "Thinking",
+        timestamp: new Date().toISOString(),
+        kind: "status",
+        pending: true,
+        mailContext: context,
+        sourcePrompt: request.visiblePrompt,
+      };
+      setState((s) => ({
+        ...s,
+        aiChatConversationId: conversationId,
+        aiChatMessages: [...messagesWithUser, pendingMessage],
+        aiChatLoading: true,
+      }));
+      try {
+        const started = await client.startInboxMailPrompt({
+          mailbox: normalizedMailbox(context.mailbox),
+          thread_id: context.thread_id,
+          anchor_message_id: context.anchor_message_id,
+          latest_message_id: context.latest_message_id,
+          visible_prompt: request.visiblePrompt,
+          expected_artifact: request.expectedArtifact || "draft_reply",
+          user_answers: request.userAnswers,
+          ai_provider: state.llmProvider,
+          storage_provider: state.storageProvider,
+        });
+        if (!isCurrentGeneration()) return null;
+        const completed = started.status === "done" && started.result
+          ? started
+          : await waitForToolRunResult(client, started.run_id || "", undefined, generationRun.controller.signal);
+        if (!isCurrentGeneration()) return null;
+        if (completed.status === "failed" || completed.error) {
+          throw new Error(completed.error || "Mail prompt failed");
+        }
+        const payload = (completed.result || {}) as unknown as MailPromptRunResult;
+        const finalMessages: AiChatMessage[] = [
+          ...messagesWithUser,
+          {
+            id: createId("msg"),
+            role: "assistant",
+            content: payload.assistant_text || "I reviewed the thread.",
+            timestamp: new Date().toISOString(),
+            kind: "chat",
+            artifact: payload.artifact || null,
+            replyGaps: payload.reply_gaps,
+            mailContext: context,
+            fallbackUsed: Boolean(payload.fallback_used),
+            sourcePrompt: request.visiblePrompt,
+          },
+        ];
+        upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: request.visiblePrompt });
+        return payload;
+      } catch (error) {
+        if (!isCurrentGeneration() || isAbortError(error)) return null;
+        const message = sanitizeToolError(error, request.visiblePrompt) || "Anna couldn't finish that reply.";
+        const failedMessages: AiChatMessage[] = [
+          ...messagesWithUser,
+          {
+            ...pendingMessage,
+            pending: false,
+            kind: "error",
+            content: message,
+            timestamp: new Date().toISOString(),
+          },
+        ];
+        upsertAiConversationHistory(conversationId, failedMessages, { kind: "chat", query: request.visiblePrompt });
+        showToast(message);
+        return null;
+      } finally {
+        if (aiGenerationRun.current === generationRun) {
+          aiGenerationRun.current = null;
+          setState((s) => ({ ...s, aiChatLoading: false }));
+        }
+      }
+    },
+    async sendInboxThreadReply({ mailbox, threadId, to, body, replyMode = "reply_to_sender", dryRun = false }) {
+      return client.replyFromAsk({
+        mailbox: normalizedMailbox(mailbox),
+        thread_id: threadId,
+        to_addr: to,
+        body,
+        reply_mode: replyMode,
+        dry_run: dryRun,
+      });
+    },
+    async loadContactAvatars(emails, mailboxOverride) {
+      const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
+      if (!mailbox || !emails.length) return { avatars: {}, permissionRequired: false };
+      const payload = await client.resolveContactAvatars(mailbox, emails);
+      return { avatars: payload.avatars || {}, permissionRequired: Boolean(payload.permission_required) };
+    },
+    async setInboxStarred(messageId, starred) {
+      const message = state.inboxSnapshotMessages.find((item) => item.id === messageId)
+        || state.inboxMessages.find((item) => item.id === messageId);
+      const mailbox = normalizedMailbox(message?.mailbox || state.selectedMailboxes[0] || state.mailbox);
+      if (!mailbox || !messageId) return;
+      const patchMessage = (item: typeof message, nextStarred: boolean) => {
+        if (!item || item.id !== messageId) return item;
+        const labels = new Set(item.label_ids || []);
+        if (nextStarred) labels.add("STARRED"); else labels.delete("STARRED");
+        return { ...item, starred: nextStarred, label_ids: [...labels] };
+      };
+      setState((s) => ({
+        ...s,
+        inboxMessages: s.inboxMessages.map((item) => patchMessage(item, starred) || item),
+        inboxSnapshotMessages: s.inboxSnapshotMessages.map((item) => patchMessage(item, starred) || item),
+      }));
+      try {
+        const result = await client.setMessageStarred(mailbox, messageId, starred);
+        if (!result.ok) throw new Error(result.error || "Failed to update star");
+      } catch (error) {
+        setState((s) => ({
+          ...s,
+          inboxMessages: s.inboxMessages.map((item) => patchMessage(item, !starred) || item),
+          inboxSnapshotMessages: s.inboxSnapshotMessages.map((item) => patchMessage(item, !starred) || item),
+        }));
+        showToast(error instanceof Error ? error.message : String(error));
+      }
+    },
+    async markInboxRead(messageId) {
+      const message = state.inboxMessages.find((item) => item.id === messageId);
+      const mailbox = normalizedMailbox(message?.mailbox || state.selectedMailboxes[0] || state.mailbox);
+      if (!messageId || !mailbox) return;
+      try {
+        const result = await client.markReadFromAsk(mailbox, [messageId]);
+        if (!result.ok) throw new Error(result.error || "Failed to mark email as read");
+        setState((s) => ({
+          ...s,
+          inboxMessages: s.inboxMessages.map((item) => item.id === messageId
+            ? { ...item, unread: false, label_ids: (item.label_ids || []).filter((label) => label !== "UNREAD") }
+            : item),
+          inboxSnapshotMessages: s.inboxSnapshotMessages.map((item) => item.id === messageId
+            ? { ...item, unread: false, label_ids: (item.label_ids || []).filter((label) => label !== "UNREAD") }
+            : item),
+        }));
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+      }
+    },
+    async trashInboxMessage(messageId) {
+      const message = state.inboxMessages.find((item) => item.id === messageId);
+      const mailbox = normalizedMailbox(message?.mailbox || state.mailbox);
+      if (!messageId || !mailbox) return;
+      try {
+        const result = await client.trashFromAsk(mailbox, [messageId]);
+        if (!result.ok) throw new Error(result.error || "Failed to move email to trash");
+        setState((s) => ({
+          ...s,
+          inboxMessages: s.inboxMessages.filter((item) => item.id !== messageId),
+          inboxSnapshotMessages: s.inboxSnapshotMessages.map((item) => item.id === messageId
+            ? { ...item, label_ids: [...new Set([...(item.label_ids || []).filter((label) => label !== "INBOX"), "TRASH"])] }
+            : item),
+        }));
+        showToast("Moved to trash.");
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+      }
+    },
     loadRunHistory,
     loadContactMemories,
     openContactMemory,
@@ -1029,11 +1897,12 @@ export function useAppController() {
         historyOpen: false,
         memoryOpen: false,
         snoozeMenuCardId: "",
-        threadContextExpanded: { ...s.threadContextExpanded, [`${key}_body`]: false },
+        pendingAction: `body:${key}`,
+        threadContextExpanded: { ...s.threadContextExpanded, [`${key}_body`]: true },
       }));
       scrollToPageTop();
       try {
-        const detail = await client.getCardDetail(cardMailbox(card, state.mailbox), card.id, state.storageProvider, false);
+        const detail = await client.getCardDetail(cardMailbox(card, state.mailbox), card.id, state.storageProvider, true);
         setState((s) => {
           const selectedKey = s.selectedCard ? s.selectedCard.uiKey || cardUiKey(s.selectedCard, s.mailbox) : "";
           if (selectedKey !== key) return s;
@@ -1053,6 +1922,8 @@ export function useAppController() {
           };
         });
       } catch {
+      } finally {
+        setState((s) => ({ ...s, pendingAction: s.pendingAction === `body:${key}` ? "" : s.pendingAction }));
       }
     },
     async loadSelectedEmailBody() {
@@ -1435,6 +2306,248 @@ export function useAppController() {
       setState((s) => ({ ...s, sourcesOpen: true }));
       if (first) void actions.setConfigMailbox(first);
     },
+    stopAiGeneration() {
+      const run = aiGenerationRun.current;
+      if (!run) return;
+      run.cancelled = true;
+      run.controller.abort();
+      aiGenerationRun.current = null;
+      setState((s) => {
+        const stoppedAt = new Date().toISOString();
+        const messages = s.aiChatMessages.map((message) => message.pending
+          ? { ...message, pending: false, kind: "stopped" as const, content: "Generation stopped.", timestamp: stoppedAt }
+          : message);
+        const lastUser = [...messages].reverse().find((message) => message.role === "user");
+        const conversationId = s.aiChatConversationId;
+        if (!lastUser || !conversationId) {
+          return { ...s, aiChatMessages: messages, aiChatLoading: false, isCustomScanning: false, scanStatus: "", customRunProgress: null };
+        }
+        const kind = lastUser.kind === "scan" ? "scan" as const : "chat" as const;
+        const timestamp = stoppedAt;
+        const entry: AskHistoryEntry = {
+          conversationId,
+          kind,
+          query: lastUser.content,
+          result: syntheticChatResult(messages),
+          timestamp,
+          messages,
+        };
+        const nextHistory = [entry, ...s.askHistory.filter((item) => item.conversationId !== conversationId)].slice(0, 30);
+        persistAskHistory(nextHistory);
+        return {
+          ...s,
+          aiChatMessages: messages,
+          askHistory: nextHistory,
+          aiChatLoading: false,
+          isCustomScanning: false,
+          scanStatus: "",
+          customRunProgress: null,
+        };
+      });
+    },
+    startNewAiConversation() {
+      const run = aiGenerationRun.current;
+      if (run) {
+        run.cancelled = true;
+        run.controller.abort();
+        aiGenerationRun.current = null;
+      }
+      setState((s) => ({
+        ...s,
+        customScanInput: "",
+        aiChatMessages: [],
+        aiChatConversationId: "",
+        aiChatLoading: false,
+        isCustomScanning: false,
+        scanStatus: "",
+        customRunProgress: null,
+      }));
+    },
+    openAiConversation(index: number) {
+      const entry = state.askHistory[index];
+      if (!entry) return;
+      const run = aiGenerationRun.current;
+      if (run) {
+        run.cancelled = true;
+        run.controller.abort();
+        aiGenerationRun.current = null;
+      }
+      setState((s) => ({
+        ...s,
+        aiChatConversationId: entry.conversationId || createId("chat"),
+        aiChatMessages: entry.messages || [
+          { id: createId("msg"), role: "user", content: entry.query || "Inbox question", timestamp: entry.timestamp },
+          {
+            id: createId("msg"),
+            role: "assistant",
+            content: entry.result.summary || entry.result.plan_description || "Anna finished scanning your inbox.",
+            timestamp: entry.timestamp,
+            kind: entry.kind || "scan",
+            result: entry.result,
+          },
+        ],
+        customScanInput: "",
+        aiChatLoading: false,
+        isCustomScanning: false,
+        scanStatus: "",
+        customRunProgress: null,
+      }));
+    },
+    async sendAiChatMessage() {
+      const userRequest = state.customScanInput.trim();
+      if (!userRequest || state.isCustomScanning || state.aiChatLoading || aiGenerationRun.current) return;
+      const generationRun = {
+        runId: createId("generation"),
+        cancelled: false,
+        controller: new AbortController(),
+      };
+      aiGenerationRun.current = generationRun;
+      const isCurrentGeneration = () => aiGenerationRun.current === generationRun && !generationRun.cancelled;
+      const isChatRequest = shouldRouteToChat(userRequest);
+      const conversationId = state.aiChatConversationId || createId("chat");
+      const userMessage: AiChatMessage = {
+        id: createId("msg"),
+        role: "user",
+        content: userRequest,
+        timestamp: new Date().toISOString(),
+        kind: isChatRequest ? "chat" : "scan",
+      };
+      const baseMessages = state.aiChatConversationId === conversationId ? state.aiChatMessages : [];
+      const messagesWithUser = [...baseMessages, userMessage];
+      const pendingMessage: AiChatMessage = {
+        id: createId("msg"),
+        role: "assistant",
+        content: isChatRequest ? chatPendingText(userRequest) : scanPendingText(userRequest),
+        timestamp: new Date().toISOString(),
+        kind: "status",
+        pending: true,
+      };
+      setState((s) => ({
+        ...s,
+        customScanInput: "",
+        aiChatConversationId: conversationId,
+        aiChatMessages: [...messagesWithUser, pendingMessage],
+        aiChatLoading: true,
+      }));
+
+      if (isChatRequest) {
+        try {
+          const reply = await completeAiChat(messagesWithUser, generationRun.controller.signal);
+          if (!isCurrentGeneration()) return;
+          const finalMessages = [...messagesWithUser, {
+            id: createId("msg"),
+            role: "assistant" as const,
+            content: reply,
+            timestamp: new Date().toISOString(),
+            kind: "chat" as const,
+          }];
+          upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
+        } catch (error) {
+          if (!isCurrentGeneration() || isAbortError(error)) return;
+          const message = sanitizeToolError(error, userRequest) || "Anna couldn't finish that reply.";
+          const failedMessages: AiChatMessage[] = [
+            ...messagesWithUser,
+            {
+              ...pendingMessage,
+              pending: false,
+              kind: "error",
+              content: message,
+              timestamp: new Date().toISOString(),
+            },
+          ];
+          upsertAiConversationHistory(conversationId, failedMessages, { kind: "chat", query: userRequest });
+          showToast(message);
+        } finally {
+          if (aiGenerationRun.current === generationRun) {
+            aiGenerationRun.current = null;
+            setState((s) => ({ ...s, aiChatLoading: false }));
+          }
+        }
+        return;
+      }
+
+      setState((s) => ({
+        ...s,
+        isCustomScanning: true,
+        scanError: "",
+        scanStatus: "Planning scan strategy...",
+        askItemActions: {},
+        customRunProgress: { runId: "", question: userRequest, status: "queued", stage: "planning", stageKey: "planning", progress: {}, partial: {}, startedAt: "" },
+      }));
+      try {
+        const runId = `cs_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+        const scanPromise = client.startCustomScan({
+          user_request: userRequest,
+          mailbox: selectedOrPrimary(state.selectedMailboxes, state.mailbox),
+          primary_count: CUSTOM_SCAN_MESSAGE_LIMIT,
+          max_messages: CUSTOM_SCAN_MESSAGE_LIMIT,
+          ai_provider: state.llmProvider,
+          storage_provider: state.storageProvider,
+          run_id: runId,
+          wait_timeout_seconds: 45,
+        });
+        const started = await scanPromise;
+        if (!isCurrentGeneration()) return;
+        if (started.status === "failed" || started.error) {
+          throw new Error(started.error || "Custom scan failed");
+        }
+        const completed = started.status === "done" && started.result
+          ? started
+          : await waitForCustomScanResult(client, runId, (status) => {
+            setState((s) => ({
+              ...s,
+              customRunProgress: makeCustomRunProgress(s.customRunProgress!, status, { runId, question: userRequest }),
+              scanStatus: scanStageLabel(status.stage, status.progress),
+            }));
+          }, generationRun.controller.signal);
+        if (!isCurrentGeneration()) return;
+        if (completed.status === "failed" || completed.error) {
+          throw new Error(completed.error || "Custom scan failed");
+        }
+        await loadActiveCards();
+        if (!isCurrentGeneration()) return;
+        await loadRunHistory();
+        if (!isCurrentGeneration()) return;
+        await loadCustomPlans();
+        if (!isCurrentGeneration()) return;
+        const result = buildCustomRunResult(runId, (completed.result || {}) as Record<string, unknown>);
+        const finalMessages: AiChatMessage[] = [
+          ...messagesWithUser,
+          {
+            ...pendingMessage,
+            pending: false,
+            kind: "scan",
+            content: result.summary || result.plan_description || "Anna finished scanning your inbox.",
+            result,
+            timestamp: new Date().toISOString(),
+          },
+        ];
+        upsertAiConversationHistory(conversationId, finalMessages, { kind: "scan", query: userRequest, result });
+        setState((s) => ({ ...s, scanStatus: "", customRunProgress: null }));
+        showToast("Custom scan complete.");
+      } catch (error) {
+        if (!isCurrentGeneration() || isAbortError(error)) return;
+        const message = sanitizeToolError(error, userRequest);
+        const failedMessages: AiChatMessage[] = [
+          ...messagesWithUser,
+          {
+            ...pendingMessage,
+            pending: false,
+            kind: "error",
+            content: message,
+            timestamp: new Date().toISOString(),
+          },
+        ];
+        upsertAiConversationHistory(conversationId, failedMessages, { kind: "chat", query: userRequest });
+        setState((s) => ({ ...s, scanError: message, customRunProgress: s.customRunProgress ? { ...s.customRunProgress, status: "failed", stageKey: "failed" } : s.customRunProgress }));
+        showToast(message);
+      } finally {
+        if (aiGenerationRun.current === generationRun) {
+          aiGenerationRun.current = null;
+          setState((s) => ({ ...s, isCustomScanning: false, aiChatLoading: false }));
+        }
+      }
+    },
     async startCustomScan() {
       const userRequest = state.customScanInput.trim();
       if (!userRequest || state.isCustomScanning) return;
@@ -1456,35 +2569,42 @@ export function useAppController() {
           ai_provider: state.llmProvider,
           storage_provider: state.storageProvider,
           run_id: runId,
+          wait_timeout_seconds: 45,
         });
-        const pollTimer = window.setInterval(() => {
-          client.getRun(runId).then((status) => {
+        const started = await scanPromise;
+        if (started.status === "failed" || started.error) {
+          throw new Error(started.error || "Custom scan failed");
+        }
+        const completed = started.status === "done" && started.result
+          ? started
+          : await waitForCustomScanResult(client, runId, (status) => {
             setState((s) => ({
               ...s,
               customRunProgress: makeCustomRunProgress(s.customRunProgress!, status, { runId, question: userRequest }),
               scanStatus: scanStageLabel(status.stage, status.progress),
             }));
-          }).catch(() => {});
-        }, POLL_INTERVAL_MS);
-        const started = await scanPromise;
-        window.clearInterval(pollTimer);
-        if (started.status === "failed" || started.error) {
-          throw new Error(started.error || "Custom scan failed");
+          });
+        if (completed.status === "failed" || completed.error) {
+          throw new Error(completed.error || "Custom scan failed");
         }
         await loadActiveCards();
         await loadRunHistory();
         await loadCustomPlans();
-        const result = buildCustomRunResult(runId, (started.result || {}) as Record<string, unknown>);
-        setState((s) => ({
-          ...s,
-          scanStatus: "",
-          customScanInput: "",
-          askHistory: [{ query: userRequest, result, timestamp: new Date().toISOString() }, ...s.askHistory],
-          customRunProgress: null,
-        }));
+        const result = buildCustomRunResult(runId, (completed.result || {}) as Record<string, unknown>);
+        setState((s) => {
+          const nextHistory = [{ query: userRequest, result, timestamp: new Date().toISOString(), kind: "scan" as const }, ...s.askHistory].slice(0, 30);
+          persistAskHistory(nextHistory);
+          return {
+            ...s,
+            scanStatus: "",
+            customScanInput: "",
+            askHistory: nextHistory,
+            customRunProgress: null,
+          };
+        });
         showToast("Custom scan complete.");
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = sanitizeToolError(error, userRequest);
         setState((s) => ({ ...s, scanError: message, customRunProgress: s.customRunProgress ? { ...s.customRunProgress, status: "failed", stageKey: "failed" } : s.customRunProgress }));
         showToast(message);
       } finally {
@@ -1513,29 +2633,36 @@ export function useAppController() {
           ai_provider: state.llmProvider,
           storage_provider: state.storageProvider,
           run_id: runId,
+          wait_timeout_seconds: 45,
         });
-        const pollTimer = window.setInterval(() => {
-          client.getRun(runId).then((status) => {
+        const started = await scanPromise;
+        if (started.status === "failed" || started.error) {
+          throw new Error(started.error || "Custom scan re-run failed");
+        }
+        const completed = started.status === "done" && started.result
+          ? started
+          : await waitForCustomScanResult(client, runId, (status) => {
             setState((s) => ({
               ...s,
               customRunProgress: makeCustomRunProgress(s.customRunProgress!, status, { runId, question }),
               scanStatus: scanStageLabel(status.stage, status.progress),
             }));
-          }).catch(() => {});
-        }, POLL_INTERVAL_MS);
-        const started = await scanPromise;
-        window.clearInterval(pollTimer);
-        if (started.status === "failed" || started.error) {
-          throw new Error(started.error || "Custom scan re-run failed");
+          });
+        if (completed.status === "failed" || completed.error) {
+          throw new Error(completed.error || "Custom scan re-run failed");
         }
         await loadActiveCards();
         await loadRunHistory();
         await loadCustomPlans();
-        const result = buildCustomRunResult(runId, (started.result || {}) as Record<string, unknown>);
-        setState((s) => ({ ...s, scanStatus: "", askHistory: [{ query: question, result, timestamp: new Date().toISOString() }, ...s.askHistory], customRunProgress: null }));
+        const result = buildCustomRunResult(runId, (completed.result || {}) as Record<string, unknown>);
+        setState((s) => {
+          const nextHistory = [{ query: question, result, timestamp: new Date().toISOString(), kind: "scan" as const }, ...s.askHistory].slice(0, 30);
+          persistAskHistory(nextHistory);
+          return { ...s, scanStatus: "", askHistory: nextHistory, customRunProgress: null };
+        });
         showToast("Re-run complete.");
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = sanitizeToolError(error, question);
         setState((s) => ({ ...s, scanError: message }));
         showToast(message);
       } finally {
@@ -1568,7 +2695,8 @@ export function useAppController() {
       try {
         const result = await client.clearHistory();
         if (result.ok) {
-          setState((s) => ({ ...s, askHistory: [] }));
+          persistAskHistory([]);
+          setState((s) => ({ ...s, askHistory: [], aiChatMessages: [], aiChatConversationId: "" }));
           showToast("History cleared.");
         }
       } catch (error) {
@@ -1579,7 +2707,8 @@ export function useAppController() {
       try {
         const result = await client.resetAllData();
         if (result.ok) {
-          setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, attachmentDownloads: {}, askItemActions: {}, askEditDraft: {}, askGapAnswers: {}, askDraftsByKey: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, draftPreferencesById: {}, replyIntentById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
+          persistAskHistory([]);
+          setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], aiChatMessages: [], aiChatConversationId: "", customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, attachmentDownloads: {}, askItemActions: {}, askEditDraft: {}, askGapAnswers: {}, askDraftsByKey: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, draftPreferencesById: {}, replyIntentById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
           showToast("All data reset. Ready for a fresh start.");
           window.location.reload();
         }
@@ -1780,5 +2909,5 @@ export function useAppController() {
     },
   };
 
-  return { state, setState, actions, toast, initialize };
+  return { state, setState, actions, toast, dismissToast, accountSwitchNotice, accountSwitchNoticeVisible, closeAccountSwitchNotice, initialize };
 }

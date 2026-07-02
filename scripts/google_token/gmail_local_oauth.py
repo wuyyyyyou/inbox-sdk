@@ -18,10 +18,17 @@ from utils.paths import default_client_secrets_path, sanitize_mailbox_id, token_
 from utils.time_utils import beijing_now_iso
 
 
-DEFAULT_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+DEFAULT_SCOPE = " ".join([
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/contacts.readonly",
+    "openid",
+    "email",
+    "profile",
+])
 DEFAULT_AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
 DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token"
 GMAIL_PROFILE_URL = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 
 # 常用 scope 参考：
 #   gmail.readonly           — 只读
@@ -83,7 +90,8 @@ def main() -> None:
     token = exchange_code(client, code, redirect_uri)
     authorized_email = fetch_authorized_email(token["access_token"])
     verify_authorized_email(args.email, authorized_email)
-    save_token(args.email, client, token, args.scope, authorized_email)
+    avatar_url = fetch_avatar_url(token["access_token"])
+    save_token(args.email, client, token, args.scope, authorized_email, avatar_url)
     print(f"Authorized Gmail account: {authorized_email}", flush=True)
     print(f"Saved Gmail token for {args.email} to {token_dir() / (sanitize_mailbox_id(args.email) + '.json')}", flush=True)
 
@@ -95,7 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--client-id", help="Google OAuth client id.")
     parser.add_argument("--client-secret", help="Google OAuth client secret.")
     parser.add_argument("--redirect-uri", help="Local OAuth redirect URI registered in Google Cloud.")
-    parser.add_argument("--scope", default=DEFAULT_SCOPE, help="OAuth scope. Default is Gmail readonly.")
+    parser.add_argument("--scope", default=DEFAULT_SCOPE, help="Space-delimited OAuth scopes. Defaults to Gmail modify, Contacts readonly, and basic profile.")
     parser.add_argument("--port", type=int, default=0, help="Local callback port. 0 picks a free port.")
     parser.add_argument("--no-browser", action="store_true", help="Print URL without opening browser.")
     return parser.parse_args()
@@ -171,7 +179,7 @@ def build_auth_url(client: dict[str, str], redirect_uri: str, state: str, scope:
         "client_id": client["client_id"],
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": scope,
+        "scope": " ".join(dict.fromkeys(f"{scope} openid email profile".split())),
         "access_type": "offline",
         "prompt": "consent",
         "state": state,
@@ -229,17 +237,33 @@ def verify_authorized_email(expected_email: str, authorized_email: str) -> None:
         )
 
 
+def fetch_avatar_url(access_token: str) -> str:
+    request = urllib.request.Request(
+        GOOGLE_USERINFO_URL,
+        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            profile = json.loads(response.read().decode("utf-8"))
+        return str(profile.get("picture") or "")
+    except Exception:
+        return ""
+
+
 def save_token(
     email: str,
     client: dict[str, str],
     token: dict[str, Any],
     scope: str,
     authorized_email: str | None = None,
+    avatar_url: str = "",
 ) -> None:
     expires_at = int(time.time()) + int(token.get("expires_in", 3600))
     record = {
         "email": email,
         "authorized_email": authorized_email or email,
+        "avatar_url": avatar_url,
         "client_id": client["client_id"],
         "client_secret": client["client_secret"],
         "token_uri": client["token_uri"],

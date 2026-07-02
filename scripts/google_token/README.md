@@ -53,18 +53,22 @@ python scripts/google_token/gmail_local_oauth.py --email your@gmail.com
 scripts/google_token/.secrets/gmail_tokens/<sanitized-email>.json
 ```
 
-默认 scope 是只读 Gmail：
+默认 scope 支持 Gmail 状态操作、账户头像和已保存联系人头像：
 
 ```text
-https://www.googleapis.com/auth/gmail.readonly
+https://www.googleapis.com/auth/gmail.modify
+https://www.googleapis.com/auth/contacts.readonly
+openid email profile
 ```
 
-如需本地测试标记已读、删除或发送等写操作，需要使用更高权限 scope，并确认产品 guardrail：
+旧 token 不会自动获得新增的 Contacts 权限。需要重新运行 OAuth helper，并在 Google 授权页确认只读联系人权限；未授权时邮件功能仍可使用，联系人头像回退为首字母。
+
+如需显式覆盖 scope，可传入完整的空格分隔列表：
 
 ```sh
 python scripts/google_token/gmail_local_oauth.py \
   --email your@gmail.com \
-  --scope https://www.googleapis.com/auth/gmail.modify
+  --scope "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/contacts.readonly openid email profile"
 ```
 
 ## 环境变量覆盖

@@ -1,8 +1,22 @@
 import type { AppState } from "../types/mail";
 import { DEFAULT_MODE, getSavedMailbox } from "./constants";
 
+const AI_ASK_HISTORY_STORAGE_KEY = "anna-inbox:ai-ask-history:v1";
+
+function loadSavedAskHistory(): AppState["askHistory"] {
+  if (typeof window === "undefined") return [];
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(AI_ASK_HISTORY_STORAGE_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed.slice(0, 30) : [];
+  } catch {
+    // 中文注释：历史记录只是 UI 恢复能力，损坏时直接丢弃，避免阻塞 App 启动。
+    return [];
+  }
+}
+
 export function createInitialState(): AppState {
   const mailbox = getSavedMailbox();
+  const savedAskHistory = loadSavedAskHistory();
   return {
     runtime: { connected: false, mode: "connecting" },
     view: "start",
@@ -31,6 +45,9 @@ export function createInitialState(): AppState {
     customScanInput: "",
     customRunResult: null,
     customRunProgress: null,
+    aiChatMessages: [],
+    aiChatConversationId: "",
+    aiChatLoading: false,
     customTraceOpen: false,
     sourcesOpen: false,
     historyOpen: false,
@@ -77,9 +94,16 @@ export function createInitialState(): AppState {
     attachmentDownloads: {},
     gmailAuthStatus: { checked: false, authorized: true },
     gmailErrorPopup: null,
+    inboxMessages: [],
+    inboxSnapshotMessages: [],
+    inboxSnapshotLoading: false,
+    inboxSnapshotComplete: false,
+    inboxLoading: true,
+    inboxError: "",
+    inboxUpdatedAt: "",
     askItemActions: {},
     askEditDraft: {},
-    askHistory: [],
+    askHistory: savedAskHistory,
     askHistoryExpanded: {},
   };
 }

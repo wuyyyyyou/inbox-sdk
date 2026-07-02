@@ -5,8 +5,14 @@ import type {
   CleanupBundlePayload,
   ContactMemoryDetailPayload,
   ContactMemorySummary,
+  ContactAvatarPayload,
   CustomPlanSummary,
   LlmStatus,
+  InboxFeedPayload,
+  InboxEmailDetailPayload,
+  InboxMessageDisplayBodyPayload,
+  InboxThreadDraftPayload,
+  InboxThreadPagePayload,
   MailboxInfo,
   RunHistoryEntry,
   RunStatus,
@@ -111,6 +117,10 @@ export class MailAgentClient {
     return this.invoke<{ mailboxes: MailboxInfo[]; selected: string[]; discovered?: MailboxInfo[] }>("list_mailboxes", { storage_provider: storageProvider });
   }
 
+  getMailboxRegistry(storageProvider: string) {
+    return this.invoke<{ mailboxes: MailboxInfo[]; selected: string[]; discovered?: MailboxInfo[] }>("get_mailbox_registry", { storage_provider: storageProvider });
+  }
+
   setMailboxSelected(mailbox: string, selected: boolean, storageProvider: string) {
     return this.invoke<{ ok?: boolean; mailboxes: MailboxInfo[]; selected: string[] }>("set_mailbox_selected", { mailbox, selected, storage_provider: storageProvider });
   }
@@ -154,6 +164,99 @@ export class MailAgentClient {
 
   getCardDetail(mailbox: string, cardId: string, storageProvider: string, includeBody = false) {
     return this.invoke<CardDetailPayload>("get_card_detail", { mailbox, card_id: cardId, storage_provider: storageProvider, include_body: includeBody });
+  }
+
+  listInboxEmails(mailbox: string, days = 7, limit = 100, category = "inbox", clearCache = false) {
+    return this.invoke<InboxFeedPayload>("list_inbox_emails", { mailbox, days, limit, category, clear_cache: clearCache }, { timeoutMs: 120_000 });
+  }
+
+  listCachedEmails(mailbox: string, days = 7, limit = 100, category = "all") {
+    return this.invoke<InboxFeedPayload>("list_cached_emails", { mailbox, days, limit, category }, { timeoutMs: 30_000 });
+  }
+
+  getInboxEmail(mailbox: string, messageId: string) {
+    return this.invoke<InboxEmailDetailPayload>("get_cached_email", { mailbox, message_id: messageId }, { timeoutMs: 120_000 });
+  }
+
+  getInboxThreadPage(mailbox: string, threadId: string, options: {
+    anchorMessageId?: string;
+    beforeIndex?: number | null;
+    limit?: number;
+    includeDisplayBody?: boolean;
+  } = {}) {
+    return this.invoke<InboxThreadPagePayload>(
+      "get_inbox_thread_page",
+      {
+        mailbox,
+        thread_id: threadId,
+        anchor_message_id: options.anchorMessageId,
+        before_index: options.beforeIndex,
+        limit: options.limit ?? 5,
+        include_display_body: options.includeDisplayBody ?? true,
+      },
+      { timeoutMs: 120_000 },
+    );
+  }
+
+  getInboxMessageDisplayBody(mailbox: string, messageId: string) {
+    return this.invoke<InboxMessageDisplayBodyPayload>(
+      "get_inbox_message_display_body",
+      { mailbox, message_id: messageId },
+      { timeoutMs: 120_000 },
+    );
+  }
+
+  prepareInboxAttachmentAccess(mailbox: string, messageId: string, attachmentId: string, mode: "preview" | "download") {
+    return this.invoke<AttachmentDownloadPayload>(
+      "prepare_inbox_attachment_access",
+      { mailbox, message_id: messageId, attachment_id: attachmentId, mode },
+      { timeoutMs: 120_000 },
+    );
+  }
+
+  startInboxThreadAssist(args: Record<string, unknown>) {
+    return this.invoke<RunStatus>("start_inbox_thread_assist", args);
+  }
+
+  startInboxMailPrompt(args: Record<string, unknown>) {
+    return this.invoke<RunStatus>("start_inbox_mail_prompt", args);
+  }
+
+  getInboxThreadDraft(mailbox: string, threadId: string) {
+    return this.invoke<InboxThreadDraftPayload>("get_inbox_thread_draft", { mailbox, thread_id: threadId });
+  }
+
+  saveInboxThreadDraft(mailbox: string, threadId: string, body: string, ifMatch?: string) {
+    return this.invoke<{ ok?: boolean; etag?: string; updated?: boolean }>(
+      "save_inbox_thread_draft",
+      { mailbox, thread_id: threadId, body, if_match: ifMatch },
+    );
+  }
+
+  deleteInboxThreadDraft(mailbox: string, threadId: string) {
+    return this.invoke<{ ok?: boolean }>("delete_inbox_thread_draft", { mailbox, thread_id: threadId });
+  }
+
+  resolveContactAvatars(mailbox: string, emails: string[]) {
+    return this.invoke<ContactAvatarPayload>("resolve_contact_avatars", { mailbox, emails }, { timeoutMs: 120_000 });
+  }
+
+  setMessageStarred(mailbox: string, messageId: string, starred: boolean) {
+    return this.invoke<{ ok?: boolean; error?: string; starred?: boolean }>("set_message_starred", { mailbox, message_id: messageId, starred });
+  }
+
+  modifyMessageLabels(mailbox: string, messageIds: string[], addLabelIds: string[] = [], removeLabelIds: string[] = []) {
+    return this.invoke<{ ok?: boolean; error?: string; message_ids?: string[] }>(
+      "modify_message_labels",
+      { mailbox, message_ids: messageIds, add_label_ids: addLabelIds, remove_label_ids: removeLabelIds },
+    );
+  }
+
+  updateInboxThreadState(mailbox: string, threadId: string, operation: string) {
+    return this.invoke<{ ok?: boolean; error?: string; thread_id?: string; message_ids?: string[] }>(
+      "update_inbox_thread_state",
+      { mailbox, thread_id: threadId, operation },
+    );
   }
 
   getThreadContextPage(mailbox: string, cardId: string, storageProvider: string, beforeIndex?: number | null, limit = 50) {

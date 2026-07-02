@@ -116,6 +116,7 @@ async def merge_discovered_mailboxes(discovered: list[dict[str, Any]]) -> Mailbo
         existing = by_email.get(email)
         if existing:
             existing.provider = str(raw.get("provider") or existing.provider or "gmail")
+            existing.avatar_url = str(raw.get("avatar_url") or raw.get("picture") or existing.avatar_url or "")
             existing.auth_source = str(raw.get("auth_source") or raw.get("source") or existing.auth_source or "")
             existing.authorized = bool(raw.get("authorized", existing.authorized))
             existing.last_auth_checked_at = str(raw.get("last_auth_checked_at") or existing.last_auth_checked_at or "")
@@ -123,6 +124,7 @@ async def merge_discovered_mailboxes(discovered: list[dict[str, Any]]) -> Mailbo
         else:
             by_email[email] = MailboxRegistryEntry(
                 email=email,
+                avatar_url=str(raw.get("avatar_url") or raw.get("picture") or ""),
                 provider=str(raw.get("provider") or "gmail"),
                 auth_source=str(raw.get("auth_source") or raw.get("source") or ""),
                 authorized=bool(raw.get("authorized", True)),
@@ -268,6 +270,85 @@ async def set_scan_plan(mailbox: str, plan: ScanPlan) -> dict:
     key = f"{_mailbox_prefix(mailbox)}/scan_plan"
     plan.updated_at = _now()
     return await get_storage().set(key, _dataclass_to_dict(plan), scope=default_scope())
+
+
+# ── Inbox thread assist / draft ─────────────────────────────────────
+
+
+def _inbox_thread_assist_key(mailbox: str, thread_id: str, latest_message_id: str) -> str:
+    return (
+        f"{_mailbox_prefix(mailbox)}/inbox-thread-assist/"
+        f"{sanitize_key_part(str(thread_id or 'thread'))}/"
+        f"{sanitize_key_part(str(latest_message_id or 'latest'))}"
+    )
+
+
+def _inbox_thread_draft_key(mailbox: str, thread_id: str) -> str:
+    return (
+        f"{_mailbox_prefix(mailbox)}/inbox-drafts/"
+        f"{sanitize_key_part(str(thread_id or 'thread'))}"
+    )
+
+
+async def get_inbox_thread_assist(mailbox: str, thread_id: str, latest_message_id: str) -> dict[str, Any]:
+    key = _inbox_thread_assist_key(mailbox, thread_id, latest_message_id)
+    result = await get_storage().get(key, scope=default_scope())
+    value = result.get("value") if result.get("exists") and isinstance(result.get("value"), dict) else {}
+    return {
+        "exists": bool(result.get("exists")),
+        "etag": str(result.get("etag") or ""),
+        "value": value,
+    }
+
+
+async def set_inbox_thread_assist(
+    mailbox: str,
+    thread_id: str,
+    latest_message_id: str,
+    payload: dict[str, Any],
+    *,
+    if_match: str | None = None,
+) -> dict[str, Any]:
+    key = _inbox_thread_assist_key(mailbox, thread_id, latest_message_id)
+    stored = {
+        **(payload if isinstance(payload, dict) else {}),
+        "thread_id": str(thread_id or ""),
+        "latest_message_id": str(latest_message_id or ""),
+        "updated_at": _now(),
+    }
+    return await get_storage().set(key, stored, scope=default_scope(), if_match=if_match)
+
+
+async def get_inbox_thread_draft(mailbox: str, thread_id: str) -> dict[str, Any]:
+    key = _inbox_thread_draft_key(mailbox, thread_id)
+    result = await get_storage().get(key, scope=default_scope())
+    value = result.get("value") if result.get("exists") and isinstance(result.get("value"), dict) else {}
+    return {
+        "exists": bool(result.get("exists")),
+        "etag": str(result.get("etag") or ""),
+        "value": value,
+    }
+
+
+async def set_inbox_thread_draft(
+    mailbox: str,
+    thread_id: str,
+    body: str,
+    *,
+    if_match: str | None = None,
+) -> dict[str, Any]:
+    key = _inbox_thread_draft_key(mailbox, thread_id)
+    payload = {
+        "thread_id": str(thread_id or ""),
+        "body": str(body or ""),
+        "updated_at": _now(),
+    }
+    return await get_storage().set(key, payload, scope=default_scope(), if_match=if_match)
+
+
+async def delete_inbox_thread_draft(mailbox: str, thread_id: str) -> dict[str, Any]:
+    key = _inbox_thread_draft_key(mailbox, thread_id)
+    return await get_storage().delete(key, scope=default_scope())
 
 
 # ── Processed message index ─────────────────────────────────────────

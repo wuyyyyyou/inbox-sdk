@@ -15,7 +15,7 @@
   "required_executas": [
     {
       "tool_id": "bundled:inbox-executa",
-      "min_version": "1.1.2",
+      "min_version": "1.1.9",
       "version": "latest"
     }
   ],
@@ -31,7 +31,9 @@
     "bundle": {
       "format": "static-spa",
       "entry": "index.html",
-      "external_origins": []
+      "external_origins": [
+        "https://claude.ai"
+      ]
     },
     "views": [
       {
@@ -44,8 +46,12 @@
           "h": 560
         },
         "default_size": {
-          "w": 980,
-          "h": 720
+          "w": 1600,
+          "h": 900
+        },
+        "max_size": {
+          "w": 4096,
+          "h": 4096
         },
         "resizable": true,
         "movable": true,
@@ -73,7 +79,7 @@
         "set_title"
       ],
       "agent": {
-        "session": { 
+        "session": {
           "auto": true,
           "fixed": {}
         },

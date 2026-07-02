@@ -10,7 +10,10 @@ import json
 import logging
 import os
 import re
+import shutil
+import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -65,6 +68,11 @@ _discovered_email: str = ""
 
 # 多邮箱 token 映射表 {email: {access_token, refresh_token, ...}}
 _multi_token_map: dict[str, dict[str, Any]] = {}
+_multi_token_lock = threading.RLock()
+_multi_token_refresh_locks: dict[str, threading.Lock] = {}
+_avatar_url_cache: dict[str, str] = {}
+_contact_avatar_cache: dict[str, dict[str, str]] = {}
+_contact_avatar_loaded: set[str] = set()
 
 
 def _looks_like_email(value: str) -> bool:
@@ -73,18 +81,34 @@ def _looks_like_email(value: str) -> bool:
 
 def set_multi_tokens(tokens: list[dict[str, Any]]) -> None:
     global _multi_token_map
+    next_map: dict[str, dict[str, Any]] = {}
     for record in tokens:
         email = str(record.get("email") or "").strip().lower()
         if _looks_like_email(email):
-            _multi_token_map[email] = dict(record)
+            next_map[email] = dict(record)
+    # Runtime credentials are a snapshot, not an append-only stream. Replacing
+    # the map ensures a token removed in Anna disappears from this process too.
+    with _multi_token_lock:
+        _multi_token_map = next_map
 
 
 def get_multi_token_map() -> dict[str, dict[str, Any]]:
-    return dict(_multi_token_map)
+    with _multi_token_lock:
+        return {email: dict(record) for email, record in _multi_token_map.items()}
 
 
 def get_multi_token_emails() -> list[str]:
-    return sorted(_multi_token_map.keys())
+    with _multi_token_lock:
+        return sorted(_multi_token_map.keys())
+
+
+def _get_multi_token_refresh_lock(email: str) -> threading.Lock:
+    with _multi_token_lock:
+        lock = _multi_token_refresh_locks.get(email)
+        if lock is None:
+            lock = threading.Lock()
+            _multi_token_refresh_locks[email] = lock
+        return lock
 
 
 def _schedule_aps_persist() -> None:
@@ -93,8 +117,9 @@ def _schedule_aps_persist() -> None:
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            tokens = [{"email": e, **{k: v for k, v in r.items() if not k.startswith("_")}}
-                      for e, r in _multi_token_map.items()]
+            with _multi_token_lock:
+                tokens = [{"email": e, **{k: v for k, v in r.items() if not k.startswith("_")}}
+                          for e, r in _multi_token_map.items()]
             asyncio.run_coroutine_threadsafe(_async_persist_multi_tokens(tokens), loop)
     except RuntimeError:
         pass
@@ -113,8 +138,9 @@ def normalize_mailbox(mailbox: str) -> str:
     raw = str(mailbox or "").strip().lower()
 
     # Multi-token path: accept any registered multi-token email.
-    if raw in _multi_token_map:
-        return raw
+    with _multi_token_lock:
+        if raw in _multi_token_map:
+            return raw
 
     # Platform path: if a token is available, discover the authorized email once.
     if os.environ.get("GMAIL_ACCESS_TOKEN") or os.environ.get("GOOGLE_ACCESS_TOKEN"):
@@ -190,6 +216,30 @@ def _storage_set_value_sync(key: str, value: Any, *, timeout: float = 30.0) -> N
     run_storage_sync(get_storage().set(key, value, scope=default_scope()), timeout=timeout)
 
 
+def _storage_clear_prefix_sync(prefix: str, *, timeout: float = 30.0) -> int:
+    """Delete every APS KV entry under ``prefix`` from a worker thread."""
+    from ...storage.client import get_storage, scope as default_scope
+    from ...storage.sync_bridge import run as run_storage_sync
+
+    storage = get_storage()
+    deleted = 0
+    while True:
+        result = run_storage_sync(
+            storage.list(prefix=prefix, limit=200, scope=default_scope()),
+            timeout=timeout,
+        )
+        items = result.get("items") or []
+        if not items:
+            break
+        for item in items:
+            key = str(item.get("key") or "") if isinstance(item, dict) else ""
+            if not key:
+                continue
+            run_storage_sync(storage.delete(key, scope=default_scope()), timeout=timeout)
+            deleted += 1
+    return deleted
+
+
 async def _storage_get_value_async(key: str, *, timeout: float = 30.0) -> Any:
     from ...storage.client import get_storage, scope as default_scope
     result = await get_storage().get(key, scope=default_scope(), timeout=timeout)
@@ -207,6 +257,29 @@ def cache_debug_info(mailbox: str) -> dict[str, Any]:
         "backend": "local",
         "cache_dir": str(_mailbox_cache_dir(mailbox)),
         "index_file": str(_index_path(mailbox)),
+    }
+
+
+def clear_mailbox_cache(mailbox: str) -> dict[str, Any]:
+    """Clear only one mailbox's Gmail feed/body cache.
+
+    OAuth credentials, mailbox registration, Brief cards, scan state, drafts,
+    and preferences are intentionally outside this cache boundary.
+    """
+    normalized = normalize_mailbox(mailbox)
+    deleted_aps_keys = 0
+    if _storage_cache_enabled():
+        deleted_aps_keys = _storage_clear_prefix_sync(f"{_storage_cache_prefix(normalized)}/")
+
+    local_dir = cache_dir() / sanitize_mailbox_id(normalized)
+    deleted_local = local_dir.exists()
+    if deleted_local:
+        shutil.rmtree(local_dir)
+
+    return {
+        "mailbox": normalized,
+        "deleted_aps_keys": deleted_aps_keys,
+        "deleted_local_cache": deleted_local,
     }
 
 
@@ -351,12 +424,14 @@ def message_summary(message: dict[str, Any]) -> dict[str, Any]:
     summary["body_preview"] = body_text[:500]
     summary["body_length"] = len(body_text)
     summary["raw_header_count"] = len(headers)
+    summary["body_cached"] = bool(message.get("_body_cached", True))
     mailbox = str(message.get("mailbox") or "")
     message_id = str(message.get("id") or "")
-    if _storage_cache_enabled():
-        summary["cache_key"] = _storage_message_key(mailbox, message_id)
-    else:
-        summary["json_file"] = str(_message_path(mailbox, message_id))
+    if summary["body_cached"]:
+        if _storage_cache_enabled():
+            summary["cache_key"] = _storage_message_key(mailbox, message_id)
+        else:
+            summary["json_file"] = str(_message_path(mailbox, message_id))
     return summary
 
 
@@ -394,10 +469,12 @@ def list_available_mailboxes_from_tokens() -> list[dict[str, Any]]:
         if path.name == "default.json":
             continue
         email = path.stem.replace("_", "@", 1) if "_" in path.stem else path.stem
+        avatar_url = ""
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(record, dict):
                 email = str(record.get("email") or record.get("mailbox") or record.get("emailAddress") or email)
+                avatar_url = str(record.get("avatar_url") or record.get("picture") or "")
         except Exception:
             pass
         email = email.strip().lower()
@@ -407,6 +484,7 @@ def list_available_mailboxes_from_tokens() -> list[dict[str, Any]]:
                 "provider": "gmail",
                 "auth_source": "local_file",
                 "authorized": True,
+                "avatar_url": avatar_url,
                 "token_file": str(path),
                 "last_auth_checked_at": beijing_now(),
             })
@@ -439,8 +517,27 @@ def _refresh_access_token(record: dict[str, Any]) -> None:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except (urllib.error.URLError, ssl.SSLError, TimeoutError) as exc:
+            last_error = exc
+            if attempt >= 2:
+                raise
+            logging.getLogger("mail_agent.gmail").warning(
+                "token refresh retry %s/3 for %s after %s",
+                attempt + 2,
+                str(record.get("email") or "<local-token>"),
+                exc,
+            )
+            time.sleep(0.35 * (attempt + 1))
+    else:
+        if last_error:
+            raise last_error
+        raise RuntimeError("token refresh failed without a captured exception")
     record["access_token"] = payload["access_token"]
     if "expires_in" in payload:
         record["expires_at"] = int(time.time()) + int(payload["expires_in"])
@@ -450,13 +547,6 @@ def _refresh_access_token(record: dict[str, Any]) -> None:
         clean_record = {key: value for key, value in record.items() if not key.startswith("_")}
         Path(str(token_file)).write_text(json.dumps(clean_record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return
-
-    # Multi-token: update in-memory map and schedule APS persistence.
-    email = str(record.get("email") or "").strip().lower()
-    if email and email in _multi_token_map:
-        _multi_token_map[email] = record
-        _schedule_aps_persist()
-
 
 def get_access_token(mailbox: str) -> str:
     normalized = str(mailbox or "").strip().lower()
@@ -470,20 +560,66 @@ def get_access_token(mailbox: str) -> str:
         if normalized == _discovered_email or not _discovered_email:
             return str(platform_token).strip()
 
-    # Multi-token path — lookup by email, with refresh support.
-    if normalized in _multi_token_map:
-        record = _multi_token_map[normalized]
-        if _should_refresh_token(record):
-            _refresh_access_token(record)
-        token = record.get("access_token")
-        if not token:
-            raise ValueError(f"Gmail access token is missing for multi-token mailbox {mailbox}")
-        return str(token)
+    # Multi-token path — lookup by email, with one refresh in flight per mailbox.
+    with _multi_token_lock:
+        has_multi_token = normalized in _multi_token_map
+    if has_multi_token:
+        refresh_lock = _get_multi_token_refresh_lock(normalized)
+        with refresh_lock:
+            with _multi_token_lock:
+                current = _multi_token_map.get(normalized)
+                if current is None:
+                    raise ValueError(f"Gmail mailbox was unbound while resolving its token: {mailbox}")
+                record = dict(current)
+            if _should_refresh_token(record):
+                try:
+                    _refresh_access_token(record)
+                except (urllib.error.HTTPError, urllib.error.URLError, ssl.SSLError, TimeoutError) as exc:
+                    # Anna may inject a fresh access token together with stale refresh
+                    # metadata. Try the access token once instead of failing before the
+                    # Gmail request; Gmail will still reject it if it is actually expired.
+                    if not record.get("access_token"):
+                        if isinstance(exc, urllib.error.HTTPError):
+                            raise ValueError(f"Gmail token refresh failed for {mailbox}: HTTP {exc.code}") from exc
+                        raise ValueError(f"Gmail token refresh failed for {mailbox}: {exc}") from exc
+                    logging.getLogger("mail_agent.gmail").warning("refresh failed for %s; trying current access token (%s)", mailbox, exc)
+                else:
+                    should_persist = False
+                    with _multi_token_lock:
+                        latest = _multi_token_map.get(normalized)
+                        if latest is None:
+                            raise ValueError(f"Gmail mailbox was unbound while refreshing its token: {mailbox}")
+                        # A newly bound credential wins over an older refresh result.
+                        if latest.get("refresh_token") == current.get("refresh_token"):
+                            updated = {
+                                **latest,
+                                "access_token": record.get("access_token"),
+                                "expires_at": record.get("expires_at"),
+                                "updated_at": record.get("updated_at"),
+                            }
+                            _multi_token_map[normalized] = updated
+                            record = dict(updated)
+                            should_persist = True
+                        else:
+                            record = dict(latest)
+                    if should_persist:
+                        _schedule_aps_persist()
+            token = record.get("access_token")
+            if not token:
+                raise ValueError(f"Gmail access token is missing for multi-token mailbox {mailbox}")
+            return str(token)
 
     # Local dev — read from JSON token file with refresh support.
     record = _load_token_record(mailbox)
     if _should_refresh_token(record):
-        _refresh_access_token(record)
+        try:
+            _refresh_access_token(record)
+        except (urllib.error.HTTPError, urllib.error.URLError, ssl.SSLError, TimeoutError) as exc:
+            if not record.get("access_token"):
+                if isinstance(exc, urllib.error.HTTPError):
+                    raise ValueError(f"Gmail token refresh failed for {mailbox}: HTTP {exc.code}") from exc
+                raise ValueError(f"Gmail token refresh failed for {mailbox}: {exc}") from exc
+            logging.getLogger("mail_agent.gmail").warning("local refresh failed for %s; trying current access token (%s)", mailbox, exc)
     token = record.get("access_token")
     if not token:
         raise ValueError(f"Local Gmail access token is missing for {mailbox}")
@@ -512,6 +648,100 @@ def get_authorized_email() -> str:
         return ""
 
     return str(profile.get("emailAddress") or "").strip()
+
+
+def get_account_avatar_url(mailbox: str) -> str:
+    """Best-effort Google profile image lookup; returns empty without profile scope."""
+    normalized = str(mailbox or "").strip().lower()
+    if normalized in _avatar_url_cache:
+        return _avatar_url_cache[normalized]
+    record = get_multi_token_map().get(normalized) or {}
+    stored = str(record.get("avatar_url") or record.get("picture") or "")
+    if not stored:
+        try:
+            local = _load_token_record(normalized)
+            stored = str(local.get("avatar_url") or local.get("picture") or "")
+        except Exception:
+            pass
+    if stored:
+        _avatar_url_cache[normalized] = stored
+        return stored
+    try:
+        token = get_access_token(normalized)
+        request = urllib.request.Request(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        stored = str(payload.get("picture") or "")
+    except Exception:
+        stored = ""
+    _avatar_url_cache[normalized] = stored
+    return stored
+
+
+def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, Any]:
+    """Resolve saved Google Contact photos for a bounded set of email addresses."""
+    normalized_mailbox = normalize_mailbox(mailbox)
+    requested = {
+        str(email or "").strip().lower()
+        for email in emails[:200]
+        if "@" in str(email or "")
+    }
+    cached = _contact_avatar_cache.setdefault(normalized_mailbox, {})
+    if normalized_mailbox not in _contact_avatar_loaded:
+        token = get_access_token(normalized_mailbox)
+        page_token = ""
+        try:
+            while True:
+                params = {
+                    "resourceName": "people/me",
+                    "pageSize": 1000,
+                    "personFields": "names,emailAddresses,photos",
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                url = "https://people.googleapis.com/v1/people/me/connections?" + urllib.parse.urlencode(params)
+                request = urllib.request.Request(
+                    url,
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                    method="GET",
+                )
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                for person in payload.get("connections") or []:
+                    if not isinstance(person, dict):
+                        continue
+                    photos = [item for item in (person.get("photos") or []) if isinstance(item, dict) and item.get("url")]
+                    photo_url = str(photos[0].get("url") or "") if photos else ""
+                    for item in person.get("emailAddresses") or []:
+                        email = str(item.get("value") or "").strip().lower() if isinstance(item, dict) else ""
+                        if email and photo_url:
+                            cached[email] = photo_url
+                page_token = str(payload.get("nextPageToken") or "")
+                if not page_token:
+                    break
+            _contact_avatar_loaded.add(normalized_mailbox)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return {
+                    "avatars": {email: cached[email] for email in requested if email in cached},
+                    "permission_required": True,
+                    "required_scope": "https://www.googleapis.com/auth/contacts.readonly",
+                }
+            raise ValueError(f"Google People API request failed: HTTP {exc.code}") from exc
+        except Exception as exc:
+            return {"avatars": {email: cached[email] for email in requested if email in cached}, "warning": str(exc)}
+
+    own_avatar = get_account_avatar_url(normalized_mailbox)
+    if own_avatar:
+        cached[normalized_mailbox] = own_avatar
+    return {
+        "avatars": {email: cached[email] for email in requested if email in cached},
+        "permission_required": False,
+    }
 
 
 # ── Gmail API request ─────────────────────────────────────────────
@@ -551,6 +781,7 @@ def _header_map(message: dict[str, Any]) -> dict[str, str]:
 
 
 _BODY_TEXT_LIMIT = 30000
+_DISPLAY_BODY_LIMIT = 200000
 _HTML_RE = re.compile(r"<\s*(?:!doctype|html|head|body|table|style|script|div|span|p|br|a)\b", re.IGNORECASE)
 _PLACEHOLDER_PLAIN_RE = re.compile(
     r"\b(?:view|open|see|read)\b.{0,40}\b(?:html|browser|web version|online)\b|"
@@ -740,8 +971,12 @@ def decode_body_for_display(message: dict[str, Any]) -> dict[str, str]:
 
     payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
     walk(payload)
-    html_body = "\n\n".join(part.strip() for part in html_parts if part.strip())[:_BODY_TEXT_LIMIT]
-    text_body = "\n\n".join(_collapse_body_whitespace(part) for part in plain_parts if part.strip())[:_BODY_TEXT_LIMIT]
+    # Display HTML is budgeted later at the JSON-RPC response boundary. Keep a
+    # larger source window here so newsletter layouts (Cloudflare, GitHub,
+    # billing providers, etc.) are not cut mid-document and downgraded to text.
+    # LLM-facing body_text remains independently capped by _BODY_TEXT_LIMIT.
+    html_body = "\n\n".join(part.strip() for part in html_parts if part.strip())[:_DISPLAY_BODY_LIMIT]
+    text_body = "\n\n".join(_collapse_body_whitespace(part) for part in plain_parts if part.strip())[:_DISPLAY_BODY_LIMIT]
     return {"html": html_body, "text": text_body}
 
 
@@ -985,19 +1220,32 @@ def _normalize_message(mailbox: str, message: dict[str, Any]) -> dict[str, Any]:
 
 def search_gmail(mailbox: str, query: str, max_results: int = 100) -> list[str]:
     """Search Gmail with a query string, return list of message IDs."""
-    try:
-        payload = gmail_request(mailbox, "/users/me/messages", {
+    target = max(1, min(int(max_results or 100), 500))
+    message_ids: list[str] = []
+    page_token = ""
+    while len(message_ids) < target:
+        params: dict[str, Any] = {
             "q": query,
-            "maxResults": min(max_results, 500),
+            "maxResults": min(100, target - len(message_ids)),
             "fields": "messages/id,nextPageToken",
-        })
-    except ValueError as exc:
-        logging.getLogger("mail_agent.gmail").warning("search_gmail failed for %s: %s", mailbox, exc)
-        return []
-    refs = payload.get("messages") if isinstance(payload, dict) else []
-    if not refs:
-        return []
-    return [str(ref["id"]) for ref in refs if isinstance(ref, dict) and ref.get("id")]
+        }
+        if "in:anywhere" in query.lower():
+            params["includeSpamTrash"] = "true"
+        if page_token:
+            params["pageToken"] = page_token
+        try:
+            payload = gmail_request(mailbox, "/users/me/messages", params)
+        except ValueError as exc:
+            logging.getLogger("mail_agent.gmail").warning("search_gmail failed for %s: %s", mailbox, exc)
+            return message_ids
+        refs = payload.get("messages") if isinstance(payload, dict) else []
+        for ref in refs or []:
+            if isinstance(ref, dict) and ref.get("id"):
+                message_ids.append(str(ref["id"]))
+        page_token = str(payload.get("nextPageToken") or "") if isinstance(payload, dict) else ""
+        if not page_token or not refs:
+            break
+    return message_ids[:target]
 
 
 def _is_at_or_before_stop_time(message: dict[str, Any], stop_internal_date: str) -> bool:
@@ -1065,6 +1313,69 @@ def fetch_and_cache_message(mailbox: str, message_id: str) -> dict[str, Any] | N
     return normalized
 
 
+def fetch_message_summary(mailbox: str, message_id: str) -> dict[str, Any] | None:
+    """Fetch headers, labels and attachment metadata without downloading bodies."""
+    try:
+        full = gmail_request(
+            mailbox,
+            f"/users/me/messages/{urllib.parse.quote(message_id, safe='')}",
+            {
+                "format": "full",
+                "fields": (
+                    "id,threadId,historyId,labelIds,internalDate,snippet,sizeEstimate,"
+                    "payload(mimeType,headers(name,value),parts(filename,mimeType,body(attachmentId,size)))"
+                ),
+            },
+        )
+    except ValueError:
+        return None
+    normalized = _normalize_message(mailbox, full)
+    normalized["_body_cached"] = False
+    summary = message_summary(normalized)
+    summary["headers_complete"] = True
+    summary["metadata_refreshed_at"] = int(time.time())
+    return summary
+
+
+def live_search_metadata_and_cache(mailbox: str, query: str, max_results: int = 100) -> list[str]:
+    """Search Gmail and cache compact summaries, leaving full bodies on demand."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    msg_ids = search_gmail(mailbox, query, max_results)
+    if not msg_ids:
+        return []
+
+    existing = read_cache(mailbox)
+    existing_by_id = {
+        str(item.get("id")): item
+        for item in existing.get("messages") or []
+        if isinstance(item, dict) and item.get("id")
+    }
+    refresh_before = int(time.time()) - 300
+    missing_ids = [
+        message_id
+        for message_id in msg_ids
+        if message_id not in existing_by_id
+        or (not existing_by_id[message_id].get("from") and not existing_by_id[message_id].get("headers_complete"))
+        or int(existing_by_id[message_id].get("metadata_refreshed_at") or 0) <= refresh_before
+    ]
+    if missing_ids:
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            futures = {pool.submit(fetch_message_summary, mailbox, message_id): message_id for message_id in missing_ids}
+            for future in as_completed(futures):
+                try:
+                    summary = future.result()
+                except Exception:
+                    summary = None
+                if summary:
+                    existing_by_id[str(summary.get("id") or futures[future])] = summary
+
+    returned_ids = [message_id for message_id in msg_ids if message_id in existing_by_id]
+    merged = sorted(existing_by_id.values(), key=lambda item: int(item.get("internal_date") or 0), reverse=True)
+    write_index(mailbox, merged)
+    return returned_ids
+
+
 def refresh_thread_cache(mailbox: str, thread_id: str) -> list[dict[str, Any]]:
     """Fetch a Gmail thread, normalize/cache all messages, and update the index."""
     normalized_mailbox = normalize_mailbox(mailbox)
@@ -1105,6 +1416,56 @@ def patch_cached_messages_read(mailbox: str, message_ids: list[str]) -> None:
             continue
         labels = [str(label) for label in (msg.get("label_ids") or []) if str(label).upper() != "UNREAD"]
         msg["label_ids"] = labels
+        write_message(normalized_mailbox, msg)
+        changed_summaries[mid] = message_summary(msg)
+
+    if not changed_summaries:
+        return
+
+    cache = read_cache(normalized_mailbox)
+    summaries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in cache.get("messages") or []:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("id") or "")
+        if not mid:
+            continue
+        summaries.append(changed_summaries.get(mid, item))
+        seen.add(mid)
+    for mid, summary in changed_summaries.items():
+        if mid not in seen:
+            summaries.append(summary)
+    summaries.sort(key=lambda item: int(item.get("internal_date") or 0), reverse=True)
+    write_index(normalized_mailbox, summaries)
+
+
+def patch_cached_message_labels(
+    mailbox: str,
+    message_ids: list[str],
+    *,
+    add_label_ids: list[str] | None = None,
+    remove_label_ids: list[str] | None = None,
+) -> None:
+    """Best-effort local cache patch after Gmail label modification."""
+    normalized_mailbox = normalize_mailbox(mailbox)
+    target_ids = {str(mid).strip() for mid in message_ids if str(mid).strip()}
+    if not target_ids:
+        return
+
+    add_set = {str(label).strip().upper() for label in (add_label_ids or []) if str(label).strip()}
+    remove_set = {str(label).strip().upper() for label in (remove_label_ids or []) if str(label).strip()}
+    changed_summaries: dict[str, dict[str, Any]] = {}
+
+    for mid in target_ids:
+        try:
+            msg = read_message(normalized_mailbox, mid)
+        except Exception:
+            continue
+        labels = {str(label).strip().upper() for label in (msg.get("label_ids") or []) if str(label).strip()}
+        labels.update(add_set)
+        labels.difference_update(remove_set)
+        msg["label_ids"] = sorted(labels)
         write_message(normalized_mailbox, msg)
         changed_summaries[mid] = message_summary(msg)
 
@@ -1455,6 +1816,194 @@ def trash_email(mailbox: str, message_id: str) -> dict[str, Any]:
     result = json.loads(raw) if raw else {}
     print(f"[trash_email] success: id={result.get('id', '?')[:20]}", file=_sys.stderr)
     return result
+
+
+THREAD_STATE_OPERATIONS: dict[str, tuple[list[str], list[str]]] = {
+    "mark_read": ([], ["UNREAD"]),
+    "mark_unread": (["UNREAD"], []),
+    "star": (["STARRED"], []),
+    "unstar": ([], ["STARRED"]),
+    "mark_important": (["IMPORTANT"], []),
+    "mark_not_important": ([], ["IMPORTANT"]),
+}
+
+
+def update_thread_state(mailbox: str, thread_id: str, operation: str) -> dict[str, Any]:
+    """Apply one guarded Gmail state transition to an entire thread."""
+    normalized_operation = str(operation or "").strip().lower()
+    if normalized_operation not in {*THREAD_STATE_OPERATIONS, "trash", "untrash"}:
+        raise ValueError(f"Unsupported thread state operation: {normalized_operation}")
+
+    token = get_access_token(mailbox)
+    encoded_thread_id = urllib.parse.quote(str(thread_id).strip(), safe="")
+    if not encoded_thread_id:
+        raise ValueError("thread_id is required")
+
+    if normalized_operation in {"trash", "untrash"}:
+        url = f"{GMAIL_API_BASE}/users/me/threads/{encoded_thread_id}/{normalized_operation}"
+        body = None
+    else:
+        add_labels, remove_labels = THREAD_STATE_OPERATIONS[normalized_operation]
+        url = f"{GMAIL_API_BASE}/users/me/threads/{encoded_thread_id}/modify"
+        body = json.dumps({
+            "addLabelIds": add_labels,
+            "removeLabelIds": remove_labels,
+        }).encode("utf-8")
+
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8")
+            detail_json = json.loads(detail) if detail else {"status_code": exc.code}
+        except Exception:
+            detail_json = {"status_code": exc.code}
+        raise ValueError(f"Gmail thread {normalized_operation} failed: {exc.code} {detail_json}") from exc
+
+    result = json.loads(raw) if raw else {"id": thread_id, "messages": []}
+    if normalized_operation == "untrash":
+        inbox_request = urllib.request.Request(
+            f"{GMAIL_API_BASE}/users/me/threads/{encoded_thread_id}/modify",
+            data=json.dumps({"addLabelIds": ["INBOX"], "removeLabelIds": []}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(inbox_request, timeout=30) as response:
+                inbox_raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8")
+                detail_json = json.loads(detail) if detail else {"status_code": exc.code}
+            except Exception:
+                detail_json = {"status_code": exc.code}
+            raise ValueError(f"Gmail thread move to inbox failed: {exc.code} {detail_json}") from exc
+        if inbox_raw:
+            result = json.loads(inbox_raw)
+    message_ids = [
+        str(item.get("id") or "")
+        for item in (result.get("messages") or [])
+        if isinstance(item, dict) and item.get("id")
+    ]
+    if normalized_operation in THREAD_STATE_OPERATIONS:
+        add_labels, remove_labels = THREAD_STATE_OPERATIONS[normalized_operation]
+    elif normalized_operation == "trash":
+        add_labels, remove_labels = ["TRASH"], ["INBOX"]
+    else:
+        add_labels, remove_labels = ["INBOX"], ["TRASH"]
+    patch_cached_message_labels(
+        mailbox,
+        message_ids,
+        add_label_ids=add_labels,
+        remove_label_ids=remove_labels,
+    )
+    return {
+        "thread_id": thread_id,
+        "operation": normalized_operation,
+        "message_ids": message_ids,
+    }
+
+
+def modify_message_labels(
+    mailbox: str,
+    message_ids: list[str],
+    *,
+    add_label_ids: list[str] | None = None,
+    remove_label_ids: list[str] | None = None,
+    allowlist: set[str] | None = None,
+) -> dict[str, Any]:
+    """Modify Gmail system labels for one or more messages with an allowlist guard."""
+    ids = [str(mid).strip() for mid in message_ids if str(mid).strip()]
+    if not ids:
+        raise ValueError("message_ids is required")
+
+    add_set = {str(label).strip().upper() for label in (add_label_ids or []) if str(label).strip()}
+    remove_set = {str(label).strip().upper() for label in (remove_label_ids or []) if str(label).strip()}
+    effective_allowlist = {str(label).strip().upper() for label in (allowlist or {"UNREAD", "IMPORTANT"}) if str(label).strip()}
+    disallowed = sorted((add_set | remove_set) - effective_allowlist)
+    if disallowed:
+        raise ValueError(f"Only these labels can be modified: {', '.join(sorted(effective_allowlist))}")
+
+    token = get_access_token(mailbox)
+    body = json.dumps({
+        "ids": ids,
+        "addLabelIds": sorted(add_set),
+        "removeLabelIds": sorted(remove_set),
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"{GMAIL_API_BASE}/users/me/messages/batchModify",
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8")
+            detail_json = json.loads(detail) if detail else {"status_code": exc.code}
+        except Exception:
+            detail_json = {"status_code": exc.code}
+        raise ValueError(f"Gmail batchModify failed: {exc.code} {detail_json}") from exc
+
+    patch_cached_message_labels(
+        mailbox,
+        ids,
+        add_label_ids=sorted(add_set),
+        remove_label_ids=sorted(remove_set),
+    )
+    return {
+        "message_ids": ids,
+        "add_label_ids": sorted(add_set),
+        "remove_label_ids": sorted(remove_set),
+        "result": json.loads(raw) if raw else {},
+    }
+
+
+def set_message_starred(mailbox: str, message_id: str, starred: bool) -> dict[str, Any]:
+    """Add or remove Gmail's STARRED label and patch the compact cache index."""
+    token = get_access_token(mailbox)
+    body = json.dumps({
+        "addLabelIds": ["STARRED"] if starred else [],
+        "removeLabelIds": [] if starred else ["STARRED"],
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"{GMAIL_API_BASE}/users/me/messages/{urllib.parse.quote(message_id, safe='')}/modify",
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"Gmail star update failed: HTTP {exc.code}") from exc
+
+    cache = read_cache(mailbox)
+    summaries: list[dict[str, Any]] = []
+    for item in cache.get("messages") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("id") or "") == message_id:
+            labels = {str(label) for label in (item.get("label_ids") or [])}
+            if starred:
+                labels.add("STARRED")
+            else:
+                labels.discard("STARRED")
+            item = {**item, "label_ids": sorted(labels)}
+        summaries.append(item)
+    write_index(mailbox, summaries)
+    return json.loads(raw) if raw else {"id": message_id, "labelIds": ["STARRED"] if starred else []}
 
 
 # ── Batch mark read via Gmail API ──────────────────────────────────
