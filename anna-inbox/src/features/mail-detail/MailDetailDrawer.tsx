@@ -181,12 +181,15 @@ function ToolbarIcon({ children }: { children: ReactNode }) {
 const CloseThreadIcon = () => <ToolbarIcon><path d="m8 6 6 6-6 6M14 6l6 6-6 6" /></ToolbarIcon>;
 const MarkUnreadIcon = () => <ToolbarIcon><rect x="3" y="5" width="18" height="14" rx="4" /><path d="m4 8 8 6 5-3.8" /><circle cx="18.5" cy="6" r="2.2" fill="currentColor" stroke="white" /></ToolbarIcon>;
 const StarIcon = () => <ToolbarIcon><path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9L12 3Z" /></ToolbarIcon>;
-const ImportantIcon = () => <ToolbarIcon><path d="M5 6h10l4 6-4 6H5l4-6-4-6Z" /><path d="M11 9v4M11 16h.01" /></ToolbarIcon>;
+const ImportantIcon = () => <ToolbarIcon><path d="M5 6h10l4 6-4 6H5l4-6-4-6Z" /></ToolbarIcon>;
 const TodoIcon = () => <ToolbarIcon><rect x="4" y="4" width="16" height="16" rx="4" /><path d="m8 12 2.5 2.5L16 9" /></ToolbarIcon>;
 const ClockIcon = () => <ToolbarIcon><circle cx="12" cy="12" r="8" /><path d="M12 7v5l3 2" /></ToolbarIcon>;
 const TrashIcon = () => <ToolbarIcon><path d="M5 7h14M9 7V4h6v3M7 7l1 13h8l1-13" /></ToolbarIcon>;
 const TrashOffIcon = () => <ToolbarIcon><path d="M9 7V4h6v3M7.5 7H19M7 10l1 10h8l.6-6M4 4l16 16" /></ToolbarIcon>;
 const DoneIcon = () => <ToolbarIcon><path d="m4 12 5 5L20 6" /></ToolbarIcon>;
+const ExpandInlineIcon = () => <ToolbarIcon><path d="M9 4H4v5" /><path d="M4 4l6 6" /><path d="M15 20h5v-5" /><path d="m20 20-6-6" /></ToolbarIcon>;
+const CollapseInlineIcon = () => <ToolbarIcon><path d="M10 4v6H4" /><path d="m4 10 6-6" /><path d="M14 20v-6h6" /><path d="m20 14-6 6" /></ToolbarIcon>;
+const AiDraftIcon = () => <ToolbarIcon><path d="M14.5 4.5 19.5 9.5" /><path d="M5 15.5 15.5 5a2.1 2.1 0 0 1 3 3L8 18.5 4 20l1-4.5Z" /><path d="M19 16v4" /><path d="M17 18h4" /></ToolbarIcon>;
 
 export function MailDetailDrawer({
   open,
@@ -291,7 +294,11 @@ export function MailDetailDrawer({
   const trashed = Boolean(latestMessage?.label_ids?.includes("TRASH") || message?.label_ids?.includes("TRASH"));
   const isTodo = Boolean(message && flags.todos.includes(message.id));
   const isSnoozed = Boolean(message && flags.snoozed.includes(message.id));
-  const isDone = Boolean(message && flags.done.includes(message.id));
+  const isSent = Boolean(message && (
+    message.label_ids?.some((label) => label.toUpperCase() === "SENT")
+    || isOutboundMessageForMailbox(message.from || undefined, mailbox)
+  ));
+  const isDone = Boolean(message && (flags.done.includes(message.id) || isSent));
   const previewableAttachments = useMemo(
     () => page?.messages.flatMap((item) => item.attachments.filter(isPreviewableAttachment).map((attachment) => ({ attachment, messageId: item.id }))) || [],
     [page],
@@ -622,9 +629,9 @@ export function MailDetailDrawer({
     setPreviewLoading(false);
   };
 
-  const submitPrompt = async (visiblePrompt: string, expectedArtifact: "draft_reply" = "draft_reply") => {
+  const submitPrompt = async (visiblePrompt: string, expectedArtifact: "draft_reply" = "draft_reply", forceNewConversation = false) => {
     if (!context) return;
-    await submitMailContextPrompt({ visiblePrompt, context, expectedArtifact });
+    await submitMailContextPrompt({ visiblePrompt, context, expectedArtifact, forceNewConversation });
   };
 
   const sendReply = async () => {
@@ -653,10 +660,10 @@ export function MailDetailDrawer({
   };
 
   const discardDraft = async () => {
-    if (draft.trim() && !window.confirm("Discard this draft reply?")) return;
     setDraft("");
     setDraftDirty(false);
     setComposerOpen(false);
+    setComposerExpanded(false);
     if (threadId) await deleteInboxThreadDraft(mailbox, threadId);
   };
 
@@ -684,7 +691,13 @@ export function MailDetailDrawer({
             <button className={isTodo ? "is-active is-todo" : ""} aria-label={isTodo ? "Click Done to remove" : "Add to Todo"} data-tooltip={isTodo ? "Click Done to remove" : "Add to Todo"} disabled={toolbarPending || isTodo} onClick={() => onTodoMessage(message)}><TodoIcon /></button>
             <button className={isSnoozed ? "is-active is-snoozed" : ""} aria-label={isSnoozed ? "Remove from snoozed" : "Snooze"} data-tooltip={isSnoozed ? "Remove from snoozed" : "Snooze"} disabled={toolbarPending} onClick={() => onSnoozeMessage(message)}><ClockIcon /></button>
             <button className={trashed ? "is-active is-trashed" : ""} aria-label={trashed ? "Remove from trash" : "Move to trash"} data-tooltip={trashed ? "Remove from trash" : "Move to trash"} disabled={toolbarPending} onClick={() => void runThreadAction(trashed ? "untrash" : "trash")}>{trashed ? <TrashOffIcon /> : <TrashIcon />}</button>
-            <button className={isDone ? "is-active is-done" : ""} aria-label={isDone ? "Move to inbox" : "Done"} data-tooltip={isDone ? "Move to inbox" : "Done"} disabled={toolbarPending} onClick={() => onDoneMessage(message)}><DoneIcon /></button>
+            <button
+              className={isDone ? "is-active is-done" : ""}
+              aria-label={isSent ? "Sent and done" : isDone ? "Move to inbox" : "Done"}
+              data-tooltip={isSent ? "Sent and done" : isDone ? "Move to inbox" : "Done"}
+              disabled={toolbarPending || isSent}
+              onClick={() => onDoneMessage(message)}
+            ><DoneIcon /></button>
           </div>
           <div className="mail-detail-summary">
             <h2>{page?.subject || message.subject || "(no subject)"}</h2>
@@ -771,9 +784,31 @@ export function MailDetailDrawer({
                 <div className="mail-detail-composer-head">
                   <span>To {deriveReplyToAddress(latestMessage, mailbox) || "thread"}</span>
                   <div>
-                    <button onClick={() => setComposerExpanded((value) => !value)}>{composerExpanded ? "Collapse" : "Expand inline"}</button>
-                    <button onClick={() => void submitPrompt("Write a first draft reply to the current thread")}>AI draft</button>
-                    <button onClick={() => void discardDraft()}>Discard draft</button>
+                    <button
+                      className="mail-detail-composer-icon-btn"
+                      aria-label={composerExpanded ? "Collapse inline" : "Expand inline"}
+                      data-tooltip={composerExpanded ? "Collapse inline" : "Expand inline"}
+                      onClick={() => setComposerExpanded((value) => !value)}
+                    >
+                      {composerExpanded ? <CollapseInlineIcon /> : <ExpandInlineIcon />}
+                    </button>
+                    <button
+                      className="mail-detail-composer-icon-btn"
+                      aria-label="AI draft"
+                      data-tooltip="AI draft"
+                      disabled={aiBusy || !context}
+                      onClick={() => void submitPrompt("Write a first draft reply to the current thread", "draft_reply", true)}
+                    >
+                      <AiDraftIcon />
+                    </button>
+                    <button
+                      className="mail-detail-composer-icon-btn"
+                      aria-label="Discard draft"
+                      data-tooltip="Discard draft"
+                      onClick={() => void discardDraft()}
+                    >
+                      <TrashIcon />
+                    </button>
                   </div>
                 </div>
                 <textarea
@@ -786,9 +821,6 @@ export function MailDetailDrawer({
                   placeholder="Write your reply…"
                 />
                 <div className="mail-detail-composer-actions">
-                  <button onClick={() => setDraft((current) => current ? `- ${current}` : "- ")}>Bulleted list</button>
-                  <button onClick={() => setDraft((current) => current ? `1. ${current}` : "1. ")}>Numbered list</button>
-                  <button onClick={() => setDraft((current) => `${current}${current ? "\n" : ""}https://`)}>Insert link</button>
                   <button className="is-primary" disabled={!draft.trim() || sending} onClick={() => void sendReply()}>{sending ? "Sending…" : "Send"}</button>
                 </div>
               </div>

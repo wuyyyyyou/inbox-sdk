@@ -471,6 +471,7 @@ export interface SubmitMailPromptRequest {
   visiblePrompt: string;
   context: AiMailContextRef;
   expectedArtifact?: "draft_reply";
+  forceNewConversation?: boolean;
   userAnswers?: Record<string, string>;
 }
 

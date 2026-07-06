@@ -1804,7 +1804,7 @@ export function useAppController() {
       };
       aiGenerationRun.current = generationRun;
       const isCurrentGeneration = () => aiGenerationRun.current === generationRun && !generationRun.cancelled;
-      const conversationId = state.aiChatConversationId || createId("chat");
+      const conversationId = request.forceNewConversation ? createId("chat") : state.aiChatConversationId || createId("chat");
       const userMessage: AiChatMessage = {
         id: createId("msg"),
         role: "user",
@@ -1814,7 +1814,7 @@ export function useAppController() {
         mailContext: context,
         sourcePrompt: request.visiblePrompt,
       };
-      const baseMessages = state.aiChatConversationId === conversationId ? state.aiChatMessages : [];
+      const baseMessages = !request.forceNewConversation && state.aiChatConversationId === conversationId ? state.aiChatMessages : [];
       const messagesWithUser = [...baseMessages, userMessage];
       const pendingMessage: AiChatMessage = {
         id: createId("msg"),
