@@ -172,13 +172,14 @@ DEFAULT_MANIFEST = {
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
                 {"name": "days", "type": "integer", "description": "Recent day window to filter cached mail, from 1 to 30.", "required": False},
-                {"name": "limit", "type": "integer", "description": "Maximum cached messages to return, from 1 to 500.", "required": False},
+                {"name": "limit", "type": "integer", "description": "Maximum cached messages to return per page, from 1 to 100.", "required": False},
                 {"name": "category", "type": "string", "description": "Cached category filter: inbox, todos, starred, snoozed, done, drafts, sent, trash, spam, or all.", "required": False},
+                {"name": "offset", "type": "integer", "description": "Zero-based offset within the filtered cached messages.", "required": False},
             ],
         },
         {
             "name": "get_cached_email",
-            "description": "Read one full Gmail message by id, fetching and caching it when the body is not cached yet.",
+            "description": "Read one bounded Gmail text body by id, fetching and caching it when the body is not cached yet.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
                 {"name": "message_id", "type": "string", "description": "Gmail message id.", "required": True},
@@ -303,6 +304,19 @@ DEFAULT_MANIFEST = {
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
                 {"name": "card_id", "type": "string", "description": "Card ID from get_active_cards.", "required": True},
                 {"name": "include_body", "type": "boolean", "description": "Whether to include the original email body for user display.", "required": False},
+            ],
+        },
+        {
+            "name": "list_gmail_emails_page",
+            "description": "List one transient compact Gmail page without writing message summaries to the local cache.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
+                {"name": "days", "type": "integer", "description": "Recent day window, from 1 to 30.", "required": False},
+                {"name": "limit", "type": "integer", "description": "Maximum messages to return, from 1 to 100.", "required": False},
+                {"name": "category", "type": "string", "description": "Gmail category filter.", "required": False},
+                {"name": "page_token", "type": "string", "description": "Opaque Gmail page token returned by the previous page.", "required": False},
+                {"name": "page_offset", "type": "integer", "description": "Offset within the current Gmail page after response byte limiting.", "required": False},
+                {"name": "exclude_message_ids", "type": "array", "description": "Already rendered message IDs to skip.", "required": False},
             ],
         },
         {

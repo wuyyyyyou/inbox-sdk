@@ -256,7 +256,7 @@
         {
           "name": "limit",
           "type": "integer",
-          "description": "Maximum cached messages to return, from 1 to 500.",
+          "description": "Maximum cached messages to return per page, from 1 to 100.",
           "required": false
         },
         {
@@ -264,13 +264,19 @@
           "type": "string",
           "description": "Cached category filter: inbox, todos, starred, snoozed, done, drafts, sent, trash, spam, or all.",
           "required": false
+        },
+        {
+          "name": "offset",
+          "type": "integer",
+          "description": "Zero-based offset within the filtered cached messages.",
+          "required": false
         }
       ],
       "timeout": 120
     },
     {
       "name": "get_cached_email",
-      "description": "Read one full Gmail message by id, fetching and caching it when the body is not cached yet.",
+      "description": "Read one bounded Gmail text body by id, fetching and caching it when the body is not cached yet.",
       "parameters": [
         {
           "name": "mailbox",
@@ -527,6 +533,55 @@
       "name": "list_mailboxes",
       "description": "Discover and list registered mailboxes, including selected and authorization state.",
       "parameters": [],
+      "timeout": 120
+    },
+    {
+      "name": "list_gmail_emails_page",
+      "description": "List one transient compact Gmail page without writing message summaries to the local cache.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email.",
+          "required": true
+        },
+        {
+          "name": "days",
+          "type": "integer",
+          "description": "Recent day window, from 1 to 30.",
+          "required": false
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Maximum messages to return, from 1 to 100.",
+          "required": false
+        },
+        {
+          "name": "category",
+          "type": "string",
+          "description": "Gmail category filter.",
+          "required": false
+        },
+        {
+          "name": "page_token",
+          "type": "string",
+          "description": "Opaque Gmail page token returned by the previous page.",
+          "required": false
+        },
+        {
+          "name": "page_offset",
+          "type": "integer",
+          "description": "Offset within the current Gmail page after response byte limiting.",
+          "required": false
+        },
+        {
+          "name": "exclude_message_ids",
+          "type": "array",
+          "description": "Already rendered message IDs to skip.",
+          "required": false
+        }
+      ],
       "timeout": 120
     },
     {

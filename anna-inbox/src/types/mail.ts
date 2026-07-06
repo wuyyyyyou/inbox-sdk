@@ -46,6 +46,7 @@ export interface LlmStatus {
 
 export interface MailboxInfo {
   email: string;
+  display_name?: string;
   avatar_url?: string;
   provider?: "gmail" | "outlook" | string;
   auth_source?: string;
@@ -166,7 +167,7 @@ export interface InboxMessage {
 
 export interface InboxEmailDetailPayload {
   mailbox?: string;
-  message?: InboxMessage & { body_text?: string | null };
+  message?: InboxMessage & { body_text?: string | null; body_truncated?: boolean };
 }
 
 export interface InboxFeedPayload {
@@ -175,6 +176,12 @@ export interface InboxFeedPayload {
   category?: string;
   query?: string;
   count?: number;
+  offset?: number;
+  next_offset?: number;
+  has_more?: boolean;
+  source?: "cache" | "gmail";
+  page_token?: string;
+  page_offset?: number;
   messages: InboxMessage[];
   updated_at?: string;
 }
@@ -184,6 +191,10 @@ export interface ContactAvatarPayload {
   avatars: Record<string, string>;
   permission_required?: boolean;
   required_scope?: string;
+  required_scopes?: string[];
+  service_disabled?: boolean;
+  service?: string;
+  activation_url?: string;
   warning?: string;
 }
 

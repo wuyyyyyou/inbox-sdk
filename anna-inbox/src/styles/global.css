@@ -860,7 +860,6 @@ body.is-resizing-ai-sidebar {
   padding: 11px 13px 8px;
   color: #656c7e;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
 }
 .account-menu header span {
   font-size: 12px;
@@ -868,7 +867,7 @@ body.is-resizing-ai-sidebar {
 }
 .account-menu header small {
   color: #a0a5b3;
-  font-size: 11px;
+  font-size: 12px;
   text-transform: none;
   letter-spacing: 0;
 }
@@ -1448,6 +1447,19 @@ body.is-resizing-ai-sidebar {
   height: 17px;
   stroke-width: 2.4;
 }
+.mail-sent-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #7e879e;
+}
+.mail-sent-badge svg {
+  width: 15px;
+  height: 15px;
+}
+.mail-sent-badge .mail-sent-check {
+  display: inline-flex;
+}
 .mail-draft-icon {
   color: #ef4b4f;
 }
@@ -1507,6 +1519,10 @@ body.is-resizing-ai-sidebar {
 .mail-row-actions button.is-active {
   color: #5068de;
   background: #e4eaff;
+}
+.mail-row-actions button.is-done {
+  color: #2e9b62;
+  background: #e7f5ee;
 }
 .mail-row-actions button.is-starred {
   color: #d6a72f;
@@ -10716,6 +10732,30 @@ body,
   font-weight: 400;
 }
 
+.mail-detail-overview-result {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.mail-detail-overview-result > svg {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  flex: none;
+  color: #6a63d8;
+}
+
+.mail-detail-overview .mail-detail-overview-loading {
+  color: transparent;
+  background: linear-gradient(90deg, #6a63d8 0%, #7ea7ff 35%, #bbb7ff 50%, #7ea7ff 65%, #6a63d8 100%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: aiThinkingGradient 1.8s linear infinite;
+}
+
 .mail-detail-update-banner {
   display: flex;
   align-items: center;
@@ -10906,15 +10946,26 @@ body,
   transform-origin: top center;
 }
 
+.safe-email-scaled,
+.safe-email-scaled * {
+  font-family: Arial, "Helvetica Neue", Helvetica, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", sans-serif !important;
+  letter-spacing: normal !important;
+  word-spacing: normal !important;
+  font-kerning: auto;
+}
+
 .safe-email-text p{
   margin-top: 0;
 }
 
 .safe-email-text {
   color: #1f2c48;
-  font-family: inherit !important;
+  font-family: Arial, "Helvetica Neue", Helvetica, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", sans-serif !important;
   font-size: 14px !important;
   line-height: 19px !important;
+  letter-spacing: normal !important;
+  word-spacing: normal !important;
+  font-kerning: auto;
   overflow-wrap: break-word;
   word-break: normal;
 }
@@ -10922,6 +10973,8 @@ body,
 .safe-email-text :where(p, div, span, a, li, blockquote, pre, font) {
   font-size: 14px !important;
   line-height: 20px !important;
+  letter-spacing: normal !important;
+  word-spacing: normal !important;
 }
 
 

@@ -58,6 +58,7 @@ scripts/google_token/.secrets/gmail_tokens/<sanitized-email>.json
 ```text
 https://www.googleapis.com/auth/gmail.modify
 https://www.googleapis.com/auth/contacts.readonly
+https://www.googleapis.com/auth/contacts.other.readonly
 openid email profile
 ```
 
@@ -68,7 +69,7 @@ openid email profile
 ```sh
 python scripts/google_token/gmail_local_oauth.py \
   --email your@gmail.com \
-  --scope "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/contacts.readonly openid email profile"
+  --scope "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly openid email profile"
 ```
 
 ## 环境变量覆盖

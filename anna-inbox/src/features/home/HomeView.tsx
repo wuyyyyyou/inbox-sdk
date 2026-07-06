@@ -1,24 +1,51 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type UIEvent as ReactUIEvent } from "react";
 import { useApp } from "../../app/AppContext";
 import type { AiChatMessage, DraftReplyArtifact, CustomRunResult, InboxMessage, InboxThreadStateOperation } from "../../types/mail";
 import { SnoozePicker } from "./SnoozePicker";
 import { MailDetailDrawer } from "../mail-detail/MailDetailDrawer";
+import { sortInboxMessagesDesc } from "./inboxMessageOrder";
 
 type FeedFilter = "important" | "other";
 type MailboxView = "inbox" | "todos" | "starred" | "snoozed" | "done" | "drafts" | "sent" | "trash" | "spam" | "all";
-type MailUiFlags = { todos: string[]; snoozed: string[]; done: string[]; drafts: string[]; saved: Record<string, InboxMessage> };
+type MailUiFlags = { todos: string[]; snoozed: string[]; done: string[]; doneRemoved: string[]; drafts: string[]; saved: Record<string, InboxMessage> };
 type CategoryFlag = "todos" | "snoozed" | "done" | "drafts";
+type InboxFeedWindow = {
+  days: number;
+  nextOffset: number;
+  hasMore: boolean;
+  localLimit: number;
+  source: "cache" | "gmail";
+  gmailPageToken: string;
+  gmailPageOffset: number;
+};
+type FeedActionState = "refresh" | "older" | "more" | "category-page" | null;
 
 const AI_SIDEBAR_WIDTH_KEY = "anna-inbox:ai-sidebar-width";
 const AI_SIDEBAR_MIN_WIDTH = 260;
 const AI_SIDEBAR_MAX_WIDTH = 680;
 const CACHED_INBOX_BANNER_SKIP_KEY = "anna-inbox:cached-inbox-banner-skip";
+const INBOX_ALL_TIME_DAYS = 0;
+const INBOX_LAST_MONTH_DAYS = 30;
+const DEFAULT_INBOX_FEED_WINDOW: InboxFeedWindow = {
+  days: 7,
+  nextOffset: 100,
+  hasMore: false,
+  localLimit: 100,
+  source: "cache",
+  gmailPageToken: "",
+  gmailPageOffset: 0,
+};
+const INBOX_FEED_PAGE_SIZE = 100;
 
 const MAILBOX_VIEWS: Array<{ id: MailboxView; label: string }> = [
   { id: "inbox", label: "Inbox" }, { id: "todos", label: "Todos" }, { id: "starred", label: "Starred" },
   { id: "snoozed", label: "Snoozed" }, { id: "done", label: "Done" }, { id: "drafts", label: "Drafts" },
   { id: "sent", label: "Sent" }, { id: "trash", label: "Trash" }, { id: "spam", label: "Spam" }, { id: "all", label: "All mail" },
 ];
+
+function isLocalMailboxView(view: MailboxView): view is "todos" | "snoozed" | "done" {
+  return view === "todos" || view === "snoozed" || view === "done";
+}
 
 function scheduleDeferredWork(task: () => void, delayMs = 180) {
   const win = window as Window & {
@@ -73,6 +100,12 @@ function persistSidebarWidth(value: number) {
 
 function cachedInboxBannerSkipStorageKey(mailbox: string) {
   return `${CACHED_INBOX_BANNER_SKIP_KEY}:${mailbox.trim().toLowerCase() || "global"}`;
+}
+
+export function accountDisplayName(account: { email: string; display_name?: string }) {
+  const displayName = String(account.display_name || "").trim();
+  if (displayName) return displayName;
+  return account.email.split("@")[0] || account.email;
 }
 
 function Icon({ children, className = "" }: { children: ReactNode; className?: string }) {
@@ -214,7 +247,19 @@ function groupLabel(message: InboxMessage) {
   if (date.toDateString() === now.toDateString()) return "TODAY";
   const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
   if (date.toDateString() === yesterday.toDateString()) return "YESTERDAY";
-  return "EARLIER THIS WEEK";
+  const daysAgo = Math.floor((now.getTime() - date.getTime()) / (24 * 60 * 60 * 1000));
+  if (daysAgo < 7) return "LAST 7 DAYS";
+  const currentMonthLabel = date.toLocaleDateString("en-US", { month: "long" }).toUpperCase();
+  // if (date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth()) {
+  //   return `EARLIER IN ${currentMonthLabel}`;
+  // }
+  return `EARLIER IN ${currentMonthLabel}`;
+}
+
+function inboxRangeLabel(days: number) {
+  if (days === INBOX_ALL_TIME_DAYS) return "All time";
+  if (days === INBOX_LAST_MONTH_DAYS) return "Last 1 month";
+  return `Last ${days} days`;
 }
 
 export function hasMessageLabel(message: InboxMessage, label: string) {
@@ -233,6 +278,50 @@ export function isDraftMessage(message: InboxMessage) {
   return (message.label_ids || []).some((label) => label.toUpperCase() === "DRAFT");
 }
 
+export function isSentMessage(message: InboxMessage) {
+  if ((message.label_ids || []).some((label) => label.toUpperCase() === "SENT")) return true;
+  const sender = senderParts(message.from);
+  const normalizedMailbox = String(message.mailbox || "").trim().toLowerCase();
+  return Boolean(normalizedMailbox && sender.email.trim().toLowerCase() === normalizedMailbox);
+}
+
+export function isDoneMessage(message: InboxMessage, flags: Pick<MailUiFlags, "done" | "doneRemoved">) {
+  return flags.done.includes(message.id) || (isSentMessage(message) && !flags.doneRemoved.includes(message.id));
+}
+
+export function resolveSourceMessages(
+  mailboxView: MailboxView,
+  inboxMessages: InboxMessage[],
+  inboxSnapshotMessages: InboxMessage[],
+  flags: MailUiFlags,
+) {
+  if (mailboxView === "todos" || mailboxView === "snoozed") {
+    return sortInboxMessagesDesc(flags[mailboxView].map((id) => flags.saved[id]).filter((message): message is InboxMessage => Boolean(message)));
+  }
+  if (mailboxView === "done") {
+    const knownMessages = new Map<string, InboxMessage>();
+    for (const message of [...inboxSnapshotMessages, ...inboxMessages, ...Object.values(flags.saved)]) {
+      knownMessages.set(message.id, message);
+    }
+    const doneIds = new Set(flags.done);
+    for (const message of knownMessages.values()) {
+      if (isDoneMessage(message, flags)) doneIds.add(message.id);
+    }
+    return sortInboxMessagesDesc([...doneIds].map((id) => knownMessages.get(id)).filter((message): message is InboxMessage => Boolean(message)));
+  }
+  if (mailboxView === "inbox") {
+    return sortInboxMessagesDesc(inboxMessages.filter((message) => hasMessageLabel(message, "INBOX")));
+  }
+  const source = inboxSnapshotMessages.length ? inboxSnapshotMessages : inboxMessages;
+  if (mailboxView === "starred") return sortInboxMessagesDesc(source.filter((message) => hasMessageLabel(message, "STARRED")));
+  if (mailboxView === "drafts") return sortInboxMessagesDesc(source.filter((message) => hasMessageLabel(message, "DRAFT")));
+  if (mailboxView === "sent") return sortInboxMessagesDesc(source.filter((message) => hasMessageLabel(message, "SENT")));
+  if (mailboxView === "trash") return sortInboxMessagesDesc(source.filter((message) => hasMessageLabel(message, "TRASH")));
+  if (mailboxView === "spam") return sortInboxMessagesDesc(source.filter((message) => hasMessageLabel(message, "SPAM")));
+  if (mailboxView === "all") return sortInboxMessagesDesc(source.filter((message) => !["TRASH", "SPAM", "CHAT"].some((label) => hasMessageLabel(message, label))));
+  return sortInboxMessagesDesc(source);
+}
+
 function InboxRow({ message, selected, flags, mailboxView, mailbox, onSelect, onFlag, onSnooze, onPrefetch, avatarUrl }: {
   message: InboxMessage; selected: boolean; flags: MailUiFlags; mailboxView: MailboxView; mailbox: string; onSelect: () => void;
   onFlag: (kind: CategoryFlag, message: InboxMessage) => void;
@@ -245,6 +334,7 @@ function InboxRow({ message, selected, flags, mailboxView, mailbox, onSelect, on
   const sender = senderParts(message.from);
   const participant = messageParticipant(message, mailboxView, mailbox);
   const sentView = participant.outgoing;
+  const isDone = isDoneMessage(message, flags);
   const starred = isStarredMessage(message);
   const draft = isDraftMessage(message);
   const preview = message.snippet || message.body_preview || "No preview available";
@@ -263,7 +353,8 @@ function InboxRow({ message, selected, flags, mailboxView, mailbox, onSelect, on
           {isImportantMessage(message) && !sentView ? <span className="mail-important-icon" title="Important"><ImportantIcon /></span> : null}
           {draft
             ? <span className="mail-draft-icon" title="Draft"><DraftIcon /></span>
-            : sentView ? <span className="mail-sent-check" title="Sent"><CheckIcon /></span> : null}
+            : sentView ? <span className="mail-sent-badge" title={isDone ? "Sent and done" : "Sent"}><SentIcon />{isDone ? <span className="mail-sent-check"><CheckIcon /></span> : null}</span>
+              : isDone ? <span className="mail-sent-check" title="Done"><CheckIcon /></span> : null}
           {starred ? <span className="mail-starred" title="Starred"><StarIcon /></span> : null}
           {message.has_attachment ? <span className="mail-attachment" title={`${message.attachment_count || 1} attachment(s)`}><PaperclipIcon /></span> : null}
         </span>
@@ -275,7 +366,7 @@ function InboxRow({ message, selected, flags, mailboxView, mailbox, onSelect, on
         <button className={flags.snoozed.includes(message.id) ? "is-active" : ""} aria-label="Snooze" data-tooltip="Snooze" onClick={() => onSnooze(message)}><ClockIcon /></button>
         {message.unread ? <button aria-label="Mark as read" data-tooltip="Mark as read" onClick={() => void actions.markInboxRead(message.id)}><MailOpenIcon /></button> : null}
         <button aria-label="Move to trash" data-tooltip="Move to trash" onClick={() => void actions.trashInboxMessage(message.id)}><TrashIcon /></button>
-        <button className={flags.done.includes(message.id) ? "is-active" : ""} aria-label="Done" data-tooltip="Done" onClick={() => onFlag("done", message)}><CheckIcon /></button>
+        <button className={isDone ? "is-active is-done" : ""} aria-label={isDone ? "Move to inbox" : "Done"} data-tooltip={isDone ? "Move to inbox" : "Done"} onClick={() => onFlag("done", message)}><CheckIcon /></button>
       </span>
     </article>
   );
@@ -612,7 +703,7 @@ function AccountRail() {
                 void actions.switchMailbox(item.email);
               }}>
                 <AccountAvatar email={item.email} url={item.avatar_url} className="account-menu-avatar" />
-                <span className="account-menu-copy"><strong>{item.email.split("@")[0]}</strong><small>{item.email}</small></span>
+                <span className="account-menu-copy"><strong>{accountDisplayName(item)}</strong><small>{item.email}</small></span>
                 {active ? <span className="account-menu-check"><CheckIcon /></span> : null}
               </button>
             );
@@ -635,15 +726,20 @@ export function HomeView() {
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const [folderOpen, setFolderOpen] = useState(false);
   const [mailboxView, setMailboxView] = useState<MailboxView>("inbox");
-  const [days, setDays] = useState(7);
+  const mailboxViewRef = useRef<MailboxView>("inbox");
+  const [feedWindow, setFeedWindow] = useState<InboxFeedWindow>(DEFAULT_INBOX_FEED_WINDOW);
+  const [feedAction, setFeedAction] = useState<FeedActionState>(null);
   const [messageBodies, setMessageBodies] = useState<Record<string, { status: "loading" | "ready" | "error"; body: string }>>({});
   const bodyRequests = useRef(new Set<string>());
+  const pageLoadInFlight = useRef(false);
+  const requestedGmailCursors = useRef(new Set<string>());
+  const mailFeedRef = useRef<HTMLElement | null>(null);
   const avatarRequestKey = useRef("");
   const avatarMisses = useRef(new Set<string>());
   const avatarPermissionNoticeShown = useRef(false);
   const mailbox = state.selectedMailboxes[0] || state.mailbox;
   const flagsKey = `anna-inbox:mail-flags:${mailbox}`;
-  const [flags, setFlags] = useState<MailUiFlags>({ todos: [], snoozed: [], done: [], drafts: [], saved: {} });
+  const [flags, setFlags] = useState<MailUiFlags>({ todos: [], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: {} });
   const [contactAvatars, setContactAvatars] = useState<Record<string, string>>({});
   const [cachedInboxBannerDismissed, setCachedInboxBannerDismissed] = useState(false);
   const sidebarWidthRef = useRef(sidebarWidth);
@@ -719,10 +815,12 @@ export function HomeView() {
       const saved = JSON.parse(window.localStorage.getItem(flagsKey) || "{}");
       setFlags({
         todos: Array.isArray(saved.todos) ? saved.todos : [],
-        snoozed: Array.isArray(saved.snoozed) ? saved.snoozed : [], done: Array.isArray(saved.done) ? saved.done : [],
+        snoozed: Array.isArray(saved.snoozed) ? saved.snoozed : [],
+        done: Array.isArray(saved.done) ? saved.done : [],
+        doneRemoved: Array.isArray(saved.doneRemoved) ? saved.doneRemoved : [],
         drafts: Array.isArray(saved.drafts) ? saved.drafts : [], saved: saved.saved && typeof saved.saved === "object" ? saved.saved : {},
       });
-    } catch { setFlags({ todos: [], snoozed: [], done: [], drafts: [], saved: {} }); }
+    } catch { setFlags({ todos: [], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: {} }); }
     try {
       const cached = JSON.parse(window.localStorage.getItem(`anna-inbox:contact-avatars:${mailbox}`) || "{}");
       const avatarsFresh = Number(cached?.avatarsUpdatedAt || cached?.updatedAt || 0) > Date.now() - 7 * 24 * 60 * 60 * 1000;
@@ -735,7 +833,9 @@ export function HomeView() {
     }
     avatarRequestKey.current = "";
     avatarPermissionNoticeShown.current = false;
-    setMailboxView("inbox"); setFilter("important"); setDays(7);
+    requestedGmailCursors.current.clear();
+    mailboxViewRef.current = "inbox";
+    setMailboxView("inbox"); setFilter("important"); setFeedWindow(DEFAULT_INBOX_FEED_WINDOW);
   }, [flagsKey]);
 
   useEffect(() => {
@@ -758,26 +858,17 @@ export function HomeView() {
   }, [mailbox, state.inboxError]);
 
   const counts = useMemo(() => ({
-    important: state.inboxMessages.filter((message) => isImportantMessage(message) && !flags.todos.includes(message.id) && !flags.done.includes(message.id) && !flags.snoozed.includes(message.id)).length,
-    other: state.inboxMessages.filter((message) => !isImportantMessage(message) && !flags.todos.includes(message.id) && !flags.done.includes(message.id) && !flags.snoozed.includes(message.id)).length,
+    important: state.inboxMessages.filter((message) => isImportantMessage(message) && !flags.todos.includes(message.id) && !isDoneMessage(message, flags) && !flags.snoozed.includes(message.id)).length,
+    other: state.inboxMessages.filter((message) => !isImportantMessage(message) && !flags.todos.includes(message.id) && !isDoneMessage(message, flags) && !flags.snoozed.includes(message.id)).length,
   }), [flags, state.inboxMessages]);
-  const localCategory = mailboxView === "todos" || mailboxView === "snoozed" || mailboxView === "done";
+  const localCategory = isLocalMailboxView(mailboxView);
 
-  const sourceMessages = useMemo(() => {
-    const localKind = localCategory ? mailboxView as "todos" | "snoozed" | "done" : null;
-    if (!localKind) {
-      const source = state.inboxSnapshotMessages.length ? state.inboxSnapshotMessages : state.inboxMessages;
-      if (mailboxView === "inbox") return source.filter((message) => hasMessageLabel(message, "INBOX"));
-      if (mailboxView === "starred") return source.filter((message) => hasMessageLabel(message, "STARRED"));
-      if (mailboxView === "drafts") return source.filter((message) => hasMessageLabel(message, "DRAFT"));
-      if (mailboxView === "sent") return source.filter((message) => hasMessageLabel(message, "SENT"));
-      if (mailboxView === "trash") return source.filter((message) => hasMessageLabel(message, "TRASH"));
-      if (mailboxView === "spam") return source.filter((message) => hasMessageLabel(message, "SPAM"));
-      if (mailboxView === "all") return source.filter((message) => !["TRASH", "SPAM", "CHAT"].some((label) => hasMessageLabel(message, label)));
-      return source;
-    }
-    return flags[localKind].map((id) => flags.saved[id]).filter((message): message is InboxMessage => Boolean(message));
-  }, [flags, localCategory, mailboxView, state.inboxMessages, state.inboxSnapshotMessages]);
+  const sourceMessages = useMemo(() => resolveSourceMessages(
+    mailboxView,
+    state.inboxMessages,
+    state.inboxSnapshotMessages,
+    flags,
+  ), [flags, mailboxView, state.inboxMessages, state.inboxSnapshotMessages]);
 
   const messagesInThread = useCallback((message: InboxMessage, currentFlags: MailUiFlags = flags) => {
     const threadId = message.thread_id || message.id;
@@ -796,6 +887,13 @@ export function HomeView() {
         const retained = current[workflowKind].filter((id) => !ids.has(id));
         next[workflowKind] = enabled && workflowKind === kind ? [...retained, ...ids] : retained;
       }
+      if (kind === "done") {
+        const sentIds = messages.filter(isSentMessage).map((item) => item.id);
+        const removed = current.doneRemoved.filter((id) => !ids.has(id));
+        next.doneRemoved = enabled ? removed : [...removed, ...sentIds];
+      } else {
+        next.doneRemoved = current.doneRemoved;
+      }
       for (const item of messages) next.saved[item.id] = item;
       window.localStorage.setItem(flagsKey, JSON.stringify(next));
       return next;
@@ -812,16 +910,14 @@ export function HomeView() {
           ...previous[workflowKind].filter((id) => ids.has(id)),
         ];
       }
+      next.doneRemoved = [
+        ...current.doneRemoved.filter((id) => !ids.has(id)),
+        ...previous.doneRemoved.filter((id) => ids.has(id)),
+      ];
       window.localStorage.setItem(flagsKey, JSON.stringify(next));
       return next;
     });
   }, [flagsKey]);
-
-  const updateFlag = useCallback((kind: CategoryFlag, message: InboxMessage) => {
-    if (kind === "drafts") return;
-    const messages = messagesInThread(message);
-    setWorkflowFlag(kind, messages, !flags[kind].includes(message.id));
-  }, [flags, messagesInThread, setWorkflowFlag]);
 
   const prefetchMessageBody = async (message: InboxMessage) => {
     if (message.id === selectedId) return;
@@ -852,11 +948,18 @@ export function HomeView() {
       const requestKey = `${mailbox}:${emails.join("|")}`;
       if (!emails.length || avatarRequestKey.current === requestKey) return;
       avatarRequestKey.current = requestKey;
-      void actions.loadContactAvatars(emails, mailbox).then(({ avatars, permissionRequired }) => {
+      void actions.loadContactAvatars(emails, mailbox).then(({ avatars, permissionRequired, serviceDisabled }) => {
+        if (serviceDisabled) {
+          if (!avatarPermissionNoticeShown.current) {
+            avatarPermissionNoticeShown.current = true;
+            actions.showToast("Enable Google People API for this OAuth project to load contact photos.");
+          }
+          return;
+        }
         if (permissionRequired) {
           if (!avatarPermissionNoticeShown.current) {
             avatarPermissionNoticeShown.current = true;
-            actions.showToast("Reconnect Google to load saved contact photos.");
+            actions.showToast("Reconnect Google to load contact photos from saved and other contacts.");
           }
           return;
         }
@@ -882,10 +985,10 @@ export function HomeView() {
   const visible = useMemo(() => {
     const query = search.trim().toLowerCase();
     return sourceMessages.filter((message) => {
-      const matchesView = mailboxView === "inbox" ? !flags.todos.includes(message.id) && !flags.done.includes(message.id) && !flags.snoozed.includes(message.id)
+      const matchesView = mailboxView === "inbox" ? !flags.todos.includes(message.id) && !isDoneMessage(message, flags) && !flags.snoozed.includes(message.id)
         : mailboxView === "todos" ? flags.todos.includes(message.id)
         : mailboxView === "snoozed" ? flags.snoozed.includes(message.id)
-          : mailboxView === "done" ? flags.done.includes(message.id)
+          : mailboxView === "done" ? isDoneMessage(message, flags)
             : mailboxView === "starred" ? isStarredMessage(message) : true;
       const matchesFilter = mailboxView !== "inbox" ? true : filter === "important" ? isImportantMessage(message)
         : !isImportantMessage(message) && !flags.todos.includes(message.id);
@@ -896,6 +999,15 @@ export function HomeView() {
     });
   }, [filter, flags, mailboxView, search, sourceMessages]);
 
+  const displayedVisible = useMemo(
+    () => localCategory ? visible.slice(0, feedWindow.localLimit) : visible,
+    [feedWindow.localLimit, localCategory, visible],
+  );
+  const sourceMessagesRef = useRef(sourceMessages);
+  useEffect(() => {
+    sourceMessagesRef.current = sourceMessages;
+  }, [sourceMessages]);
+
   const dismissCachedInboxBanner = () => {
     setCachedInboxBannerDismissed(true);
     try {
@@ -905,16 +1017,301 @@ export function HomeView() {
     }
   };
 
+  const loadGmailPage = useCallback(async (
+    category: MailboxView,
+    targetDays: number,
+    pageToken: string,
+    pageOffset: number,
+    excludeMessageIds: string[],
+  ) => {
+    let nextToken = pageToken;
+    let nextOffset = pageOffset;
+    for (let attempts = 0; attempts < 4; attempts += 1) {
+      const cursorKey = `${category}:${targetDays}:${nextToken || "first"}:${nextOffset}`;
+      if (requestedGmailCursors.current.has(cursorKey)) return null;
+      requestedGmailCursors.current.add(cursorKey);
+      const result = await actions.loadGmailInboxEmailsPage(
+        category,
+        targetDays,
+        nextToken,
+        nextOffset,
+        excludeMessageIds,
+      );
+      if (!result.ok) {
+        requestedGmailCursors.current.delete(cursorKey);
+        return result;
+      }
+      if (result.count > 0 || !result.hasMore) {
+        return result;
+      }
+      nextToken = result.pageToken;
+      nextOffset = result.pageOffset;
+    }
+    return {
+      ok: true,
+      count: 0,
+      hasMore: false,
+      pageToken: nextToken,
+      pageOffset: nextOffset,
+    };
+  }, [actions]);
+
+  const loadRemoteCategory = useCallback(async (category: MailboxView, targetDays = 7) => {
+    const result = await actions.loadCachedInboxEmails(category, targetDays, 0, false);
+    if (!result.ok || mailboxViewRef.current !== category) return result.ok;
+    if (result.count === 0 && !result.hasMore) {
+      const gmail = await loadGmailPage(category, targetDays, "", 0, []);
+      if (gmail?.ok && mailboxViewRef.current === category) {
+        setFeedWindow({
+          days: targetDays,
+          nextOffset: result.nextOffset,
+          hasMore: gmail.hasMore,
+          localLimit: INBOX_FEED_PAGE_SIZE,
+          source: "gmail",
+          gmailPageToken: gmail.pageToken,
+          gmailPageOffset: gmail.pageOffset,
+        });
+      }
+      return Boolean(gmail?.ok);
+    }
+    setFeedWindow({
+      days: targetDays,
+      nextOffset: result.nextOffset,
+      hasMore: true,
+      localLimit: INBOX_FEED_PAGE_SIZE,
+      source: result.hasMore ? "cache" : "gmail",
+      gmailPageToken: "",
+      gmailPageOffset: 0,
+    });
+    return true;
+  }, [actions, loadGmailPage]);
+
+  const syncInbox = useCallback(async (targetDays = feedWindow.days) => {
+    setFeedAction("refresh");
+    try {
+    if (localCategory) {
+      const result = await actions.refreshInboxEmails("inbox", 7);
+      if (result.ok) {
+        setFeedWindow((current) => ({ ...current, localLimit: INBOX_FEED_PAGE_SIZE }));
+      }
+      return result.ok;
+    }
+    if (targetDays > 7) {
+      return loadRemoteCategory(mailboxView, targetDays);
+    }
+    const result = await actions.refreshInboxEmails(mailboxView, targetDays);
+    if (result.ok) {
+      setFeedWindow({
+        days: targetDays,
+        nextOffset: result.nextOffset,
+        hasMore: true,
+        localLimit: INBOX_FEED_PAGE_SIZE,
+        source: result.hasMore ? "cache" : "gmail",
+        gmailPageToken: "",
+        gmailPageOffset: 0,
+      });
+    }
+    return result.ok;
+    } finally {
+      setFeedAction((current) => current === "refresh" ? null : current);
+    }
+  }, [actions, feedWindow.days, loadRemoteCategory, localCategory, mailboxView]);
+
+  const loadOlderInbox = useCallback(async () => {
+    setFeedAction("older");
+    try {
+      const result = await actions.loadCachedInboxEmails("inbox", INBOX_LAST_MONTH_DAYS, 0, false);
+      if (mailboxViewRef.current !== "inbox") return;
+      if (result.ok) {
+        setFeedWindow({
+          days: INBOX_LAST_MONTH_DAYS,
+          nextOffset: result.nextOffset,
+          hasMore: true,
+          localLimit: INBOX_FEED_PAGE_SIZE,
+          source: result.hasMore ? "cache" : "gmail",
+          gmailPageToken: "",
+          gmailPageOffset: 0,
+        });
+        actions.showToast("Inbox synced for the last 1 month.");
+      } else {
+        actions.showToast("Failed to sync the last 1 month.");
+      }
+    } finally {
+      setFeedAction((current) => current === "older" ? null : current);
+    }
+  }, [actions]);
+
+  const loadMoreInbox = useCallback(async () => {
+    if (pageLoadInFlight.current || mailboxView !== "inbox" || feedWindow.days !== INBOX_LAST_MONTH_DAYS) return;
+    pageLoadInFlight.current = true;
+    setFeedAction("more");
+    try {
+      const initial = await actions.loadCachedInboxEmails("inbox", INBOX_ALL_TIME_DAYS, 0, false);
+      if (mailboxViewRef.current !== "inbox") return;
+      if (!initial.ok) {
+        actions.showToast("Failed to load emails older than 1 month.");
+        return;
+      }
+      let source: InboxFeedWindow["source"] = initial.hasMore ? "cache" : "gmail";
+      let nextOffset = initial.nextOffset;
+      let gmailPageToken = "";
+      let gmailPageOffset = 0;
+      setFeedWindow({
+        days: INBOX_ALL_TIME_DAYS,
+        nextOffset,
+        hasMore: true,
+        localLimit: INBOX_FEED_PAGE_SIZE,
+        source,
+        gmailPageToken,
+        gmailPageOffset,
+      });
+      while (mailboxViewRef.current === "inbox") {
+        if (source === "gmail") {
+          await new Promise((resolve) => window.setTimeout(resolve, 0));
+        }
+        const result = source === "cache"
+          ? await actions.loadCachedInboxEmails("inbox", INBOX_ALL_TIME_DAYS, nextOffset, true)
+          : await loadGmailPage(
+            "inbox",
+            INBOX_ALL_TIME_DAYS,
+            gmailPageToken,
+            gmailPageOffset,
+            sourceMessagesRef.current.map((message) => message.id),
+          );
+        if (mailboxViewRef.current !== "inbox") return;
+        if (!result?.ok) {
+          actions.showToast("Failed to load emails older than 1 month.");
+          return;
+        }
+        if (source === "cache") {
+          nextOffset = "nextOffset" in result ? result.nextOffset : nextOffset;
+          if (result.hasMore) {
+            setFeedWindow({
+              days: INBOX_ALL_TIME_DAYS,
+              nextOffset,
+              hasMore: true,
+              localLimit: INBOX_FEED_PAGE_SIZE,
+              source: "cache",
+              gmailPageToken: "",
+              gmailPageOffset: 0,
+            });
+            continue;
+          }
+          source = "gmail";
+          setFeedWindow({
+            days: INBOX_ALL_TIME_DAYS,
+            nextOffset,
+            hasMore: true,
+            localLimit: INBOX_FEED_PAGE_SIZE,
+            source,
+            gmailPageToken,
+            gmailPageOffset,
+          });
+          continue;
+        }
+        gmailPageToken = "pageToken" in result ? result.pageToken : gmailPageToken;
+        gmailPageOffset = "pageOffset" in result ? result.pageOffset : gmailPageOffset;
+        setFeedWindow({
+          days: INBOX_ALL_TIME_DAYS,
+          nextOffset,
+          hasMore: result.hasMore,
+          localLimit: INBOX_FEED_PAGE_SIZE,
+          source: "gmail",
+          gmailPageToken,
+          gmailPageOffset,
+        });
+        if (!result.hasMore) break;
+      }
+      actions.showToast("Loaded all inbox emails.");
+    } finally {
+      pageLoadInFlight.current = false;
+      setFeedAction((current) => current === "more" ? null : current);
+    }
+  }, [actions, feedWindow.days, loadGmailPage, mailboxView]);
+
+  const loadNextCategoryPage = useCallback(async () => {
+    if (mailboxView === "inbox" || pageLoadInFlight.current) return;
+    if (localCategory) {
+      if (feedWindow.localLimit < visible.length) {
+        setFeedWindow((current) => ({ ...current, localLimit: current.localLimit + INBOX_FEED_PAGE_SIZE }));
+      }
+      return;
+    }
+    if (!feedWindow.hasMore) return;
+    pageLoadInFlight.current = true;
+    setFeedAction("category-page");
+    try {
+      if (feedWindow.source === "cache") {
+        const result = await actions.loadCachedInboxEmails(mailboxView, feedWindow.days, feedWindow.nextOffset, true);
+        if (result.ok) {
+          setFeedWindow((current) => ({
+            ...current,
+            nextOffset: result.nextOffset,
+            hasMore: true,
+            source: result.hasMore ? "cache" : "gmail",
+            gmailPageToken: "",
+            gmailPageOffset: 0,
+          }));
+        }
+      } else {
+        const result = await loadGmailPage(
+          mailboxView,
+          feedWindow.days,
+          feedWindow.gmailPageToken,
+          feedWindow.gmailPageOffset,
+          sourceMessages.map((message) => message.id),
+        );
+        if (result?.ok) {
+          setFeedWindow((current) => ({
+            ...current,
+            hasMore: result.hasMore,
+            source: "gmail",
+            gmailPageToken: result.pageToken,
+            gmailPageOffset: result.pageOffset,
+          }));
+        }
+      }
+    } finally {
+      pageLoadInFlight.current = false;
+      setFeedAction((current) => current === "category-page" ? null : current);
+    }
+  }, [actions, feedWindow.days, feedWindow.gmailPageOffset, feedWindow.gmailPageToken, feedWindow.hasMore, feedWindow.localLimit, feedWindow.nextOffset, feedWindow.source, loadGmailPage, localCategory, mailboxView, sourceMessages, visible.length]);
+
+  const handleFeedScroll = useCallback((event: ReactUIEvent<HTMLElement>) => {
+    if (mailboxView === "inbox") return;
+    const feed = event.currentTarget;
+    if (feed.scrollTop <= 0 || feed.scrollHeight - feed.scrollTop - feed.clientHeight > 80) return;
+    void loadNextCategoryPage();
+  }, [loadNextCategoryPage, mailboxView]);
+
+  useEffect(() => {
+    if (mailboxView === "inbox" || localCategory || !feedWindow.hasMore || state.inboxSnapshotLoading) return;
+    const frame = window.requestAnimationFrame(() => {
+      const feed = mailFeedRef.current;
+      if (feed && feed.scrollHeight <= feed.clientHeight + 1) {
+        void loadNextCategoryPage();
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [displayedVisible.length, feedWindow.hasMore, loadNextCategoryPage, localCategory, mailboxView, state.inboxSnapshotLoading]);
+
+  const isInboxSyncing = state.inboxSnapshotLoading;
+  const days = feedWindow.days;
+  const canLoadMoreInbox = mailboxView === "inbox" && days === INBOX_LAST_MONTH_DAYS;
+
   const grouped = useMemo(() => {
+    if (mailboxView !== "inbox") {
+      return [{ label: "", messages: displayedVisible }];
+    }
     const groups: Array<{ label: string; messages: InboxMessage[] }> = [];
-    for (const message of visible) {
+    for (const message of displayedVisible) {
       const label = groupLabel(message);
       const current = groups[groups.length - 1];
       if (!current || current.label !== label) groups.push({ label, messages: [message] });
       else current.messages.push(message);
     }
     return groups;
-  }, [visible]);
+  }, [displayedVisible, mailboxView]);
 
   const selectedMessage = useMemo(() => {
     if (!selectedId) return null;
@@ -924,6 +1321,18 @@ export function HomeView() {
       || flags.saved[selectedId]
       || null;
   }, [flags.saved, selectedId, sourceMessages, state.inboxMessages, state.inboxSnapshotMessages]);
+
+  const detailFlags = useMemo(() => ({
+    todos: flags.todos,
+    snoozed: flags.snoozed,
+    done: [
+      ...new Set([
+        ...flags.done,
+        ...sourceMessages.filter((message) => isDoneMessage(message, flags)).map((message) => message.id),
+        ...(selectedMessage && isDoneMessage(selectedMessage, flags) ? [selectedMessage.id] : []),
+      ]),
+    ],
+  }), [flags, selectedMessage, sourceMessages]);
 
   const latestSelectedThreadMessageId = useMemo(() => {
     if (!selectedMessage) return "";
@@ -999,6 +1408,59 @@ export function HomeView() {
     }
   }, [actions, closeDetailDrawer, mailbox]);
 
+  const syncDoneMessagesRead = useCallback(async (messages: InboxMessage[]) => {
+    const pendingThreads = [...new Set(messages.reduce<string[]>((threads, message) => {
+      if ((message.unread || hasMessageLabel(message, "UNREAD")) && message.thread_id) {
+        threads.push(message.thread_id);
+      }
+      return threads;
+    }, []))];
+    const pendingSingles = messages.filter((message) => (message.unread || hasMessageLabel(message, "UNREAD")) && !message.thread_id);
+    const results = await Promise.allSettled([
+      ...pendingThreads.map((threadId) => actions.updateInboxThreadState(mailbox, threadId, "mark_read")),
+      ...pendingSingles.map((message) => actions.markInboxRead(message.id)),
+    ]);
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") {
+      actions.showToast(failed.reason instanceof Error ? failed.reason.message : String(failed.reason));
+    }
+  }, [actions, mailbox]);
+
+  const toggleDoneState = useCallback((message: InboxMessage, closeAfter = false) => {
+    const wasDone = isDoneMessage(message, flags);
+    const previous = flags;
+    const messages = messagesInThread(message);
+    setWorkflowFlag("done", messages, !wasDone);
+    if (!wasDone) {
+      void syncDoneMessagesRead(messages);
+    }
+    if (closeAfter) {
+      closeDetailDrawer();
+    }
+    actions.showToast(wasDone ? "Moved to inbox." : "Marked as done.", {
+      actionLabel: "Undo",
+      onAction: () => restoreWorkflowFlags(messages, previous),
+      secondaryActionLabel: "View",
+      onSecondaryAction: () => {
+        setMailboxView(wasDone ? "inbox" : "done");
+        setFilter(isImportantMessage(message) ? "important" : "other");
+        setFolderOpen(false);
+        setSelectedId("");
+      },
+    });
+  }, [actions, closeDetailDrawer, flags, messagesInThread, restoreWorkflowFlags, setWorkflowFlag, syncDoneMessagesRead]);
+
+  const updateFlag = useCallback((kind: CategoryFlag, message: InboxMessage) => {
+    if (kind === "drafts") return;
+    if (kind === "done") {
+      toggleDoneState(message);
+      return;
+    }
+    const messages = messagesInThread(message);
+    const enabled = flags[kind].includes(message.id);
+    setWorkflowFlag(kind, messages, !enabled);
+  }, [flags, messagesInThread, setWorkflowFlag, toggleDoneState]);
+
   const handleTodoFromDetail = useCallback((message: InboxMessage) => {
     if (flags.todos.includes(message.id)) return;
     const previous = flags;
@@ -1018,23 +1480,8 @@ export function HomeView() {
   }, [actions, closeDetailDrawer, flags, messagesInThread, restoreWorkflowFlags, setWorkflowFlag]);
 
   const handleDoneFromDetail = useCallback((message: InboxMessage) => {
-    const wasDone = flags.done.includes(message.id);
-    const previous = flags;
-    const messages = messagesInThread(message);
-    setWorkflowFlag("done", messages, !wasDone);
-    closeDetailDrawer();
-    actions.showToast(wasDone ? "Moved to inbox." : "Marked as done.", {
-      actionLabel: "Undo",
-      onAction: () => restoreWorkflowFlags(messages, previous),
-      secondaryActionLabel: "View",
-      onSecondaryAction: () => {
-        setMailboxView(wasDone ? "inbox" : "done");
-        setFilter(isImportantMessage(message) ? "important" : "other");
-        setFolderOpen(false);
-        setSelectedId("");
-      },
-    });
-  }, [actions, closeDetailDrawer, flags, messagesInThread, restoreWorkflowFlags, setWorkflowFlag]);
+    toggleDoneState(message, true);
+  }, [toggleDoneState]);
 
   const openSnoozePicker = useCallback((message: InboxMessage) => {
     if (mailboxView === "snoozed" || flags.snoozed.includes(message.id)) {
@@ -1073,25 +1520,42 @@ export function HomeView() {
   }, [actions, closeDetailDrawer, flags, messagesInThread, restoreWorkflowFlags, selectedId, setWorkflowFlag, snoozeTarget]);
 
   const selectMailboxView = (next: MailboxView) => {
-    setMailboxView(next); setFolderOpen(false); setDays(7); setSelectedId("");
+    if (next === mailboxView) {
+      setFolderOpen(false);
+      return;
+    }
+    pageLoadInFlight.current = false;
+    requestedGmailCursors.current.clear();
+    mailboxViewRef.current = next;
+    setMailboxView(next); setFolderOpen(false); setSelectedId("");
     setFilter("important");
+    setFeedWindow(DEFAULT_INBOX_FEED_WINDOW);
+    if (next === "done") {
+      void actions.loadCachedInboxEmails("sent", 7, 0, false).catch(() => undefined);
+      return;
+    }
+    if (isLocalMailboxView(next)) {
+      return;
+    }
+    actions.resetInboxFeed();
+    if (!isLocalMailboxView(next)) {
+      void loadRemoteCategory(next, 7);
+    }
   };
 
   const markTimelineDone = (messages: InboxMessage[]) => {
-    setFlags((current) => {
-      const done = [...new Set([...current.done, ...messages.map((message) => message.id)])];
-      const saved = { ...current.saved };
-      for (const message of messages) saved[message.id] = message;
-      const ids = new Set(messages.map((message) => message.id));
-      const next = {
-        ...current,
-        todos: current.todos.filter((id) => !ids.has(id)),
-        snoozed: current.snoozed.filter((id) => !ids.has(id)),
-        done,
-        saved,
-      };
-      window.localStorage.setItem(flagsKey, JSON.stringify(next));
-      return next;
+    const previous = flags;
+    setWorkflowFlag("done", messages, true);
+    void syncDoneMessagesRead(messages);
+    actions.showToast("Marked as done.", {
+      actionLabel: "Undo",
+      onAction: () => restoreWorkflowFlags(messages, previous),
+      secondaryActionLabel: "View",
+      onSecondaryAction: () => {
+        setMailboxView("done");
+        setFolderOpen(false);
+        setSelectedId("");
+      },
     });
   };
 
@@ -1123,7 +1587,7 @@ export function HomeView() {
             </div>
           </div>
           <label className="mail-search"><SearchIcon /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search in this catagory" /></label>
-          <button className={`refresh-mail-btn ${state.inboxSnapshotLoading ? "is-syncing" : ""}`} disabled={state.inboxSnapshotLoading} onClick={() => void actions.refreshInboxEmails(days)}><RefreshIcon /><span>{state.inboxSnapshotLoading ? "Syncing" : "Refresh"}</span></button>
+          <button className={`refresh-mail-btn ${isInboxSyncing ? "is-syncing" : ""}`} disabled={isInboxSyncing} onClick={() => void syncInbox()}><RefreshIcon /><span>{feedAction === "refresh" ? "Syncing" : "Refresh"}</span></button>
         </header>
 
         {mailboxView === "inbox" ? <nav className="mail-tabs" aria-label="Inbox filters">
@@ -1133,44 +1597,45 @@ export function HomeView() {
           ] as Array<[FeedFilter, string]>).map(([key, label]) => (
             <button key={key} className={filter === key ? "is-active" : ""} onClick={() => setFilter(key)}>{label}<span>{counts[key]}</span></button>
           ))}
-          <p>Last {days} days</p>
+          <p>{inboxRangeLabel(days)}</p>
         </nav> : null}
 
-        <section className="mail-feed" aria-live="polite">
-          {state.inboxError && state.inboxMessages.length > 0 && !cachedInboxBannerDismissed ? (
+        <section className="mail-feed" aria-live="polite" ref={mailFeedRef} onScroll={handleFeedScroll}>
+          {state.inboxError && sourceMessages.length > 0 && !cachedInboxBannerDismissed ? (
             <div className="mail-sync-banner">
               <span>Showing cached inbox.</span>
               <div className="mail-sync-banner-actions">
                 <button className="mail-sync-banner-skip" onClick={dismissCachedInboxBanner}>Skip</button>
-                <button onClick={() => void actions.loadInboxEmails(mailboxView, days, true)}>Retry sync</button>
+                <button onClick={() => void syncInbox(days)} disabled={isInboxSyncing}>Retry sync</button>
               </div>
             </div>
           ) : null}
-          {!localCategory && state.inboxLoading && !state.inboxMessages.length ? (
+          {!localCategory && state.inboxLoading && !sourceMessages.length ? (
             <div className="mail-loading">{[1, 2, 3, 4, 5, 6].map((item) => <span key={item} />)}</div>
-          ) : !localCategory && state.inboxError && !state.inboxMessages.length ? (
-            <div className="mail-empty"><InboxIcon /><h2>We couldn’t load Gmail</h2><p>{state.inboxError}</p><button onClick={() => void actions.loadInboxEmails(mailboxView, days, true)}>Try again</button></div>
+          ) : !localCategory && state.inboxError && !sourceMessages.length ? (
+            <div className="mail-empty"><InboxIcon /><h2>We couldn’t load Gmail</h2><p>{state.inboxError}</p><button onClick={() => void syncInbox(days)} disabled={isInboxSyncing}>Try again</button></div>
           ) : !visible.length ? (
             mailboxView !== "inbox" && mailboxView !== "all"
               ? <div className="mail-empty is-category-empty"><SearchIcon /><h2>No matching results</h2></div>
               : <div className="mail-empty"><InboxIcon /><h2>No messages here</h2><p>{search ? "Try a different search." : `This filter is clear for the last ${days} days.`}</p></div>
           ) : grouped.map((group) => (
             <div className="mail-group" key={group.label}>
-              <div className="mail-group-label"><span>{group.label}</span><i /><button title="Mark this timeline as done" onClick={() => markTimelineDone(group.messages)}><AllDoneIcon /></button></div>
+              {mailboxView === "inbox" ? <div className="mail-group-label"><span>{group.label}</span><i /><button title="Mark this timeline as done" onClick={() => markTimelineDone(group.messages)}><AllDoneIcon /></button></div> : null}
               {group.messages.map((message) => {
                 const avatarEmail = messageParticipant(message, mailboxView, mailbox).email.toLowerCase();
                 return <InboxRow key={message.id} message={message} mailboxView={mailboxView} mailbox={mailbox} flags={flags} selected={selectedId === message.id} avatarUrl={contactAvatars[avatarEmail]} onPrefetch={() => void prefetchMessageBody(message)} onFlag={updateFlag} onSnooze={openSnoozePicker} onSelect={() => openMessageDetail(message)} />;
               })}
             </div>
           ))}
-          {days === 7 && !state.inboxLoading && state.inboxMessages.length > 0 && (mailboxView === "inbox" || mailboxView === "all") ? <button className="older-mail-btn" onClick={() => { setDays(30); void actions.loadInboxEmails(mailboxView, 30); }}>Show emails older than 7 days</button> : null}
+          {days === 7 && !state.inboxLoading && sourceMessages.length > 0 && mailboxView === "inbox" ? <button className="older-mail-btn" onClick={() => void loadOlderInbox()} disabled={isInboxSyncing}>{feedAction === "older" ? "Loading older emails..." : "Show emails older than 7 days"}</button> : null}
+          {canLoadMoreInbox ? <button className="older-mail-btn" onClick={() => void loadMoreInbox()} disabled={isInboxSyncing}>{feedAction === "more" ? "Loading older emails..." : "Show emails older than 1 month"}</button> : null}
         </section>
         <MailDetailDrawer
           key={`${mailbox}:${selectedMessage?.id || "closed"}`}
           open={Boolean(selectedMessage)}
           mailbox={mailbox}
           message={selectedMessage}
-          flags={flags}
+          flags={detailFlags}
           aiBusy={state.aiChatLoading}
           insertRequest={insertRequest}
           onConsumeInsertRequest={(nonce) => setInsertRequest((current) => current?.nonce === nonce ? null : current)}

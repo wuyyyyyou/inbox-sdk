@@ -16,6 +16,30 @@ function normalizeLinks(root: DocumentFragment | HTMLElement) {
   });
 }
 
+function normalizeDocumentMarkup(root: HTMLElement) {
+  root.querySelectorAll("meta, title, base, link").forEach((node) => node.remove());
+
+  const htmlNode = root.querySelector("html");
+  if (htmlNode) {
+    while (htmlNode.firstChild) {
+      root.appendChild(htmlNode.firstChild);
+    }
+    htmlNode.remove();
+  }
+
+  const bodyNode = root.querySelector("body");
+  if (bodyNode) {
+    const bodyWrapper = document.createElement("div");
+    copyAttributes(bodyNode, bodyWrapper);
+    while (bodyNode.firstChild) {
+      bodyWrapper.appendChild(bodyNode.firstChild);
+    }
+    bodyNode.replaceWith(bodyWrapper);
+  }
+
+  root.querySelectorAll("head").forEach((node) => node.remove());
+}
+
 function hasFixedEmailLayout(root: HTMLElement) {
   if (root.querySelector("table, tbody, thead, tfoot, tr, td, th, colgroup, col, center, img")) {
     return true;
@@ -163,6 +187,7 @@ export function SafeEmailHtml({ html, className = "", scaleToFit = false }: { ht
     normalizeLinks(value as DocumentFragment);
     const container = document.createElement("div");
     container.appendChild(value as DocumentFragment);
+    normalizeDocumentMarkup(container);
     const fixedLayout = scaleToFit && hasFixedEmailLayout(container);
     if (!fixedLayout) {
       normalizeTextEmailBlocks(container);

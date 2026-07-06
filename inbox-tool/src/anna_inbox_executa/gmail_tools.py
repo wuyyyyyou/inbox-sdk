@@ -11,6 +11,12 @@ def tool_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+HOME_FEED_SNIPPET_MAX_CHARS = 120
+HOME_FEED_BODY_PREVIEW_MAX_CHARS = 120
+CACHED_FEED_RESPONSE_MAX_BYTES = 48 * 1024
+CACHED_EMAIL_BODY_MAX_CHARS = 24_000
+
+
 def sanitize_mailbox_id(mailbox: str) -> str:
     safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in mailbox.strip())
     return safe.strip("._") or "default"
@@ -476,19 +482,19 @@ def read_primary_emails(mailbox_arg: str, limit_arg: Any) -> dict[str, Any]:
 
 
 def _compact_inbox_message(item: dict[str, Any], mailbox: str) -> dict[str, Any]:
-    labels = [str(label) for label in (item.get("label_ids") or [])]
+    labels = [str(label)[:80] for label in (item.get("label_ids") or [])][:32]
     attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
     return {
-        "id": item.get("id"),
-        "thread_id": item.get("thread_id"),
+        "id": str(item.get("id") or "")[:128],
+        "thread_id": str(item.get("thread_id") or "")[:128],
         "mailbox": mailbox,
-        "internal_date": item.get("internal_date"),
-        "date": item.get("date"),
-        "from": item.get("from"),
-        "to": item.get("to"),
-        "subject": item.get("subject"),
-        "snippet": item.get("snippet"),
-        "body_preview": str(item.get("body_preview") or "")[:240],
+        "internal_date": str(item.get("internal_date") or "")[:32],
+        "date": str(item.get("date") or "")[:128],
+        "from": str(item.get("from") or "")[:512],
+        "to": str(item.get("to") or "")[:512],
+        "subject": str(item.get("subject") or "")[:512],
+        "snippet": str(item.get("snippet") or "")[:HOME_FEED_SNIPPET_MAX_CHARS],
+        "body_preview": str(item.get("body_preview") or "")[:HOME_FEED_BODY_PREVIEW_MAX_CHARS],
         "label_ids": labels,
         "unread": "UNREAD" in labels,
         "important": "IMPORTANT" in labels,
@@ -496,6 +502,43 @@ def _compact_inbox_message(item: dict[str, Any], mailbox: str) -> dict[str, Any]
         "has_attachment": bool(attachments),
         "attachment_count": len(attachments),
         "body_cached": bool(item.get("body_cached")),
+    }
+
+
+def _inbox_message_sort_key(item: dict[str, Any]) -> tuple[int, str]:
+    try:
+        internal_date = int(item.get("internal_date") or 0)
+    except (TypeError, ValueError):
+        internal_date = 0
+    return (-internal_date, str(item.get("id") or ""))
+
+
+def _cached_rpc_frame_size(tool: str, data: dict[str, Any]) -> int:
+    frame = {
+        "jsonrpc": "2.0",
+        "id": "x" * 128,
+        "result": {"success": True, "tool": tool, "data": data},
+    }
+    return len(json.dumps(frame, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _compact_cached_email_detail(item: dict[str, Any], mailbox: str) -> dict[str, Any]:
+    body = str(item.get("body_text") or item.get("body_preview") or item.get("snippet") or "")
+    body_truncated = len(body) > CACHED_EMAIL_BODY_MAX_CHARS
+    return {
+        "id": str(item.get("id") or "")[:128],
+        "thread_id": str(item.get("thread_id") or "")[:128],
+        "mailbox": mailbox,
+        "internal_date": str(item.get("internal_date") or "")[:32],
+        "date": str(item.get("date") or "")[:128],
+        "from": str(item.get("from") or "")[:512],
+        "to": str(item.get("to") or "")[:512],
+        "subject": str(item.get("subject") or "")[:512],
+        "label_ids": [str(label)[:80] for label in (item.get("label_ids") or [])][:32],
+        "snippet": str(item.get("snippet") or "")[:HOME_FEED_SNIPPET_MAX_CHARS],
+        "body_preview": str(item.get("body_preview") or "")[:HOME_FEED_BODY_PREVIEW_MAX_CHARS],
+        "body_text": body[:CACHED_EMAIL_BODY_MAX_CHARS],
+        "body_truncated": body_truncated,
     }
 
 
@@ -516,6 +559,35 @@ def _normalize_inbox_category(category_arg: Any) -> str:
     if category not in category_queries:
         return "all"
     return category
+
+
+def _inbox_category_base_query(category: str) -> str:
+    category_queries = {
+        "inbox": "in:inbox",
+        "todos": "in:inbox",
+        "snoozed": "in:inbox",
+        "done": "in:inbox",
+        "starred": "is:starred",
+        "drafts": "in:drafts",
+        "sent": "in:sent",
+        "trash": "in:trash",
+        "spam": "in:spam",
+        "all": "in:anywhere -in:chats",
+    }
+    return category_queries[category]
+
+
+def _inbox_category_query(category: str, days: int) -> str:
+    if days <= 0:
+        return _inbox_category_base_query(category)
+    return f"{_inbox_category_base_query(category)} newer_than:{days}d"
+
+
+def _gmail_fallback_query(category: str, days: int) -> str:
+    base_query = _inbox_category_base_query(category)
+    if category == "inbox" and days > 0:
+        return f"{base_query} newer_than:{days}d"
+    return base_query
 
 
 def _matches_cached_category(item: dict[str, Any], category: str) -> bool:
@@ -559,24 +631,11 @@ def list_inbox_emails(
     if authorized_email and authorized_email != mailbox:
         raise ValueError(f"Gmail credential mismatch: selected {mailbox}, authorized {authorized_email}")
     cache_reset = clear_mailbox_cache(mailbox) if clear_cache_arg is True else None
-    days = max(1, min(int(days_arg or 7), 30))
+    days_input = 7 if days_arg in (None, "") else days_arg
+    days = max(0, min(int(days_input), 3650))
     limit = max(1, min(int(limit_arg or 100), 500))
-    category = str(category_arg or "inbox").strip().lower()
-    category_queries = {
-        "inbox": "in:inbox",
-        "todos": "in:inbox",
-        "snoozed": "in:inbox",
-        "done": "in:inbox",
-        "starred": "is:starred",
-        "drafts": "in:drafts",
-        "sent": "in:sent",
-        "trash": "in:trash",
-        "spam": "in:spam",
-        "all": "in:anywhere -in:chats",
-    }
-    if category not in category_queries:
-        category = "inbox"
-    query = f"{category_queries[category]} newer_than:{days}d"
+    category = _normalize_inbox_category(category_arg)
+    query = _inbox_category_query(category, days)
     matched_ids = live_search_metadata_and_cache(mailbox, query, limit)
     by_id = {
         str(item.get("id") or ""): item
@@ -590,6 +649,7 @@ def list_inbox_emails(
         if not item:
             continue
         messages.append(_compact_inbox_message(item, mailbox))
+    messages.sort(key=_inbox_message_sort_key)
 
     return {
         "mailbox": mailbox,
@@ -611,27 +671,86 @@ def resolve_contact_avatars(mailbox_arg: str, emails_arg: Any) -> dict[str, Any]
     return {"mailbox": mailbox, **resolve_contact_avatar_urls(mailbox, emails)}
 
 
-def list_cached_emails(mailbox_arg: str, days_arg: Any = 7, limit_arg: Any = 100, category_arg: Any = "all") -> dict[str, Any]:
-    from mail_agent.mail_providers.gmail.adapter import cache_debug_info, read_cache as adapter_read_cache, normalize_mailbox as adapter_normalize_mailbox
+def list_cached_emails(
+    mailbox_arg: str,
+    days_arg: Any = 7,
+    limit_arg: Any = 100,
+    category_arg: Any = "all",
+    offset_arg: Any = 0,
+) -> dict[str, Any]:
+    from mail_agent.mail_providers.gmail.adapter import (
+        cache_debug_info,
+        ensure_cached_feed_index,
+        get_cached_feed_page,
+        normalize_mailbox as adapter_normalize_mailbox,
+    )
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
-    days = max(1, min(int(days_arg or 7), 30))
-    limit = max(1, min(int(limit_arg or 100), 500))
+    days_input = 7 if days_arg in (None, "") else days_arg
+    days = max(0, min(int(days_input), 3650))
+    limit = max(1, min(int(limit_arg or 100), 100))
+    offset = max(0, int(offset_arg or 0))
     category = _normalize_inbox_category(category_arg)
     started_at = time.perf_counter()
-    cached = adapter_read_cache(mailbox)
-    raw_messages = cached.get("messages") if isinstance(cached, dict) else []
-    cached_messages = sorted(
-        [item for item in raw_messages if isinstance(item, dict) and item.get("id")],
-        key=lambda item: int(item.get("internal_date") or 0),
-        reverse=True,
-    )
-    cutoff = int((time.time() - days * 24 * 60 * 60) * 1000)
-    messages = [
-        _compact_inbox_message(item, mailbox)
-        for item in cached_messages
-        if int(item.get("internal_date") or 0) >= cutoff and _matches_cached_category(item, category)
-    ][:limit]
+    feed_meta = ensure_cached_feed_index(mailbox)
+    page_descriptors = feed_meta.get("pages") if isinstance(feed_meta.get("pages"), list) else []
+    total_cached_messages = int(feed_meta.get("message_count") or 0)
+    cutoff = int((time.time() - days * 24 * 60 * 60) * 1000) if days > 0 else 0
+    cache_info = cache_debug_info(mailbox)
+    updated_at = feed_meta.get("updated_at")
+    messages: list[dict[str, Any]] = []
+    matched_total = 0
+    skipped = 0
+    stop_after_page = False
+    for descriptor in page_descriptors:
+        page_number = int(descriptor.get("page") or 0)
+        oldest_internal_date = str(descriptor.get("oldest_internal_date") or "")
+        if stop_after_page:
+            break
+        if oldest_internal_date:
+            try:
+                if int(oldest_internal_date) < cutoff:
+                    stop_after_page = True
+            except (TypeError, ValueError):
+                stop_after_page = False
+        page_payload = get_cached_feed_page(mailbox, page_number)
+        page_messages = page_payload.get("messages") if isinstance(page_payload.get("messages"), list) else []
+        for item in page_messages:
+            try:
+                internal_date = int(item.get("internal_date") or 0)
+            except (TypeError, ValueError):
+                internal_date = 0
+            if cutoff and internal_date < cutoff:
+                continue
+            if not _matches_cached_category(item, category):
+                continue
+            matched_total += 1
+            if skipped < offset:
+                skipped += 1
+                continue
+            if len(messages) >= limit:
+                continue
+            candidate_messages = [*messages, item]
+            candidate_next_offset = offset + len(candidate_messages)
+            candidate_payload = {
+                "mailbox": mailbox,
+                "days": days,
+                "category": category,
+                "cache": cache_info,
+                "updated_at": updated_at,
+                "count": len(candidate_messages),
+                "offset": offset,
+                "next_offset": candidate_next_offset,
+                "has_more": matched_total > candidate_next_offset,
+                "messages": candidate_messages,
+            }
+            if messages and _cached_rpc_frame_size("list_cached_emails", candidate_payload) > CACHED_FEED_RESPONSE_MAX_BYTES:
+                break
+            messages = candidate_messages
+        if len(messages) >= limit:
+            continue
+    next_offset = offset + len(messages)
+    has_more = matched_total > next_offset
     elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
     print(
         json.dumps(
@@ -640,8 +759,11 @@ def list_cached_emails(mailbox_arg: str, days_arg: Any = 7, limit_arg: Any = 100
                 "mailbox": mailbox,
                 "days": days,
                 "limit": limit,
+                "offset": offset,
                 "category": category,
-                "cache_messages": len(cached_messages),
+                "cache_messages": total_cached_messages,
+                "page_count": len(page_descriptors),
+                "matched_messages": matched_total,
                 "returned_messages": len(messages),
                 "elapsed_ms": elapsed_ms,
             },
@@ -653,15 +775,147 @@ def list_cached_emails(mailbox_arg: str, days_arg: Any = 7, limit_arg: Any = 100
         "mailbox": mailbox,
         "days": days,
         "category": category,
-        "cache": cache_debug_info(mailbox),
-        "updated_at": cached.get("updated_at"),
+        "cache": cache_info,
+        "updated_at": updated_at,
         "count": len(messages),
+        "offset": offset,
+        "next_offset": next_offset,
+        "has_more": has_more,
         "messages": messages,
     }
 
 
+def list_gmail_emails_page(
+    mailbox_arg: str,
+    days_arg: Any = 7,
+    limit_arg: Any = 100,
+    category_arg: Any = "all",
+    page_token_arg: Any = "",
+    page_offset_arg: Any = 0,
+    exclude_message_ids_arg: Any = None,
+) -> dict[str, Any]:
+    """Return one transient Gmail page without writing summaries to the local cache."""
+    from mail_agent.mail_providers.gmail.adapter import (
+        GMAIL_PAGE_SUMMARY_FETCH_MAX_WORKERS,
+        fetch_message_summary,
+        gmail_request,
+        normalize_mailbox as adapter_normalize_mailbox,
+    )
+
+    mailbox = adapter_normalize_mailbox(mailbox_arg)
+    days_input = 7 if days_arg in (None, "") else days_arg
+    days = max(0, min(int(days_input), 3650))
+    limit = max(1, min(int(limit_arg or 100), 100))
+    category = _normalize_inbox_category(category_arg)
+    query = _gmail_fallback_query(category, days)
+    current_token = str(page_token_arg or "")
+    current_offset = max(0, int(page_offset_arg or 0))
+    excluded = {
+        str(message_id)
+        for message_id in (exclude_message_ids_arg or [])[:2000]
+        if str(message_id or "")
+    } if isinstance(exclude_message_ids_arg, list) else set()
+    messages: list[dict[str, Any]] = []
+    pages_scanned = 0
+
+    def build_payload(token: str, offset: int, has_more: bool) -> dict[str, Any]:
+        ordered_messages = sorted(messages, key=_inbox_message_sort_key)
+        return {
+            "mailbox": mailbox,
+            "days": days,
+            "category": category,
+            "query": query,
+            "source": "gmail",
+            "count": len(ordered_messages),
+            "page_token": token,
+            "page_offset": offset,
+            "has_more": has_more,
+            "messages": ordered_messages,
+            "updated_at": beijing_now(),
+        }
+
+    while pages_scanned < 5 and len(messages) < limit:
+        request_token = current_token
+        params: dict[str, Any] = {
+            "q": query,
+            "maxResults": 100,
+            "fields": "messages/id,nextPageToken",
+        }
+        if category in {"all", "trash", "spam"}:
+            params["includeSpamTrash"] = "true"
+        if request_token:
+            params["pageToken"] = request_token
+        page = gmail_request(mailbox, "/users/me/messages", params)
+        refs = [
+            str(ref.get("id"))
+            for ref in (page.get("messages") or [])
+            if isinstance(ref, dict) and ref.get("id")
+        ] if isinstance(page, dict) else []
+        api_next_token = str(page.get("nextPageToken") or "") if isinstance(page, dict) else ""
+        index = min(current_offset, len(refs))
+        pages_scanned += 1
+
+        while index < len(refs) and len(messages) < limit:
+            batch_end = len(refs)
+            positions = [position for position in range(index, batch_end) if refs[position] not in excluded]
+            summaries: dict[int, dict[str, Any]] = {}
+            if positions:
+                with ThreadPoolExecutor(max_workers=min(GMAIL_PAGE_SUMMARY_FETCH_MAX_WORKERS, len(positions))) as pool:
+                    futures = {
+                        pool.submit(fetch_message_summary, mailbox, refs[position]): position
+                        for position in positions
+                    }
+                    for future, position in ((future, futures[future]) for future in futures):
+                        try:
+                            summary = future.result()
+                        except Exception:
+                            summary = None
+                        if isinstance(summary, dict) and summary.get("id"):
+                            summaries[position] = summary
+
+            for position in range(index, batch_end):
+                message_id = refs[position]
+                summary = summaries.get(position)
+                if message_id in excluded or not summary:
+                    continue
+                compact = _compact_inbox_message(summary, mailbox)
+                candidate_messages = [*messages, compact]
+                next_position = position + 1
+                cursor_token = request_token if next_position < len(refs) else api_next_token
+                cursor_offset = next_position if next_position < len(refs) else 0
+                candidate_payload = {
+                    "mailbox": mailbox,
+                    "days": days,
+                    "category": category,
+                    "query": query,
+                    "source": "gmail",
+                    "count": len(candidate_messages),
+                    "page_token": cursor_token,
+                    "page_offset": cursor_offset,
+                    "has_more": bool(next_position < len(refs) or api_next_token),
+                    "messages": candidate_messages,
+                    "updated_at": beijing_now(),
+                }
+                if messages and _cached_rpc_frame_size("list_gmail_emails_page", candidate_payload) > CACHED_FEED_RESPONSE_MAX_BYTES:
+                    return build_payload(request_token, position, True)
+                messages.append(compact)
+                excluded.add(message_id)
+                if len(messages) >= limit:
+                    return build_payload(cursor_token, cursor_offset, bool(next_position < len(refs) or api_next_token))
+            index = batch_end
+
+        current_token = api_next_token
+        current_offset = 0
+        if messages:
+            return build_payload(current_token, 0, bool(current_token))
+        if not current_token:
+            break
+
+    return build_payload(current_token, current_offset, bool(current_token))
+
+
 def get_cached_email(mailbox_arg: str, message_id: str) -> dict[str, Any]:
-    from mail_agent.mail_providers.gmail.adapter import cache_debug_info, fetch_and_cache_message, read_message as adapter_read_message, normalize_mailbox as adapter_normalize_mailbox
+    from mail_agent.mail_providers.gmail.adapter import fetch_and_cache_message, read_message as adapter_read_message, normalize_mailbox as adapter_normalize_mailbox
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
     msg_id = str(message_id or "")
@@ -673,8 +927,7 @@ def get_cached_email(mailbox_arg: str, message_id: str) -> dict[str, Any]:
             raise ValueError(f"Gmail message not found: {msg_id}")
     return {
         "mailbox": mailbox,
-        "cache": cache_debug_info(mailbox),
-        "message": message,
+        "message": _compact_cached_email_detail(message, mailbox),
     }
 
 

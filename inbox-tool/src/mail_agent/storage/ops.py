@@ -115,6 +115,7 @@ async def merge_discovered_mailboxes(discovered: list[dict[str, Any]]) -> Mailbo
             continue
         existing = by_email.get(email)
         if existing:
+            existing.display_name = str(raw.get("display_name") or raw.get("name") or existing.display_name or "")
             existing.provider = str(raw.get("provider") or existing.provider or "gmail")
             existing.avatar_url = str(raw.get("avatar_url") or raw.get("picture") or existing.avatar_url or "")
             existing.auth_source = str(raw.get("auth_source") or raw.get("source") or existing.auth_source or "")
@@ -124,6 +125,7 @@ async def merge_discovered_mailboxes(discovered: list[dict[str, Any]]) -> Mailbo
         else:
             by_email[email] = MailboxRegistryEntry(
                 email=email,
+                display_name=str(raw.get("display_name") or raw.get("name") or ""),
                 avatar_url=str(raw.get("avatar_url") or raw.get("picture") or ""),
                 provider=str(raw.get("provider") or "gmail"),
                 auth_source=str(raw.get("auth_source") or raw.get("source") or ""),

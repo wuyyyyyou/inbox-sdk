@@ -70,6 +70,7 @@ _discovered_email: str = ""
 _multi_token_map: dict[str, dict[str, Any]] = {}
 _multi_token_lock = threading.RLock()
 _multi_token_refresh_locks: dict[str, threading.Lock] = {}
+_display_name_cache: dict[str, str] = {}
 _avatar_url_cache: dict[str, str] = {}
 _contact_avatar_cache: dict[str, dict[str, str]] = {}
 _contact_avatar_loaded: set[str] = set()
@@ -183,6 +184,20 @@ def _message_path(mailbox: str, message_id: str) -> Path:
     return _mailbox_cache_dir(mailbox) / f"{sanitize_mailbox_id(message_id)}.json"
 
 
+def _feed_pages_dir(mailbox: str) -> Path:
+    path = _mailbox_cache_dir(mailbox) / "feed_pages"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _feed_meta_path(mailbox: str) -> Path:
+    return _feed_pages_dir(mailbox) / "meta.json"
+
+
+def _feed_page_path(mailbox: str, page_number: int) -> Path:
+    return _feed_pages_dir(mailbox) / f"page-{page_number:04d}.json"
+
+
 def _storage_cache_enabled() -> bool:
     try:
         from ...storage.client import backend, is_ready
@@ -203,6 +218,14 @@ def _storage_message_key(mailbox: str, message_id: str) -> str:
     return f"{_storage_cache_prefix(mailbox)}/messages/{sanitize_mailbox_id(message_id)}"
 
 
+def _storage_feed_meta_key(mailbox: str) -> str:
+    return f"{_storage_cache_prefix(mailbox)}/feed_pages/meta"
+
+
+def _storage_feed_page_key(mailbox: str, page_number: int) -> str:
+    return f"{_storage_cache_prefix(mailbox)}/feed_pages/page/{page_number:04d}"
+
+
 def _storage_get_value_sync(key: str, *, timeout: float = 30.0) -> Any:
     from ...storage.client import get_storage, scope as default_scope
     from ...storage.sync_bridge import run as run_storage_sync
@@ -214,6 +237,12 @@ def _storage_set_value_sync(key: str, value: Any, *, timeout: float = 30.0) -> N
     from ...storage.client import get_storage, scope as default_scope
     from ...storage.sync_bridge import run as run_storage_sync
     run_storage_sync(get_storage().set(key, value, scope=default_scope()), timeout=timeout)
+
+
+def _storage_delete_value_sync(key: str, *, timeout: float = 30.0) -> None:
+    from ...storage.client import get_storage, scope as default_scope
+    from ...storage.sync_bridge import run as run_storage_sync
+    run_storage_sync(get_storage().delete(key, scope=default_scope()), timeout=timeout)
 
 
 def _storage_clear_prefix_sync(prefix: str, *, timeout: float = 30.0) -> int:
@@ -356,19 +385,23 @@ def _clear_aps_cache_errors() -> None:
 
 
 def write_index(mailbox: str, messages: list[dict[str, Any]]) -> None:
+    ordered_messages = sorted(messages, key=_internal_date_sort_key, reverse=True)
+    updated_at = beijing_now()
     payload = {
         "mailbox": mailbox,
-        "updated_at": beijing_now(),
-        "message_count": len(messages),
-        "messages": messages,
+        "updated_at": updated_at,
+        "message_count": len(ordered_messages),
+        "messages": ordered_messages,
     }
     if _storage_cache_enabled():
         try:
             _storage_set_value_sync(_storage_index_key(mailbox), payload)
         except Exception as exc:
             _aps_cache_errors.append(f"write_index({mailbox}): {exc}")
+        _write_cached_feed_pages(mailbox, ordered_messages, updated_at)
         return
     _index_path(mailbox).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_cached_feed_pages(mailbox, ordered_messages, updated_at)
 
 
 def write_message(mailbox: str, message: dict[str, Any]) -> None:
@@ -435,6 +468,167 @@ def message_summary(message: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def _internal_date_sort_key(item: dict[str, Any]) -> int:
+    try:
+        return int(item.get("internal_date") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _compact_feed_message(message: dict[str, Any], mailbox: str) -> dict[str, Any]:
+    labels = [str(label)[:80] for label in (message.get("label_ids") or [])][:32]
+    attachments = message.get("attachments") if isinstance(message.get("attachments"), list) else []
+    return {
+        "id": str(message.get("id") or "")[:128],
+        "thread_id": str(message.get("thread_id") or "")[:128],
+        "mailbox": mailbox,
+        "internal_date": str(message.get("internal_date") or "")[:32],
+        "date": str(message.get("date") or "")[:128],
+        "from": str(message.get("from") or "")[:512],
+        "to": str(message.get("to") or "")[:512],
+        "subject": str(message.get("subject") or "")[:512],
+        "snippet": str(message.get("snippet") or "")[:HOME_FEED_SNIPPET_MAX_CHARS],
+        "body_preview": str(message.get("body_preview") or "")[:HOME_FEED_BODY_PREVIEW_MAX_CHARS],
+        "label_ids": labels,
+        "unread": "UNREAD" in labels,
+        "important": "IMPORTANT" in labels,
+        "starred": "STARRED" in labels,
+        "has_attachment": bool(attachments),
+        "attachment_count": len(attachments),
+        "body_cached": bool(message.get("body_cached")),
+    }
+
+
+def _build_feed_page_metadata(mailbox: str, messages: list[dict[str, Any]], updated_at: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    ordered = sorted(messages, key=_internal_date_sort_key, reverse=True)
+    compact_messages = [_compact_feed_message(message, mailbox) for message in ordered]
+    pages: list[dict[str, Any]] = []
+    page_payloads: list[dict[str, Any]] = []
+    for page_number, start in enumerate(range(0, len(compact_messages), CACHED_FEED_PAGE_SIZE)):
+        page_messages = compact_messages[start:start + CACHED_FEED_PAGE_SIZE]
+        pages.append({
+            "page": page_number,
+            "count": len(page_messages),
+            "start_offset": start,
+            "newest_internal_date": str(page_messages[0].get("internal_date") or "") if page_messages else "",
+            "oldest_internal_date": str(page_messages[-1].get("internal_date") or "") if page_messages else "",
+        })
+        page_payloads.append({
+            "mailbox": mailbox,
+            "page": page_number,
+            "updated_at": updated_at,
+            "count": len(page_messages),
+            "messages": page_messages,
+        })
+    meta = {
+        "mailbox": mailbox,
+        "updated_at": updated_at,
+        "page_size": CACHED_FEED_PAGE_SIZE,
+        "message_count": len(compact_messages),
+        "page_count": len(page_payloads),
+        "pages": pages,
+    }
+    return meta, page_payloads
+
+
+def _write_cached_feed_pages(mailbox: str, messages: list[dict[str, Any]], updated_at: str | None = None) -> None:
+    stamp = str(updated_at or beijing_now())
+    meta, page_payloads = _build_feed_page_metadata(mailbox, messages, stamp)
+    if _storage_cache_enabled():
+        previous = _storage_get_value_sync(_storage_feed_meta_key(mailbox))
+        previous_count = int(previous.get("page_count") or 0) if isinstance(previous, dict) else 0
+        _storage_set_value_sync(_storage_feed_meta_key(mailbox), meta)
+        for page_payload in page_payloads:
+            _storage_set_value_sync(_storage_feed_page_key(mailbox, int(page_payload["page"])), page_payload)
+        for page_number in range(len(page_payloads), previous_count):
+            try:
+                _storage_delete_value_sync(_storage_feed_page_key(mailbox, page_number))
+            except Exception:
+                pass
+        return
+
+    meta_path = _feed_meta_path(mailbox)
+    pages_dir = _feed_pages_dir(mailbox)
+    previous_count = 0
+    if meta_path.exists():
+        try:
+            previous = json.loads(meta_path.read_text(encoding="utf-8"))
+            previous_count = int(previous.get("page_count") or 0) if isinstance(previous, dict) else 0
+        except Exception:
+            previous_count = 0
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    for page_payload in page_payloads:
+        _feed_page_path(mailbox, int(page_payload["page"])).write_text(
+            json.dumps(page_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    for page_number in range(len(page_payloads), previous_count):
+        stale_path = _feed_page_path(mailbox, page_number)
+        if stale_path.exists():
+            stale_path.unlink()
+
+
+def _read_cached_feed_meta(mailbox: str) -> dict[str, Any] | None:
+    if _storage_cache_enabled():
+        payload = _storage_get_value_sync(_storage_feed_meta_key(mailbox))
+        return payload if isinstance(payload, dict) else None
+    path = _feed_meta_path(mailbox)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _read_cached_feed_page(mailbox: str, page_number: int) -> dict[str, Any] | None:
+    if _storage_cache_enabled():
+        payload = _storage_get_value_sync(_storage_feed_page_key(mailbox, page_number))
+        return payload if isinstance(payload, dict) else None
+    path = _feed_page_path(mailbox, page_number)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def ensure_cached_feed_index(mailbox: str) -> dict[str, Any]:
+    meta = _read_cached_feed_meta(mailbox)
+    if isinstance(meta, dict):
+        return meta
+    cached = read_cache(mailbox)
+    messages = cached.get("messages") if isinstance(cached, dict) and isinstance(cached.get("messages"), list) else []
+    updated_at = str(cached.get("updated_at") or beijing_now())
+    _write_cached_feed_pages(mailbox, messages, updated_at)
+    return _read_cached_feed_meta(mailbox) or {
+        "mailbox": mailbox,
+        "updated_at": updated_at,
+        "page_size": CACHED_FEED_PAGE_SIZE,
+        "message_count": 0,
+        "page_count": 0,
+        "pages": [],
+    }
+
+
+def get_cached_feed_page(mailbox: str, page_number: int) -> dict[str, Any]:
+    payload = _read_cached_feed_page(mailbox, page_number)
+    if isinstance(payload, dict):
+        return payload
+    return {"mailbox": mailbox, "page": page_number, "updated_at": None, "count": 0, "messages": []}
+
+
+SUMMARY_METADATA_REFRESH_SECONDS = 30 * 60
+SUMMARY_FETCH_MAX_WORKERS = 20
+GMAIL_PAGE_SUMMARY_FETCH_MAX_WORKERS = 20
+CACHED_FEED_PAGE_SIZE = 100
+HOME_FEED_SNIPPET_MAX_CHARS = 120
+HOME_FEED_BODY_PREVIEW_MAX_CHARS = 120
+
+
 # ── Gmail API token management ────────────────────────────────────
 
 def _token_dir() -> Path:
@@ -469,11 +663,13 @@ def list_available_mailboxes_from_tokens() -> list[dict[str, Any]]:
         if path.name == "default.json":
             continue
         email = path.stem.replace("_", "@", 1) if "_" in path.stem else path.stem
+        display_name = ""
         avatar_url = ""
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(record, dict):
                 email = str(record.get("email") or record.get("mailbox") or record.get("emailAddress") or email)
+                display_name = str(record.get("display_name") or record.get("name") or "")
                 avatar_url = str(record.get("avatar_url") or record.get("picture") or "")
         except Exception:
             pass
@@ -481,6 +677,7 @@ def list_available_mailboxes_from_tokens() -> list[dict[str, Any]]:
         if _looks_like_email(email):
             results.append({
                 "email": email,
+                "display_name": display_name,
                 "provider": "gmail",
                 "auth_source": "local_file",
                 "authorized": True,
@@ -650,36 +847,111 @@ def get_authorized_email() -> str:
     return str(profile.get("emailAddress") or "").strip()
 
 
+def _load_stored_account_profile(mailbox: str) -> tuple[str, str]:
+    normalized = str(mailbox or "").strip().lower()
+    record = get_multi_token_map().get(normalized) or {}
+    display_name = str(record.get("display_name") or record.get("name") or "")
+    avatar_url = str(record.get("avatar_url") or record.get("picture") or "")
+    if display_name or avatar_url:
+        return display_name, avatar_url
+    try:
+        local = _load_token_record(normalized)
+        return (
+            str(local.get("display_name") or local.get("name") or ""),
+            str(local.get("avatar_url") or local.get("picture") or ""),
+        )
+    except Exception:
+        return "", ""
+
+
+def _fetch_account_profile(mailbox: str) -> tuple[str, str]:
+    normalized = str(mailbox or "").strip().lower()
+    token = get_access_token(normalized)
+    request = urllib.request.Request(
+        "https://www.googleapis.com/oauth2/v3/userinfo",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=12) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return str(payload.get("name") or ""), str(payload.get("picture") or "")
+
+
+def get_account_display_name(mailbox: str) -> str:
+    normalized = str(mailbox or "").strip().lower()
+    if normalized in _display_name_cache:
+        return _display_name_cache[normalized]
+    stored_name, stored_avatar = _load_stored_account_profile(normalized)
+    if stored_name:
+        _display_name_cache[normalized] = stored_name
+        if stored_avatar:
+            _avatar_url_cache[normalized] = stored_avatar
+        return stored_name
+    try:
+        fetched_name, fetched_avatar = _fetch_account_profile(normalized)
+    except Exception:
+        fetched_name = ""
+        fetched_avatar = stored_avatar
+    _display_name_cache[normalized] = fetched_name
+    if fetched_avatar:
+        _avatar_url_cache[normalized] = fetched_avatar
+    return fetched_name
+
+
 def get_account_avatar_url(mailbox: str) -> str:
     """Best-effort Google profile image lookup; returns empty without profile scope."""
     normalized = str(mailbox or "").strip().lower()
     if normalized in _avatar_url_cache:
         return _avatar_url_cache[normalized]
-    record = get_multi_token_map().get(normalized) or {}
-    stored = str(record.get("avatar_url") or record.get("picture") or "")
-    if not stored:
-        try:
-            local = _load_token_record(normalized)
-            stored = str(local.get("avatar_url") or local.get("picture") or "")
-        except Exception:
-            pass
+    stored_name, stored = _load_stored_account_profile(normalized)
+    if stored_name and normalized not in _display_name_cache:
+        _display_name_cache[normalized] = stored_name
     if stored:
         _avatar_url_cache[normalized] = stored
         return stored
     try:
-        token = get_access_token(normalized)
-        request = urllib.request.Request(
-            "https://www.googleapis.com/oauth2/v3/userinfo",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-            method="GET",
-        )
-        with urllib.request.urlopen(request, timeout=12) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        stored = str(payload.get("picture") or "")
+        fetched_name, stored = _fetch_account_profile(normalized)
+        if fetched_name:
+            _display_name_cache[normalized] = fetched_name
     except Exception:
         stored = ""
     _avatar_url_cache[normalized] = stored
     return stored
+
+
+def _people_api_get(token: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
+    url = f"https://people.googleapis.com/v1/{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params, doseq=True)
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _cache_people_photo_urls(cached: dict[str, str], people: list[Any]) -> None:
+    for person in people:
+        if not isinstance(person, dict):
+            continue
+        photos = [item for item in (person.get("photos") or []) if isinstance(item, dict) and item.get("url")]
+        photo_url = str(photos[0].get("url") or "") if photos else ""
+        if not photo_url:
+            continue
+        for item in person.get("emailAddresses") or []:
+            email = str(item.get("value") or "").strip().lower() if isinstance(item, dict) else ""
+            if email:
+                cached[email] = photo_url
+
+
+def _http_error_json(exc: urllib.error.HTTPError) -> dict[str, Any]:
+    try:
+        body = exc.read().decode("utf-8")
+        return json.loads(body) if body else {}
+    except Exception:
+        return {}
 
 
 def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, Any]:
@@ -693,8 +965,8 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
     cached = _contact_avatar_cache.setdefault(normalized_mailbox, {})
     if normalized_mailbox not in _contact_avatar_loaded:
         token = get_access_token(normalized_mailbox)
-        page_token = ""
         try:
+            page_token = ""
             while True:
                 params = {
                     "resourceName": "people/me",
@@ -703,33 +975,57 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
                 }
                 if page_token:
                     params["pageToken"] = page_token
-                url = "https://people.googleapis.com/v1/people/me/connections?" + urllib.parse.urlencode(params)
-                request = urllib.request.Request(
-                    url,
-                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-                    method="GET",
-                )
-                with urllib.request.urlopen(request, timeout=30) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                for person in payload.get("connections") or []:
-                    if not isinstance(person, dict):
-                        continue
-                    photos = [item for item in (person.get("photos") or []) if isinstance(item, dict) and item.get("url")]
-                    photo_url = str(photos[0].get("url") or "") if photos else ""
-                    for item in person.get("emailAddresses") or []:
-                        email = str(item.get("value") or "").strip().lower() if isinstance(item, dict) else ""
-                        if email and photo_url:
-                            cached[email] = photo_url
+                payload = _people_api_get(token, "people/me/connections", params)
+                _cache_people_photo_urls(cached, payload.get("connections") or [])
+                page_token = str(payload.get("nextPageToken") or "")
+                if not page_token:
+                    break
+
+            page_token = ""
+            while True:
+                params = {
+                    "pageSize": 1000,
+                    "readMask": "names,emailAddresses,photos",
+                    "sources": ["READ_SOURCE_TYPE_CONTACT", "READ_SOURCE_TYPE_PROFILE"],
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                payload = _people_api_get(token, "otherContacts", params)
+                _cache_people_photo_urls(cached, payload.get("otherContacts") or [])
                 page_token = str(payload.get("nextPageToken") or "")
                 if not page_token:
                     break
             _contact_avatar_loaded.add(normalized_mailbox)
         except urllib.error.HTTPError as exc:
+            error_payload = _http_error_json(exc)
+            error_info = (((error_payload.get("error") or {}).get("details") or []) if isinstance(error_payload, dict) else [])
+            service_disabled = next(
+                (
+                    item for item in error_info
+                    if isinstance(item, dict)
+                    and item.get("@type") == "type.googleapis.com/google.rpc.ErrorInfo"
+                    and item.get("reason") == "SERVICE_DISABLED"
+                ),
+                None,
+            )
+            if service_disabled:
+                metadata = service_disabled.get("metadata") if isinstance(service_disabled.get("metadata"), dict) else {}
+                return {
+                    "avatars": {email: cached[email] for email in requested if email in cached},
+                    "permission_required": False,
+                    "service_disabled": True,
+                    "service": str(metadata.get("service") or "people.googleapis.com"),
+                    "activation_url": str(metadata.get("activationUrl") or ""),
+                    "warning": str(((error_payload.get("error") or {}).get("message") or "People API is disabled.")),
+                }
             if exc.code in (401, 403):
                 return {
                     "avatars": {email: cached[email] for email in requested if email in cached},
                     "permission_required": True,
-                    "required_scope": "https://www.googleapis.com/auth/contacts.readonly",
+                    "required_scopes": [
+                        "https://www.googleapis.com/auth/contacts.readonly",
+                        "https://www.googleapis.com/auth/contacts.other.readonly",
+                    ],
                 }
             raise ValueError(f"Google People API request failed: HTTP {exc.code}") from exc
         except Exception as exc:
@@ -1315,26 +1611,62 @@ def fetch_and_cache_message(mailbox: str, message_id: str) -> dict[str, Any] | N
 
 def fetch_message_summary(mailbox: str, message_id: str) -> dict[str, Any] | None:
     """Fetch headers, labels and attachment metadata without downloading bodies."""
+    metadata_headers = [
+        "Date",
+        "From",
+        "To",
+        "Cc",
+        "Bcc",
+        "Subject",
+        "Message-Id",
+        "In-Reply-To",
+        "References",
+    ]
     try:
-        full = gmail_request(
+        payload = gmail_request(
             mailbox,
             f"/users/me/messages/{urllib.parse.quote(message_id, safe='')}",
             {
-                "format": "full",
+                "format": "metadata",
+                "metadataHeaders": metadata_headers,
                 "fields": (
                     "id,threadId,historyId,labelIds,internalDate,snippet,sizeEstimate,"
-                    "payload(mimeType,headers(name,value),parts(filename,mimeType,body(attachmentId,size)))"
+                    "payload(headers(name,value),mimeType,filename,body(attachmentId,size),parts(filename,mimeType,body(attachmentId,size)))"
                 ),
             },
         )
     except ValueError:
         return None
-    normalized = _normalize_message(mailbox, full)
-    normalized["_body_cached"] = False
-    summary = message_summary(normalized)
-    summary["headers_complete"] = True
-    summary["metadata_refreshed_at"] = int(time.time())
-    return summary
+    headers = _header_map(payload)
+    message_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    return {
+        "id": payload.get("id"),
+        "thread_id": payload.get("threadId"),
+        "mailbox": mailbox,
+        "history_id": payload.get("historyId"),
+        "internal_date": payload.get("internalDate"),
+        "date": headers.get("date", ""),
+        "from": headers.get("from", ""),
+        "to": headers.get("to", ""),
+        "cc": headers.get("cc", ""),
+        "bcc": headers.get("bcc", ""),
+        "subject": headers.get("subject", ""),
+        "message_id": headers.get("message-id", ""),
+        "in_reply_to": headers.get("in-reply-to", ""),
+        "references": headers.get("references", ""),
+        "label_ids": payload.get("labelIds") or [],
+        "snippet": payload.get("snippet") or "",
+        "size_estimate": payload.get("sizeEstimate"),
+        "mime_type": message_payload.get("mimeType"),
+        "attachments": _extract_attachments(message_payload),
+        "fetched_at": beijing_now(),
+        "body_preview": "",
+        "body_length": 0,
+        "raw_header_count": len(headers),
+        "body_cached": False,
+        "headers_complete": True,
+        "metadata_refreshed_at": int(time.time()),
+    }
 
 
 def live_search_metadata_and_cache(mailbox: str, query: str, max_results: int = 100) -> list[str]:
@@ -1351,7 +1683,7 @@ def live_search_metadata_and_cache(mailbox: str, query: str, max_results: int = 
         for item in existing.get("messages") or []
         if isinstance(item, dict) and item.get("id")
     }
-    refresh_before = int(time.time()) - 300
+    refresh_before = int(time.time()) - SUMMARY_METADATA_REFRESH_SECONDS
     missing_ids = [
         message_id
         for message_id in msg_ids
@@ -1360,7 +1692,7 @@ def live_search_metadata_and_cache(mailbox: str, query: str, max_results: int = 
         or int(existing_by_id[message_id].get("metadata_refreshed_at") or 0) <= refresh_before
     ]
     if missing_ids:
-        with ThreadPoolExecutor(max_workers=20) as pool:
+        with ThreadPoolExecutor(max_workers=SUMMARY_FETCH_MAX_WORKERS) as pool:
             futures = {pool.submit(fetch_message_summary, mailbox, message_id): message_id for message_id in missing_ids}
             for future in as_completed(futures):
                 try:

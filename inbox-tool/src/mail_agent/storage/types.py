@@ -29,6 +29,7 @@ def _now() -> str:
 @dataclass
 class MailboxRegistryEntry:
     email: str
+    display_name: str = ""
     avatar_url: str = ""
     provider: str = "gmail"
     auth_source: str = ""

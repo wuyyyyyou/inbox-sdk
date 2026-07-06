@@ -70,6 +70,21 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
                 arguments.get("days", 7),
                 arguments.get("limit", 100),
                 arguments.get("category", "all"),
+                arguments.get("offset", 0),
+            ),
+        }
+    if tool == "list_gmail_emails_page":
+        return {
+            "success": True,
+            "tool": tool,
+            "data": list_gmail_emails_page(
+                arguments.get("mailbox", ""),
+                arguments.get("days", 7),
+                arguments.get("limit", 100),
+                arguments.get("category", "all"),
+                arguments.get("page_token", ""),
+                arguments.get("page_offset", 0),
+                arguments.get("exclude_message_ids", []),
             ),
         }
     if tool == "get_cached_email":

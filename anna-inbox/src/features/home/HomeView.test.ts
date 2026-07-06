@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hasMailboxScanError, isDraftMessage, isImportantMessage, isStarredMessage, messageParticipant, senderParts } from "./HomeView";
+import { accountDisplayName, hasMailboxScanError, isDoneMessage, isDraftMessage, isImportantMessage, isSentMessage, isStarredMessage, messageParticipant, resolveSourceMessages, senderParts } from "./HomeView";
 
 describe("senderParts", () => {
   it("accepts null sender values from Gmail Trash", () => {
@@ -8,6 +8,16 @@ describe("senderParts", () => {
 
   it("parses display names and addresses", () => {
     expect(senderParts("Jane Doe <jane@example.com>")).toEqual({ name: "Jane Doe", email: "jane@example.com" });
+  });
+});
+
+describe("accountDisplayName", () => {
+  it("prefers Google profile names for account labels", () => {
+    expect(accountDisplayName({ email: "kateq@anna.partners", display_name: "KateQ Zhou" })).toBe("KateQ Zhou");
+  });
+
+  it("falls back to the mailbox local-part when no profile name is available", () => {
+    expect(accountDisplayName({ email: "kateq@anna.partners" })).toBe("kateq");
   });
 });
 
@@ -51,6 +61,66 @@ describe("cached message label fallbacks", () => {
     expect(isImportantMessage(cachedMessage)).toBe(true);
     expect(isStarredMessage(cachedMessage)).toBe(true);
     expect(isDraftMessage({ id: "draft", label_ids: ["draft"] })).toBe(true);
+  });
+});
+
+describe("resolveSourceMessages", () => {
+  it("prefers live inbox messages over stale snapshot data in inbox view", () => {
+    const liveInbox = [
+      { id: "live-1", label_ids: ["INBOX", "IMPORTANT"], internal_date: "200" },
+      { id: "live-2", label_ids: ["INBOX"], internal_date: "100" },
+    ];
+    const staleSnapshot = [
+      { id: "stale-1", label_ids: ["INBOX", "IMPORTANT"], internal_date: "300" },
+    ];
+    const flags = { todos: [], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: {} };
+
+    expect(resolveSourceMessages("inbox", liveInbox, staleSnapshot, flags).map((message) => message.id)).toEqual(["live-1", "live-2"]);
+  });
+
+  it("keeps all-mail results in strict reverse chronological order", () => {
+    const snapshot = [
+      { id: "older", label_ids: ["INBOX"], internal_date: "100" },
+      { id: "newest", label_ids: ["INBOX"], internal_date: "300" },
+      { id: "middle", label_ids: ["INBOX"], internal_date: "200" },
+    ];
+    const flags = { todos: [], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: {} };
+
+    expect(resolveSourceMessages("all", [], snapshot, flags).map((message) => message.id)).toEqual(["newest", "middle", "older"]);
+  });
+
+  it("treats sent mail as done by default", () => {
+    const snapshot = [
+      { id: "sent-1", label_ids: ["SENT"], internal_date: "300" },
+      { id: "done-1", label_ids: ["INBOX"], internal_date: "200" },
+    ];
+    const flags = { todos: [], snoozed: [], done: ["done-1"], doneRemoved: [], drafts: [], saved: {} };
+
+    expect(resolveSourceMessages("done", [], snapshot, flags).map((message) => message.id)).toEqual(["sent-1", "done-1"]);
+    expect(isSentMessage(snapshot[0])).toBe(true);
+    expect(isDoneMessage(snapshot[0], flags)).toBe(true);
+  });
+
+  it("treats mailbox-authored mail as sent even without an explicit SENT label", () => {
+    const sentMessage = {
+      id: "sent-implicit",
+      mailbox: "owner@example.com",
+      from: "Owner <owner@example.com>",
+      label_ids: ["INBOX"],
+      internal_date: "300",
+    };
+    const flags = { todos: [], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: {} };
+
+    expect(isSentMessage(sentMessage)).toBe(true);
+    expect(isDoneMessage(sentMessage, flags)).toBe(true);
+  });
+
+  it("lets sent mail be moved back out of done", () => {
+    const sentMessage = { id: "sent-1", label_ids: ["SENT"], internal_date: "300" };
+    const flags = { todos: [], snoozed: [], done: [], doneRemoved: ["sent-1"], drafts: [], saved: {} };
+
+    expect(resolveSourceMessages("done", [], [sentMessage], flags)).toEqual([]);
+    expect(isDoneMessage(sentMessage, flags)).toBe(false);
   });
 });
 

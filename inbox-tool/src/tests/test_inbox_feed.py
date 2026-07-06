@@ -15,8 +15,26 @@ if str(SRC) not in sys.path:
 
 
 def main() -> None:
-    from anna_inbox_executa.gmail_tools import get_cached_email, list_cached_emails, list_inbox_emails
-    from mail_agent.mail_providers.gmail.adapter import clear_mailbox_cache, search_gmail, update_thread_state
+    from anna_inbox_executa.gmail_tools import (
+        CACHED_EMAIL_BODY_MAX_CHARS,
+        CACHED_FEED_RESPONSE_MAX_BYTES,
+        _cached_rpc_frame_size,
+        get_cached_email,
+        list_cached_emails,
+        list_gmail_emails_page,
+        list_inbox_emails,
+    )
+    from mail_agent.mail_providers.gmail.adapter import (
+        SUMMARY_METADATA_REFRESH_SECONDS,
+        clear_mailbox_cache,
+        ensure_cached_feed_index,
+        fetch_message_summary,
+        get_cached_feed_page,
+        live_search_metadata_and_cache,
+        search_gmail,
+        write_index,
+        update_thread_state,
+    )
 
     captured: dict[str, object] = {}
 
@@ -53,6 +71,8 @@ def main() -> None:
     assert result["messages"][0]["important"] is True
     assert result["messages"][0]["attachment_count"] == 1
     assert result["messages"][0]["to"] == "User <user@example.com>"
+    assert result["messages"][0]["snippet"] == "Newest"
+    assert result["messages"][0]["body_preview"] == "Preview"
     assert "body_text" not in result["messages"][0]
     assert starred["category"] == "starred"
     assert all_mail["category"] == "all"
@@ -86,22 +106,130 @@ def main() -> None:
             "from": "Star <star@example.com>", "subject": "Flagged", "snippet": "Flagged", "label_ids": ["STARRED"], "attachments": [],
         },
     ]
-    with (
-        patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
-        patch("mail_agent.mail_providers.gmail.adapter.read_cache", return_value={"updated_at": "now", "messages": recent_messages}),
-        patch("mail_agent.mail_providers.gmail.adapter.cache_debug_info", return_value={"backend": "local"}),
-        patch("anna_inbox_executa.gmail_tools.time.time", return_value=now_ms / 1000),
-    ):
-        cached_feed = list_cached_emails("USER@example.com", 7, 10, "all")
-        starred_cached_feed = list_cached_emails("USER@example.com", 7, 1, "starred")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cache_root = Path(temp_dir)
+        with (
+            patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+            patch("mail_agent.mail_providers.gmail.adapter.read_cache", return_value={"updated_at": "now", "messages": recent_messages}),
+            patch("mail_agent.mail_providers.gmail.adapter.cache_dir", return_value=cache_root),
+            patch("mail_agent.mail_providers.gmail.adapter.cache_debug_info", return_value={"backend": "local"}),
+            patch("anna_inbox_executa.gmail_tools.time.time", return_value=now_ms / 1000),
+        ):
+            cached_feed = list_cached_emails("USER@example.com", 7, 10, "all")
+            starred_cached_feed = list_cached_emails("USER@example.com", 7, 1, "starred")
     cached_new = next(item for item in cached_feed["messages"] if item["id"] == "new")
     assert cached_feed["category"] == "all"
     assert starred_cached_feed["category"] == "starred"
     assert starred_cached_feed["count"] == 1
+    assert starred_cached_feed["offset"] == 0
+    assert starred_cached_feed["next_offset"] == 1
+    assert starred_cached_feed["has_more"] is False
     assert starred_cached_feed["messages"][0]["id"] == "star"
     assert cached_new["important"] is True
     assert cached_new["unread"] is True
     assert cached_new["attachment_count"] == 1
+
+    long_text = "x" * 300
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cache_root = Path(temp_dir)
+        with (
+            patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+            patch("mail_agent.mail_providers.gmail.adapter.read_cache", return_value={
+                "updated_at": "now",
+                "messages": [{
+                    "id": "long",
+                    "thread_id": "t-long",
+                    "internal_date": str(now_ms),
+                    "from": "Long <long@example.com>",
+                    "subject": "Long",
+                    "snippet": long_text,
+                    "body_preview": long_text,
+                    "label_ids": ["INBOX"],
+                    "attachments": [],
+                }],
+            }),
+            patch("mail_agent.mail_providers.gmail.adapter.cache_dir", return_value=cache_root),
+            patch("mail_agent.mail_providers.gmail.adapter.cache_debug_info", return_value={"backend": "local"}),
+            patch("anna_inbox_executa.gmail_tools.time.time", return_value=now_ms / 1000),
+        ):
+            compact_feed = list_cached_emails("USER@example.com", 7, 10, "all")
+    assert compact_feed["messages"][0]["snippet"] == "x" * 120
+    assert compact_feed["messages"][0]["body_preview"] == "x" * 120
+
+    paged_messages = [
+        {
+            "id": f"page-{index}",
+            "thread_id": f"thread-{index}",
+            "internal_date": str(now_ms - index),
+            "from": "Sender <sender@example.com>",
+            "subject": f"Message {index}",
+            "snippet": "Preview",
+            "label_ids": ["INBOX"],
+            "attachments": [],
+        }
+        for index in range(205)
+    ]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cache_root = Path(temp_dir)
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+        patch("mail_agent.mail_providers.gmail.adapter.read_cache", return_value={"updated_at": "now", "messages": paged_messages}),
+        patch("mail_agent.mail_providers.gmail.adapter.cache_dir", return_value=cache_root),
+        patch("mail_agent.mail_providers.gmail.adapter.cache_debug_info", return_value={"backend": "local"}),
+        patch("anna_inbox_executa.gmail_tools.time.time", return_value=now_ms / 1000),
+    ):
+            first_page = list_cached_emails("USER@example.com", 30, 500, "inbox", 0)
+            second_page = list_cached_emails("USER@example.com", 30, 100, "inbox", 100)
+            final_page = list_cached_emails("USER@example.com", 30, 100, "inbox", 200)
+            all_time_page = list_cached_emails("USER@example.com", 0, 100, "inbox", 200)
+    assert first_page["count"] == 100
+    assert first_page["has_more"] is True
+    assert first_page["next_offset"] == 100
+    assert second_page["messages"][0]["id"] == "page-100"
+    assert final_page["count"] == 5
+    assert final_page["has_more"] is False
+    assert final_page["next_offset"] == 205
+    assert all_time_page["days"] == 0
+    assert all_time_page["messages"][0]["id"] == "page-200"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cache_root = Path(temp_dir)
+        with (
+            patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+            patch("mail_agent.mail_providers.gmail.adapter.cache_dir", return_value=cache_root),
+        ):
+            write_index("user@example.com", paged_messages)
+            feed_meta = ensure_cached_feed_index("user@example.com")
+            feed_page = get_cached_feed_page("user@example.com", 1)
+        assert feed_meta["page_count"] == 3
+        assert feed_page["count"] == 100
+        assert feed_page["messages"][0]["id"] == "page-100"
+
+    large_page_messages = [
+        {
+            **item,
+            "from": f"Sender {index} <sender-{index}@example.com> " + "f" * 400,
+            "to": "recipient@example.com " + "t" * 400,
+            "subject": "s" * 500,
+            "snippet": "p" * 120,
+            "body_preview": "b" * 120,
+        }
+        for index, item in enumerate(paged_messages[:100])
+    ]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cache_root = Path(temp_dir)
+        with (
+            patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+            patch("mail_agent.mail_providers.gmail.adapter.read_cache", return_value={"updated_at": "now", "messages": large_page_messages}),
+            patch("mail_agent.mail_providers.gmail.adapter.cache_dir", return_value=cache_root),
+            patch("mail_agent.mail_providers.gmail.adapter.cache_debug_info", return_value={"backend": "local"}),
+            patch("anna_inbox_executa.gmail_tools.time.time", return_value=now_ms / 1000),
+        ):
+            byte_bounded_page = list_cached_emails("USER@example.com", 30, 100, "inbox", 0)
+    assert 0 < byte_bounded_page["count"] < 100
+    assert byte_bounded_page["next_offset"] == byte_bounded_page["count"]
+    assert byte_bounded_page["has_more"] is True
+    assert _cached_rpc_frame_size("list_cached_emails", byte_bounded_page) <= CACHED_FEED_RESPONSE_MAX_BYTES
 
     gmail_pages = [
         {"messages": [{"id": "m1"}, {"id": "m2"}], "nextPageToken": "page-2"},
@@ -112,6 +240,142 @@ def main() -> None:
     assert ids == ["m1", "m2", "m3"]
     assert request.call_args_list[0].args[2]["includeSpamTrash"] == "true"
     assert request.call_args_list[1].args[2]["pageToken"] == "page-2"
+
+    metadata_message = {
+        "id": "meta-1",
+        "threadId": "thread-meta-1",
+        "historyId": "history-meta-1",
+        "internalDate": str(now_ms),
+        "snippet": "Snippet text",
+        "labelIds": ["INBOX", "UNREAD"],
+        "sizeEstimate": 1234,
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "headers": [
+                {"name": "From", "value": "Meta Sender <meta@example.com>"},
+                {"name": "To", "value": "user@example.com"},
+                {"name": "Subject", "value": "Metadata only"},
+                {"name": "Date", "value": "Mon, 01 Jul 2024 10:00:00 +0000"},
+            ],
+            "parts": [
+                {"filename": "brief.pdf", "mimeType": "application/pdf", "body": {"attachmentId": "att-1", "size": 42}},
+            ],
+        },
+    }
+    with patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value=metadata_message) as metadata_request:
+        summary = fetch_message_summary("user@example.com", "meta-1")
+    assert summary is not None
+    assert summary["from"] == "Meta Sender <meta@example.com>"
+    assert summary["attachments"][0]["attachmentId"] == "att-1"
+    assert summary["body_cached"] is False
+    assert summary["headers_complete"] is True
+    assert metadata_request.call_args.args[2]["format"] == "metadata"
+    assert metadata_request.call_args.args[2]["metadataHeaders"] == [
+        "Date", "From", "To", "Cc", "Bcc", "Subject", "Message-Id", "In-Reply-To", "References",
+    ]
+
+    stale_age = SUMMARY_METADATA_REFRESH_SECONDS - 60
+    existing_summary = {
+        "id": "cached-1",
+        "from": "Cached <cached@example.com>",
+        "headers_complete": True,
+        "metadata_refreshed_at": int(now_ms / 1000) - stale_age,
+        "internal_date": str(now_ms),
+    }
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.search_gmail", return_value=["cached-1"]),
+        patch("mail_agent.mail_providers.gmail.adapter.read_cache", return_value={"messages": [existing_summary]}),
+        patch("mail_agent.mail_providers.gmail.adapter.fetch_message_summary") as refresh_summary,
+        patch("mail_agent.mail_providers.gmail.adapter.write_index"),
+        patch("mail_agent.mail_providers.gmail.adapter.time.time", return_value=now_ms / 1000),
+    ):
+        ids = live_search_metadata_and_cache("user@example.com", "in:inbox", 10)
+    assert ids == ["cached-1"]
+    refresh_summary.assert_not_called()
+
+    fetched_summaries = {
+        "gmail-2": {
+            "id": "gmail-2",
+            "thread_id": "thread-2",
+            "internal_date": str(now_ms - 2),
+            "from": "Two <two@example.com>",
+            "subject": "Second",
+            "snippet": "second",
+            "label_ids": ["INBOX"],
+            "attachments": [],
+        },
+        "gmail-3": {
+            "id": "gmail-3",
+            "thread_id": "thread-3",
+            "internal_date": str(now_ms - 3),
+            "from": "Three <three@example.com>",
+            "subject": "Third",
+            "snippet": "third",
+            "label_ids": ["INBOX"],
+            "attachments": [],
+        },
+    }
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+        patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"messages": [{"id": "gmail-1"}, {"id": "gmail-2"}, {"id": "gmail-3"}], "nextPageToken": "next-page"}) as gmail_request,
+        patch("mail_agent.mail_providers.gmail.adapter.fetch_message_summary", side_effect=lambda mailbox, message_id: fetched_summaries.get(message_id)),
+    ):
+        all_mail_page = list_gmail_emails_page("USER@example.com", 30, 100, "all", "", 0, ["gmail-1"])
+    assert [item["id"] for item in all_mail_page["messages"]] == ["gmail-2", "gmail-3"]
+    assert all_mail_page["page_token"] == "next-page"
+    assert all_mail_page["page_offset"] == 0
+    assert all_mail_page["has_more"] is True
+    assert gmail_request.call_args.args[2]["q"] == "in:anywhere -in:chats"
+
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+        patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"messages": [{"id": "gmail-2"}]}) as gmail_request,
+        patch("mail_agent.mail_providers.gmail.adapter.fetch_message_summary", return_value=fetched_summaries["gmail-2"]),
+    ):
+        inbox_page = list_gmail_emails_page("USER@example.com", 30, 100, "inbox")
+    assert [item["id"] for item in inbox_page["messages"]] == ["gmail-2"]
+    assert inbox_page["has_more"] is False
+    assert gmail_request.call_args.args[2]["q"] == "in:inbox newer_than:30d"
+
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+        patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"messages": [{"id": "gmail-2"}]}) as gmail_request,
+        patch("mail_agent.mail_providers.gmail.adapter.fetch_message_summary", return_value=fetched_summaries["gmail-2"]),
+    ):
+        all_time_inbox_page = list_gmail_emails_page("USER@example.com", 0, 100, "inbox")
+    assert [item["id"] for item in all_time_inbox_page["messages"]] == ["gmail-2"]
+    assert all_time_inbox_page["has_more"] is False
+    assert gmail_request.call_args.args[2]["q"] == "in:inbox"
+
+    out_of_order_summaries = {
+        "gmail-new": {
+            "id": "gmail-new",
+            "thread_id": "thread-new",
+            "internal_date": str(now_ms),
+            "from": "New <new@example.com>",
+            "subject": "Newest",
+            "snippet": "new",
+            "label_ids": ["INBOX"],
+            "attachments": [],
+        },
+        "gmail-old": {
+            "id": "gmail-old",
+            "thread_id": "thread-old",
+            "internal_date": str(now_ms - 10),
+            "from": "Old <old@example.com>",
+            "subject": "Older",
+            "snippet": "old",
+            "label_ids": ["INBOX"],
+            "attachments": [],
+        },
+    }
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+        patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"messages": [{"id": "gmail-old"}, {"id": "gmail-new"}]}),
+        patch("mail_agent.mail_providers.gmail.adapter.fetch_message_summary", side_effect=lambda mailbox, message_id: out_of_order_summaries.get(message_id)),
+    ):
+        ordered_page = list_gmail_emails_page("USER@example.com", 30, 100, "all")
+    assert [item["id"] for item in ordered_page["messages"]] == ["gmail-new", "gmail-old"]
 
     class FakeResponse:
         def __init__(self, payload: dict[str, object]) -> None:
@@ -160,6 +424,56 @@ def main() -> None:
     ):
         detail = get_cached_email("USER@example.com", "missing")
     assert detail["message"]["body_text"] == "Fetched body"
+    assert detail["message"]["body_truncated"] is False
+
+    oversized = {
+        "id": "oversized",
+        "thread_id": "thread-oversized",
+        "body_text": "x" * (CACHED_EMAIL_BODY_MAX_CHARS + 5000),
+        "payload": {"body": {"data": "y" * 100_000}},
+        "raw_headers": {"received": "z" * 10_000},
+    }
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+        patch("mail_agent.mail_providers.gmail.adapter.read_message", return_value=oversized),
+    ):
+        bounded_detail = get_cached_email("USER@example.com", "oversized")
+    assert len(bounded_detail["message"]["body_text"]) == CACHED_EMAIL_BODY_MAX_CHARS
+    assert bounded_detail["message"]["body_truncated"] is True
+    assert "payload" not in bounded_detail["message"]
+    assert "raw_headers" not in bounded_detail["message"]
+    assert _cached_rpc_frame_size("get_cached_email", bounded_detail) <= CACHED_FEED_RESPONSE_MAX_BYTES
+
+    gmail_refs = {
+        "messages": [{"id": "gmail-1"}, {"id": "gmail-2"}, {"id": "gmail-3"}],
+        "nextPageToken": "gmail-next",
+    }
+
+    def fake_gmail_summary(_mailbox: str, message_id: str) -> dict[str, object]:
+        return {
+            "id": message_id,
+            "thread_id": f"thread-{message_id}",
+            "internal_date": str(now_ms),
+            "from": "Sender <sender@example.com>",
+            "subject": message_id,
+            "label_ids": ["INBOX"],
+        }
+
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+        patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value=gmail_refs) as gmail_page_request,
+        patch("mail_agent.mail_providers.gmail.adapter.fetch_message_summary", side_effect=fake_gmail_summary) as fetch_summary,
+    ):
+        transient_page = list_gmail_emails_page(
+            "USER@example.com", 30, 100, "all", "", 0, ["gmail-1"],
+        )
+    assert [message["id"] for message in transient_page["messages"]] == ["gmail-2", "gmail-3"]
+    assert transient_page["page_token"] == "gmail-next"
+    assert transient_page["page_offset"] == 0
+    assert transient_page["has_more"] is True
+    assert fetch_summary.call_count == 2
+    assert gmail_page_request.call_args.args[2]["q"] == "in:anywhere -in:chats"
+    assert gmail_page_request.call_args.args[2]["includeSpamTrash"] == "true"
     print("PASS inbox feed tests")
 
 

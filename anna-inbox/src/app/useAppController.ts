@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { buildDraftPreferencesInstruction, resolveDraftPreferences } from "../features/handle/draftPreferences";
+import { sortInboxMessagesDesc } from "../features/home/inboxMessageOrder";
 import { connectRuntime } from "../runtime/runtimeLoader";
 import type {
   ActiveCardsPayload,
@@ -357,6 +358,9 @@ type ToastOptions = {
   onSecondaryAction?: () => void;
 };
 
+type InboxPageResult = { ok: boolean; count: number; hasMore: boolean; nextOffset: number };
+type GmailInboxPageResult = { ok: boolean; count: number; hasMore: boolean; pageToken: string; pageOffset: number };
+
 export interface AppActions {
   showToast(message: string, options?: ToastOptions): void;
   closeDrawers(): void;
@@ -385,8 +389,11 @@ export interface AppActions {
   switchMailbox(mailbox: string): Promise<void>;
   setBriefMailboxFilter(mailboxes: string[]): void;
   loadActiveCards(): Promise<void>;
-  loadInboxEmails(category?: string, days?: number, force?: boolean): Promise<void>;
-  refreshInboxEmails(days?: number): Promise<void>;
+  loadInboxEmails(category?: string, days?: number, force?: boolean): Promise<boolean>;
+  refreshInboxEmails(category?: string, days?: number): Promise<InboxPageResult>;
+  loadCachedInboxEmails(category?: string, days?: number, offset?: number, append?: boolean): Promise<InboxPageResult>;
+  loadGmailInboxEmailsPage(category: string, days: number, pageToken: string, pageOffset: number, excludeMessageIds: string[]): Promise<GmailInboxPageResult>;
+  resetInboxFeed(): void;
   preloadMailboxSnapshot(force?: boolean): Promise<boolean>;
   loadInboxEmailBody(messageId: string, mailbox?: string): Promise<string>;
   loadInboxThreadPage(mailbox: string, threadId: string, options?: {
@@ -405,7 +412,12 @@ export interface AppActions {
   updateInboxThreadState(mailbox: string, threadId: string, operation: InboxThreadStateOperation): Promise<void>;
   submitMailContextPrompt(request: SubmitMailPromptRequest): Promise<MailPromptRunResult | null>;
   sendInboxThreadReply(args: { mailbox: string; threadId: string; to: string; body: string; replyMode?: string; dryRun?: boolean }): Promise<{ ok?: boolean; dry_run?: boolean; error?: string }>;
-  loadContactAvatars(emails: string[], mailbox?: string): Promise<{ avatars: Record<string, string>; permissionRequired: boolean }>;
+  loadContactAvatars(emails: string[], mailbox?: string): Promise<{
+    avatars: Record<string, string>;
+    permissionRequired: boolean;
+    serviceDisabled: boolean;
+    activationUrl: string;
+  }>;
   setInboxStarred(messageId: string, starred: boolean): Promise<void>;
   markInboxRead(messageId: string): Promise<void>;
   trashInboxMessage(messageId: string): Promise<void>;
@@ -504,18 +516,24 @@ export function useAppController() {
     setToast(null);
   }, []);
 
-  const applyInboxSnapshotPayload = useCallback((payload: InboxFeedPayload, options: { error?: string } = {}) => {
-    const snapshotMessages = Array.isArray(payload.messages) ? payload.messages : [];
-    const visibleMessages = snapshotMessages.filter((message) => (message.label_ids || []).includes("INBOX"));
-    setState((s) => ({
-      ...s,
-      inboxMessages: visibleMessages,
-      inboxSnapshotMessages: snapshotMessages,
-      inboxUpdatedAt: String(payload.updated_at || ""),
-      inboxLoading: false,
-      inboxError: options.error || "",
-      inboxSnapshotComplete: true,
-    }));
+  const applyInboxSnapshotPayload = useCallback((payload: InboxFeedPayload, options: { error?: string; append?: boolean } = {}) => {
+    const pageMessages = Array.isArray(payload.messages) ? payload.messages : [];
+    setState((s) => {
+      const snapshotMessages = options.append
+        ? sortInboxMessagesDesc(
+          [...new Map([...s.inboxSnapshotMessages, ...pageMessages].map((message) => [message.id, message])).values()],
+        )
+        : sortInboxMessagesDesc(pageMessages);
+      return {
+        ...s,
+        inboxMessages: snapshotMessages.filter((message) => (message.label_ids || []).includes("INBOX")),
+        inboxSnapshotMessages: snapshotMessages,
+        inboxUpdatedAt: String(payload.updated_at || s.inboxUpdatedAt || ""),
+        inboxLoading: false,
+        inboxError: options.error || "",
+        inboxSnapshotComplete: true,
+      };
+    });
   }, []);
 
   const preloadMailboxSnapshot = useCallback(async (mailboxOverride?: string, days = 7, force = false) => {
@@ -527,7 +545,7 @@ export function useAppController() {
       const startedAt = performance.now();
       setState((s) => ({ ...s, inboxSnapshotLoading: true }));
       try {
-        const cached = await client.listCachedEmails(mailbox, days, 500, "all");
+        const cached = await client.listCachedEmails(mailbox, days, 100, "inbox", 0);
         if (snapshotRequestMailbox.current !== mailbox) return false;
         applyInboxSnapshotPayload(cached);
         setState((s) => ({ ...s, inboxSnapshotLoading: false }));
@@ -664,7 +682,7 @@ export function useAppController() {
     const requestId = ++inboxRequestSequence.current;
     if (!mailbox || mailbox === "all") {
       setState((s) => ({ ...s, inboxMessages: [], inboxLoading: false, inboxError: "Connect a Gmail mailbox to load your inbox." }));
-      return;
+      return false;
     }
     const cacheKey = `${mailbox}|${category}|${days}`;
     const cached = inboxFeedCache.current.get(cacheKey);
@@ -676,13 +694,13 @@ export function useAppController() {
         inboxLoading: false,
         inboxError: "",
       }));
-      if (!force && Date.now() - cached.loadedAt < 60_000) return;
+      if (!force && Date.now() - cached.loadedAt < 60_000) return true;
     }
     setState((s) => ({ ...s, inboxLoading: true, inboxError: "" }));
     try {
       const payload = await client.listInboxEmails(mailbox, days, 100, category);
       inboxFeedCache.current.set(cacheKey, { payload, loadedAt: Date.now() });
-      if (requestId !== inboxRequestSequence.current) return;
+      if (requestId !== inboxRequestSequence.current) return false;
       setState((s) => ({
         ...s,
         inboxMessages: Array.isArray(payload.messages) ? payload.messages : [],
@@ -690,19 +708,22 @@ export function useAppController() {
         inboxLoading: false,
         inboxError: "",
       }));
+      return true;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.error("[loadInboxEmails] failed:", detail, error);
-      if (requestId !== inboxRequestSequence.current) return;
+      if (requestId !== inboxRequestSequence.current) return false;
       setState((s) => ({ ...s, inboxLoading: false, inboxError: detail }));
+      return false;
     }
+    return false;
   }, [client, state.mailbox, state.selectedMailboxes]);
 
-  const refreshInboxEmails = useCallback(async (days = 7) => {
+  const refreshInboxEmails = useCallback(async (category = "inbox", days = 7): Promise<InboxPageResult> => {
     const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
     if (!mailbox || mailbox === "all") {
       setState((s) => ({ ...s, inboxMessages: [], inboxSnapshotMessages: [], inboxLoading: false, inboxSnapshotLoading: false, inboxError: "Connect a Gmail mailbox to load your inbox." }));
-      return;
+      return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
     }
 
     const requestKey = `${mailbox}#refresh:${++inboxRequestSequence.current}`;
@@ -713,37 +734,40 @@ export function useAppController() {
     }
     setState((s) => ({
       ...s,
-      inboxMessages: [],
-      inboxSnapshotMessages: [],
-      inboxUpdatedAt: "",
-      inboxLoading: true,
+      inboxLoading: s.inboxSnapshotMessages.length || s.inboxMessages.length ? false : true,
       inboxSnapshotLoading: true,
       inboxSnapshotComplete: false,
       inboxError: "",
     }));
 
     try {
-      const payload = await client.listInboxEmails(mailbox, days, 500, "all", true);
-      if (snapshotRequestMailbox.current !== requestKey) return;
-      inboxFeedCache.current.set(`${mailbox}|all|${days}`, { payload, loadedAt: Date.now() });
+      const payload = await client.listInboxEmails(mailbox, days, 100, category, false);
+      if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
+      inboxFeedCache.current.set(`${mailbox}|${category}|${days}`, { payload, loadedAt: Date.now() });
       applyInboxSnapshotPayload(payload);
+      const count = Array.isArray(payload.messages) ? payload.messages.length : 0;
+      showToast(days > 7
+        ? `Inbox synced for the last ${days} days. ${count} messages loaded.`
+        : `Inbox refreshed. ${count} messages loaded.`);
+      return { ok: true, count, hasMore: count >= 100, nextOffset: count };
     } catch (error) {
-      if (snapshotRequestMailbox.current !== requestKey) return;
+      if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
       const detail = error instanceof Error ? error.message : String(error);
       console.error("[refreshInboxEmails] failed:", detail, error);
       setState((s) => ({
         ...s,
-        inboxMessages: [],
-        inboxSnapshotMessages: [],
         inboxLoading: false,
         inboxSnapshotComplete: true,
         inboxError: detail,
       }));
+      showToast(days > 7 ? `Failed to sync the last ${days} days. ${detail}` : detail);
+      return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
     } finally {
       if (snapshotRequestMailbox.current === requestKey) {
         setState((s) => ({ ...s, inboxSnapshotLoading: false }));
       }
     }
+    return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
   }, [applyInboxSnapshotPayload, client, state.mailbox, state.selectedMailboxes]);
 
   const loadActiveCards = useCallback(async (storageOverride?: string, mailboxOverride?: string, options: { timeoutMs?: number } = {}) => {
@@ -1545,12 +1569,117 @@ export function useAppController() {
     loadActiveCards,
     async loadInboxEmails(category = "inbox", days = 7, force = false) {
       if (force && (category === "inbox" || category === "all")) {
-        await preloadMailboxSnapshot(undefined, days, true);
-        return;
+        return preloadMailboxSnapshot(undefined, days, true);
       }
-      await loadInboxEmails(undefined, category, days, force);
+      return loadInboxEmails(undefined, category, days, force);
     },
     refreshInboxEmails,
+    async loadCachedInboxEmails(category = "inbox", days = 7, offset = 0, append = false): Promise<InboxPageResult> {
+      const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
+      if (!mailbox || mailbox === "all") return { ok: false, count: 0, hasMore: false, nextOffset: offset };
+      const requestId = ++inboxRequestSequence.current;
+      setState((s) => ({
+        ...s,
+        inboxLoading: append || s.inboxSnapshotMessages.length || s.inboxMessages.length ? false : true,
+        inboxSnapshotLoading: true,
+        inboxError: "",
+      }));
+      try {
+        const cached = await client.listCachedEmails(mailbox, days, 100, category, offset);
+        if (requestId !== inboxRequestSequence.current) {
+          return { ok: false, count: 0, hasMore: false, nextOffset: offset };
+        }
+        applyInboxSnapshotPayload(cached, { append });
+        const count = Array.isArray(cached.messages) ? cached.messages.length : 0;
+        return {
+          ok: true,
+          count,
+          hasMore: Boolean(cached.has_more),
+          nextOffset: Number(cached.next_offset ?? offset + count),
+        };
+      } catch (error) {
+        if (requestId !== inboxRequestSequence.current) {
+          return { ok: false, count: 0, hasMore: false, nextOffset: offset };
+        }
+        const detail = error instanceof Error ? error.message : String(error);
+        setState((s) => ({
+          ...s,
+          inboxSnapshotLoading: false,
+          inboxLoading: false,
+          inboxSnapshotComplete: true,
+          inboxError: detail,
+        }));
+        return { ok: false, count: 0, hasMore: false, nextOffset: offset };
+      } finally {
+        if (requestId === inboxRequestSequence.current) {
+          setState((s) => ({ ...s, inboxSnapshotLoading: false }));
+        }
+      }
+    },
+    async loadGmailInboxEmailsPage(category, days, pageToken, pageOffset, excludeMessageIds): Promise<GmailInboxPageResult> {
+      const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
+      if (!mailbox || mailbox === "all") {
+        return { ok: false, count: 0, hasMore: false, pageToken, pageOffset };
+      }
+      const requestId = ++inboxRequestSequence.current;
+      setState((s) => ({ ...s, inboxSnapshotLoading: true, inboxError: "" }));
+      try {
+        const page = await client.listGmailEmailsPage(
+          mailbox,
+          days,
+          100,
+          category,
+          pageToken,
+          pageOffset,
+          excludeMessageIds,
+        );
+        if (requestId !== inboxRequestSequence.current) {
+          return { ok: false, count: 0, hasMore: false, pageToken, pageOffset };
+        }
+        applyInboxSnapshotPayload(page, { append: true });
+        const count = Array.isArray(page.messages) ? page.messages.length : 0;
+        return {
+          ok: true,
+          count,
+          hasMore: Boolean(page.has_more),
+          pageToken: String(page.page_token || ""),
+          pageOffset: Number(page.page_offset || 0),
+        };
+      } catch (error) {
+        if (requestId !== inboxRequestSequence.current) {
+          return { ok: false, count: 0, hasMore: false, pageToken, pageOffset };
+        }
+        const detail = error instanceof Error ? error.message : String(error);
+        setState((s) => ({
+          ...s,
+          inboxSnapshotLoading: false,
+          inboxLoading: false,
+          inboxSnapshotComplete: true,
+          inboxError: detail,
+        }));
+        return { ok: false, count: 0, hasMore: false, pageToken, pageOffset };
+      } finally {
+        if (requestId === inboxRequestSequence.current) {
+          setState((s) => ({ ...s, inboxSnapshotLoading: false }));
+        }
+      }
+    },
+    resetInboxFeed() {
+      inboxRequestSequence.current += 1;
+      snapshotRequestMailbox.current = "";
+      snapshotPromise.current = null;
+      inboxFeedCache.current.clear();
+      setState((s) => ({
+        ...s,
+        inboxMessages: [],
+        inboxSnapshotMessages: [],
+        inboxUpdatedAt: "",
+        inboxLoading: false,
+        inboxSnapshotLoading: false,
+        inboxSnapshotComplete: true,
+        inboxError: "",
+      }));
+    },
     preloadMailboxSnapshot: (force = false) => preloadMailboxSnapshot(undefined, 7, force),
     async loadInboxEmailBody(messageId, mailboxOverride) {
       const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
@@ -1776,9 +1905,14 @@ export function useAppController() {
     },
     async loadContactAvatars(emails, mailboxOverride) {
       const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
-      if (!mailbox || !emails.length) return { avatars: {}, permissionRequired: false };
+      if (!mailbox || !emails.length) return { avatars: {}, permissionRequired: false, serviceDisabled: false, activationUrl: "" };
       const payload = await client.resolveContactAvatars(mailbox, emails);
-      return { avatars: payload.avatars || {}, permissionRequired: Boolean(payload.permission_required) };
+      return {
+        avatars: payload.avatars || {},
+        permissionRequired: Boolean(payload.permission_required),
+        serviceDisabled: Boolean(payload.service_disabled),
+        activationUrl: String(payload.activation_url || ""),
+      };
     },
     async setInboxStarred(messageId, starred) {
       const message = state.inboxSnapshotMessages.find((item) => item.id === messageId)

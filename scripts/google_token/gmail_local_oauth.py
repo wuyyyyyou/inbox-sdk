@@ -21,6 +21,7 @@ from utils.time_utils import beijing_now_iso
 DEFAULT_SCOPE = " ".join([
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/contacts.other.readonly",
     "openid",
     "email",
     "profile",
@@ -90,8 +91,8 @@ def main() -> None:
     token = exchange_code(client, code, redirect_uri)
     authorized_email = fetch_authorized_email(token["access_token"])
     verify_authorized_email(args.email, authorized_email)
-    avatar_url = fetch_avatar_url(token["access_token"])
-    save_token(args.email, client, token, args.scope, authorized_email, avatar_url)
+    display_name, avatar_url = fetch_google_profile(token["access_token"])
+    save_token(args.email, client, token, args.scope, authorized_email, display_name, avatar_url)
     print(f"Authorized Gmail account: {authorized_email}", flush=True)
     print(f"Saved Gmail token for {args.email} to {token_dir() / (sanitize_mailbox_id(args.email) + '.json')}", flush=True)
 
@@ -237,7 +238,7 @@ def verify_authorized_email(expected_email: str, authorized_email: str) -> None:
         )
 
 
-def fetch_avatar_url(access_token: str) -> str:
+def fetch_google_profile(access_token: str) -> tuple[str, str]:
     request = urllib.request.Request(
         GOOGLE_USERINFO_URL,
         headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
@@ -246,9 +247,9 @@ def fetch_avatar_url(access_token: str) -> str:
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             profile = json.loads(response.read().decode("utf-8"))
-        return str(profile.get("picture") or "")
+        return str(profile.get("name") or ""), str(profile.get("picture") or "")
     except Exception:
-        return ""
+        return "", ""
 
 
 def save_token(
@@ -257,12 +258,14 @@ def save_token(
     token: dict[str, Any],
     scope: str,
     authorized_email: str | None = None,
+    display_name: str = "",
     avatar_url: str = "",
 ) -> None:
     expires_at = int(time.time()) + int(token.get("expires_in", 3600))
     record = {
         "email": email,
         "authorized_email": authorized_email or email,
+        "display_name": display_name,
         "avatar_url": avatar_url,
         "client_id": client["client_id"],
         "client_secret": client["client_secret"],

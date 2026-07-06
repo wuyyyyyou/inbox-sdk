@@ -139,11 +139,38 @@ function scrollToLatestMessage(container: HTMLDivElement | null, latestMessageId
   }
 }
 
-function QuickReplyIcon() {
+function AiSparkleIcon() {
   return (
-    <svg viewBox="0 0 12 12" aria-hidden="true" focusable="false">
-      <path d="M6 1.25 7.2 4.8l3.55 1.2L7.2 7.2 6 10.75 4.8 7.2 1.25 6l3.55-1.2L6 1.25Z" fill="currentColor" />
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
+      <path d="M12 3c.6 4.5 2.8 6.7 7.2 7.2-4.4.5-6.6 2.7-7.2 7.2-.6-4.5-2.8-6.7-7.2-7.2C9.2 9.7 11.4 7.5 12 3Z" />
+      <path d="M19 3v4M17 5h4" />
     </svg>
+  );
+}
+
+function AnimatedMailOverview({ text }: { text: string }) {
+  const [visibleText, setVisibleText] = useState("");
+
+  useEffect(() => {
+    setVisibleText("");
+    let frame = 0;
+    const timer = window.setInterval(() => {
+      frame += Math.max(1, Math.ceil(text.length / 36));
+      if (frame >= text.length) {
+        window.clearInterval(timer);
+        setVisibleText(text);
+        return;
+      }
+      setVisibleText(text.slice(0, frame));
+    }, 24);
+    return () => window.clearInterval(timer);
+  }, [text]);
+
+  return (
+    <p className="mail-detail-overview-result">
+      <AiSparkleIcon />
+      <span>{visibleText}</span>
+    </p>
   );
 }
 
@@ -668,7 +695,7 @@ export function MailDetailDrawer({
               </div>
             ) : null}
             <div className="mail-detail-overview">
-              {assistLoading ? <p>Loading AI overview…</p> : assist?.overview ? <p>{assist.overview}</p> : assistError ? <p>AI is unavailable. <button onClick={() => context && void loadInboxThreadAssist(mailbox, context.thread_id, context.latest_message_id, context.anchor_message_id).then(setAssist).catch((reason) => setAssistError(reason instanceof Error ? reason.message : String(reason)))}>Retry</button></p> : null}
+              {assistLoading ? <p className="mail-detail-overview-loading">Loading AI overview…</p> : assist?.overview ? <AnimatedMailOverview text={assist.overview} /> : assistError ? <p>AI is unavailable. <button onClick={() => context && void loadInboxThreadAssist(mailbox, context.thread_id, context.latest_message_id, context.anchor_message_id).then(setAssist).catch((reason) => setAssistError(reason instanceof Error ? reason.message : String(reason)))}>Retry</button></p> : null}
             </div>
             {fromAddress || toAddress ? (
               <div className="mail-detail-participants">
@@ -721,7 +748,7 @@ export function MailDetailDrawer({
             <section className="mail-detail-quick-replies" aria-label="Quick reply prompts">
               {assist!.quick_replies.map((item) => (
                 <button key={item.id} onClick={() => void submitPrompt(buildQuickReplyPrompt(item))}>
-                  <QuickReplyIcon />
+                  <AiSparkleIcon />
                   <span>{item.label}</span>
                 </button>
               ))}

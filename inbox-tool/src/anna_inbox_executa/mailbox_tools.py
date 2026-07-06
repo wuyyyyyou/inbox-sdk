@@ -6,6 +6,7 @@ def _registry_to_frontend(registry: Any) -> list[dict[str, Any]]:
     return [
         {
             "email": entry.email,
+            "display_name": getattr(entry, "display_name", ""),
             "avatar_url": entry.avatar_url,
             "provider": entry.provider,
             "auth_source": entry.auth_source,
@@ -53,7 +54,14 @@ async def _get_all_multi_tokens() -> list[dict[str, Any]]:
 
 
 def _discover_mailboxes() -> list[dict[str, Any]]:
-    from mail_agent.mail_providers.gmail.adapter import get_authorized_email, list_available_mailboxes_from_tokens, get_multi_token_emails, get_multi_token_map, get_account_avatar_url
+    from mail_agent.mail_providers.gmail.adapter import (
+        get_account_avatar_url,
+        get_account_display_name,
+        get_authorized_email,
+        get_multi_token_emails,
+        get_multi_token_map,
+        list_available_mailboxes_from_tokens,
+    )
 
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -65,6 +73,7 @@ def _discover_mailboxes() -> list[dict[str, Any]]:
         results.append({
             "email": email, "provider": "gmail",
             "auth_source": "platform", "authorized": True,
+            "display_name": get_account_display_name(email),
             "avatar_url": get_account_avatar_url(email),
             "last_auth_checked_at": beijing_now(),
         })
@@ -77,6 +86,7 @@ def _discover_mailboxes() -> list[dict[str, Any]]:
             results.append({
                 "email": multi_email, "provider": "gmail",
                 "auth_source": "platform_multi", "authorized": True,
+                "display_name": str(multi_token_map.get(multi_email, {}).get("display_name") or multi_token_map.get(multi_email, {}).get("name") or get_account_display_name(multi_email) or ""),
                 "avatar_url": str(multi_token_map.get(multi_email, {}).get("avatar_url") or multi_token_map.get(multi_email, {}).get("picture") or ""),
                 "last_auth_checked_at": beijing_now(),
             })
