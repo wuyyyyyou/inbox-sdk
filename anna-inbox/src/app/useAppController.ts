@@ -4,6 +4,7 @@ import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep }
 import { buildDraftPreferencesInstruction, resolveDraftPreferences } from "../features/handle/draftPreferences";
 import { sortInboxMessagesDesc } from "../features/home/inboxMessageOrder";
 import { connectRuntime } from "../runtime/runtimeLoader";
+import { triggerBrowserDownload } from "../shared/browserDownload";
 import type {
   ActiveCardsPayload,
   AiChatMessage,
@@ -329,17 +330,6 @@ function scrollToCard(key: string) {
     run();
     window.requestAnimationFrame(run);
   });
-}
-
-function triggerDownloadUrl(url: string, filename: string) {
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename || "attachment";
-  link.target = "_blank";
-  link.rel = "noopener noreferrer";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
 }
 
 function base64ToBlobUrl(contentB64: string, mimeType: string) {
@@ -2138,17 +2128,18 @@ export function useAppController() {
       const stateKey = `${key}::${attachmentId}`;
       if (state.attachmentDownloads[stateKey] === "preparing") return;
       setState((s) => ({ ...s, attachmentDownloads: { ...s.attachmentDownloads, [stateKey]: "preparing" } }));
+      showToast("Preparing download...");
       try {
         const result = await client.prepareAttachmentDownload(cardMailbox(card, state.mailbox), card.id, attachmentId, state.storageProvider);
         if (!result.ok) {
           throw new Error(result.error || "Attachment download is unavailable in this runtime.");
         }
         if (result.download_url) {
-          triggerDownloadUrl(result.download_url, result.filename || "attachment");
+          triggerBrowserDownload(result.download_url, result.filename || "attachment");
         } else if (result.content_b64) {
           const blobUrl = base64ToBlobUrl(result.content_b64, result.mime_type || "application/octet-stream");
           try {
-            triggerDownloadUrl(blobUrl, result.filename || "attachment");
+            triggerBrowserDownload(blobUrl, result.filename || "attachment");
           } finally {
             window.setTimeout(() => URL.revokeObjectURL(blobUrl), 30_000);
           }

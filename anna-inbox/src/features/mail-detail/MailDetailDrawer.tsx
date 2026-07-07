@@ -12,16 +12,23 @@ import type {
   SubmitMailPromptRequest,
 } from "../../types/mail";
 import { SafeEmailHtml, SafeEmailText } from "../../shared/SafeEmailHtml";
+import { PdfAttachmentPreview } from "./PdfAttachmentPreview";
 import {
   buildQuickReplyPrompt,
   deriveReplyToAddress,
+  estimateAttachmentPreviewMemory,
   formatAbsoluteDateTime,
   formatAttachmentSize,
   isOutboundMessageForMailbox,
   isPreviewableAttachment,
+  materializeAttachmentAccess,
   matchesDraftArtifact,
+  normalizeAttachmentKind,
+  resolveAttachmentAccess,
   senderParts,
   splitAddresses,
+  triggerAttachmentDownload,
+  type ResolvedAttachmentAccess,
 } from "./mailDetailHelpers";
 
 type MailUiFlags = {
@@ -34,6 +41,112 @@ type InsertRequest = {
   nonce: string;
   artifact: DraftReplyArtifact;
 } | null;
+
+type PreviewAttachmentRef = {
+  attachment: MailAttachmentMeta;
+  messageId: string;
+};
+
+type PreviewTransition = "idle" | "exit-previous" | "exit-next" | "enter-previous" | "enter-next";
+
+const PREVIEW_EXIT_MS = 170;
+const PREVIEW_ENTER_MS = 240;
+
+function waitForPreviewAnimation(duration: number) {
+  const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  if (reduceMotion) return Promise.resolve();
+  return new Promise<void>((resolve) => window.setTimeout(resolve, duration));
+}
+
+type PreviewCacheEntry = {
+  key: string;
+  item: PreviewAttachmentRef;
+  status: "loading" | "ready" | "error";
+  access: ResolvedAttachmentAccess | null;
+  text: string;
+  textTruncated: boolean;
+  error: string;
+  shouldRender: boolean;
+  promise?: Promise<PreviewCacheEntry>;
+};
+
+const MAX_BACKGROUND_RENDERED_PREVIEWS = 3;
+const MAX_BACKGROUND_PREVIEW_BYTES = 80 * 1024 * 1024;
+
+function previewCacheKey(item: PreviewAttachmentRef) {
+  return `${item.messageId}:${item.attachment.id}`;
+}
+
+function DownloadIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 3v11m0 0 4-4m-4 4-4-4" />
+      <path d="M5 13v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m6 6 12 12M18 6 6 18" />
+    </svg>
+  );
+}
+
+function DownloadButton({ onClick, disabled = false }: { onClick: () => void; disabled?: boolean }) {
+  return (
+    <button
+      className="attachment-download-button"
+      type="button"
+      aria-label="Download"
+      data-tooltip={disabled ? "Preparing download" : "Download"}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <DownloadIcon />
+    </button>
+  );
+}
+
+function PreviewToolbarButton({
+  label,
+  onClick,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      className="attachment-preview-toolbar-button"
+      type="button"
+      aria-label={label}
+      data-tooltip={label}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+}
+
+function PreviewArrow({ direction, onClick, disabled }: { direction: "previous" | "next"; onClick: () => void; disabled: boolean }) {
+  const previous = direction === "previous";
+  const label = previous ? "Previous attachment" : "Next attachment";
+  return (
+    <button
+      className={`attachment-preview-arrow is-${direction}`}
+      type="button"
+      aria-label={label}
+      data-tooltip={label}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d={previous ? "m15 18-6-6 6-6" : "m9 18 6-6-6-6"} /></svg>
+    </button>
+  );
+}
 
 function messageAvatar(sender: string) {
   const parts = senderParts(sender);
@@ -55,26 +168,42 @@ function AttachmentSection({
   attachments,
   onPreview,
   onDownload,
+  isDownloading,
 }: {
   attachments: MailAttachmentMeta[];
   onPreview: (attachment: MailAttachmentMeta) => void;
   onDownload: (attachment: MailAttachmentMeta) => void;
+  isDownloading: (attachment: MailAttachmentMeta) => boolean;
 }) {
   if (!attachments.length) return null;
   return (
     <div className="mail-detail-attachments">
-      {attachments.map((attachment) => (
-        <article key={attachment.id} className="mail-detail-attachment">
-          <div>
-            <strong>{attachment.filename}</strong>
-            <span>{attachment.mime_type}{attachment.size ? ` · ${formatAttachmentSize(attachment.size)}` : ""}</span>
-          </div>
-          <div>
-            {isPreviewableAttachment(attachment) ? <button onClick={() => onPreview(attachment)}>Preview</button> : null}
-            <button onClick={() => onDownload(attachment)}>Download</button>
-          </div>
-        </article>
-      ))}
+      {attachments.map((attachment) => {
+        const previewable = isPreviewableAttachment(attachment);
+        return (
+          <article key={attachment.id} className={`mail-detail-attachment${previewable ? " is-previewable" : ""}`}>
+            {previewable ? (
+              <button
+                className="attachment-preview-hitarea"
+                type="button"
+                aria-label={`Preview ${attachment.filename}`}
+                onClick={() => onPreview(attachment)}
+              />
+            ) : null}
+            <div>
+              <strong>{attachment.filename}</strong>
+              <span>
+                {[attachment.mime_type !== "application/octet-stream" ? attachment.mime_type : "", attachment.size ? formatAttachmentSize(attachment.size) : ""]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </span>
+            </div>
+            <div className="mail-detail-attachment-actions">
+              <DownloadButton disabled={isDownloading(attachment)} onClick={() => onDownload(attachment)} />
+            </div>
+          </article>
+        );
+      })}
     </div>
   );
 }
@@ -138,6 +267,8 @@ function scrollToLatestMessage(container: HTMLDivElement | null, latestMessageId
     target.scrollIntoView({ block: "start", behavior: "auto" });
   }
 }
+
+const TEXT_PREVIEW_MAX_BYTES = 256 * 1024;
 
 function AiSparkleIcon() {
   return (
@@ -267,10 +398,18 @@ export function MailDetailDrawer({
   const [displayBodyLoading, setDisplayBodyLoading] = useState<Set<string>>(() => new Set());
   const [displayBodyLoaded, setDisplayBodyLoaded] = useState<Set<string>>(() => new Set());
   const [displayBodyErrors, setDisplayBodyErrors] = useState<Record<string, string>>({});
-  const [previewAttachment, setPreviewAttachment] = useState<MailAttachmentMeta | null>(null);
-  const [previewUrl, setPreviewUrl] = useState("");
+  const [previewAttachment, setPreviewAttachment] = useState<PreviewAttachmentRef | null>(null);
+  const [previewAccess, setPreviewAccess] = useState<ResolvedAttachmentAccess | null>(null);
   const [previewText, setPreviewText] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState("");
+  const [previewTextTruncated, setPreviewTextTruncated] = useState(false);
+  const [previewTransition, setPreviewTransition] = useState<PreviewTransition>("idle");
+  const [previewSwitching, setPreviewSwitching] = useState(false);
+  const [attachmentDownloads, setAttachmentDownloads] = useState<Record<string, boolean>>({});
+  const previewBodyRef = useRef<HTMLDivElement | null>(null);
+  const previewSwitchTokenRef = useRef(0);
+  const [, setPreviewCacheRevision] = useState(0);
   const [resolvedAvatars, setResolvedAvatars] = useState<Record<string, string>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
@@ -283,6 +422,34 @@ export function MailDetailDrawer({
   const saveInboxThreadDraftRef = useRef(saveInboxThreadDraft);
   const loadContactAvatarsRef = useRef(loadContactAvatars);
   const assistRequestKeyRef = useRef("");
+  const previewAccessRef = useRef<ResolvedAttachmentAccess | null>(null);
+  const previewCacheRef = useRef<Map<string, PreviewCacheEntry>>(new Map());
+  const previewSessionRef = useRef(0);
+  const currentPreviewKeyRef = useRef("");
+  const backgroundWarmSessionRef = useRef(-1);
+  const renderedPreviewKeysRef = useRef<Set<string>>(new Set());
+  const previewRenderWaitersRef = useRef<Map<string, () => void>>(new Map());
+  const attachmentDownloadsRef = useRef<Set<string>>(new Set());
+
+  const clearPreviewAccess = () => {
+    previewAccessRef.current = null;
+    setPreviewAccess(null);
+  };
+
+  const invalidatePreviewCache = () => {
+    previewSessionRef.current += 1;
+    backgroundWarmSessionRef.current = -1;
+    currentPreviewKeyRef.current = "";
+    for (const entry of previewCacheRef.current.values()) entry.access?.revoke?.();
+    previewCacheRef.current.clear();
+    renderedPreviewKeysRef.current.clear();
+    for (const resolve of previewRenderWaitersRef.current.values()) resolve();
+    previewRenderWaitersRef.current.clear();
+    clearPreviewAccess();
+    setPreviewCacheRevision((value) => value + 1);
+  };
+
+  const notifyPreviewCacheChanged = () => setPreviewCacheRevision((value) => value + 1);
 
   const threadId = message?.thread_id || "";
   const messageId = message?.id || "";
@@ -300,7 +467,12 @@ export function MailDetailDrawer({
   ));
   const isDone = Boolean(message && (flags.done.includes(message.id) || isSent));
   const previewableAttachments = useMemo(
-    () => page?.messages.flatMap((item) => item.attachments.filter(isPreviewableAttachment).map((attachment) => ({ attachment, messageId: item.id }))) || [],
+    () => page?.messages.flatMap((item) => item.attachments
+      .filter(isPreviewableAttachment)
+      .map((attachment) => ({
+        attachment,
+        messageId: attachment.message_id || item.id,
+      }))) || [],
     [page],
   );
   const showQuickReplies = Boolean(
@@ -323,6 +495,14 @@ export function MailDetailDrawer({
     loadContactAvatarsRef.current = loadContactAvatars;
   }, [getInboxThreadDraft, loadContactAvatars, loadInboxEmailBody, loadInboxMessageDisplayBody, loadInboxThreadAssist, loadInboxThreadPage, saveInboxThreadDraft]);
 
+  useEffect(() => () => {
+    previewSessionRef.current += 1;
+    for (const entry of previewCacheRef.current.values()) entry.access?.revoke?.();
+    previewCacheRef.current.clear();
+    previewAccessRef.current = null;
+    attachmentDownloadsRef.current.clear();
+  }, []);
+
   useEffect(() => {
     if (!open || !message || !mailbox || !messageId) return;
     let cancelled = false;
@@ -339,9 +519,11 @@ export function MailDetailDrawer({
     setDraftDirty(false);
     setDraftEtag("");
     setPreviewAttachment(null);
-    setPreviewUrl("");
+    invalidatePreviewCache();
     setPreviewText("");
     setPreviewLoading(false);
+    setPreviewError("");
+    setPreviewTextTruncated(false);
     const requestAssist = (latestMessageId: string) => {
       if (!threadId) return;
       const requestKey = `${mailbox}:${threadId}:${latestMessageId}:${messageId}`;
@@ -599,34 +781,251 @@ export function MailDetailDrawer({
     }
   };
 
-  const openAttachment = async (attachment: MailAttachmentMeta, mode: "preview" | "download") => {
-    if (!page) return;
-    const owner = page.messages.find((item) => item.attachments.some((candidate) => candidate.id === attachment.id));
-    if (!owner) return;
-    const result = await prepareInboxAttachmentAccess(mailbox, owner.id, attachment.id, mode);
-    const url = String((mode === "preview" ? result.preview_url : result.download_url) || result.download_url || "");
-    if (!url) {
-      showToast(String(result.error || "Attachment URL is unavailable."));
-      return;
+  const prepareAttachmentAccess = async (item: PreviewAttachmentRef, mode: "preview" | "download") => {
+    const messageId = String(item.messageId || item.attachment.message_id || "").trim();
+    const attachmentId = String(item.attachment.id || "").trim();
+    if (!messageId || !attachmentId) {
+      throw new Error("This attachment is missing its message or attachment id. Refresh the thread and try again.");
     }
-    if (mode === "download") {
-      window.open(url, "_blank", "noopener,noreferrer");
-      return;
-    }
-    setPreviewAttachment(attachment);
-    setPreviewLoading(true);
-    setPreviewUrl(url);
-    if ((attachment.mime_type || "").startsWith("text/") || attachment.mime_type === "application/json") {
-      try {
-        const response = await fetch(url);
-        setPreviewText(await response.text());
-      } catch {
-        setPreviewText("");
+    const result = await prepareInboxAttachmentAccess(mailbox, messageId, attachmentId, mode);
+    return resolveAttachmentAccess(result);
+  };
+
+  const attachmentDownloadKey = (item: PreviewAttachmentRef) =>
+    `${String(item.messageId || item.attachment.message_id || "").trim()}::${String(item.attachment.id || "").trim()}`;
+
+  const isAttachmentDownloading = (item: PreviewAttachmentRef) => Boolean(attachmentDownloads[attachmentDownloadKey(item)]);
+
+  const downloadAttachment = async (item: PreviewAttachmentRef) => {
+    const stateKey = attachmentDownloadKey(item);
+    if (attachmentDownloadsRef.current.has(stateKey)) return;
+    let access: ResolvedAttachmentAccess | null = null;
+    attachmentDownloadsRef.current.add(stateKey);
+    setAttachmentDownloads((current) => ({ ...current, [stateKey]: true }));
+    showToast("Preparing download...");
+    try {
+      access = await prepareAttachmentAccess(item, "download");
+      triggerAttachmentDownload(access, item.attachment.filename);
+    } catch (reason) {
+      throw new Error(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (access?.kind === "blob") {
+        window.setTimeout(() => access?.revoke?.(), 60_000);
       }
-    } else {
-      setPreviewText("");
+      setAttachmentDownloads((current) => {
+        const next = { ...current };
+        delete next[stateKey];
+        return next;
+      });
+      attachmentDownloadsRef.current.delete(stateKey);
     }
+  };
+
+  const applyPreviewEntry = (entry: PreviewCacheEntry) => {
+    previewAccessRef.current = entry.access;
+    setPreviewAccess(entry.access);
+    setPreviewText(entry.text);
+    setPreviewTextTruncated(entry.textTruncated);
+    setPreviewError(entry.error);
+  };
+
+  const ensurePreviewEntry = (item: PreviewAttachmentRef, shouldRender: boolean, session: number) => {
+    const key = previewCacheKey(item);
+    const cached = previewCacheRef.current.get(key);
+    if (cached) {
+      if (shouldRender && !cached.shouldRender) {
+        cached.shouldRender = true;
+        notifyPreviewCacheChanged();
+      }
+      return cached.promise || Promise.resolve(cached);
+    }
+
+    const entry: PreviewCacheEntry = {
+      key,
+      item,
+      status: "loading",
+      access: null,
+      text: "",
+      textTruncated: false,
+      error: "",
+      shouldRender,
+    };
+    const promise = (async () => {
+      let access: ResolvedAttachmentAccess | null = null;
+      try {
+        access = await prepareAttachmentAccess(item, "preview");
+        const kind = normalizeAttachmentKind(item.attachment);
+        if (access.kind === "url" && kind !== "text") access = await materializeAttachmentAccess(access);
+        if (session !== previewSessionRef.current) {
+          access.revoke?.();
+          throw new Error("Preview session ended.");
+        }
+        entry.access = access;
+        if (kind === "text") {
+          if ((item.attachment.size || 0) > TEXT_PREVIEW_MAX_BYTES) {
+            entry.textTruncated = true;
+          } else {
+            const response = await fetch(access.url);
+            if (!response.ok) throw new Error(`Preview fetch failed with ${response.status}`);
+            entry.text = await response.text();
+          }
+        }
+        entry.status = "ready";
+      } catch (reason) {
+        if (session !== previewSessionRef.current) throw reason;
+        access?.revoke?.();
+        entry.access = null;
+        entry.status = "error";
+        entry.error = reason instanceof Error ? reason.message : String(reason);
+      } finally {
+        entry.promise = undefined;
+        if (session === previewSessionRef.current) notifyPreviewCacheChanged();
+      }
+      return entry;
+    })();
+    entry.promise = promise;
+    previewCacheRef.current.set(key, entry);
+    notifyPreviewCacheChanged();
+    return promise;
+  };
+
+  const markPreviewRendered = (key: string) => {
+    renderedPreviewKeysRef.current.add(key);
+    previewRenderWaitersRef.current.get(key)?.();
+    previewRenderWaitersRef.current.delete(key);
+  };
+
+  const waitForPreviewRender = (key: string, session: number) => {
+    if (renderedPreviewKeysRef.current.has(key) || session !== previewSessionRef.current) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      let timer = 0;
+      const finish = () => {
+        window.clearTimeout(timer);
+        previewRenderWaitersRef.current.delete(key);
+        resolve();
+      };
+      timer = window.setTimeout(finish, 30_000);
+      previewRenderWaitersRef.current.set(key, finish);
+    });
+  };
+
+  const warmRemainingPreviews = (activeKey: string, session: number) => {
+    if (backgroundWarmSessionRef.current === session) return;
+    backgroundWarmSessionRef.current = session;
+    const activeIndex = previewableAttachments.findIndex((item) => previewCacheKey(item) === activeKey);
+    const ordered = activeIndex < 0
+      ? previewableAttachments
+      : [...previewableAttachments.slice(activeIndex + 1), ...previewableAttachments.slice(0, activeIndex)];
+    void (async () => {
+      let renderedCount = 0;
+      let estimatedBytes = 0;
+      for (const item of ordered) {
+        if (session !== previewSessionRef.current) return;
+        const key = previewCacheKey(item);
+        if (key === activeKey) continue;
+        const estimate = estimateAttachmentPreviewMemory(item.attachment);
+        const shouldRender = renderedCount < MAX_BACKGROUND_RENDERED_PREVIEWS
+          && estimatedBytes + estimate <= MAX_BACKGROUND_PREVIEW_BYTES;
+        const entry = await ensurePreviewEntry(item, shouldRender, session).catch(() => null);
+        if (!entry || session !== previewSessionRef.current || entry.status !== "ready") continue;
+        if (!shouldRender) continue;
+        renderedCount += 1;
+        estimatedBytes += estimate;
+        const kind = normalizeAttachmentKind(item.attachment);
+        if (kind === "pdf" || kind === "image") await waitForPreviewRender(key, session);
+        else markPreviewRendered(key);
+      }
+    })();
+  };
+
+  const loadPreviewItem = async (item: PreviewAttachmentRef) => {
+    const key = previewCacheKey(item);
+    const session = previewSessionRef.current;
+    currentPreviewKeyRef.current = key;
+    setPreviewAttachment(item);
+    setPreviewError("");
+    setPreviewText("");
+    setPreviewTextTruncated(false);
+    clearPreviewAccess();
+    const cached = previewCacheRef.current.get(key);
+    if (cached?.status === "error") {
+      previewCacheRef.current.delete(key);
+    } else if (cached?.status === "ready") {
+      cached.shouldRender = true;
+      applyPreviewEntry(cached);
+      setPreviewLoading(false);
+      notifyPreviewCacheChanged();
+      warmRemainingPreviews(key, session);
+      return;
+    }
+    setPreviewLoading(true);
+    try {
+      const entry = await ensurePreviewEntry(item, true, session);
+      if (session !== previewSessionRef.current || currentPreviewKeyRef.current !== key) return;
+      applyPreviewEntry(entry);
+      if (entry.status === "ready") warmRemainingPreviews(key, session);
+    } catch (reason) {
+      if (session === previewSessionRef.current && currentPreviewKeyRef.current === key) {
+        clearPreviewAccess();
+        setPreviewError(reason instanceof Error ? reason.message : String(reason));
+      }
+    } finally {
+      if (session === previewSessionRef.current && currentPreviewKeyRef.current === key) setPreviewLoading(false);
+    }
+  };
+
+  const previewIndex = previewAttachment
+    ? previewableAttachments.findIndex((item) => item.attachment.id === previewAttachment.attachment.id && item.messageId === previewAttachment.messageId)
+    : -1;
+  const activePreviewKey = previewAttachment ? previewCacheKey(previewAttachment) : "";
+  const mountedPreviewEntries = Array.from(previewCacheRef.current.values()).filter((entry) => (
+    entry.status === "ready"
+    && entry.access
+    && (entry.shouldRender || entry.key === activePreviewKey)
+  ));
+
+  const closePreview = () => {
+    previewSwitchTokenRef.current += 1;
+    setPreviewAttachment(null);
     setPreviewLoading(false);
+    setPreviewSwitching(false);
+    setPreviewTransition("idle");
+    setPreviewError("");
+    setPreviewText("");
+    setPreviewTextTruncated(false);
+    invalidatePreviewCache();
+  };
+
+  const openAttachmentPreview = async (item: PreviewAttachmentRef) => {
+    previewSwitchTokenRef.current += 1;
+    setPreviewSwitching(false);
+    setPreviewTransition("idle");
+    await loadPreviewItem(item);
+  };
+
+  const stepPreview = async (direction: -1 | 1) => {
+    if (previewIndex < 0 || previewSwitching) return;
+    const next = previewableAttachments[previewIndex + direction];
+    if (!next) return;
+    const switchToken = previewSwitchTokenRef.current + 1;
+    previewSwitchTokenRef.current = switchToken;
+    const transitionDirection = direction < 0 ? "previous" : "next";
+    setPreviewSwitching(true);
+    setPreviewTransition(`exit-${transitionDirection}`);
+    try {
+      await waitForPreviewAnimation(PREVIEW_EXIT_MS);
+      if (previewSwitchTokenRef.current !== switchToken) return;
+      if (previewBodyRef.current) previewBodyRef.current.scrollTop = 0;
+      await loadPreviewItem(next);
+      if (previewSwitchTokenRef.current !== switchToken) return;
+      setPreviewTransition(`enter-${transitionDirection}`);
+      await waitForPreviewAnimation(PREVIEW_ENTER_MS);
+    } finally {
+      if (previewSwitchTokenRef.current === switchToken) {
+        setPreviewTransition("idle");
+        setPreviewSwitching(false);
+      }
+    }
   };
 
   const submitPrompt = async (visiblePrompt: string, expectedArtifact: "draft_reply" = "draft_reply", forceNewConversation = false) => {
@@ -754,7 +1153,12 @@ export function MailDetailDrawer({
                 </p>
               ) : null}
               {displayBodyErrors[item.id] ? <p className="mail-thread-message-notice is-error">{displayBodyErrors[item.id]}</p> : null}
-              <AttachmentSection attachments={item.attachments} onPreview={(attachment) => void openAttachment(attachment, "preview")} onDownload={(attachment) => void openAttachment(attachment, "download")} />
+              <AttachmentSection
+                attachments={item.attachments}
+                onPreview={(attachment) => void openAttachmentPreview({ attachment, messageId: attachment.message_id || item.id })}
+                onDownload={(attachment) => void downloadAttachment({ attachment, messageId: attachment.message_id || item.id }).catch((reason) => showToast(reason instanceof Error ? reason.message : String(reason)))}
+                isDownloading={(attachment) => isAttachmentDownloading({ attachment, messageId: attachment.message_id || item.id })}
+              />
             </article>
           ))}
           {showQuickReplies ? (
@@ -830,28 +1234,61 @@ export function MailDetailDrawer({
       </aside>
 
       {previewAttachment ? (
-        <div className="attachment-preview-modal" role="dialog" aria-modal="true" aria-label={previewAttachment.filename}>
-          <button className="attachment-preview-backdrop" aria-label="Close attachment preview" onClick={() => {
-            setPreviewAttachment(null);
-            setPreviewUrl("");
-            setPreviewText("");
-          }} />
+        <div className="attachment-preview-modal" role="dialog" aria-modal="true" aria-label={previewAttachment.attachment.filename}>
+          <button className="attachment-preview-backdrop" aria-label="Close attachment preview" onClick={closePreview} />
           <div className="attachment-preview-sheet">
             <header>
-              <strong>{previewableAttachments.findIndex((item) => item.attachment.id === previewAttachment.id) + 1} / {previewableAttachments.length} - {previewAttachment.filename}</strong>
+              <strong>{previewIndex + 1} / {previewableAttachments.length} - {previewAttachment.attachment.filename}</strong>
               <div>
-                <button onClick={() => previewAttachment && void openAttachment(previewAttachment, "download")}>Download</button>
-                <button onClick={() => void Promise.all(previewableAttachments.map((item) => openAttachment(item.attachment, "download")))}>Download all</button>
-                <button onClick={() => {
-                  setPreviewAttachment(null);
-                  setPreviewUrl("");
-                  setPreviewText("");
-                }}>Close</button>
+                <DownloadButton disabled={isAttachmentDownloading(previewAttachment)} onClick={() => void downloadAttachment(previewAttachment).catch((reason) => showToast(reason instanceof Error ? reason.message : String(reason)))} />
+                <PreviewToolbarButton label="Close" onClick={closePreview}><CloseIcon /></PreviewToolbarButton>
               </div>
             </header>
-            <div className="attachment-preview-body">
-              {previewLoading ? <p>Loading preview…</p> : previewAttachment.mime_type === "application/pdf" ? <iframe src={previewUrl} title={previewAttachment.filename} /> : previewAttachment.mime_type.startsWith("image/") ? <img src={previewUrl} alt={previewAttachment.filename} /> : previewAttachment.mime_type.startsWith("audio/") ? <audio src={previewUrl} controls /> : previewAttachment.mime_type.startsWith("video/") ? <video src={previewUrl} controls /> : <pre>{previewText || previewUrl}</pre>}
+            <div ref={previewBodyRef} className={`attachment-preview-body is-${previewTransition}`}>
+              {previewLoading ? <p>Loading preview…</p> : null}
+              {!previewLoading && previewError ? (
+                <div className="attachment-preview-error">
+                  <p>{previewError}</p>
+                  <div className="attachment-preview-actions">
+                    <button onClick={() => void loadPreviewItem(previewAttachment)}>Retry</button>
+                    <DownloadButton disabled={isAttachmentDownloading(previewAttachment)} onClick={() => void downloadAttachment(previewAttachment).catch((reason) => showToast(reason instanceof Error ? reason.message : String(reason)))} />
+                  </div>
+                </div>
+              ) : null}
+              {mountedPreviewEntries.map((entry) => {
+                const access = entry.access!;
+                const attachment = entry.item.attachment;
+                const kind = normalizeAttachmentKind(attachment);
+                const active = entry.key === activePreviewKey;
+                return (
+                  <div
+                    key={entry.key}
+                    className={`attachment-preview-pane ${active ? "is-active" : "is-preloading"}`}
+                    aria-hidden={!active}
+                  >
+                    {kind === "pdf" ? (
+                      <PdfAttachmentPreview url={access.url} onReady={() => markPreviewRendered(entry.key)} />
+                    ) : null}
+                    {kind === "image" ? <img src={access.url} alt={active ? attachment.filename : ""} onLoad={() => markPreviewRendered(entry.key)} /> : null}
+                    {kind === "audio" ? <audio src={access.url} controls={active} preload="auto" onCanPlay={() => markPreviewRendered(entry.key)} /> : null}
+                    {kind === "video" ? <video src={access.url} controls={active} preload="auto" onCanPlay={() => markPreviewRendered(entry.key)} /> : null}
+                    {kind === "text" && entry.textTruncated ? (
+                      <div className="attachment-preview-external-only">
+                        <p>Text preview is limited to 256 KB for safety. Download the file to inspect the full content.</p>
+                        {active ? (
+                          <div className="attachment-preview-actions">
+                            <DownloadButton disabled={isAttachmentDownloading(entry.item)} onClick={() => void downloadAttachment(entry.item).catch((reason) => showToast(reason instanceof Error ? reason.message : String(reason)))} />
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {kind === "text" && !entry.textTruncated ? <pre>{entry.text}</pre> : null}
+                  </div>
+                );
+              })}
             </div>
+            {previewIndex > 0 ? <PreviewArrow direction="previous" disabled={previewLoading || previewSwitching} onClick={() => void stepPreview(-1)} /> : null}
+            {previewIndex >= 0 && previewIndex < previewableAttachments.length - 1 ? <PreviewArrow direction="next" disabled={previewLoading || previewSwitching} onClick={() => void stepPreview(1)} /> : null}
           </div>
         </div>
       ) : null}

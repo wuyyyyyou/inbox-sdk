@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "dompurify": "^3.4.9",
+    "pdfjs-dist": "^5.7.284",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },

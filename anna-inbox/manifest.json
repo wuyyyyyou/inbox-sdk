@@ -93,11 +93,29 @@
       "style-src": [
         "'self'"
       ],
+      "connect-src": [
+        "'self'",
+        "blob:",
+        "https:",
+        "http://127.0.0.1:*"
+      ],
+      "frame-src": [
+        "'self'",
+        "blob:",
+        "https:",
+        "http://127.0.0.1:*"
+      ],
       "img-src": [
         "'self'",
         "data:",
         "blob:",
         "https:"
+      ],
+      "media-src": [
+        "'self'",
+        "blob:",
+        "https:",
+        "http://127.0.0.1:*"
       ]
     },
     "state_merge": "last_writer_wins"

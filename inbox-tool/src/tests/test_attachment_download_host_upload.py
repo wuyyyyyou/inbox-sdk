@@ -91,6 +91,7 @@ class FakePresignedHostUpload:
 async def main_async() -> None:
     from anna_inbox_executa import v2_tools
     from executa_sdk.host_upload import HostUploadClient
+    from mail_agent.mail_providers.gmail import adapter as gmail_adapter
     import os
 
     frames: list[dict[str, Any]] = []
@@ -211,8 +212,123 @@ async def main_async() -> None:
     with urllib.request.urlopen(loopback_payload["download_url"], timeout=5) as response:
         loopback_body = response.read()
         loopback_disposition = str(response.headers.get("Content-Disposition") or "")
+        loopback_cors = str(response.headers.get("Access-Control-Allow-Origin") or "")
     check("loopback payload serves bytes", loopback_body == b"loopback-bytes")
     check("loopback payload serves attachment header", "loopback.txt" in loopback_disposition)
+    check("loopback payload serves cors header", loopback_cors == "*")
+
+    preview_payload = v2_tools._loopback_attachment_download_payload(
+        {
+            "filename": "sponsor-brief.pdf",
+            "mime_type": "application/pdf",
+        },
+        b"preview-pdf-bytes",
+        disposition="inline",
+    )
+    preview_url = str(preview_payload["download_url"])
+    check("loopback preview uses dedicated route", "/preview/" in preview_url)
+    check("loopback preview omits filename", "sponsor-brief.pdf" not in preview_url)
+    with urllib.request.urlopen(preview_url, timeout=5) as response:
+        preview_body = response.read()
+        preview_disposition = str(response.headers.get("Content-Disposition") or "")
+        preview_type = str(response.headers.get("Content-Type") or "")
+    check("loopback preview serves bytes", preview_body == b"preview-pdf-bytes")
+    check("loopback preview serves inline header", preview_disposition.startswith("inline;"))
+    check("loopback preview serves pdf type", preview_type == "application/pdf")
+
+    serialized = v2_tools._serialize_inbox_thread_message(
+        {
+            "id": "msg-serialize",
+            "thread_id": "thread-1",
+            "internal_date": "123",
+            "from": "A <a@example.com>",
+            "to": "B <b@example.com>",
+            "subject": "Subject",
+            "label_ids": ["INBOX"],
+            "attachments": [
+                {
+                    "filename": "thread.pdf",
+                    "mimeType": "application/octet-stream",
+                    "attachmentId": "gmail-att-serialize",
+                    "size": 77,
+                },
+            ],
+        },
+        include_display_body=False,
+        body_limit=0,
+    )
+    check("thread serialization rewrites attachment list", len(serialized["attachments"]) == 1)
+    check("thread serialization injects opaque attachment id", bool(serialized["attachments"][0]["id"]))
+    check("thread serialization keeps message id", serialized["attachments"][0]["message_id"] == "msg-serialize")
+
+    original_read_message = gmail_adapter.read_message
+    original_find_attachment_for_token = gmail_adapter.find_attachment_for_token
+    original_fetch_attachment_bytes = gmail_adapter.fetch_attachment_bytes
+    original_normalize_mailbox = gmail_adapter.normalize_mailbox
+    original_should_use_aps_storage = v2_tools._should_use_aps_storage
+    original_upload_for_download = v2_tools._upload_attachment_for_download
+    original_download_mode = v2_tools._attachment_download_mode
+    try:
+        gmail_adapter.read_message = lambda mailbox, message_id: {"id": message_id, "attachments": []}
+        gmail_adapter.find_attachment_for_token = lambda message, token: {
+            "id": token,
+            "message_id": str(message.get("id") or ""),
+            "filename": "report.pdf",
+            "mime_type": "application/octet-stream",
+            "size": len(b"preview-bytes"),
+            "gmail_attachment_id": "gmail-att-1",
+        }
+        gmail_adapter.fetch_attachment_bytes = lambda mailbox, message_id, gmail_attachment_id: b"preview-bytes"
+        gmail_adapter.normalize_mailbox = lambda mailbox: mailbox.strip().lower()
+        v2_tools._should_use_aps_storage = lambda: True
+        v2_tools._attachment_download_mode = lambda: "direct_inline"
+
+        preview_result = await v2_tools._handle_v2_tool(
+            "prepare_inbox_attachment_access",
+            {
+                "mailbox": "User@Example.com",
+                "message_id": "msg-77",
+                "attachment_id": "token-77",
+                "mode": "preview",
+            },
+            "invoke-1",
+        )
+        check("preview tool marks ok", preview_result["ok"] is True)
+        check("preview tool returns url delivery", preview_result["delivery"] == "url")
+        check("preview tool returns mode", preview_result["mode"] == "preview")
+        check("preview tool normalizes mime from filename", preview_result["mime_type"] == "application/pdf")
+        check("preview tool carries attachment id", preview_result["attachment_id"] == "token-77")
+        check("preview tool returns preview url", str(preview_result["preview_url"]).startswith("http://127.0.0.1:"))
+        check("preview tool uses dedicated preview route", "/preview/" in str(preview_result["preview_url"]))
+        check("preview tool does not expose a download route", "/download/" not in str(preview_result["preview_url"]))
+
+        async def _raise_upload(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("host upload unavailable")
+
+        v2_tools._attachment_download_mode = lambda: "host_preferred"
+        v2_tools._upload_attachment_for_download = _raise_upload
+        download_result = await v2_tools._handle_v2_tool(
+            "prepare_inbox_attachment_access",
+            {
+                "mailbox": "user@example.com",
+                "message_id": "msg-88",
+                "attachment_id": "token-88",
+                "mode": "download",
+            },
+            "invoke-2",
+        )
+        check("download tool falls back to inline for small content", download_result["delivery"] == "inline")
+        check("download tool returns mode", download_result["mode"] == "download")
+        check("download tool returns message id", download_result["message_id"] == "msg-88")
+        check("download tool normalizes mime", download_result["mime_type"] == "application/pdf")
+    finally:
+        gmail_adapter.read_message = original_read_message
+        gmail_adapter.find_attachment_for_token = original_find_attachment_for_token
+        gmail_adapter.fetch_attachment_bytes = original_fetch_attachment_bytes
+        gmail_adapter.normalize_mailbox = original_normalize_mailbox
+        v2_tools._should_use_aps_storage = original_should_use_aps_storage
+        v2_tools._upload_attachment_for_download = original_upload_for_download
+        v2_tools._attachment_download_mode = original_download_mode
 
 
 def main() -> None:

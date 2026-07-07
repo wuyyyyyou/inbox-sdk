@@ -245,7 +245,7 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
     from mail_agent.mail_providers.gmail.adapter import sanitize_mailbox_id
 
     filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
-    mime_type = str(attachment.get("mime_type") or "application/octet-stream")
+    mime_type = _normalized_attachment_mime_type(attachment)
 
     host_presign_started = False
     host_unavailable_error = ""
@@ -341,11 +341,12 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
 
 
 def _inline_attachment_download_payload(attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
+    mime_type = _normalized_attachment_mime_type(attachment)
     return {
         "ok": True,
         "delivery": "inline",
         "filename": attachment.get("filename") or "attachment",
-        "mime_type": attachment.get("mime_type") or "application/octet-stream",
+        "mime_type": mime_type,
         "size": len(content),
         "content_b64": base64.b64encode(content).decode("ascii"),
     }
@@ -382,13 +383,29 @@ def _ensure_loopback_download_server() -> str:
         class AttachmentDownloadHandler(http.server.BaseHTTPRequestHandler):
             server_version = "AnnaInboxAttachment/1.0"
 
+            def _send_cors_headers(self) -> None:
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Expose-Headers", "Content-Disposition, Content-Type, Content-Length")
+
+            def do_OPTIONS(self) -> None:
+                self.send_response(204)
+                self._send_cors_headers()
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+
             def do_GET(self) -> None:
                 _cleanup_expired_download_tokens()
-                prefix = "/download/"
-                if not self.path.startswith(prefix):
+                path = urllib.parse.urlsplit(self.path).path
+                prefix = next(
+                    (candidate for candidate in ("/download/", "/preview/") if path.startswith(candidate)),
+                    "",
+                )
+                if not prefix:
                     self.send_error(404)
                     return
-                token = self.path[len(prefix):].split("/", 1)[0].strip()
+                token = path[len(prefix):].split("/", 1)[0].strip()
                 meta = _DOWNLOAD_TOKENS.get(token)
                 if not meta:
                     self.send_error(404)
@@ -403,6 +420,7 @@ def _ensure_loopback_download_server() -> str:
                 disposition = "inline" if str(meta.get("disposition") or "").lower() == "inline" else "attachment"
                 data = file_path.read_bytes()
                 self.send_response(200)
+                self._send_cors_headers()
                 self.send_header("Content-Type", mime_type)
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Content-Disposition", f'{disposition}; filename="{filename}"')
@@ -432,7 +450,7 @@ def _loopback_attachment_download_payload(
 ) -> dict[str, Any]:
     _cleanup_expired_download_tokens()
     filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
-    mime_type = str(attachment.get("mime_type") or "application/octet-stream")
+    mime_type = _normalized_attachment_mime_type(attachment)
     token = uuid.uuid4().hex
     file_path = _attachment_download_dir() / f"{token}-{filename}"
     file_path.write_bytes(content)
@@ -445,15 +463,83 @@ def _loopback_attachment_download_payload(
         "expires_at_ts": expires_at_ts,
     }
     base_url = _ensure_loopback_download_server()
+    if disposition == "inline":
+        access_url = f"{base_url}/preview/{token}"
+    else:
+        access_url = f"{base_url}/download/{token}/{urllib.parse.quote(filename, safe='')}"
     return {
         "ok": True,
         "delivery": "url",
         "filename": filename,
         "mime_type": mime_type,
         "size": len(content),
-        "download_url": f"{base_url}/download/{token}/{urllib.parse.quote(filename, safe='')}",
+        "download_url": access_url,
         "expires_at": datetime.fromtimestamp(expires_at_ts, tz=timezone.utc).isoformat(),
     }
+
+
+def _normalized_attachment_mime_type(attachment: dict[str, Any]) -> str:
+    import mimetypes
+
+    raw = str(attachment.get("mime_type") or "").strip().lower()
+    if raw and raw != "application/octet-stream":
+        return raw[:120]
+    filename = str(attachment.get("filename") or "").strip()
+    guessed, _ = mimetypes.guess_type(filename)
+    if guessed:
+        return guessed[:120]
+    return "application/octet-stream"
+
+
+def _attachment_preview_kind(attachment: dict[str, Any]) -> str:
+    import mimetypes
+
+    mime_type = _normalized_attachment_mime_type(attachment)
+    filename = str(attachment.get("filename") or "").strip().lower()
+    guessed, _ = mimetypes.guess_type(filename)
+    effective_mime = str(guessed or mime_type).lower()
+    if effective_mime == "application/pdf":
+        return "pdf"
+    if effective_mime.startswith("image/"):
+        return "image"
+    if (
+        effective_mime.startswith("text/")
+        or effective_mime in {"application/json", "text/csv"}
+    ):
+        return "text"
+    if effective_mime.startswith("audio/"):
+        return "audio"
+    if effective_mime.startswith("video/"):
+        return "video"
+    return "download"
+
+
+def _finalize_attachment_access_payload(
+    base_payload: dict[str, Any],
+    *,
+    mode: str,
+    message_id: str,
+    attachment_id: str,
+    attachment: dict[str, Any],
+) -> dict[str, Any]:
+    payload = dict(base_payload)
+    payload["ok"] = bool(payload.get("ok", True))
+    payload["delivery"] = str(payload.get("delivery") or ("inline" if payload.get("content_b64") else "url"))
+    payload["mode"] = mode
+    payload["message_id"] = message_id
+    payload["attachment_id"] = attachment_id
+    payload["filename"] = str(payload.get("filename") or attachment.get("filename") or "attachment")
+    payload["mime_type"] = _normalized_attachment_mime_type(attachment)
+    payload["size"] = int(payload.get("size") or attachment.get("size") or 0)
+    if payload["delivery"] == "url":
+        if mode == "preview":
+            preview_url = str(payload.get("preview_url") or payload.get("download_url") or "")
+            payload["preview_url"] = preview_url
+            payload.setdefault("download_url", str(payload.get("download_url") or ""))
+        else:
+            download_url = str(payload.get("download_url") or payload.get("preview_url") or "")
+            payload["download_url"] = download_url
+    return payload
 
 
 def _clamp_int(value: Any, fallback: int, min_value: int, max_value: int) -> int:
@@ -574,6 +660,8 @@ def _display_body_payload(message: dict[str, Any], *, limit: int, prefer_html: b
 
 
 def _serialize_inbox_thread_message(message: dict[str, Any], *, include_display_body: bool, body_limit: int) -> dict[str, Any]:
+    from mail_agent.mail_providers.gmail.adapter import attachment_metadata_from_message
+
     payload = {
         "id": str(message.get("id") or ""),
         "thread_id": str(message.get("thread_id") or ""),
@@ -584,7 +672,7 @@ def _serialize_inbox_thread_message(message: dict[str, Any], *, include_display_
         "bcc": str(message.get("bcc") or ""),
         "subject": str(message.get("subject") or ""),
         "label_ids": _normalize_label_ids(message.get("label_ids")),
-        "attachments": list(message.get("attachments") or []),
+        "attachments": attachment_metadata_from_message(message),
     }
     if include_display_body:
         payload.update(_display_body_payload(message, limit=body_limit))
@@ -1447,35 +1535,66 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             )
             if mode == "preview":
                 preview = _loopback_attachment_download_payload(attachment, content, disposition="inline")
-                return {
-                    **preview,
-                    "mode": mode,
-                    "message_id": message_id,
-                    "attachment_id": attachment_id,
-                    "preview_url": preview.get("download_url") or "",
-                }
+                preview["preview_url"] = preview.get("download_url") or ""
+                return _finalize_attachment_access_payload(
+                    preview,
+                    mode=mode,
+                    message_id=message_id,
+                    attachment_id=attachment_id,
+                    attachment=attachment,
+                )
             download_mode = _attachment_download_mode()
             if not _should_use_aps_storage() or download_mode == "loopback":
                 download = _loopback_attachment_download_payload(attachment, content, disposition="attachment")
-                return {**download, "mode": mode, "message_id": message_id, "attachment_id": attachment_id}
+                return _finalize_attachment_access_payload(
+                    download,
+                    mode=mode,
+                    message_id=message_id,
+                    attachment_id=attachment_id,
+                    attachment=attachment,
+                )
+            if download_mode != "host_preferred" and len(content) <= INLINE_ATTACHMENT_DIRECT_MAX_BYTES:
+                return _finalize_attachment_access_payload(
+                    _inline_attachment_download_payload(attachment, content),
+                    mode=mode,
+                    message_id=message_id,
+                    attachment_id=attachment_id,
+                    attachment=attachment,
+                )
             try:
                 uploaded = await _upload_attachment_for_download(normalized_mailbox, message_id, attachment, content)
-                return {
-                    "ok": True,
-                    "delivery": "url",
-                    "mode": mode,
-                    "message_id": message_id,
-                    "attachment_id": attachment_id,
-                    "filename": attachment.get("filename") or "attachment",
-                    "mime_type": attachment.get("mime_type") or "application/octet-stream",
-                    "size": len(content),
-                    "download_url": uploaded.get("url") or uploaded.get("download_url") or "",
-                    "expires_at": uploaded.get("expires_at") or "",
-                }
+                return _finalize_attachment_access_payload(
+                    {
+                        "ok": True,
+                        "delivery": "url",
+                        "filename": attachment.get("filename") or "attachment",
+                        "size": len(content),
+                        "download_url": uploaded.get("url") or uploaded.get("download_url") or "",
+                        "expires_at": uploaded.get("expires_at") or "",
+                    },
+                    mode=mode,
+                    message_id=message_id,
+                    attachment_id=attachment_id,
+                    attachment=attachment,
+                )
             except Exception as upload_exc:
                 log(f"inbox attachment upload fallback: {type(upload_exc).__name__}: {upload_exc}")
+                if len(content) <= INLINE_ATTACHMENT_DIRECT_MAX_BYTES:
+                    return _finalize_attachment_access_payload(
+                        _inline_attachment_download_payload(attachment, content),
+                        mode=mode,
+                        message_id=message_id,
+                        attachment_id=attachment_id,
+                        attachment=attachment,
+                    )
                 download = _loopback_attachment_download_payload(attachment, content, disposition="attachment")
-                return {**download, "mode": mode, "message_id": message_id, "attachment_id": attachment_id}
+                return _finalize_attachment_access_payload(
+                    download,
+                    mode=mode,
+                    message_id=message_id,
+                    attachment_id=attachment_id,
+                    attachment=attachment,
+                )
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 

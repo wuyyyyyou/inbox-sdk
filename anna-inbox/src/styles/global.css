@@ -11074,16 +11074,191 @@ body,
 }
 
 .mail-detail-attachment {
+  position: relative;
   justify-content: space-between;
   gap: 14px;
   padding: 12px 14px;
   border-radius: 14px;
   background: #f6f8fd;
+  transition: background 140ms ease, box-shadow 140ms ease;
+}
+
+.mail-detail-attachment.is-previewable {
+  cursor: pointer;
+}
+
+.mail-detail-attachment.is-previewable:hover,
+.mail-detail-attachment.is-previewable:focus-within {
+  background: #f1f4fc;
+  box-shadow: 0 5px 16px rgba(62, 75, 122, 0.08);
 }
 
 .mail-detail-attachment > div {
   display: grid;
   gap: 4px;
+}
+
+.mail-detail-attachment > div:last-child {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mail-detail-attachment .attachment-preview-hitarea {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.mail-detail-attachment .attachment-preview-hitarea:focus-visible {
+  outline: 2px solid #5068de;
+  outline-offset: 2px;
+}
+
+.mail-detail-attachment-actions {
+  position: relative;
+  z-index: 2;
+}
+
+.mail-detail-attachment .attachment-download-button,
+.attachment-preview-sheet .attachment-download-button,
+.attachment-preview-actions .attachment-download-button {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  min-height: 36px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  color: #7b849d;
+  background: transparent;
+  line-height: 0;
+}
+
+.mail-detail-attachment .attachment-download-button {
+  visibility: hidden;
+  opacity: 0;
+  transform: translateX(4px);
+  transition: color 140ms ease, background 140ms ease, border-color 140ms ease, opacity 140ms ease, transform 140ms ease;
+}
+
+.mail-detail-attachment:hover .attachment-download-button,
+.mail-detail-attachment:focus-within .attachment-download-button {
+  visibility: visible;
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.mail-detail-attachment .attachment-download-button:hover:not(:disabled),
+.mail-detail-attachment .attachment-download-button:focus-visible:not(:disabled),
+.attachment-preview-sheet .attachment-download-button:hover:not(:disabled),
+.attachment-preview-sheet .attachment-download-button:focus-visible:not(:disabled),
+.attachment-preview-actions .attachment-download-button:hover:not(:disabled),
+.attachment-preview-actions .attachment-download-button:focus-visible:not(:disabled) {
+  border-color: rgba(79, 109, 245, 0.14);
+  color: #5068de;
+  background: #e9edfc;
+}
+
+.mail-detail-attachment .attachment-download-button:disabled,
+.attachment-preview-sheet .attachment-download-button:disabled,
+.attachment-preview-actions .attachment-download-button:disabled {
+  visibility: visible;
+  opacity: 0.58;
+  transform: translateX(0);
+  cursor: wait;
+}
+
+.attachment-download-button svg {
+  width: 21px;
+  height: 21px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.attachment-preview-toolbar-button {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  min-height: 36px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  color: #7b849d;
+  background: transparent;
+  line-height: 0;
+}
+
+.attachment-preview-toolbar-button:hover,
+.attachment-preview-toolbar-button:focus-visible {
+  border-color: rgba(79, 109, 245, 0.14);
+  color: #5068de;
+  background: #e9edfc;
+}
+
+.attachment-preview-toolbar-button svg {
+  width: 21px;
+  height: 21px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.attachment-download-button::after,
+.attachment-preview-toolbar-button::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 7px);
+  left: 50%;
+  padding: 6px 8px;
+  border-radius: 7px;
+  color: #fff;
+  background: rgba(24, 24, 28, 0.96);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(-3px);
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.attachment-download-button:hover::after,
+.attachment-download-button:focus-visible::after,
+.attachment-preview-toolbar-button:hover::after,
+.attachment-preview-toolbar-button:focus-visible::after {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+@media (hover: none) {
+  .mail-detail-attachment .attachment-download-button {
+    visibility: visible;
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .mail-detail-quick-replies {
@@ -11430,19 +11605,249 @@ body,
 }
 
 .attachment-preview-sheet {
-  width: min(920px, calc(100vw - 28px));
+  width: calc(100vw - 24px);
+  max-width: none;
+  height: calc(100vh - 24px);
+  margin: 12px auto 0;
+  padding: 0;
+  gap: 0;
+  border-radius: 20px;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.attachment-preview-sheet > header {
+  position: relative;
+  z-index: 20;
+  padding: 14px 18px;
+  border-bottom: 1px solid rgba(120, 131, 164, 0.16);
+  background: rgba(255, 255, 255, 0.96);
+  overflow: visible;
+}
+
+.attachment-preview-sheet > header > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.attachment-preview-sheet > header strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .attachment-preview-body {
-  min-height: 320px;
-  max-height: calc(100vh - 220px);
+  position: relative;
+  z-index: 1;
+  min-height: 0;
+  height: 100%;
+  padding: 18px;
   overflow: auto;
+  background: #eef1f8;
+  will-change: transform, opacity;
+}
+
+.attachment-preview-body.is-exit-next {
+  animation: attachmentPreviewExitLeft 170ms cubic-bezier(0.4, 0, 1, 1) both;
+}
+
+.attachment-preview-body.is-exit-previous {
+  animation: attachmentPreviewExitRight 170ms cubic-bezier(0.4, 0, 1, 1) both;
+}
+
+.attachment-preview-body.is-enter-next {
+  animation: attachmentPreviewEnterRight 240ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.attachment-preview-body.is-enter-previous {
+  animation: attachmentPreviewEnterLeft 240ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes attachmentPreviewExitLeft {
+  from { opacity: 1; transform: translateX(0); }
+  to { opacity: 0; transform: translateX(-9%); }
+}
+
+@keyframes attachmentPreviewExitRight {
+  from { opacity: 1; transform: translateX(0); }
+  to { opacity: 0; transform: translateX(9%); }
+}
+
+@keyframes attachmentPreviewEnterRight {
+  from { opacity: 0; transform: translateX(9%); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes attachmentPreviewEnterLeft {
+  from { opacity: 0; transform: translateX(-9%); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.attachment-preview-pane.is-active {
+  min-height: 100%;
+}
+
+.attachment-preview-pane.is-preloading {
+  position: fixed;
+  top: 0;
+  left: -200vw;
+  width: min(1100px, calc(100vw - 60px));
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.attachment-preview-arrow {
+  position: absolute;
+  z-index: 8;
+  top: 50%;
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  min-height: 52px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: #fff;
+  background: rgba(31, 30, 45, 0.82);
+  box-shadow: 0 10px 28px rgba(24, 27, 43, 0.24);
+  transform: translateY(-50%);
+  transition: background 140ms ease, transform 140ms ease, opacity 140ms ease;
+}
+
+.attachment-preview-arrow.is-previous {
+  left: 18px;
+}
+
+.attachment-preview-arrow.is-next {
+  right: 18px;
+}
+
+.attachment-preview-arrow:hover:not(:disabled),
+.attachment-preview-arrow:focus-visible:not(:disabled) {
+  background: rgba(31, 30, 45, 0.96);
+  transform: translateY(-50%) scale(1.04);
+}
+
+.attachment-preview-arrow:disabled {
+  cursor: wait;
+  opacity: 0.48;
+}
+
+.attachment-preview-arrow svg {
+  width: 30px;
+  height: 30px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .attachment-preview-body.is-exit-next,
+  .attachment-preview-body.is-exit-previous,
+  .attachment-preview-body.is-enter-next,
+  .attachment-preview-body.is-enter-previous {
+    animation: none;
+  }
+}
+
+.attachment-preview-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.attachment-preview-error,
+.attachment-preview-external-only {
+  padding: 18px;
+  border-radius: 16px;
+  background: #f7f9ff;
+}
+
+.attachment-preview-error p,
+.attachment-preview-external-only p {
+  margin: 0;
+}
+
+.attachment-preview-hint {
+  margin: 0 0 12px;
+  color: #4f5b78;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .attachment-preview-body iframe {
   width: 100%;
-  min-height: 70vh;
+  height: 100%;
+  min-height: 0;
   border: 0;
+  background: #fff;
+}
+
+.attachment-preview-body img,
+.attachment-preview-body video {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  margin: 0 auto;
+}
+
+.attachment-preview-body audio {
+  width: min(720px, 100%);
+  margin: 0 auto;
+  display: block;
+}
+
+.attachment-preview-body pre {
+  min-height: 100%;
+  padding: 18px;
+  border-radius: 16px;
+  background: #fff;
+}
+
+.pdf-attachment-preview {
+  width: min(1100px, 100%);
+  min-height: 100%;
+  margin: 0 auto;
+}
+
+.pdf-attachment-progress,
+.pdf-attachment-error {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  width: fit-content;
+  margin: 0 auto 14px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 4px 14px rgba(39, 49, 78, 0.12);
+  color: #4f5b78;
+  font-size: 13px;
+}
+
+.pdf-attachment-error {
+  color: #a03a4d;
+}
+
+.pdf-attachment-pages {
+  display: grid;
+  justify-items: center;
+  gap: 18px;
+}
+
+.pdf-attachment-pages canvas {
+  display: block;
+  max-width: 100%;
+  border-radius: 4px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(39, 49, 78, 0.16);
 }
 
 @media (max-width: 900px) {

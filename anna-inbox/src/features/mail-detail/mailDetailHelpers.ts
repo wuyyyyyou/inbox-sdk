@@ -1,4 +1,23 @@
-import type { DraftReplyArtifact, InboxThreadMessage, MailAttachmentMeta, QuickReplySuggestion } from "../../types/mail";
+import type {
+  AttachmentDownloadPayload,
+  DraftReplyArtifact,
+  InboxThreadMessage,
+  MailAttachmentMeta,
+  QuickReplySuggestion,
+} from "../../types/mail";
+import { triggerBrowserDownload } from "../../shared/browserDownload";
+
+export type AttachmentKind = "pdf" | "image" | "text" | "audio" | "video" | "download";
+
+export interface ResolvedAttachmentAccess {
+  kind: "url" | "blob";
+  url: string;
+  mimeType: string;
+  filename: string;
+  externalPreview: boolean;
+  sourceUrl?: string;
+  revoke?: () => void;
+}
 
 export interface AddressParts {
   name: string;
@@ -67,17 +86,126 @@ export function formatAttachmentSize(size?: number) {
   return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
 }
 
-export function isPreviewableAttachment(attachment: MailAttachmentMeta) {
-  const mime = String(attachment.mime_type || "").toLowerCase();
-  return (
+function attachmentExtension(filename: string) {
+  const match = String(filename || "").trim().toLowerCase().match(/\.([a-z0-9]+)$/);
+  return match?.[1] || "";
+}
+
+export function normalizeAttachmentKind(attachment: Pick<MailAttachmentMeta, "filename" | "mime_type">): AttachmentKind {
+  const mime = String(attachment.mime_type || "").trim().toLowerCase();
+  const extension = attachmentExtension(attachment.filename);
+  if (mime === "application/pdf" || extension === "pdf") return "pdf";
+  if (
     mime.startsWith("image/")
-    || mime === "application/pdf"
-    || mime.startsWith("text/")
+    || ["png", "jpg", "jpeg", "gif", "webp"].includes(extension)
+  ) return "image";
+  if (
+    mime.startsWith("text/")
     || mime === "application/json"
     || mime === "text/csv"
-    || mime.startsWith("audio/")
-    || mime.startsWith("video/")
-  );
+    || ["txt", "json", "csv", "log", "md"].includes(extension)
+  ) return "text";
+  if (
+    mime.startsWith("audio/")
+    || ["mp3", "wav"].includes(extension)
+  ) return "audio";
+  if (
+    mime.startsWith("video/")
+    || ["mp4", "webm"].includes(extension)
+  ) return "video";
+  return "download";
+}
+
+export function isPreviewableAttachment(attachment: MailAttachmentMeta) {
+  return normalizeAttachmentKind(attachment) !== "download";
+}
+
+export function estimateAttachmentPreviewMemory(attachment: Pick<MailAttachmentMeta, "filename" | "mime_type" | "size">) {
+  const megabyte = 1024 * 1024;
+  const size = Math.max(0, Number(attachment.size || 0));
+  switch (normalizeAttachmentKind(attachment)) {
+    case "pdf":
+      return Math.max(12 * megabyte, Math.min(48 * megabyte, size * 12));
+    case "image":
+      return Math.max(4 * megabyte, Math.min(32 * megabyte, size * 4));
+    case "audio":
+    case "video":
+      return 4 * megabyte;
+    case "text":
+      return Math.min(size, 512 * 1024);
+    default:
+      return 0;
+  }
+}
+
+export function resolveAttachmentAccess(payload: AttachmentDownloadPayload): ResolvedAttachmentAccess {
+  const filename = String(payload.filename || "attachment");
+  const mimeType = String(payload.mime_type || "application/octet-stream");
+  if (payload.ok === false) {
+    throw new Error(String(payload.error || "Attachment access failed."));
+  }
+  if (payload.delivery === "inline" && payload.content_b64) {
+    const binary = window.atob(payload.content_b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    const blobUrl = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+    return {
+      kind: "blob",
+      url: blobUrl,
+      mimeType,
+      filename,
+      externalPreview: false,
+      sourceUrl: "",
+      revoke: () => URL.revokeObjectURL(blobUrl),
+    };
+  }
+  const requestedMode = String(payload.mode || "download");
+  const preferredUrl = requestedMode === "preview"
+    ? String(payload.preview_url || payload.download_url || "")
+    : String(payload.download_url || payload.preview_url || "");
+  if (preferredUrl) {
+    return {
+      kind: "url",
+      url: preferredUrl,
+      mimeType,
+      filename,
+      externalPreview: requestedMode === "preview" && !payload.preview_url && Boolean(payload.download_url),
+      sourceUrl: preferredUrl,
+    };
+  }
+  throw new Error(String(payload.error || "Attachment content is unavailable."));
+}
+
+export async function materializeAttachmentAccess(access: ResolvedAttachmentAccess): Promise<ResolvedAttachmentAccess> {
+  if (access.kind === "blob") return access;
+  const response = await fetch(access.url);
+  if (!response.ok) {
+    throw new Error(`Attachment fetch failed with ${response.status}`);
+  }
+  const responseBlob = await response.blob();
+  const blob = responseBlob.type || !access.mimeType
+    ? responseBlob
+    : new Blob([await responseBlob.arrayBuffer()], { type: access.mimeType });
+  const blobUrl = URL.createObjectURL(blob);
+  return {
+    kind: "blob",
+    url: blobUrl,
+    mimeType: blob.type || access.mimeType,
+    filename: access.filename,
+    externalPreview: access.externalPreview,
+    sourceUrl: access.sourceUrl || access.url,
+    revoke: () => URL.revokeObjectURL(blobUrl),
+  };
+}
+
+export function triggerAttachmentDownload(
+  access: ResolvedAttachmentAccess,
+  filename?: string,
+  ownerDocument: Document = document,
+) {
+  triggerBrowserDownload(access.url, filename || access.filename || "attachment", ownerDocument);
 }
 
 export function deriveReplyToAddress(message: InboxThreadMessage | undefined, mailbox: string) {
