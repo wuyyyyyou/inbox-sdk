@@ -1,4 +1,4 @@
-# Anna Inbox 2.0.1
+# Anna Inbox 2.0.2
 
 Anna Inbox 是运行在 Anna App 中的 Gmail 工作台。2.0 以完整收件箱和 AI 侧栏为主界面：用户可以浏览和处理邮件、查看线程详情、保存草稿、预览附件，并让 Anna 搜索、汇总或协助回复邮件。
 
@@ -107,7 +107,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' | uv --directory inbo
 
 ## 版本与发布
 
-App、Executa manifest、开发 stub 和 Python package 当前统一为 `2.0.1`。
+App、Executa manifest、开发 stub 和 Python package 当前统一为 `2.0.2`。
 
 Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Executa 版本后运行：
 

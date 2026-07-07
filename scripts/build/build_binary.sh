@@ -271,15 +271,51 @@ if method == "describe":
         raise SystemExit(f"describe smoke returned name={result.get('name')!r}, expected {tool_id!r}")
     if result.get("version") != version:
         raise SystemExit(f"describe smoke returned version={result.get('version')!r}, expected {version!r}")
+    tool_names = {
+        tool.get("name")
+        for tool in result.get("tools", [])
+        if isinstance(tool, dict)
+    }
+    if "list_inbox_emails" not in tool_names:
+        raise SystemExit("describe smoke did not register required tool list_inbox_emails")
 elif method == "health":
     if result.get("status") != "healthy":
         raise SystemExit(f"health smoke returned status={result.get('status')!r}")
 PY
 }
 
+run_list_inbox_invoke_smoke() {
+  local output_path="$WORK_DIR/smoke-invoke-list-inbox.out"
+  local error_path="$WORK_DIR/smoke-invoke-list-inbox.err"
+  local smoke_storage_dir="$WORK_DIR/smoke-local-storage"
+
+  printf '%s\n' '{"jsonrpc":"2.0","method":"invoke","params":{"tool":"list_inbox_emails","arguments":{"mailbox":""},"context":{}},"id":1}' \
+    | env ZHAOPY_MAIL_AGENT_STORAGE_DIR="$smoke_storage_dir" "$PACKAGE_DIR/bin/$BINARY_NAME" >"$output_path" 2>"$error_path"
+
+  "$PYTHON_BIN" - "$output_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+output_path = Path(sys.argv[1])
+lines = [line for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+if len(lines) != 1:
+    raise SystemExit(f"list_inbox_emails invoke smoke expected one JSON line, got {len(lines)}")
+payload = json.loads(lines[0])
+if payload.get("jsonrpc") != "2.0" or payload.get("id") != 1:
+    raise SystemExit("list_inbox_emails invoke smoke returned invalid JSON-RPC envelope")
+error = payload.get("error")
+if isinstance(error, dict) and str(error.get("message", "")).startswith("Unknown tool:"):
+    raise SystemExit("list_inbox_emails invoke smoke reached an unregistered dispatcher tool")
+if not isinstance(payload.get("result"), dict) and not isinstance(error, dict):
+    raise SystemExit("list_inbox_emails invoke smoke returned neither result nor error")
+PY
+}
+
 if [ "$SKIP_SMOKE" -eq 0 ]; then
   run_smoke describe
   run_smoke health
+  run_list_inbox_invoke_smoke
 else
   echo "Skipping smoke tests."
 fi
