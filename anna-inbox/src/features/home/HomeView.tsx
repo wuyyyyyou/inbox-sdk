@@ -37,6 +37,7 @@ type MailboxView =
 type MailUiFlags = {
   todos: string[];
   snoozed: string[];
+  snoozedUntil?: Record<string, string>;
   done: string[];
   doneRemoved: string[];
   drafts: string[];
@@ -86,8 +87,8 @@ const MAILBOX_VIEWS: Array<{ id: MailboxView; label: string }> = [
 
 function isLocalMailboxView(
   view: MailboxView,
-): view is "todos" | "snoozed" | "done" {
-  return view === "todos" || view === "snoozed" || view === "done";
+): view is "todos" | "snoozed" | "done" | "drafts" {
+  return view === "todos" || view === "snoozed" || view === "done" || view === "drafts";
 }
 
 function scheduleDeferredWork(task: () => void, delayMs = 180) {
@@ -389,14 +390,20 @@ export function messageParticipant(
   );
   const sender = senderParts(message.from);
   const normalizedMailbox = mailbox.trim().toLowerCase();
+  const draft = isDraftMessage(message);
   const outgoing =
     mailboxView === "sent" ||
     labels.has("SENT") ||
-    labels.has("DRAFT") ||
+    draft ||
     Boolean(
       normalizedMailbox && sender.email.toLowerCase() === normalizedMailbox,
     );
-  const recipients = splitAddresses(message.to).map(senderParts);
+  const recipientSource = draft
+    && normalizedMailbox
+    && sender.email.toLowerCase() !== normalizedMailbox
+    ? message.from
+    : message.to;
+  const recipients = splitAddresses(recipientSource).map(senderParts);
   const outgoingParticipant = () => {
     const names = [
       "me",
@@ -413,14 +420,14 @@ export function messageParticipant(
     const name = names.join(", ") || "me";
     return {
       name,
-      title: String(message.to || message.from || "Draft without recipients"),
+      title: String(recipientSource || message.from || "Draft without recipients"),
       initial: recipients[0]?.name || "me",
       email: recipients[0]?.email || normalizedMailbox,
       outgoing,
     };
   };
 
-  if (labels.has("DRAFT")) {
+  if (draft) {
     return outgoingParticipant();
   }
 
@@ -428,7 +435,7 @@ export function messageParticipant(
     return outgoingParticipant();
   }
 
-  const fallbackName = labels.has("DRAFT") ? "Draft" : "No sender";
+  const fallbackName = draft ? "Draft" : "No sender";
   return {
     name: sender.name === "Unknown sender" ? fallbackName : sender.name,
     title: String(message.from || fallbackName),
@@ -468,6 +475,23 @@ function dateLabel(message: InboxMessage) {
   yesterday.setDate(now.getDate() - 1);
   if (date.toDateString() === yesterday.toDateString()) return "Yesterday";
   return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function snoozeUntilLabel(value: string | undefined) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const target = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const days = Math.round((target.getTime() - today.getTime()) / (24 * 60 * 60 * 1000));
+  const dayLabel = days === 0
+    ? "Today"
+    : days === 1
+      ? "Tomorrow"
+      : date.toLocaleDateString("en-US", days > 1 && days < 7 ? { weekday: "short" } : { month: "short", day: "numeric" });
+  const timeLabel = `${date.getHours()}:${String(date.getMinutes()).padStart(2, "0")}`;
+  return `${dayLabel} ${timeLabel}`;
 }
 
 function groupLabel(message: InboxMessage) {
@@ -510,9 +534,15 @@ export function isStarredMessage(message: InboxMessage) {
 }
 
 export function isDraftMessage(message: InboxMessage) {
-  return (message.label_ids || []).some(
-    (label) => label.toUpperCase() === "DRAFT",
-  );
+  return Boolean(message.draft_local || message.draft_body);
+}
+
+export function shouldShowImportantIcon(
+  important: boolean,
+  outgoing: boolean,
+  draft: boolean,
+) {
+  return important && (!outgoing || draft);
 }
 
 export function isSentMessage(message: InboxMessage) {
@@ -528,10 +558,36 @@ export function isSentMessage(message: InboxMessage) {
   );
 }
 
+export function mergeDraftOverlayMessages(
+  messages: InboxMessage[],
+  drafts: InboxMessage[],
+) {
+  const draftsByThread = new Map(
+    drafts.map((draft) => [draft.thread_id || draft.id, draft]),
+  );
+  const merged = messages.map((message) => {
+    const threadKey = message.thread_id || message.id;
+    const draft = draftsByThread.get(threadKey);
+    if (!draft) return message;
+    draftsByThread.delete(threadKey);
+    return {
+      ...message,
+      ...draft,
+      id: message.id,
+      thread_id: message.thread_id || draft.thread_id,
+      label_ids: [...new Set([...(message.label_ids || []), ...(draft.label_ids || [])])],
+      important: Boolean(message.important || draft.important),
+      starred: Boolean(message.starred || draft.starred),
+    };
+  });
+  return [...merged, ...draftsByThread.values()];
+}
+
 export function isDoneMessage(
   message: InboxMessage,
-  flags: Pick<MailUiFlags, "done">,
+  flags: Pick<MailUiFlags, "done" | "doneRemoved">,
 ) {
+  if (flags.doneRemoved.includes(message.id)) return false;
   return flags.done.includes(message.id) || isSentMessage(message);
 }
 
@@ -581,7 +637,7 @@ export function resolveSourceMessages(
     );
   if (mailboxView === "drafts")
     return sortInboxMessagesDesc(
-      source.filter((message) => hasMessageLabel(message, "DRAFT")),
+      source.filter((message) => isDraftMessage(message)),
     );
   if (mailboxView === "sent")
     return sortInboxMessagesDesc(
@@ -615,6 +671,7 @@ function InboxRow({
   mailbox,
   onSelect,
   onFlag,
+  onThreadAction,
   onSnooze,
   onPrefetch,
   avatarUrl,
@@ -626,6 +683,7 @@ function InboxRow({
   mailbox: string;
   onSelect: () => void;
   onFlag: (kind: CategoryFlag, message: InboxMessage) => void;
+  onThreadAction: (operation: InboxThreadStateOperation, message: InboxMessage) => void;
   onSnooze: (message: InboxMessage) => void;
   onPrefetch: () => void;
   avatarUrl?: string;
@@ -637,16 +695,20 @@ function InboxRow({
   const sentView = participant.outgoing;
   const sentMessage = isSentMessage(message);
   const isDone = isDoneMessage(message, flags);
+  const isTodo = flags.todos.includes(message.id);
+  const isSnoozed = flags.snoozed.includes(message.id);
+  const snoozeLabel = mailboxView === "snoozed" ? snoozeUntilLabel(flags.snoozedUntil?.[message.id]) : "";
+  const important = isImportantMessage(message);
   const starred = isStarredMessage(message);
   const draft = isDraftMessage(message);
   const preview =
-    message.snippet || message.body_preview || "No preview available";
+    (draft ? message.draft_body : "") || message.snippet || message.body_preview || "No preview available";
   return (
     <article
       className={`mail-row ${mailboxView === "all" ? "is-all-mail" : ""} ${message.unread ? "is-unread" : ""} ${selected ? "is-selected" : ""}`}
     >
       <button
-        className="mail-row-main"
+        className={`mail-row-main ${snoozeLabel ? "has-snooze-time" : ""}`}
         data-mail-row-id={message.id}
         onMouseEnter={onPrefetch}
         onFocus={onPrefetch}
@@ -689,7 +751,7 @@ function InboxRow({
           </span>
         </span>
         <span className="mail-flags">
-          {isImportantMessage(message) && !sentView ? (
+          {shouldShowImportantIcon(important, sentView, draft) ? (
             <span className="mail-important-icon" title="Important">
               <ImportantIcon />
             </span>
@@ -724,11 +786,18 @@ function InboxRow({
             </span>
           ) : null}
         </span>
-        <time>{dateLabel(message)}</time>
+        {snoozeLabel ? (
+          <span className="mail-snooze-until" title={`Snoozed until ${snoozeLabel}`}>
+            <ClockIcon />
+            <span>{snoozeLabel}</span>
+          </span>
+        ) : (
+          <time>{dateLabel(message)}</time>
+        )}
       </button>
       <span className="mail-row-actions">
         <button
-          className={starred ? "is-active" : ""}
+          className={starred ? "is-active is-starred" : ""}
           aria-label={starred ? "Unstar" : "Star"}
           data-tooltip={starred ? "Unstar" : "Star"}
           onClick={() => void actions.setInboxStarred(message.id, !starred)}
@@ -736,17 +805,26 @@ function InboxRow({
           <StarIcon />
         </button>
         <button
-          className={flags.todos.includes(message.id) ? "is-active" : ""}
-          aria-label="Add to Todos"
-          data-tooltip="Add to Todos"
+          className={important ? "is-active is-important" : ""}
+          aria-label={important ? "Mark not important" : "Mark important"}
+          data-tooltip={important ? "Mark not important" : "Mark important"}
+          onClick={() => onThreadAction(important ? "mark_not_important" : "mark_important", message)}
+        >
+          <ImportantIcon />
+        </button>
+        <button
+          className={isTodo ? "is-active is-todo" : ""}
+          aria-label={isTodo ? "Click Done to remove" : "Add to Todo"}
+          data-tooltip={isTodo ? "Click Done to remove" : "Add to Todo"}
+          disabled={isTodo}
           onClick={() => onFlag("todos", message)}
         >
           <TodoIcon />
         </button>
         <button
-          className={flags.snoozed.includes(message.id) ? "is-active" : ""}
-          aria-label="Snooze"
-          data-tooltip="Snooze"
+          className={isSnoozed ? "is-active is-snoozed" : ""}
+          aria-label={isSnoozed ? "Remove from snoozed" : "Snooze"}
+          data-tooltip={isSnoozed ? "Remove from snoozed" : "Snooze"}
           onClick={() => onSnooze(message)}
         >
           <ClockIcon />
@@ -1461,6 +1539,7 @@ export function HomeView() {
   const [flags, setFlags] = useState<MailUiFlags>({
     todos: [],
     snoozed: [],
+    snoozedUntil: {},
     done: [],
     doneRemoved: [],
     drafts: [],
@@ -1560,6 +1639,10 @@ export function HomeView() {
       setFlags({
         todos: Array.isArray(saved.todos) ? saved.todos : [],
         snoozed: Array.isArray(saved.snoozed) ? saved.snoozed : [],
+        snoozedUntil:
+          saved.snoozedUntil && typeof saved.snoozedUntil === "object"
+            ? saved.snoozedUntil
+            : {},
         done: Array.isArray(saved.done) ? saved.done : [],
         doneRemoved: Array.isArray(saved.doneRemoved) ? saved.doneRemoved : [],
         drafts: Array.isArray(saved.drafts) ? saved.drafts : [],
@@ -1570,6 +1653,7 @@ export function HomeView() {
       setFlags({
         todos: [],
         snoozed: [],
+        snoozedUntil: {},
         done: [],
         doneRemoved: [],
         drafts: [],
@@ -1654,15 +1738,23 @@ export function HomeView() {
   );
   const localCategory = isLocalMailboxView(mailboxView);
 
+  const inboxMessagesWithDrafts = useMemo(
+    () => mergeDraftOverlayMessages(state.inboxMessages, state.inboxDraftMessages),
+    [state.inboxDraftMessages, state.inboxMessages],
+  );
+  const inboxSnapshotMessagesWithDrafts = useMemo(
+    () => mergeDraftOverlayMessages(state.inboxSnapshotMessages, state.inboxDraftMessages),
+    [state.inboxDraftMessages, state.inboxSnapshotMessages],
+  );
   const sourceMessages = useMemo(
     () =>
       resolveSourceMessages(
         mailboxView,
-        state.inboxMessages,
-        state.inboxSnapshotMessages,
+        inboxMessagesWithDrafts,
+        inboxSnapshotMessagesWithDrafts,
         flags,
       ),
-    [flags, mailboxView, state.inboxMessages, state.inboxSnapshotMessages],
+    [flags, inboxMessagesWithDrafts, inboxSnapshotMessagesWithDrafts, mailboxView],
   );
 
   const messagesInThread = useCallback(
@@ -1688,14 +1780,19 @@ export function HomeView() {
       kind: "todos" | "snoozed" | "done",
       messages: InboxMessage[],
       enabled: boolean,
+      snoozeUntil?: string,
     ) => {
       const ids = new Set(messages.map((item) => item.id));
       setFlags((current) => {
-        const next = { ...current, saved: { ...current.saved } };
+        const next = { ...current, saved: { ...current.saved }, snoozedUntil: { ...(current.snoozedUntil || {}) } };
         for (const workflowKind of ["todos", "snoozed", "done"] as const) {
           const retained = current[workflowKind].filter((id) => !ids.has(id));
           next[workflowKind] =
             enabled && workflowKind === kind ? [...retained, ...ids] : retained;
+        }
+        for (const id of ids) delete next.snoozedUntil[id];
+        if (enabled && kind === "snoozed" && snoozeUntil) {
+          for (const id of ids) next.snoozedUntil[id] = snoozeUntil;
         }
         if (kind === "done") {
           const sentIds = messages.filter(isSentMessage).map((item) => item.id);
@@ -1716,12 +1813,16 @@ export function HomeView() {
     (messages: InboxMessage[], previous: MailUiFlags) => {
       const ids = new Set(messages.map((item) => item.id));
       setFlags((current) => {
-        const next = { ...current, saved: { ...current.saved } };
+        const next = { ...current, saved: { ...current.saved }, snoozedUntil: { ...(current.snoozedUntil || {}) } };
         for (const workflowKind of ["todos", "snoozed", "done"] as const) {
           next[workflowKind] = [
             ...current[workflowKind].filter((id) => !ids.has(id)),
             ...previous[workflowKind].filter((id) => ids.has(id)),
           ];
+        }
+        for (const id of ids) {
+          if (previous.snoozedUntil?.[id]) next.snoozedUntil[id] = previous.snoozedUntil[id];
+          else delete next.snoozedUntil[id];
         }
         next.doneRemoved = [
           ...current.doneRemoved.filter((id) => !ids.has(id)),
@@ -1968,6 +2069,11 @@ export function HomeView() {
       setFeedAction("refresh");
       try {
         if (localCategory) {
+          if (mailboxView === "drafts") {
+            await actions.listInboxThreadDrafts(mailbox, 100);
+            setFeedWindow((current) => ({ ...current, localLimit: INBOX_FEED_PAGE_SIZE }));
+            return true;
+          }
           const result = await actions.refreshInboxEmails("inbox", 7);
           if (result.ok) {
             setFeedWindow((current) => ({
@@ -2000,7 +2106,7 @@ export function HomeView() {
         setFeedAction((current) => (current === "refresh" ? null : current));
       }
     },
-    [actions, feedWindow.days, loadRemoteCategory, localCategory, mailboxView],
+    [actions, feedWindow.days, loadRemoteCategory, localCategory, mailbox, mailboxView],
   );
 
   const loadOlderInbox = useCallback(async () => {
@@ -2274,6 +2380,7 @@ export function HomeView() {
     if (!selectedId) return null;
     return (
       sourceMessages.find((item) => item.id === selectedId) ||
+      state.inboxDraftMessages.find((item) => item.id === selectedId) ||
       state.inboxSnapshotMessages.find((item) => item.id === selectedId) ||
       state.inboxMessages.find((item) => item.id === selectedId) ||
       flags.saved[selectedId] ||
@@ -2283,6 +2390,7 @@ export function HomeView() {
     flags.saved,
     selectedId,
     sourceMessages,
+    state.inboxDraftMessages,
     state.inboxMessages,
     state.inboxSnapshotMessages,
   ]);
@@ -2306,11 +2414,12 @@ export function HomeView() {
     [flags, selectedMessage, sourceMessages],
   );
 
-  const latestSelectedThreadMessageId = useMemo(() => {
-    if (!selectedMessage) return "";
+  const latestSelectedThreadMessage = useMemo(() => {
+    if (!selectedMessage) return null;
     const threadKey = selectedMessage.thread_id || selectedMessage.id;
     const candidates = [
       ...sourceMessages,
+      ...state.inboxDraftMessages,
       ...state.inboxSnapshotMessages,
       ...state.inboxMessages,
       flags.saved[selectedId],
@@ -2322,12 +2431,13 @@ export function HomeView() {
       const latestTime = Number(latest.internal_date || 0);
       if (Number.isFinite(itemTime) && itemTime > latestTime) latest = item;
     }
-    return latest.id || "";
+    return latest;
   }, [
     flags.saved,
     selectedId,
     selectedMessage,
     sourceMessages,
+    state.inboxDraftMessages,
     state.inboxMessages,
     state.inboxSnapshotMessages,
   ]);
@@ -2502,9 +2612,32 @@ export function HomeView() {
       }
       const messages = messagesInThread(message);
       const enabled = flags[kind].includes(message.id);
+      if (kind === "todos") {
+        if (enabled) return;
+        const previous = flags;
+        setWorkflowFlag("todos", messages, true);
+        actions.showToast("Added to Todo.", {
+          actionLabel: "Undo",
+          onAction: () => restoreWorkflowFlags(messages, previous),
+          secondaryActionLabel: "View",
+          onSecondaryAction: () => {
+            setMailboxView("todos");
+            setFolderOpen(false);
+            setSelectedId("");
+          },
+        });
+        return;
+      }
       setWorkflowFlag(kind, messages, !enabled);
     },
-    [flags, messagesInThread, setWorkflowFlag, toggleDoneState],
+    [
+      actions,
+      flags,
+      messagesInThread,
+      restoreWorkflowFlags,
+      setWorkflowFlag,
+      toggleDoneState,
+    ],
   );
 
   const handleTodoFromDetail = useCallback(
@@ -2573,7 +2706,7 @@ export function HomeView() {
       const previous = flags;
       const messages = messagesInThread(target);
       setSnoozeTarget(null);
-      setWorkflowFlag("snoozed", messages, true);
+      setWorkflowFlag("snoozed", messages, true, isoTime);
       if (selectedId === target.id) {
         closeDetailDrawer();
       }
@@ -2619,6 +2752,12 @@ export function HomeView() {
     if (next === "done") {
       void actions
         .loadCachedInboxEmails("sent", 7, 0, false)
+        .catch(() => undefined);
+      return;
+    }
+    if (next === "drafts") {
+      void actions
+        .listInboxThreadDrafts(mailbox, 100)
         .catch(() => undefined);
       return;
     }
@@ -2855,6 +2994,7 @@ export function HomeView() {
                       avatarUrl={contactAvatars[avatarEmail]}
                       onPrefetch={() => void prefetchMessageBody(message)}
                       onFlag={updateFlag}
+                      onThreadAction={(operation, message) => void handleGmailThreadAction(operation, message)}
                       onSnooze={openSnoozePicker}
                       onSelect={() => openMessageDetail(message)}
                     />
@@ -2923,7 +3063,8 @@ export function HomeView() {
           sendInboxThreadReply={actions.sendInboxThreadReply}
           contactAvatars={contactAvatars}
           loadContactAvatars={actions.loadContactAvatars}
-          latestThreadMessageId={latestSelectedThreadMessageId}
+          latestThreadMessageId={latestSelectedThreadMessage?.id || ""}
+          latestThreadInternalDate={latestSelectedThreadMessage?.internal_date || ""}
         />
         <SnoozePicker
           open={Boolean(snoozeTarget)}

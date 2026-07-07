@@ -19,6 +19,7 @@ import type {
   FrontendCard,
   GmailErrorPopup,
   InboxFeedPayload,
+  InboxMessage,
   InboxMessageDisplayBodyPayload,
   InboxThreadAssistPayload,
   InboxThreadDraftPayload,
@@ -175,6 +176,76 @@ function patchInboxMessageList(messages: InboxFeedPayload["messages"], messageId
       return updater(message);
     })
     .filter((message): message is InboxFeedPayload["messages"][number] => Boolean(message));
+}
+
+function patchInboxThreadDraftPreview(messages: InboxFeedPayload["messages"], mailbox: string, threadId: string, body: string) {
+  const normalized = normalizedMailbox(mailbox);
+  const preview = body.trim();
+  if (!normalized || !threadId || !preview) return messages;
+  return messages.map((message) => {
+    if (normalizedMailbox(message.mailbox || normalized) !== normalized || message.thread_id !== threadId) return message;
+    const labels = new Set((message.label_ids || []).map((label) => String(label)));
+    labels.add("DRAFT");
+    return {
+      ...message,
+      draft_body: preview,
+      draft_local: true,
+      body_preview: preview,
+      label_ids: [...labels],
+    };
+  });
+}
+
+function clearInboxThreadDraftPreview(messages: InboxFeedPayload["messages"], mailbox: string, threadId: string) {
+  const normalized = normalizedMailbox(mailbox);
+  if (!normalized || !threadId) return messages;
+  return messages.map((message) => {
+    if (normalizedMailbox(message.mailbox || normalized) !== normalized || message.thread_id !== threadId) return message;
+    const labels = (message.label_ids || []).filter((label) => String(label).toUpperCase() !== "DRAFT");
+    return {
+      ...message,
+      draft_body: "",
+      draft_local: false,
+      label_ids: labels,
+    };
+  });
+}
+
+function upsertInboxThreadDraftPreview(
+  messages: InboxMessage[],
+  mailbox: string,
+  threadId: string,
+  body: string,
+  source?: Record<string, unknown>,
+) {
+  const normalized = normalizedMailbox(mailbox);
+  const preview = body.trim();
+  if (!normalized || !threadId || !preview) return messages;
+  const sourceMessage = (source || {}) as Partial<InboxMessage>;
+  const existingIndex = messages.findIndex((message) =>
+    normalizedMailbox(message.mailbox || normalized) === normalized
+    && (message.thread_id || message.id) === threadId,
+  );
+  const existing = existingIndex >= 0 ? messages[existingIndex] : undefined;
+  const labels = new Set([
+    ...(existing?.label_ids || []),
+    ...(sourceMessage.label_ids || []),
+  ].map((label) => String(label)));
+  labels.add("DRAFT");
+  const nextMessage: InboxMessage = {
+    ...existing,
+    ...sourceMessage,
+    id: String(sourceMessage.id || existing?.id || threadId),
+    thread_id: threadId,
+    mailbox: normalized,
+    draft_body: preview,
+    draft_local: true,
+    body_preview: preview,
+    snippet: preview,
+    label_ids: [...labels],
+  };
+  if (existingIndex < 0) return [nextMessage, ...messages];
+  return messages.map((message, index) => index === existingIndex ? nextMessage : message);
 }
 
 const AI_ASK_HISTORY_STORAGE_KEY = "anna-inbox:ai-ask-history:v1";
@@ -395,7 +466,8 @@ export interface AppActions {
   loadInboxMessageDisplayBody(mailbox: string, messageId: string): Promise<InboxMessageDisplayBodyPayload>;
   loadInboxThreadAssist(mailbox: string, threadId: string, latestMessageId: string, anchorMessageId?: string): Promise<InboxThreadAssistPayload>;
   getInboxThreadDraft(mailbox: string, threadId: string): Promise<InboxThreadDraftPayload>;
-  saveInboxThreadDraft(mailbox: string, threadId: string, body: string, ifMatch?: string): Promise<{ ok?: boolean; etag?: string; updated?: boolean }>;
+  listInboxThreadDrafts(mailbox: string, limit?: number): Promise<InboxFeedPayload>;
+  saveInboxThreadDraft(mailbox: string, threadId: string, body: string, ifMatch?: string, message?: Record<string, unknown>): Promise<{ ok?: boolean; etag?: string; updated?: boolean }>;
   deleteInboxThreadDraft(mailbox: string, threadId: string): Promise<{ ok?: boolean }>;
   prepareInboxAttachmentAccess(mailbox: string, messageId: string, attachmentId: string, mode: "preview" | "download"): Promise<AttachmentDownloadPayload>;
   modifyInboxMessageLabels(mailbox: string, messageIds: string[], addLabelIds?: string[], removeLabelIds?: string[]): Promise<void>;
@@ -1482,6 +1554,7 @@ export function useAppController() {
           inboxError: "",
           inboxMessages: [],
           inboxSnapshotMessages: [],
+          inboxDraftMessages: [],
           inboxSnapshotComplete: false,
         };
       });
@@ -1707,11 +1780,46 @@ export function useAppController() {
     async getInboxThreadDraft(mailbox, threadId) {
       return client.getInboxThreadDraft(normalizedMailbox(mailbox), threadId);
     },
-    async saveInboxThreadDraft(mailbox, threadId, body, ifMatch) {
-      return client.saveInboxThreadDraft(normalizedMailbox(mailbox), threadId, body, ifMatch);
+    async listInboxThreadDrafts(mailbox, limit = 100) {
+      const normalized = normalizedMailbox(mailbox);
+      const payload = await client.listInboxThreadDrafts(normalized, limit);
+      setState((s) => ({
+        ...s,
+        inboxDraftMessages: Array.isArray(payload.messages) ? payload.messages : [],
+        inboxUpdatedAt: String(payload.updated_at || ""),
+        inboxLoading: false,
+        inboxSnapshotLoading: false,
+        inboxSnapshotComplete: true,
+        inboxError: "",
+      }));
+      return payload;
+    },
+    async saveInboxThreadDraft(mailbox, threadId, body, ifMatch, message) {
+      const normalized = normalizedMailbox(mailbox);
+      const result = await client.saveInboxThreadDraft(normalized, threadId, body, ifMatch, message);
+      if (body.trim()) {
+        setState((s) => ({
+          ...s,
+          inboxMessages: patchInboxThreadDraftPreview(s.inboxMessages, normalized, threadId, body),
+          inboxSnapshotMessages: patchInboxThreadDraftPreview(s.inboxSnapshotMessages, normalized, threadId, body),
+          inboxDraftMessages: upsertInboxThreadDraftPreview(s.inboxDraftMessages, normalized, threadId, body, message),
+        }));
+      }
+      return result;
     },
     async deleteInboxThreadDraft(mailbox, threadId) {
-      return client.deleteInboxThreadDraft(normalizedMailbox(mailbox), threadId);
+      const normalized = normalizedMailbox(mailbox);
+      const result = await client.deleteInboxThreadDraft(normalized, threadId);
+      setState((s) => ({
+        ...s,
+        inboxMessages: clearInboxThreadDraftPreview(s.inboxMessages, normalized, threadId),
+        inboxSnapshotMessages: clearInboxThreadDraftPreview(s.inboxSnapshotMessages, normalized, threadId),
+        inboxDraftMessages: s.inboxDraftMessages.filter((message) =>
+          normalizedMailbox(message.mailbox || normalized) !== normalized
+          || (message.thread_id || message.id) !== threadId,
+        ),
+      }));
+      return result;
     },
     async prepareInboxAttachmentAccess(mailbox, messageId, attachmentId, mode) {
       return client.prepareInboxAttachmentAccess(normalizedMailbox(mailbox), messageId, attachmentId, mode);

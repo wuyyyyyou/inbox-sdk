@@ -32,7 +32,9 @@
 - 明确承接上一轮回答、artifact 或当前打开 thread 时，优先走 chat / mail-context prompt。
 - 对短指令、指代词和上下文依赖表达保持保守，不直接扫描邮箱。
 - 不确定时先澄清，而不是做高成本、低相关的 inbox scan。
-- 第一阶段尽量不改 Executa 工具契约，不修改 Python 后端协议。
+- 意图路由第一阶段不改 Executa 工具名和输入参数；结果说明能力只做向后兼容的可选输出字段扩展。
+- draft 结果的主操作随当前打开的 thread 动态变化：不在目标 thread 时引导跳转，已在目标 thread 时允许追加或替换草稿。
+- 生成 draft 时同时给出必要的上下文说明和结果总结，不只展示一块孤立的草稿正文。
 
 ## 3. 意图区分模型
 
@@ -101,7 +103,7 @@ Do you want me to revise the current draft, or search your inbox?
 
 ## 5. 第一阶段实施方案：前端确定性路由
 
-第一阶段只改前端路由，不改 Executa 工具契约。
+意图路由第一阶段只改前端，不改 Executa 工具名和输入参数。第 5.7 节的结果说明呈现是独立的兼容性增强，需要增加可选输出字段。
 
 ### 5.1 新增路由 helper
 
@@ -200,6 +202,74 @@ interface AiClarificationPayload {
 - `clarify`：立即显示澄清卡片，不显示 `Thinking`，不进入 loading
 
 同时保留现有 `New chat` 行为：点击 New chat 后清空 `aiChatMessages`，短指令不再继承旧 artifact。
+
+### 5.6 Draft artifact 的上下文操作按钮
+
+draft artifact 必须携带 `mailbox + thread_id`。前端不得仅根据“邮件详情抽屉是否打开”决定按钮，而应比较 artifact 指向的目标 thread 与当前详情页 thread：
+
+```ts
+const isTargetThreadOpen =
+  currentMailDetail != null
+  && normalizeMailbox(currentMailDetail.mailbox) === normalizeMailbox(artifact.mailbox)
+  && currentMailDetail.threadId === artifact.thread_id;
+```
+
+按钮按实时页面上下文渲染：
+
+| 页面状态 | 主操作 | 行为 |
+| --- | --- | --- |
+| 未打开邮件详情，或当前打开的是其他 thread | `Go to thread` | 打开 artifact 对应的 mailbox/thread 详情；保留左侧 AI 对话和该 artifact |
+| 已打开 artifact 对应的 thread | `Append to draft reply` | 把生成内容追加到当前 reply composer；若已有内容，使用明确的换行分隔，不静默覆盖 |
+| 已打开 artifact 对应的 thread | `Replace draft reply` | 用生成内容替换当前 reply composer；当前草稿非空时应防止误覆盖，可使用确认或可撤销机制 |
+
+补充规则：
+
+- 当前打开的是其他邮件时，仍显示 `Go to thread`，不能把草稿写进错误 thread。
+- 点击 `Go to thread` 后，详情加载成功，按钮应基于新上下文自动切换为 `Append to draft reply` / `Replace draft reply`，不要求重新生成。
+- thread 不在当前 Inbox 列表时，复用 thread page fallback，通过 `mailbox + thread_id` 拉取并打开；跳转失败时显示错误提示，不丢失生成结果。
+- `Append` / `Replace` 只更新 composer，不自动发送邮件，不自动 mark read。
+- 复制等次要动作可放入 `...` 菜单，但不能取代上述上下文主操作。
+
+这对应参考图的两种状态：图 1 是目标 thread 未打开，图 2 是目标 thread 已打开。
+
+### 5.7 生成结果的说明文字与内容顺序
+
+mail-context 生成结果不应只返回 draft artifact。一次完整回答按固定顺序包含三个可独立渲染的部分：
+
+1. `assistant_text`：生成前的简短说明，说明已读取当前 thread、对用户意图和关键上下文的理解。
+2. `draft_reply` artifact：实际可操作的草稿正文。
+3. `assistant_followup_text`：生成后的简短总结，说明草稿采用的策略、关键取舍以及用户可以继续怎样调整。
+
+期望呈现形态：
+
+```text
+I'll read the email first to understand the context, then help you draft a reply.
+
+[draft reply artifact + context-aware actions]
+
+I've drafted the reply to acknowledge their decision, thank them for their time,
+and keep the door open for future collaboration. Feel free to adjust it as needed.
+```
+
+实现约束：
+
+- 说明文字必须基于同一次 mail-context 生成结果，不在前端用固定模板臆测邮件内容。
+- `assistant_text` 和 `assistant_followup_text` 应简洁，避免重复粘贴 artifact 正文；允许使用短段落或少量 bullet。
+- UI 必须按“前置说明 -> artifact -> 后置总结”的顺序渲染，不能把两段说明合并后全部放在 artifact 前面。
+- 为保持向后兼容，保留现有 `assistant_text`，在 mail prompt result 中新增可选 `assistant_followup_text`；旧结果缺少该字段时仍正常展示 artifact。
+- LLM fallback 至少返回简短 `assistant_text`；无法可靠生成后置总结时可以省略 `assistant_followup_text`，不能编造具体判断。
+- typing animation 只影响说明文字的显示节奏，不应导致 artifact 操作按钮永久不可用；前置说明完成后即可展示 artifact，后置说明随后展示。
+
+建议结果类型向后兼容扩展：
+
+```ts
+interface MailPromptRunResult {
+  // existing fields omitted
+  assistant_text: string;
+  assistant_followup_text?: string;
+  artifact?: DraftReplyArtifact | null;
+}
+```
 
 ## 6. 第二阶段：路由可观测与少量 LLM 辅助
 
@@ -353,7 +423,7 @@ openMailDetailFromAskLink({
 
 ## 9. 需要修改的文件草案
 
-第一阶段预计只改前端：
+意图路由第一阶段预计只改前端；截图对应的 draft 结果呈现增强还涉及 mail-context 输出与详情 composer：
 
 - `anna-inbox/src/app/useAppController.ts`
   - 新增/替换 AI route helper。
@@ -361,10 +431,18 @@ openMailDetailFromAskLink({
   - `clarify` 分支写入带 actions 的 clarification message，等待用户选择后再执行。
 - `anna-inbox/src/types/mail.ts`
   - 如需要，补充 route decision、clarification payload 类型。
+  - 为 `MailPromptRunResult` 增加可选 `assistant_followup_text`。
 - `anna-inbox/src/features/home/HomeView.tsx`
   - 渲染 clarification card：快捷选择、自由输入、取消/关闭。
   - 处理澄清 action 点击后的二次路由。
   - 如果需要把当前打开 thread context 显式传给 controller，再做小范围 props/state 调整。
+  - 根据 artifact thread 与当前详情 thread 是否匹配，渲染 `Go to thread` 或 `Append to draft reply` / `Replace draft reply`。
+  - 按“前置说明 -> artifact -> 后置总结”渲染 mail-context 结果。
+- `anna-inbox/src/features/mail-detail/MailDetailDrawer.tsx`
+  - 提供 append / replace 两种明确的 composer 写入动作，并防止写入非目标 thread。
+- `inbox-tool/src/anna_inbox_executa/v2_tools.py`
+  - mail-context prompt 要求模型分别返回简短 `assistant_text` 与可选 `assistant_followup_text`。
+  - 将新增字段作为向后兼容的 result 字段返回，不修改工具名和输入参数。
 - `anna-inbox/src/app/useAppController.test.ts` 或新增 `aiRoute.test.ts`
   - 覆盖路由纯函数。
 
@@ -408,6 +486,17 @@ openMailDetailFromAskLink({
 - clarification 点击 `Revise current draft` + no context => 显示打开邮件提示，不进入 `scan`
 - clarification resolved 后重复点击不会重复触发工具
 
+新增 draft artifact 呈现测试：
+
+- 未打开详情时，artifact 只显示 `Go to thread`，不显示 append / replace。
+- 当前打开其他 thread 时仍显示 `Go to thread`，且不会写入当前 composer。
+- 当前 `mailbox + thread_id` 与 artifact 匹配时，显示 `Append to draft reply` 和 `Replace draft reply`。
+- 点击 `Go to thread` 使用 artifact 的 mailbox/thread 打开详情；加载成功后按钮自动切换。
+- `Append to draft reply` 保留已有 composer 内容并正确添加分隔换行。
+- `Replace draft reply` 按防误覆盖约定替换已有内容。
+- 同时存在 `assistant_text`、artifact、`assistant_followup_text` 时严格按该顺序渲染。
+- 旧结果没有 `assistant_followup_text` 时仍能展示说明和 artifact。
+
 新增 Ask link 测试：
 
 - `mail_links` 有合法 `mailbox + thread_id + message_id` 时渲染为可点击 link。
@@ -424,7 +513,17 @@ openMailDetailFromAskLink({
 2. 点击 AI draft，生成 draft artifact。
 3. 在左侧 Anna 输入 `Change it`。
 4. 期望：不出现 `Searched 1 focused inbox query`，不触发 `Custom scan complete`。
-5. 期望：assistant 返回改写后的 draft artifact，按钮仍是 `Insert draft reply` / `Copy draft`。
+5. 期望：assistant 返回改写后的 draft artifact；由于目标 thread 已打开，按钮为 `Append to draft reply` / `Replace draft reply`。
+
+Draft artifact 上下文按钮与说明文字：
+
+1. 在未打开目标邮件详情的状态下，通过左侧 AI 生成该 thread 的 draft。
+2. 期望：回答依次展示前置说明、draft artifact、后置总结；artifact 主按钮为 `Go to thread`。
+3. 点击 `Go to thread`。
+4. 期望：打开正确 mailbox/thread，左侧回答不丢失；artifact 按钮切换为 `Append to draft reply` 和 `Replace draft reply`。
+5. 在 composer 已有文本时分别验证 append 与 replace：append 不覆盖原文，replace 遵循确认或可撤销约定。
+6. 打开另一封邮件，再查看原 artifact。
+7. 期望：按钮恢复为 `Go to thread`，不能把 artifact 写入另一封邮件的 composer。
 
 Ask 场景回归：
 
@@ -487,6 +586,9 @@ uv run python tests/test_ask_planner.py
 - 快速跳转链接必须是结构化内部导航，不允许模型生成任意 URL；否则会有错误跳转和安全风险。
 - Ask link 会让用户更自然地从 scan 进入 mail detail，因此后续 `mail_context` 路由要优先使用当前打开详情，而不是继续引用旧 Ask 结果。
 - Clarification card 会增加一点前端状态复杂度，但能显著降低误触发高成本 scan 的概率。
+- draft artifact 的按钮必须由 `mailbox + thread_id` 精确匹配驱动；只检查 Drawer 是否打开会产生跨 thread 误写风险。
+- `Replace draft reply` 有内容丢失风险，必须提供确认或可撤销能力；任何情况下都不自动发送。
+- 前后说明会增加少量 LLM 输出和 UI 状态复杂度，但结构化为两个独立字段比前端解析一段 Markdown 更稳定。
 
 ## 12. 推荐审批结论
 
@@ -494,8 +596,15 @@ uv run python tests/test_ask_planner.py
 
 - 前端新增 `decideAiRoute()` 纯函数。
 - 将左侧输入从 chat/scan 二分改为 chat/mail_context/scan/clarify 四分。
-- 保持 Executa 工具契约不变。
+- 保持 Executa 工具名和输入参数不变；仅为结果说明增加可选输出字段。
 - 用单元测试覆盖截图中的 `Change it` 误路由。
+
+同时批准截图对应的 draft 结果呈现增强：
+
+- 未处于 artifact 对应 thread 时显示 `Go to thread`。
+- 已处于对应 thread 时显示 `Append to draft reply` / `Replace draft reply`。
+- mail-context 结果按“前置说明 -> artifact -> 后置总结”展示。
+- 以可选 `assistant_followup_text` 扩展返回结果，保持旧结果兼容。
 
 快速跳转链接建议作为同一轮或紧随其后的体验增强：
 

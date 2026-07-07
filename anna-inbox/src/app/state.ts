@@ -96,6 +96,7 @@ export function createInitialState(): AppState {
     gmailErrorPopup: null,
     inboxMessages: [],
     inboxSnapshotMessages: [],
+    inboxDraftMessages: [],
     inboxSnapshotLoading: false,
     inboxSnapshotComplete: false,
     inboxLoading: true,

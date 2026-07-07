@@ -2130,14 +2130,108 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             "updated_at": str(value.get("updated_at") or ""),
         }
 
+    if tool == "list_inbox_thread_drafts":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        limit = max(1, min(int(arguments.get("limit") or 100), 500))
+        from mail_agent.storage.ops import list_inbox_thread_drafts, set_inbox_thread_draft
+        payload = await list_inbox_thread_drafts(mailbox, limit=limit)
+        messages: list[dict[str, Any]] = []
+        for draft in payload.get("drafts") or []:
+            if not isinstance(draft, dict):
+                continue
+            body = str(draft.get("body") or "")
+            if not body.strip():
+                continue
+            meta = draft.get("message") if isinstance(draft.get("message"), dict) else {}
+            thread_id = str(draft.get("thread_id") or meta.get("thread_id") or "")
+            metadata_complete = bool(
+                (meta.get("id") or meta.get("message_id"))
+                and (meta.get("from") or meta.get("to"))
+            )
+            if thread_id and not metadata_complete:
+                try:
+                    thread_messages = _read_cached_thread_messages(mailbox, thread_id)
+                    if not thread_messages:
+                        thread_messages = await asyncio.to_thread(_load_thread_messages, mailbox, thread_id)
+                    if thread_messages:
+                        latest = thread_messages[-1]
+                        latest_labels = [str(label) for label in (latest.get("label_ids") or [])]
+                        meta = {
+                            **meta,
+                            "id": str(latest.get("id") or meta.get("id") or ""),
+                            "thread_id": thread_id,
+                            "internal_date": str(latest.get("internal_date") or meta.get("internal_date") or ""),
+                            "date": str(latest.get("date") or meta.get("date") or ""),
+                            "from": str(latest.get("from") or meta.get("from") or ""),
+                            "to": str(latest.get("to") or meta.get("to") or ""),
+                            "subject": str(latest.get("subject") or meta.get("subject") or ""),
+                            "label_ids": latest_labels,
+                            "important": "IMPORTANT" in [label.upper() for label in latest_labels],
+                            "starred": "STARRED" in [label.upper() for label in latest_labels],
+                            "has_attachment": bool(latest.get("attachments")),
+                            "attachment_count": len(latest.get("attachments") or []),
+                        }
+                        try:
+                            await set_inbox_thread_draft(
+                                mailbox,
+                                thread_id,
+                                body,
+                                if_match=str(draft.get("etag") or "") or None,
+                                message=meta,
+                                updated_at=str(draft.get("updated_at") or "") or None,
+                            )
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    log(f"draft metadata recovery failed for {thread_id}: {type(exc).__name__}: {exc}")
+            message_id = str(meta.get("id") or meta.get("message_id") or thread_id or f"draft_{len(messages) + 1}")
+            labels = [str(label)[:80] for label in (meta.get("label_ids") or []) if str(label).upper() != "DRAFT"][:31]
+            labels.append("DRAFT")
+            messages.append({
+                "id": message_id[:128],
+                "thread_id": thread_id[:128],
+                "mailbox": mailbox,
+                "internal_date": str(meta.get("internal_date") or "")[:32],
+                "date": str(meta.get("date") or draft.get("updated_at") or "")[:128],
+                "from": str(meta.get("from") or "")[:512],
+                "to": str(meta.get("to") or "")[:512],
+                "subject": str(meta.get("subject") or "(no subject)")[:512],
+                "snippet": body[:120],
+                "body_preview": body[:120],
+                "draft_body": body,
+                "draft_local": True,
+                "label_ids": labels,
+                "unread": False,
+                "important": bool(meta.get("important")),
+                "starred": bool(meta.get("starred")),
+                "has_attachment": bool(meta.get("has_attachment")),
+                "attachment_count": int(meta.get("attachment_count") or 0),
+                "body_cached": False,
+            })
+        return {
+            "mailbox": mailbox,
+            "category": "drafts",
+            "count": len(messages),
+            "messages": messages,
+            "updated_at": str(payload.get("updated_at") or ""),
+        }
+
     if tool == "save_inbox_thread_draft":
         thread_id = str(arguments.get("thread_id", "")).strip()
         body = str(arguments.get("body", ""))
         if_match = str(arguments.get("if_match", "")).strip() or None
         if not mailbox or not thread_id:
             return {"error": "mailbox and thread_id are required"}
+        message = arguments.get("message") if isinstance(arguments.get("message"), dict) else {}
         from mail_agent.storage.ops import set_inbox_thread_draft
-        result = await set_inbox_thread_draft(mailbox, thread_id, body, if_match=if_match)
+        result = await set_inbox_thread_draft(
+            mailbox,
+            thread_id,
+            body,
+            if_match=if_match,
+            message=message,
+        )
         return {
             "ok": True,
             "mailbox": mailbox,

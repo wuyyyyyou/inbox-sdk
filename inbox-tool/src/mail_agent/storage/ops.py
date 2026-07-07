@@ -338,12 +338,15 @@ async def set_inbox_thread_draft(
     body: str,
     *,
     if_match: str | None = None,
+    message: dict[str, Any] | None = None,
+    updated_at: str | None = None,
 ) -> dict[str, Any]:
     key = _inbox_thread_draft_key(mailbox, thread_id)
     payload = {
         "thread_id": str(thread_id or ""),
         "body": str(body or ""),
-        "updated_at": _now(),
+        "message": message if isinstance(message, dict) else {},
+        "updated_at": str(updated_at or _now()),
     }
     return await get_storage().set(key, payload, scope=default_scope(), if_match=if_match)
 
@@ -351,6 +354,30 @@ async def set_inbox_thread_draft(
 async def delete_inbox_thread_draft(mailbox: str, thread_id: str) -> dict[str, Any]:
     key = _inbox_thread_draft_key(mailbox, thread_id)
     return await get_storage().delete(key, scope=default_scope())
+
+
+async def list_inbox_thread_drafts(mailbox: str, *, limit: int = 100) -> dict[str, Any]:
+    prefix = f"{_mailbox_prefix(mailbox)}/inbox-drafts/"
+    result = await get_storage().list(prefix=prefix, limit=max(1, min(int(limit or 100), 500)), scope=default_scope())
+    drafts: list[dict[str, Any]] = []
+    for item in result.get("items") or []:
+        key = item.get("key") if isinstance(item, dict) else item
+        if not key:
+            continue
+        loaded = await get_storage().get(str(key), scope=default_scope())
+        value = loaded.get("value") if loaded.get("exists") and isinstance(loaded.get("value"), dict) else {}
+        body = str(value.get("body") or "")
+        if not body.strip():
+            continue
+        drafts.append({
+            "thread_id": str(value.get("thread_id") or str(key).rsplit("/", 1)[-1]),
+            "body": body,
+            "message": value.get("message") if isinstance(value.get("message"), dict) else {},
+            "updated_at": str(value.get("updated_at") or ""),
+            "etag": str(loaded.get("etag") or ""),
+        })
+    drafts.sort(key=lambda draft: draft.get("updated_at") or "", reverse=True)
+    return {"mailbox": mailbox, "count": len(drafts), "drafts": drafts, "updated_at": _now()}
 
 
 # ── Processed message index ─────────────────────────────────────────

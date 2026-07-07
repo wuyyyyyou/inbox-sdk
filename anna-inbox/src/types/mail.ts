@@ -156,6 +156,8 @@ export interface InboxMessage {
   subject?: string | null;
   snippet?: string | null;
   body_preview?: string | null;
+  draft_body?: string | null;
+  draft_local?: boolean;
   label_ids?: string[];
   unread?: boolean;
   important?: boolean;
@@ -657,6 +659,7 @@ export interface AppState {
   gmailErrorPopup: GmailErrorPopup | null;
   inboxMessages: InboxMessage[];
   inboxSnapshotMessages: InboxMessage[];
+  inboxDraftMessages: InboxMessage[];
   inboxSnapshotLoading: boolean;
   inboxSnapshotComplete: boolean;
   inboxLoading: boolean;

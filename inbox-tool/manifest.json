@@ -1151,6 +1151,31 @@
           "type": "string",
           "description": "Optional etag for optimistic concurrency.",
           "required": false
+        },
+        {
+          "name": "message",
+          "type": "object",
+          "description": "Optional compact source message metadata for the local Drafts folder.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "list_inbox_thread_drafts",
+      "description": "List locally persisted Inbox thread drafts for the Anna Drafts folder.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Maximum drafts to return.",
+          "required": false
         }
       ],
       "timeout": 120

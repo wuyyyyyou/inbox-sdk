@@ -238,10 +238,14 @@ export class MailAgentClient {
     return this.invoke<InboxThreadDraftPayload>("get_inbox_thread_draft", { mailbox, thread_id: threadId });
   }
 
-  saveInboxThreadDraft(mailbox: string, threadId: string, body: string, ifMatch?: string) {
+  listInboxThreadDrafts(mailbox: string, limit = 100) {
+    return this.invoke<InboxFeedPayload>("list_inbox_thread_drafts", { mailbox, limit });
+  }
+
+  saveInboxThreadDraft(mailbox: string, threadId: string, body: string, ifMatch?: string, message?: Record<string, unknown>) {
     return this.invoke<{ ok?: boolean; etag?: string; updated?: boolean }>(
       "save_inbox_thread_draft",
-      { mailbox, thread_id: threadId, body, if_match: ifMatch },
+      { mailbox, thread_id: threadId, body, if_match: ifMatch, message: message || {} },
     );
   }
 

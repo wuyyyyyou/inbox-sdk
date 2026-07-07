@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildQuickReplyPrompt,
   estimateAttachmentPreviewMemory,
+  hasNewerThreadMessage,
   isOutboundMessageForMailbox,
   isPreviewableAttachment,
   materializeAttachmentAccess,
@@ -15,6 +16,30 @@ import {
 } from "./mailDetailHelpers";
 
 describe("mailDetailHelpers", () => {
+  it("only reports a thread update when the known message is actually newer", () => {
+    const page = {
+      mailbox: "owner@example.com",
+      thread_id: "thread-1",
+      subject: "Subject",
+      latest_message_id: "latest",
+      returned_count: 1,
+      has_earlier: false,
+      next_before_index: null,
+      messages: [{
+        id: "latest",
+        thread_id: "thread-1",
+        internal_date: "200",
+        from: "sender@example.com",
+        to: "owner@example.com",
+        subject: "Subject",
+        label_ids: [],
+        attachments: [],
+      }],
+    };
+    expect(hasNewerThreadMessage(page, "old-draft-anchor", "100")).toBe(false);
+    expect(hasNewerThreadMessage(page, "new-feed-message", "300")).toBe(true);
+  });
+
   it("splits address lists without breaking display names", () => {
     expect(splitAddresses('"Anna Team" <team@anna.ai>, Bob <bob@example.com>')).toEqual([
       '"Anna Team" <team@anna.ai>',

@@ -65,6 +65,7 @@ async def main() -> None:
         delete_inbox_thread_draft,
         get_inbox_thread_assist,
         get_inbox_thread_draft,
+        list_inbox_thread_drafts,
         set_inbox_thread_assist,
         set_inbox_thread_draft,
     )
@@ -96,11 +97,35 @@ async def main() -> None:
     assert loaded_assist["value"]["thread_id"] == thread_id
     assert loaded_assist["value"]["latest_message_id"] == latest_message_id
 
-    saved_draft = await set_inbox_thread_draft(mailbox, thread_id, "Draft reply body")
+    saved_draft = await set_inbox_thread_draft(
+        mailbox,
+        thread_id,
+        "Draft reply body",
+        message={"id": "msg-123", "thread_id": thread_id, "subject": "Hello"},
+    )
     assert saved_draft.get("etag")
     loaded_draft = await get_inbox_thread_draft(mailbox, thread_id)
     assert loaded_draft["exists"] is True
     assert loaded_draft["value"]["body"] == "Draft reply body"
+    assert loaded_draft["value"]["message"]["subject"] == "Hello"
+
+    listed = await list_inbox_thread_drafts(mailbox)
+    assert listed["count"] == 1
+    assert listed["drafts"][0]["body"] == "Draft reply body"
+    assert listed["drafts"][0]["message"]["id"] == "msg-123"
+
+    repaired = await set_inbox_thread_draft(
+        mailbox,
+        thread_id,
+        "Draft reply body",
+        if_match=listed["drafts"][0]["etag"],
+        message={"id": "msg-999", "thread_id": thread_id, "subject": "Latest subject"},
+        updated_at=listed["drafts"][0]["updated_at"],
+    )
+    assert repaired.get("etag")
+    repaired_draft = await get_inbox_thread_draft(mailbox, thread_id)
+    assert repaired_draft["value"]["updated_at"] == listed["drafts"][0]["updated_at"]
+    assert repaired_draft["value"]["message"]["subject"] == "Latest subject"
 
     deleted = await delete_inbox_thread_draft(mailbox, thread_id)
     assert deleted["deleted"] is True

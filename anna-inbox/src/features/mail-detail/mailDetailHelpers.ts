@@ -2,6 +2,7 @@ import type {
   AttachmentDownloadPayload,
   DraftReplyArtifact,
   InboxThreadMessage,
+  InboxThreadPagePayload,
   MailAttachmentMeta,
   QuickReplySuggestion,
 } from "../../types/mail";
@@ -28,6 +29,18 @@ export interface SnoozePreset {
   id: string;
   label: string;
   at: Date;
+}
+
+export function hasNewerThreadMessage(
+  page: InboxThreadPagePayload | null,
+  latestThreadMessageId: string,
+  latestThreadInternalDate: string,
+) {
+  if (!page?.latest_message_id || !latestThreadMessageId || page.latest_message_id === latestThreadMessageId) return false;
+  const loadedLatest = page.messages.find((item) => item.id === page.latest_message_id) || page.messages[page.messages.length - 1];
+  const loadedTime = Number(loadedLatest?.internal_date || 0);
+  const knownTime = Number(latestThreadInternalDate || 0);
+  return Number.isFinite(loadedTime) && Number.isFinite(knownTime) && knownTime > loadedTime;
 }
 
 export function senderParts(value: unknown): AddressParts {

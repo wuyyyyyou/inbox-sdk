@@ -19,6 +19,7 @@ import {
   estimateAttachmentPreviewMemory,
   formatAbsoluteDateTime,
   formatAttachmentSize,
+  hasNewerThreadMessage,
   isOutboundMessageForMailbox,
   isPreviewableAttachment,
   materializeAttachmentAccess,
@@ -223,6 +224,10 @@ function displayAddress(parts: { name: string; email: string } | null) {
   };
 }
 
+function isLocalDraftMessage(message: Pick<InboxMessage, "draft_body" | "draft_local"> | null | undefined) {
+  return Boolean(message?.draft_local || message?.draft_body);
+}
+
 function HeaderContactRow({
   label,
   address,
@@ -349,6 +354,7 @@ export function MailDetailDrawer({
   contactAvatars,
   loadContactAvatars,
   latestThreadMessageId = "",
+  latestThreadInternalDate = "",
 }: {
   open: boolean;
   mailbox: string;
@@ -373,7 +379,7 @@ export function MailDetailDrawer({
   loadInboxMessageDisplayBody: (mailbox: string, messageId: string) => Promise<{ body_text?: string; body_html?: string; body_truncated?: boolean }>;
   loadInboxThreadAssist: (mailbox: string, threadId: string, latestMessageId: string, anchorMessageId?: string) => Promise<InboxThreadAssistPayload>;
   getInboxThreadDraft: (mailbox: string, threadId: string) => Promise<{ exists: boolean; body: string; etag?: string }>;
-  saveInboxThreadDraft: (mailbox: string, threadId: string, body: string, ifMatch?: string) => Promise<{ etag?: string }>;
+  saveInboxThreadDraft: (mailbox: string, threadId: string, body: string, ifMatch?: string, message?: Record<string, unknown>) => Promise<{ etag?: string }>;
   deleteInboxThreadDraft: (mailbox: string, threadId: string) => Promise<{ ok?: boolean }>;
   prepareInboxAttachmentAccess: (mailbox: string, messageId: string, attachmentId: string, mode: "preview" | "download") => Promise<AttachmentDownloadPayload>;
   submitMailContextPrompt: (request: SubmitMailPromptRequest) => Promise<unknown>;
@@ -381,6 +387,7 @@ export function MailDetailDrawer({
   contactAvatars?: Record<string, string>;
   loadContactAvatars: (emails: string[], mailbox?: string) => Promise<{ avatars: Record<string, string>; permissionRequired: boolean }>;
   latestThreadMessageId?: string;
+  latestThreadInternalDate?: string;
 }) {
   const [page, setPage] = useState<InboxThreadPagePayload | null>(null);
   const [loading, setLoading] = useState(false);
@@ -454,8 +461,13 @@ export function MailDetailDrawer({
   const threadId = message?.thread_id || "";
   const messageId = message?.id || "";
   const context = useMemo(() => (message ? buildMailContext(mailbox, message, page) : null), [mailbox, message, page]);
-  const latestMessage = page?.messages[page.messages.length - 1];
-  const hasThreadUpdate = Boolean(page?.latest_message_id && latestThreadMessageId && latestThreadMessageId !== page.latest_message_id);
+  const visibleThreadMessages = useMemo(
+    () => page?.messages || [],
+    [page?.messages],
+  );
+  const latestMessage = visibleThreadMessages[visibleThreadMessages.length - 1] || page?.messages[page.messages.length - 1];
+  const selectedIsDraft = isLocalDraftMessage(message);
+  const hasThreadUpdate = hasNewerThreadMessage(page, latestThreadMessageId, latestThreadInternalDate);
   const important = Boolean(latestMessage?.label_ids?.includes("IMPORTANT") || message?.important);
   const starred = Boolean(latestMessage?.label_ids?.includes("STARRED") || message?.starred);
   const trashed = Boolean(latestMessage?.label_ids?.includes("TRASH") || message?.label_ids?.includes("TRASH"));
@@ -467,13 +479,13 @@ export function MailDetailDrawer({
   ));
   const isDone = Boolean(message && (flags.done.includes(message.id) || isSent));
   const previewableAttachments = useMemo(
-    () => page?.messages.flatMap((item) => item.attachments
+    () => visibleThreadMessages.flatMap((item) => item.attachments
       .filter(isPreviewableAttachment)
       .map((attachment) => ({
         attachment,
         messageId: attachment.message_id || item.id,
       }))) || [],
-    [page],
+    [visibleThreadMessages],
   );
   const showQuickReplies = Boolean(
     assist?.quick_replies?.length
@@ -649,13 +661,17 @@ export function MailDetailDrawer({
   }, [contactAvatars, mailbox, message?.from, message?.to, open, page, resolvedAvatars]);
 
   useEffect(() => {
-    if (!composerOpen || !threadId || !mailbox) return;
+    if ((!composerOpen && !selectedIsDraft) || !threadId || !mailbox) return;
     let cancelled = false;
     void getInboxThreadDraftRef.current(mailbox, threadId)
       .then((stored) => {
         if (cancelled) return;
-        if (stored.body) {
-          setDraft(stored.body);
+        const storedBody = stored.body || "";
+        const fallbackBody = message?.draft_body || "";
+        const nextDraft = storedBody || fallbackBody;
+        if (nextDraft) {
+          setComposerOpen(true);
+          setDraft(nextDraft);
           setDraftEtag(stored.etag || "");
         }
       })
@@ -663,12 +679,26 @@ export function MailDetailDrawer({
     return () => {
       cancelled = true;
     };
-  }, [composerOpen, mailbox, threadId]);
+  }, [composerOpen, mailbox, message?.draft_body, selectedIsDraft, threadId]);
 
   useEffect(() => {
     if (!composerOpen || !threadId || !mailbox || !draftDirty) return;
     const timer = window.setTimeout(() => {
-      void saveInboxThreadDraftRef.current(mailbox, threadId, draft, draftEtag || undefined)
+      void saveInboxThreadDraftRef.current(mailbox, threadId, draft, draftEtag || undefined, {
+        id: latestMessage?.id || message?.id || "",
+        thread_id: threadId,
+        mailbox,
+        internal_date: latestMessage?.internal_date || message?.internal_date || "",
+        date: message?.date || "",
+        from: latestMessage?.from || message?.from || "",
+        to: latestMessage?.to || message?.to || "",
+        subject: latestMessage?.subject || message?.subject || "",
+        label_ids: (latestMessage?.label_ids || message?.label_ids || []).filter((label) => label.toUpperCase() !== "DRAFT"),
+        important: Boolean(message?.important || latestMessage?.label_ids?.includes("IMPORTANT")),
+        starred: Boolean(message?.starred || latestMessage?.label_ids?.includes("STARRED")),
+        has_attachment: Boolean(message?.has_attachment),
+        attachment_count: Number(message?.attachment_count || 0),
+      })
         .then((result) => {
           setDraftDirty(false);
           if (result.etag) setDraftEtag(result.etag);
@@ -676,7 +706,7 @@ export function MailDetailDrawer({
         .catch(() => undefined);
     }, 500);
     return () => window.clearTimeout(timer);
-  }, [composerOpen, draft, draftDirty, draftEtag, mailbox, threadId]);
+  }, [composerOpen, draft, draftDirty, draftEtag, latestMessage, mailbox, message, threadId]);
 
   useEffect(() => {
     if (!composerOpen) return;
@@ -696,6 +726,7 @@ export function MailDetailDrawer({
     onConsumeInsertRequest(nonce);
     if (draft.trim() && !window.confirm("Replace the current draft reply?")) return;
     setComposerOpen(true);
+    setComposerExpanded(true);
     setDraft(artifact.body);
     setDraftDirty(true);
     requestAnimationFrame(() => bodyRef.current?.focus());
@@ -1066,6 +1097,11 @@ export function MailDetailDrawer({
     if (threadId) await deleteInboxThreadDraft(mailbox, threadId);
   };
 
+  const closeThread = () => {
+    if (draft.trim()) showToast("Draft saved to Drafts.");
+    onClose();
+  };
+
   const runThreadAction = async (operation: InboxThreadStateOperation) => {
     if (!message || toolbarPending) return;
     setToolbarPending(true);
@@ -1083,7 +1119,7 @@ export function MailDetailDrawer({
       <aside className={`mail-detail-drawer ${open ? "is-open" : ""}`} aria-hidden={!open}>
         <header className="mail-detail-header">
           <div className="mail-detail-toolbar">
-            <button aria-label="Close thread" data-tooltip="Close thread" onClick={onClose}><CloseThreadIcon /></button>
+            <button aria-label="Close thread" data-tooltip="Close thread" onClick={closeThread}><CloseThreadIcon /></button>
             <button aria-label="Mark unread" data-tooltip="Mark unread" disabled={toolbarPending} onClick={() => void runThreadAction("mark_unread")}><MarkUnreadIcon /></button>
             <button className={starred ? "is-active is-starred" : ""} aria-label={starred ? "Remove stars" : "Add stars"} data-tooltip={starred ? "Remove stars" : "Add stars"} disabled={toolbarPending} onClick={() => void runThreadAction(starred ? "unstar" : "star")}><StarIcon /></button>
             <button className={important ? "is-active is-important" : ""} aria-label={important ? "Mark not important" : "Mark important"} data-tooltip={important ? "Mark not important" : "Mark important"} disabled={toolbarPending} onClick={() => void runThreadAction(important ? "mark_not_important" : "mark_important")}><ImportantIcon /></button>
@@ -1122,7 +1158,7 @@ export function MailDetailDrawer({
           {page?.has_earlier ? <button className="mail-detail-load-earlier" onClick={() => void loadEarlier()}>Load earlier messages</button> : null}
           {loading ? <div className="mail-detail-loading">Loading thread…</div> : null}
           {error ? <div className="mail-detail-error">Thread failed to load. {error}</div> : null}
-          {(page?.messages.length ? page.messages : []).map((item) => (
+          {(visibleThreadMessages.length ? visibleThreadMessages : []).map((item) => (
             <article key={item.id} className="mail-thread-message" data-message-id={item.id}>
               <div className="mail-thread-message-head">
                 <div className="mail-thread-message-author">

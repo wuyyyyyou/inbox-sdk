@@ -467,6 +467,15 @@ DEFAULT_MANIFEST = {
                 {"name": "thread_id", "type": "string", "description": "Gmail thread ID.", "required": True},
                 {"name": "body", "type": "string", "description": "Draft body text.", "required": True},
                 {"name": "if_match", "type": "string", "description": "Optional etag for optimistic concurrency.", "required": False},
+                {"name": "message", "type": "object", "description": "Optional compact source message metadata for the local Drafts folder.", "required": False},
+            ],
+        },
+        {
+            "name": "list_inbox_thread_drafts",
+            "description": "List locally persisted Inbox thread drafts for the Anna Drafts folder.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "limit", "type": "integer", "description": "Maximum drafts to return.", "required": False},
             ],
         },
         {

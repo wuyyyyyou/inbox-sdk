@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accountDisplayName, hasMailboxScanError, isDoneMessage, isDraftMessage, isImportantMessage, isSentMessage, isStarredMessage, messageParticipant, resolveSourceMessages, senderParts } from "./HomeView";
+import { accountDisplayName, hasMailboxScanError, isDoneMessage, isDraftMessage, isImportantMessage, isSentMessage, isStarredMessage, mergeDraftOverlayMessages, messageParticipant, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
 
 describe("senderParts", () => {
   it("accepts null sender values from Gmail Trash", () => {
@@ -35,12 +35,12 @@ describe("messageParticipant", () => {
   });
 
   it("labels recipient-less drafts without showing Unknown sender", () => {
-    expect(messageParticipant({ id: "draft", from: null, to: null, label_ids: ["DRAFT"] }, "all", "owner@example.com").name).toBe("me");
+    expect(messageParticipant({ id: "draft", from: null, to: null, draft_local: true }, "all", "owner@example.com").name).toBe("me");
   });
 
   it("shows drafts as authored by me instead of listing recipients", () => {
     const participant = messageParticipant({
-      id: "draft-with-recipient", from: "Owner <owner@example.com>", to: "Helena <helena@example.com>", label_ids: ["DRAFT"],
+      id: "draft-with-recipient", from: "Owner <owner@example.com>", to: "Helena <helena@example.com>", draft_local: true,
     }, "drafts", "owner@example.com");
     expect(participant.name).toBe("me, Helena");
     expect(participant.title).toBe("Helena <helena@example.com>");
@@ -60,11 +60,35 @@ describe("cached message label fallbacks", () => {
     const cachedMessage = { id: "cached", label_ids: ["INBOX", "IMPORTANT", "STARRED"] };
     expect(isImportantMessage(cachedMessage)).toBe(true);
     expect(isStarredMessage(cachedMessage)).toBe(true);
-    expect(isDraftMessage({ id: "draft", label_ids: ["draft"] })).toBe(true);
+    expect(isDraftMessage({ id: "gmail-draft", label_ids: ["draft"] })).toBe(false);
+    expect(isDraftMessage({ id: "local-draft", draft_local: true })).toBe(true);
+  });
+
+  it("uses the original sender as the reply recipient for inbound local drafts", () => {
+    const participant = messageParticipant({
+      id: "draft-inbound", from: "Sahra <sahra@example.com>", to: "owner@example.com", draft_local: true,
+    }, "drafts", "owner@example.com");
+    expect(participant.name).toBe("me, Sahra");
+    expect(participant.email).toBe("sahra@example.com");
+  });
+
+  it("keeps the important icon visible on outgoing draft rows", () => {
+    expect(shouldShowImportantIcon(true, true, true)).toBe(true);
+    expect(shouldShowImportantIcon(true, true, false)).toBe(false);
   });
 });
 
 describe("resolveSourceMessages", () => {
+  it("keeps a drafted starred message in both category projections", () => {
+    const base = [{ id: "message-1", thread_id: "thread-1", label_ids: ["INBOX", "STARRED"], subject: "Hello" }];
+    const drafts = [{ id: "message-1", thread_id: "thread-1", label_ids: ["INBOX", "STARRED", "DRAFT"], draft_local: true, draft_body: "Reply" }];
+    const merged = mergeDraftOverlayMessages(base, drafts);
+    const flags = { todos: [], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: {} };
+
+    expect(resolveSourceMessages("starred", [], merged, flags).map((message) => message.id)).toEqual(["message-1"]);
+    expect(resolveSourceMessages("drafts", [], merged, flags).map((message) => message.id)).toEqual(["message-1"]);
+  });
+
   it("prefers live inbox messages over stale snapshot data in inbox view", () => {
     const liveInbox = [
       { id: "live-1", label_ids: ["INBOX", "IMPORTANT"], internal_date: "200" },
