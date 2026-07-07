@@ -765,8 +765,7 @@ body.is-resizing-ai-sidebar {
   background: #f4f6fc;
 }
 
-.account-avatar-btn,
-.account-settings-btn {
+.account-avatar-btn {
   place-items: center;
   flex: none;
 }
@@ -812,21 +811,6 @@ body.is-resizing-ai-sidebar {
 }
 .account-avatar-btn i.is-inactive {
   background: #a9b1c2;
-}
-.account-settings-btn {
-  width: 36px;
-  height: 36px;
-  border-radius: 9px;
-  color: #788198;
-  background: transparent;
-}
-.account-settings-btn:hover {
-  color: #5368dc;
-  background: #e7ebf8;
-}
-.account-settings-btn svg {
-  width: 28px;
-  height: 28px;
 }
 .account-menu-backdrop {
   position: fixed;

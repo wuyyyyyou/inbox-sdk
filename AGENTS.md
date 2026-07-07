@@ -1,231 +1,83 @@
 # AGENTS.md
 
-## 项目概览
+代码编写前先保证对功能和内容的理解与用户完全对齐；存在会改变实现方向的不明确内容时，先沟通再修改。
 
-这个仓库是一个 Anna App 项目，主体目录是 `anna-inbox/`。
+## 项目基线
 
-- `anna-inbox/manifest.json` 声明 App、静态 SPA bundle、必需 Executa、Host API、权限和本地开发默认值。
-- `anna-inbox/src/` 是计划中的前端源码目录，使用 Vite + React + TypeScript 组织 Anna Inbox UI。
-- `anna-inbox/bundle/` 是 Anna App 读取的静态 SPA 构建产物目录，不作为主要手写源码维护。
-- `inbox-tool/` 是邮件代理的 Python Executa 工程源码目录。目录名不是协议 `tool_id`。
-- `inbox-tool/manifest.json` 是 Executa 身份的单一来源；`name` 作为协议 `tool_id` 使用。
-- `inbox-tool/src/mail_agent/` 包含 Gmail 扫描、Brief 管线、Ask 流程、存储、卡片、LLM 和本地缓存逻辑。
-- `inbox-tool/src/anna_inbox_executa/main.py` 是 JSON-RPC stdio 入口，同时内嵌 `describe` 返回的 Executa manifest 数据。
-- `anna-inbox/executas/inbox-tool/executa.json` 是 Anna App 开发启动用的 Executa stub；其中 `tool_id` 由 `scripts/sync/sync_executa_identity.py` 从 `inbox-tool/manifest.json` 同步。
-- `anna-inbox/.docs/` 是复制到仓库内的 Anna 协议参考。修改平台协议相关行为前先读这里，不要凭印象猜。
-- `anna-inbox/docs/` 是项目设计文档和实施计划，主要为中文。
+Anna Inbox 当前版本为 `2.0.1`。前端位于 `anna-inbox/`，后端 Executa 位于 `inbox-tool/`。
 
-核心产品形态：
+- `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表。
+- `anna-inbox/src/features/mail-detail/`：线程详情、正文、草稿和附件预览。
+- `anna-inbox/src/app/useAppController.ts`：主要状态与工作流控制。
+- `anna-inbox/src/api/mailAgentClient.ts`：所有 Executa 工具调用的统一 facade。
+- `inbox-tool/src/anna_inbox_executa/`：JSON-RPC 入口和工具分发。
+- `inbox-tool/src/mail_agent/mail_providers/gmail/adapter.py`：Gmail API、OAuth、本地缓存和正文解码。
+- `inbox-tool/src/mail_agent/storage/`：APS/local storage 的统一 async 层。
+- `inbox-tool/src/mail_agent/ask/`：Ask 规划、搜索和回答。
+- `inbox-tool/src/mail_agent/core/`、`cards/`、`judgment_engine/`：Brief 管线。
 
-- Brief 是工作流管线：Gmail 扫描 -> Phase 1 分类 -> Phase 2 判断 -> 规则守护 -> 卡片生成 -> 存储 -> 前端卡片视图。
-- Ask 是 agent 式自定义查询：规划/搜索/读取选定邮件 -> 一次 LLM 生成答案容器 -> 前端展示结果和历史。
-- 存储统一走 `storage_ops.py`，平台可用时由 Anna APS 支撑，本地开发时可走 local JSON storage。
+`anna-inbox/bundle/` 是构建产物，不手写、不提交。设置入口在 2.0.1 前端暂时隐藏；除非任务明确要求，不删除设置相关后端工具和状态。
 
-## 关键协议背景
+## 协议与安全
 
-修改协议、存储、凭据或 Executa 启动行为前，先阅读这些文件：
+- Executa 使用 JSON-RPC 2.0 over stdio，每行一条 UTF-8 JSON。
+- `stdout` 只能输出协议响应，日志写 `stderr`。
+- 凭据在 manifest 中声明，通过 `params.context.credentials` 接收；不得新增密钥工具参数。
+- 不记录 access token、refresh token、API key、authorization header 或完整 credential context。
+- 大内容使用 Host upload、APS files 或本地 loopback URL，不放入 APS KV 或 JSON-RPC result。
+- Gmail 状态变更和发送操作必须由明确用户操作触发，并保留现有 guardrail。
 
-- `anna-inbox/.docs/anna-rpc/protocol-spec.md`
-- `anna-inbox/.docs/anna-rpc/protocol-spec.zh-CN.md`
-- `anna-inbox/.docs/anna-rpc/authorization.zh-CN.md`
-- `anna-inbox/.docs/anna-storate/01-concepts-and-decision.md`
-- `anna-inbox/.docs/anna-storate/02-executa-aps-reverse-rpc.md`
-- `anna-inbox/.docs/anna-storate/03-anna-app-host-api-storage-files.md`
+## 开发与版本
 
-本项目必须遵守的 Executa 协议规则：
-
-- 使用 JSON-RPC 2.0 over stdio，每行一条 JSON 消息。
-- `stdout` 只能输出协议响应。日志和调试信息必须写到 `stderr`。
-- 消息必须使用 UTF-8。
-- 工具凭据在 manifest 的 `credentials` 中声明，通过 `params.context.credentials` 接收；不要把密钥暴露为工具参数。
-- 大字节内容不能通过 JSON-RPC result 返回。使用 APS files/object storage 或 host upload，并在工具结果里返回轻量引用。
-- APS KV 只用于小型 JSON 状态，例如 cursor、计划、偏好和索引。不要把大 blob、长 HTML、图片、PDF 或大数组塞进 KV。
-
-## 安装与环境
-
-从仓库根目录执行：
+后端安装：
 
 ```sh
 cd inbox-tool/src
 uv sync
 ```
 
-Executa 项目使用 `uv` 和 `pyproject.toml`：
-
-- 包名：`anna-inbox-executa`
-- Python：`>=3.10`
-- 命令入口：`anna-inbox-executa = anna_inbox_executa.main:main`
-
-本地密钥刻意放在仓库外。本地调试时可以读取可选的本地环境文件：
+前端：
 
 ```sh
-$HOME/.anna-mail-agent.env
+cd anna-inbox
+npm test
+npm run build
 ```
 
-不要提交 OAuth token、DashScope key、Gmail token 文件、生成的本地缓存或 `.local_storage`。
+Anna App 本地开发读取 `anna-inbox/app.json` 和 `anna-inbox/executas/inbox-tool/executa.json`。旧 `anna-inbox/dev-wsl.sh` 不是权威入口。
 
-## 开发流程
-
-`anna-inbox/dev-wsl.sh` 是旧本地开发脚本，当前重构后不作为首选入口；不要把它当作新结构的权威启动说明。
-
-Anna App 开发启动应读取 `anna-inbox/executas/inbox-tool/executa.json`。该 stub 的 command 指向根目录源码：
-
-```sh
-uv --directory ../../../inbox-tool/src run anna-inbox-executa
-```
-
-本地 Google/Gmail OAuth helper 在 `scripts/google_token/`。使用说明见 `scripts/google_token/README.md`。
-
-本地 Gmail token 目录默认在：
-
-```sh
-scripts/google_token/.secrets/gmail_tokens
-```
-
-直接 smoke-test Executa manifest：
-
-```sh
-printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' \
-  | uv --directory inbox-tool/src run anna-inbox-executa
-```
-
-直接 smoke-test health：
-
-```sh
-printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' \
-  | uv --directory inbox-tool/src run anna-inbox-executa
-```
-
-新增、删除或重命名工具时，保持这些文件同步：
-
-- `inbox-tool/src/anna_inbox_executa/main.py`
-- `inbox-tool/manifest.json`
-- `anna-inbox/executas/inbox-tool/executa.json`
-- 变更已发布 Executa 版本时，同步 `anna-inbox/manifest.json` 的 `required_executas[].min_version`
-
-修改 Executa `tool_id` 或版本时，先改 `inbox-tool/manifest.json`，再从仓库根目录运行：
+Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改其 `tool_id` 或版本后，同步：
 
 ```sh
 python scripts/sync/sync_executa_identity.py
+python scripts/sync/sync_executa_identity.py --check
 ```
 
-## 测试说明
+保持以下版本一致：
 
-从 Executa 的 `src` 目录运行本地 Python 测试：
+- `anna-inbox/app.json`
+- `inbox-tool/manifest.json`
+- `inbox-tool/src/pyproject.toml`
+- `anna-inbox/executas/inbox-tool/executa.json`
+- `anna-inbox/manifest.json#required_executas[].min_version`
+
+## 测试
+
+后端测试位于 `inbox-tool/src/tests/`，当前为可直接执行的脚本式测试。按改动范围运行相关文件；协议、manifest 或 dispatcher 变更还必须运行：
 
 ```sh
-cd inbox-tool/src
-uv run python tests/test_llm_json_repair.py
-uv run python tests/test_storage_integration.py
+printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' | uv --directory inbox-tool/src run anna-inbox-executa
+printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' | uv --directory inbox-tool/src run anna-inbox-executa
 ```
 
-当前测试是脚本式 async 测试，不是 pytest 测试套件。
+前端测试使用 Vitest；构建必须先通过 TypeScript typecheck。
 
-修改 JSON-RPC 行为前，还要运行直接 `describe` smoke test，并检查输出是否是合法的 newline-delimited JSON：
+## 实现约束
 
-```sh
-printf '%s\n' '{"jsonrpc":"2.0","method":"describe","id":1}' \
-  | uv --directory inbox-tool/src run anna-inbox-executa
-```
-
-修改前端源码后，先从 `anna-inbox/` 运行前端构建，生成 `bundle/` 静态产物，再在 Anna App UI 中验证。前端工程化后，`npm run build` 应先执行 TypeScript typecheck，再执行 Vite build。
-
-## 代码组织
-
-邮件代理核心模块：
-
-- `mail_adapter.py`：Gmail API 访问、OAuth token 解析与刷新、本地缓存。
-- `pipeline.py`：Brief 和 custom scan 的编排。
-- `phase1.py`：基于邮件头的批量分类，输出 `reply`、`review` 或 `ignore`。
-- `judgment.py`：Phase 2 LLM 判断、解析和归一化。
-- `guards.py`：规则型安全守护。
-- `card_service.py`：持久卡片构建、cleanup bundle 构建、前端格式化和合并规则。
-- `storage_types.py`：卡片、运行记录、偏好、计划和已处理消息的数据类。
-- `storage_ops.py`：高层 async 持久化操作。
-- `storage_client.py`、`local_storage.py`：APS/local storage 客户端接线。
-- `llm.py`：DashScope 和 Anna Sampling JSON 调用、JSON repair fallback、安全 fallback。
-- `planner.py`：自定义 Ask 规划。
-
-有用的设计文档：
-
-- `anna-inbox/docs/Brief管线全链路设计.md`
-- `anna-inbox/docs/Ask-重设计计划.md`
-- `anna-inbox/docs/Anna-Sampling-Brief全链路分析.md`
-- `anna-inbox/docs/Draft与Summary持久化计划.md`
-- `anna-inbox/docs/HTML邮件处理方案.md`
-- `anna-inbox/docs/PyInstaller二进制打包指南.md`
-
-## 代码风格
-
-- Python 代码整体偏类型化；I/O 逻辑优先 async；持久化领域对象主要使用 dataclass。
-- 存储 API 保持 async，并通过 `storage_ops.py` 走统一入口；不要让调用方直接散落访问 APS/local client。
-- 协议响应必须 JSON 可序列化且尽量紧凑。除非工具语义明确需要，否则不要返回原始 Gmail 正文或大 artifact。
-- Executa 进程里的诊断信息写到 `stderr`。除协议写出器输出 JSON-RPC 响应外，不要用普通 `print()` 写 `stdout`。
-- 保留现有双语风格：已有文件用中文注释表达产品/领域意图时，可以继续使用中文注释。
-- 保持改动聚焦。除非任务明确要求，不要在一次改动里同时重构静态前端、管线和协议入口。
-
-## 前端约束
-
-- 前端工程根目录是 `anna-inbox/`；源码入口使用 `anna-inbox/src/index.html` 和 `anna-inbox/src/main.tsx`。
-- 前端技术栈使用 Vite + React + TypeScript。第一阶段不引入路由库、Redux/Zustand、Tailwind、CSS-in-JS、组件库或图标库。
-- 前端使用 npm。提交 `package-lock.json`，不要提交 `bundle/` 构建产物。
-- `package.json` 第一阶段只需要最小脚本：`typecheck`、`build`、`test`。不要添加 `npm run dev`；本地验证通过 Anna App 测试环境完成。
-- `npm run build` 必须先运行 `tsc --noEmit`，再运行 Vite build。
-- 前端测试使用 Vitest，第一阶段优先覆盖纯逻辑、DTO adapter、reducers 和 API facade。不要为了第一阶段迁移引入 React Testing Library 或 jsdom。
-- `anna-inbox/bundle/` 是构建产物目录，应由 `npm run build` 生成；`bundle/` 加入 `.gitignore`，不要把它当成源码目录手写维护。
-- 构建产物保持稳定入口文件名：`bundle/index.html`、`bundle/app.js`、`bundle/style.css`。
-- App manifest 的 CSP 当前只允许 `'self'` 下的 script 和 style；除非有意修改 `manifest.json`，否则不要引入外部 origin。
-- `anna-inbox/manifest.json` 声明的 App Host API 包括 tools、chat write、storage get/set/list/delete、LLM complete 和 window title。
-- Anna Runtime 适配层是前端源码的一部分，应维护在 `src/runtime/`，保留平台注入 SDK、官方 SDK 动态导入、bundle 内 compat 的降级顺序。
-- 前端组件不要直接写 Executa tool 名称；工具调用集中在 API facade 中，例如 `src/api/mailAgentClient.ts`。
-- 修改卡片渲染时，对照 `card_service.py::cards_to_frontend` 和 `storage_types.PersistentCard`，确保前后端字段名保持一致。前端应手写 DTO 类型，贴合实际 JSON 返回边界。
-- 第一阶段迁移目标是行为等价和视觉尽量不变；不要顺手重设计 Brief、Ask、Handle、History 或 Scan Plan。
-- 前端 UI 文案第一阶段保持现有英文文案，不引入 i18n。
-- 第一阶段不要修改 Executa 工具契约或 Python 后端。API facade 只封装现有工具名、参数和返回值。
-- 推荐迁移顺序：先跑通最小 React shell 和 runtime，再迁移 API/types、Brief、Drawers/Scan Plan/History、Handle、Ask，最后补测试和整理样式。
-
-## 存储约束
-
-- 邮箱级 storage key 在 `storage_ops.py` 中构造，前缀形如 `mailbox/<sanitized-mailbox>/...`。
-- 读取 KV 时使用 `result.get("exists")` 判断是否存在。`null`、`false`、`0` 或 `[]` 都可能是合法存储值。
-- 需要并发更新时使用 `etag` / `if_match` 模式。
-- scan state、run history、cards、preferences、custom plans、summaries、drafts 作为小 JSON 持久化。
-- 大文件或持久二进制 artifact 使用 APS files/object storage，并返回引用。
-- 本地测试可以参考 `tests/test_storage_integration.py` 使用 fake storage client。
-
-## 安全与隐私
-
-- Gmail 凭据应来自 Anna platform authorization、插件凭据、环境变量或本地 token 文件。不要新增接收凭据的工具参数。
-- 不要记录 OAuth token、access token、refresh token、API key、原始 authorization header 或完整 credential context。
-- 只用于 JSON repair 的 prompt 不应泄露原始邮件正文；`test_llm_json_repair.py` 已覆盖这个行为。
-- mark-read 或类似发送/删除的 Gmail 状态变更需要明确产品审查，并沿用现有 guardrail 模式。
-- `main.py` / `mail_adapter.py` 中的 mailbox normalize 和 local-token fallback 行为应保持保守。
-
-## 发布与打包
-
-- 当前 Executa 版本是 `1.1.0`。
-- `executa.json` 声明二进制分发元数据和本地开发命令。
-- `manifest.json` 声明 Executa 工具和凭据。
-- 修改二进制打包前先读 `anna-inbox/docs/PyInstaller二进制打包指南.md`。
-
-## Agent 工作规则
-
-- 修改 Anna 协议、存储、LLM sampling、Gmail auth 或卡片 schema 前，先读最近的项目文档。
-- 命令如果依赖网络、凭据或外部 Anna 服务，要先明确说明，不能把它当作无条件可用。
-- 除非任务明确要求，不要覆盖用户密钥、生成的 token 文件、本地存储或 release artifact。
-- 保留工作树中与当前任务无关的已有改动。
-- 修改代码后，运行上面列出的聚焦脚本测试，并按改动范围运行相关 JSON-RPC smoke test。
-
-## Agent skills
-
-### Issue tracker
-
-本仓库的 issue 和 PRD 使用本地 Markdown 文件管理，写入 `.scratch/` 目录。详见 `docs/agents/issue-tracker.md`。
-
-### Triage labels
-
-本仓库使用默认五个 triage 状态：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`。详见 `docs/agents/triage-labels.md`。
-
-### Domain docs
-
-本仓库使用 single-context 领域文档布局：根目录 `CONTEXT.md`，以及存在时的 `docs/adr/`。详见 `docs/agents/domain.md`。
+- 前端组件不得直接散落工具名称；统一通过 `mailAgentClient.ts`。
+- 存储调用统一通过 `mail_agent/storage/ops.py`，不要绕过高层入口。
+- 读取 KV 时用 `result.get("exists")` 判断存在性；`null`、`false`、`0`、`[]` 都可能是合法值。
+- 并发存储更新使用 `etag` / `if_match`。
+- 修改邮件 DTO 时同时核对 `anna-inbox/src/types/mail.ts`、API facade 和后端返回边界。
+- 修改协议、Gmail auth、LLM sampling、存储或卡片 schema 前，先阅读对应当前文档和实现，不凭旧设计记录猜测。
+- 保留无关工作树改动，不覆盖 token、本地缓存、release artifact 或用户密钥。

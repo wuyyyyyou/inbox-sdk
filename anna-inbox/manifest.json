@@ -15,12 +15,12 @@
   "required_executas": [
     {
       "tool_id": "bundled:inbox-executa",
-      "min_version": "1.1.9",
+      "min_version": "2.0.1",
       "version": "latest"
     }
   ],
   "optional_executas": [],
-  "system_prompt_addendum": "This app is a minimal Anna mail-agent skeleton. Gmail access is read from local token files owned by the project. Mail-agent evaluation can use DashScope inside the Executa or Anna Executa sampling; do not ask the user for API keys.",
+  "system_prompt_addendum": "Anna Inbox is a Gmail workspace with inbox sync, thread actions, drafts, attachments, Brief workflows, and mailbox search. Credentials are supplied by Anna authorization or the Executa credential context; never ask the user to paste API keys or OAuth tokens.",
   "tags": [
     "email",
     "gmail",
@@ -38,7 +38,7 @@
     "views": [
       {
         "name": "main",
-        "title": "Panwb Mail Agent",
+        "title": "Anna Inbox",
         "default": true,
         "entry": "index.html",
         "min_size": {

@@ -1,59 +1,60 @@
 # Anna Inbox
 
-Anna Inbox 是 Anna App 中用于处理 Gmail 收件箱注意力管理的产品语境。它把邮箱内容整理成可行动的简报、可处理的卡片，以及按自然语言发起的自定义查询。
+Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；Brief、Attention Card 和 Custom Scan 是仍由后端提供的工作流能力，不再代表 2.0 的整体界面结构。
 
 ## Language
 
-**Mailbox**:
-一个被 Anna Inbox 读取和处理的 Gmail 邮箱账户。一个 Brief、Ask 或 Scan Plan 都针对一个 Mailbox。
-_Avoid_: account, source account
+**Mailbox**
 
-**Brief**:
-一个稳定、可预测的邮箱扫描工作流，目的是产出用户当天需要关注的 Attention Cards。Brief 不是开放式问答。
-_Avoid_: daily scan, inbox summary, workflow page
+一个已授权并可在 Anna Inbox 中切换的 Gmail 邮箱。避免使用 source account。
 
-**Ask**:
-一个由用户自然语言请求驱动的自定义邮箱查询，用于回答开放问题或执行一次性扫描。Ask 不等同于 Brief，也不产出 Brief 的卡片队列作为主要目标。
-_Avoid_: custom brief, search page
+**Inbox Workspace**
 
-**Custom Scan**:
-一次 Ask 请求的执行实例。它围绕用户的自然语言请求读取相关邮件，并返回结构化结果。
-_Avoid_: ask run, custom workflow
+2.0 主工作区，负责邮件列表、邮箱文件夹、筛选、同步和邮件状态操作。避免将其称为 Brief 页面。
 
-**Custom Scan Plan**:
-Ask 为某个自然语言请求形成的可复用查询计划。一个 Custom Scan Plan 可以被再次执行，但它不是 Brief 的 Scan Plan。
-_Avoid_: saved search, ask template
+**Mailbox View**
 
-**Scan Plan**:
-Mailbox 的 Brief 扫描偏好，包括扫描窗口、频率和包含范围。Scan Plan 描述后续 Brief 如何扫描，而不是 Ask 如何回答问题。
-_Avoid_: schedule settings, source settings
+Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 或 All mail 中的一个视图。
 
-**Attention Card**:
-Brief 产出的一个待处理邮件事项。Attention Card 表示用户需要回复、查看、暂缓或标记已处理的一个邮件线程或事项。
-_Avoid_: email card, task card
+**Mail Detail**
 
-**Cleanup Bundle**:
-Brief 将低价值邮件聚合成的一张可折叠卡片。Cleanup Bundle 用于从行动队列中隔离噪音，而不是逐封生成独立 Attention Card。
-_Avoid_: low priority list, ignored emails
+线程详情抽屉，包含消息正文、附件、AI overview、草稿编辑和发送操作。它不同于旧 Attention Card 的 Handle 视图。
 
-**Handle**:
-用户处理单张 Attention Card 的详情体验，包括查看线程上下文、生成或修改草稿、发送回复、标记无需操作或手动完成。
-_Avoid_: detail page, reply drawer
+**Anna AI Sidebar**
 
-**Run**:
-一次后台执行记录，可以属于 Brief、Ask、草稿生成或线程总结等长耗时操作。Run 是执行实例，不是用户可复用的计划。
-_Avoid_: job, task
+主界面左侧的对话入口。它根据请求和当前邮件上下文路由到普通对话、邮箱扫描或邮件上下文协助。
 
-## Example Dialogue
+**Local Draft**
 
-开发者：这个 Mailbox 的 Brief 今天没有 Attention Card，是不是说明 Ask 也没结果？
+按 mailbox 和 thread 持久化、尚未发送到 Gmail 的用户草稿。发送成功或用户丢弃后删除。
 
-领域专家：不是。Brief 只产出稳定的注意力队列；Ask 是用户临时提问，可以针对同一个 Mailbox 做不同的 Custom Scan。
+**Brief**
 
-开发者：那用户保存的查询应该叫 Scan Plan 吗？
+后端中稳定、可续跑的邮箱注意力扫描工作流，产出 Attention Cards。Brief 不是 2.0 Inbox Workspace 的同义词。
 
-领域专家：如果它来自 Ask，就叫 Custom Scan Plan。Scan Plan 特指 Brief 的扫描偏好。
+**Attention Card**
 
-开发者：Cleanup Bundle 里的邮件也算 Attention Card 吗？
+Brief 产出的待处理事项，包含 reply、review 或 cleanup 语义。
 
-领域专家：它是 Brief 产出的卡片，但语义上是噪音聚合，不应该当成需要逐项处理的普通 Attention Card。
+**Ask / Custom Scan**
+
+由自然语言请求驱动的邮箱搜索与综合回答流程。AI Sidebar 可以触发该能力。
+
+**Custom Scan Plan**
+
+Ask 生成并可再次执行的查询计划，不等同于 Brief Scan Plan。
+
+**Scan Plan**
+
+Brief 的扫描窗口、数量和行为偏好。
+
+**Contact Memory**
+
+按 mailbox 和 contact 隔离的长期线程摘要，用于补充当前线程之外的关系上下文。
+
+## Product boundaries
+
+- 2.0.1 只支持 Gmail；Outlook 仍是未来方向。
+- 设置入口暂时不在前端展示，后端配置和工具契约保留。
+- 邮件发送、标记已读、标签变更和移至垃圾箱必须来自明确用户操作。
+- 凭据不作为工具参数传递，也不得写入日志或持久化状态。

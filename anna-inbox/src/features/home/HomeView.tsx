@@ -236,12 +236,6 @@ const RefreshIcon = () => (
     <path d="M19 11a7.5 7.5 0 1 0 .2 5" />
   </Icon>
 );
-const SettingsIcon = () => (
-  <Icon>
-    <circle cx="12.6" cy="12" r="3" />
-    <path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1A8 8 0 0 0 15 6l-.3-2.6h-4L10.5 6A8 8 0 0 0 9 7l-2.4-1-2 3.4 2 1.6a7 7 0 0 0 0 2l-2 1.6 2 3.4L9 17a8 8 0 0 0 1.5 1l.3 2.6h4L15 18a8 8 0 0 0 1.5-1l2.4 1 2-3.4-2-1.5c.1-.4.1-.7.1-1.1Z" />
-  </Icon>
-);
 const HistoryIcon = () => (
   <Icon>
     <path d="M4 5v5h5" />
@@ -1551,13 +1545,6 @@ function AccountRail() {
           className="account-avatar-image"
         />
         <i className={scanFailed ? "is-inactive" : ""} />
-      </button>
-      <button
-        className="account-settings-btn"
-        title="Settings"
-        onClick={() => actions.setDrawer("sources", true)}
-      >
-        <SettingsIcon />
       </button>
       {menuOpen ? (
         <button
