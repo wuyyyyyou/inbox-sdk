@@ -847,15 +847,28 @@ function shouldAnimateAssistantText(timestamp?: string) {
 function AnimatedAssistantText({
   text,
   animate,
+  onComplete,
 }: {
   text: string;
   animate: boolean;
+  onComplete?: () => void;
 }) {
   const [visibleText, setVisibleText] = useState(animate ? "" : text);
+  const onCompleteRef = useRef(onComplete);
+
+  useEffect(() => {
+    onCompleteRef.current = onComplete;
+  }, [onComplete]);
 
   useEffect(() => {
     if (!animate) {
       setVisibleText(text);
+      onCompleteRef.current?.();
+      return;
+    }
+    if (!text) {
+      setVisibleText("");
+      onCompleteRef.current?.();
       return;
     }
     setVisibleText("");
@@ -865,6 +878,7 @@ function AnimatedAssistantText({
       if (frame >= text.length) {
         window.clearInterval(timer);
         setVisibleText(text);
+        onCompleteRef.current?.();
         return;
       }
       setVisibleText(text.slice(0, frame));
@@ -885,6 +899,9 @@ function AiAssistantMessage({
   const { actions } = useApp();
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [submittingGap, setSubmittingGap] = useState(false);
+  const [assistantTextComplete, setAssistantTextComplete] = useState(
+    () => !shouldAnimateAssistantText(message.timestamp),
+  );
 
   if (message.pending) {
     return (
@@ -902,6 +919,10 @@ function AiAssistantMessage({
   if (!result) {
     const text = displayAssistantText(message);
     const animate = shouldAnimateAssistantText(message.timestamp);
+    const draftArtifact =
+      message.artifact && (!animate || assistantTextComplete)
+        ? message.artifact
+        : null;
     const submitReplyGap = async () => {
       if (
         !message.mailContext ||
@@ -934,19 +955,27 @@ function AiAssistantMessage({
       <div
         className={`ai-message is-assistant ${message.kind === "error" ? "is-error" : ""} ${message.kind === "stopped" ? "is-stopped" : ""}`}
       >
-        <AnimatedAssistantText text={text} animate={animate} />
-        {message.artifact ? (
+        <AnimatedAssistantText
+          text={text}
+          animate={animate}
+          onComplete={() => setAssistantTextComplete(true)}
+        />
+        {draftArtifact ? (
           <div className="ai-draft-artifact">
-            <pre>{message.artifact.body}</pre>
+            <pre>{draftArtifact.body}</pre>
             <div className="ai-draft-artifact-actions">
-              <button onClick={() => onInsertArtifact(message.artifact!)}>
+              <button
+                className="is-primary"
+                onClick={() => onInsertArtifact(draftArtifact)}
+              >
                 Insert draft reply
               </button>
-              <button disabled title="Coming later">
+              <button className="is-secondary" disabled title="Coming later">
                 Insert into new email
               </button>
               <button
-                onClick={() => void actions.copyDraft(message.artifact!.body)}
+                className="is-secondary"
+                onClick={() => void actions.copyDraft(draftArtifact.body)}
               >
                 Copy draft
               </button>
@@ -2866,7 +2895,7 @@ export function HomeView() {
           mailbox={mailbox}
           message={selectedMessage}
           flags={detailFlags}
-          aiBusy={state.aiChatLoading}
+          aiBusy={state.aiChatLoading || state.isCustomScanning}
           insertRequest={insertRequest}
           onConsumeInsertRequest={(nonce) =>
             setInsertRequest((current) =>
@@ -2887,7 +2916,10 @@ export function HomeView() {
           saveInboxThreadDraft={actions.saveInboxThreadDraft}
           deleteInboxThreadDraft={actions.deleteInboxThreadDraft}
           prepareInboxAttachmentAccess={actions.prepareInboxAttachmentAccess}
-          submitMailContextPrompt={actions.submitMailContextPrompt}
+          submitMailContextPrompt={(request) => {
+            setSidebarCollapsed(false);
+            return actions.submitMailContextPrompt(request);
+          }}
           sendInboxThreadReply={actions.sendInboxThreadReply}
           contactAvatars={contactAvatars}
           loadContactAvatars={actions.loadContactAvatars}

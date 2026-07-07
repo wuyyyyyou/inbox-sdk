@@ -11138,19 +11138,24 @@ body,
 }
 
 .mail-detail-composer textarea {
+  height: 136px;
   min-height: 136px;
-  max-height: 280px;
+  max-height: 136px;
   width: 100%;
   padding: 14px 16px;
-  resize: vertical;
+  resize: none;
+  overflow-y: auto;
   border: 1px solid rgba(120, 131, 164, 0.2);
   border-radius: 16px;
   font: inherit;
   line-height: 1.6;
+  scrollbar-width: thin;
+  scrollbar-color: #d8dce8 transparent;
 }
 
 .mail-detail-footer.is-expanded .mail-detail-composer textarea {
-  max-height: 420px;
+  height: clamp(280px, 45vh, 520px);
+  max-height: clamp(280px, 45vh, 520px);
 }
 
 .mail-detail-composer-head > div,
@@ -11158,6 +11163,89 @@ body,
 .ai-draft-artifact-actions {
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.mail-detail-composer-head > div {
+  flex: 0 0 auto;
+}
+
+.mail-detail-composer-head .mail-detail-composer-icon-btn {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 31px;
+  height: 31px;
+  padding: 0;
+  border-color: transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #74809b;
+  line-height: 0;
+}
+
+.mail-detail-composer-head .mail-detail-composer-icon-btn:hover:not(:disabled),
+.mail-detail-composer-head .mail-detail-composer-icon-btn:focus-visible:not(:disabled) {
+  color: #4f6df5;
+  background: #edf1ff;
+}
+
+.mail-detail-composer-head .mail-detail-composer-icon-btn:disabled {
+  cursor: default;
+  color: #b5bac8;
+  background: transparent;
+}
+
+.mail-detail-composer-head .mail-detail-composer-icon-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+.mail-detail-composer-head .mail-detail-composer-icon-btn::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  z-index: 22;
+  right: 50%;
+  bottom: calc(100% + 8px);
+  padding: 6px 8px;
+  border-radius: 8px;
+  color: #ffffff;
+  background: rgba(24, 24, 28, 0.96);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.2);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(50%) translateY(4px);
+  transition:
+    opacity 140ms ease,
+    transform 140ms ease;
+}
+
+.mail-detail-composer-head .mail-detail-composer-icon-btn:hover::after,
+.mail-detail-composer-head .mail-detail-composer-icon-btn:focus-visible::after {
+  opacity: 1;
+  transform: translateX(50%) translateY(0);
+}
+
+.mail-detail-composer-actions {
+  justify-content: flex-end;
+}
+
+.mail-detail-composer-actions .is-primary {
+  min-width: 76px;
+  min-height: 34px;
+  border-radius: 999px;
+  font-weight: 650;
+}
+
+.mail-detail-composer-actions .is-primary:disabled {
+  cursor: default;
+  color: #ffffff;
+  border-color: #c9ceda;
+  background: #c9ceda;
+  box-shadow: none;
 }
 
 .mail-detail-loading,
@@ -11176,12 +11264,86 @@ body,
   background: rgba(244, 247, 255, 0.96);
 }
 
+.ai-draft-artifact {
+  border: 1px solid rgba(111, 129, 214, 0.15);
+  box-shadow: 0 12px 28px rgba(65, 76, 130, 0.08);
+  animation: aiDraftArtifactIn 220ms ease-out both;
+}
+
 .ai-draft-artifact pre,
 .attachment-preview-body pre {
   margin: 0;
   white-space: pre-wrap;
   word-break: break-word;
   font: inherit;
+}
+
+.ai-draft-artifact-actions {
+  justify-content: flex-start;
+}
+
+.ai-draft-artifact-actions button {
+  min-height: 36px;
+  padding: 0 13px;
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 650;
+  transition:
+    color 140ms ease,
+    border-color 140ms ease,
+    background 140ms ease,
+    box-shadow 140ms ease,
+    transform 140ms ease;
+}
+
+.ai-draft-artifact-actions button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.ai-draft-artifact-actions .is-primary {
+  color: #ffffff;
+  border-color: #4f6df5;
+  background: #4f6df5;
+  box-shadow: 0 8px 18px rgba(79, 109, 245, 0.24);
+}
+
+.ai-draft-artifact-actions .is-primary:hover:not(:disabled) {
+  border-color: #405ee2;
+  background: #405ee2;
+  box-shadow: 0 10px 22px rgba(79, 109, 245, 0.3);
+}
+
+.ai-draft-artifact-actions .is-secondary {
+  color: #4c5f99;
+  border-color: rgba(79, 109, 245, 0.17);
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.72) inset;
+}
+
+.ai-draft-artifact-actions .is-secondary:hover:not(:disabled) {
+  color: #3654d5;
+  border-color: rgba(79, 109, 245, 0.3);
+  background: #ffffff;
+}
+
+.ai-draft-artifact-actions button:disabled {
+  cursor: default;
+  color: #7d89ae;
+  border-color: rgba(122, 138, 198, 0.14);
+  background: rgba(235, 240, 255, 0.72);
+  box-shadow: none;
+  opacity: 0.72;
+}
+
+@keyframes aiDraftArtifactIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .ai-reply-gaps label {
