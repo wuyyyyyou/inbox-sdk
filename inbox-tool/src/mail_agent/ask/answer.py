@@ -132,6 +132,7 @@ async def _read_candidate_context(
     candidates: list[MessageLite],
     mailbox: str,
     *,
+    mailbox_by_message_id: dict[str, str] | None = None,
     sampling_create_message: Any = None,
     progress_callback: Any = None,
 ) -> list[dict[str, Any]]:
@@ -178,7 +179,10 @@ async def _read_candidate_context(
 
     enriched: list[dict[str, Any]] = []
     for idx, msg in enumerate(candidates, 1):
+        source_mailbox = (mailbox_by_message_id or {}).get(msg.message_id or "", mailbox)
+        source_mailbox = normalize_mailbox(source_mailbox)
         entry: dict[str, Any] = {
+            "mailbox": source_mailbox,
             "message_id": msg.message_id or "",
             "thread_id": msg.thread_id or "",
             "from": msg.from_addr or "",
@@ -195,7 +199,7 @@ async def _read_candidate_context(
 
         # Read body
         try:
-            detail = get_message_detail(normalized, msg.message_id)
+            detail = get_message_detail(source_mailbox, msg.message_id)
             if detail:
                 entry["body"] = (getattr(detail, "body_text", "") or "")[:4000]
         except Exception:
@@ -203,7 +207,7 @@ async def _read_candidate_context(
 
         # Read thread context
         try:
-            thread_ctx = get_thread_context(normalized, msg.thread_id or msg.message_id)
+            thread_ctx = get_thread_context(source_mailbox, msg.thread_id or msg.message_id)
             if thread_ctx and thread_ctx.messages:
                 entry["thread"] = []
                 for tm in thread_ctx.messages[:10]:
@@ -247,6 +251,7 @@ def _render_candidates_for_llm(
             f"From: {e.get('from', '')}\n"
             f"Subject: {e.get('subject', '')}{unread_label}\n"
             f"Date: {e.get('date', '')}\n"
+            f"Mailbox: {e.get('mailbox', '')}\n"
             f"Thread ID: {e.get('thread_id', '')}\n"
             f"Message ID: {e.get('message_id', '')}{labels_str}"
         )
@@ -303,6 +308,12 @@ async def _generate_answer(
             f"with specific questions. The user will answer, and a draft will be generated later.\n"
             f"CRITICAL: Never include both draft AND reply_gaps.needs_user_input on the same item.\n"
             f"When in doubt, choose Path B. A bad guess is worse than asking.\n\n"
+            f"## Structured mail references\n"
+            f"When an item cites one or more provided emails, include mail_links (maximum 5):\n"
+            f"[{{\"label\": \"exact email subject\", \"mailbox\": \"provided mailbox\", "
+            f"\"thread_id\": \"provided thread id\", \"message_id\": \"provided message id\"}}]\n"
+            f"Use only IDs and subjects shown below. Never emit href, URLs, or invented references.\n"
+            f"For a single-email item, also include its mailbox, thread_id, and message_id fields.\n\n"
             f"## Relevant emails ({len(enriched)} total)\n"
             f"{rendered}\n\n"
             f"## Important\n"
@@ -373,7 +384,28 @@ async def _generate_answer(
 _FORBIDDEN_ACTIONS: list[str] = ["send", "delete", "forward", "unsubscribe"]
 
 
-def _apply_guard(result: dict[str, Any], valid_ids: set[str], valid_thread_ids: set[str]) -> dict[str, Any]:
+def _normalize_reference_text(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _mail_link_from_source(message_id: str, source: dict[str, str]) -> dict[str, str]:
+    return {
+        "label": str(source.get("subject") or "(no subject)")[:120],
+        "mailbox": str(source.get("mailbox") or ""),
+        "thread_id": str(source.get("thread_id") or ""),
+        "message_id": message_id,
+        "from": str(source.get("from") or "")[:240],
+        "date": str(source.get("date") or "")[:80],
+        "snippet": str(source.get("snippet") or "")[:240],
+    }
+
+
+def _apply_guard(
+    result: dict[str, Any],
+    valid_ids: set[str],
+    valid_thread_ids: set[str],
+    valid_sources: dict[str, dict[str, str]] | None = None,
+) -> dict[str, Any]:
     """Apply safety guards to the Answer LLM output.
 
     1. Block forbidden action language in suggestions and drafts
@@ -420,6 +452,72 @@ def _apply_guard(result: dict[str, Any], valid_ids: set[str], valid_thread_ids: 
             if tid and tid not in valid_thread_ids:
                 item["thread_id"] = ""
                 _logger.warning("Ask guard stripped invalid thread_id: %s", tid[:40])
+
+            sources = valid_sources or {}
+            source = sources.get(mid)
+            item_source_is_valid = False
+            if source:
+                expected_thread = source.get("thread_id", "")
+                if tid and tid != expected_thread:
+                    item["thread_id"] = ""
+                else:
+                    item_source_is_valid = True
+                    item["thread_id"] = expected_thread
+                    item["mailbox"] = source.get("mailbox", "")
+                    item["subject"] = source.get("subject", item.get("subject", ""))
+                    item["from"] = source.get("from", item.get("from", ""))
+
+            raw_links = item.get("mail_links")
+            safe_links: list[dict[str, str]] = []
+            seen_threads: set[tuple[str, str]] = set()
+
+            def add_source_link(link_mid: str, link_source: dict[str, str]) -> None:
+                if len(safe_links) >= 5:
+                    return
+                link_mailbox = str(link_source.get("mailbox") or "").strip().lower()
+                link_tid = str(link_source.get("thread_id") or "").strip()
+                if not link_mid or not link_mailbox or not link_tid:
+                    return
+                thread_key = (link_mailbox, link_tid)
+                if thread_key in seen_threads:
+                    return
+                seen_threads.add(thread_key)
+                safe_links.append(_mail_link_from_source(link_mid, link_source))
+
+            if isinstance(raw_links, list):
+                for raw_link in raw_links:
+                    if not isinstance(raw_link, dict):
+                        continue
+                    link_mid = str(raw_link.get("message_id") or "").strip()
+                    link_tid = str(raw_link.get("thread_id") or "").strip()
+                    link_mailbox = str(raw_link.get("mailbox") or "").strip().lower()
+                    link_source = sources.get(link_mid)
+                    if not link_source:
+                        continue
+                    if link_tid != link_source.get("thread_id") or link_mailbox != link_source.get("mailbox", "").lower():
+                        continue
+                    add_source_link(link_mid, link_source)
+
+            # 中文注释：模型可能漏掉 mail_links；条目自身的合法 ID 仍应确定性补成链接。
+            if source and item_source_is_valid:
+                add_source_link(mid, source)
+
+            # 中文注释：若模型连 ID 也漏掉，只接受结果文本中完整出现的候选邮件主题，避免模糊匹配误跳转。
+            reference_text = _normalize_reference_text(" ".join(
+                str(item.get(field) or "") for field in ("subject", "context", "suggestion", "draft")
+            ))
+            item_subject = _normalize_reference_text(item.get("subject"))
+            for source_mid, candidate_source in sources.items():
+                candidate_subject = _normalize_reference_text(candidate_source.get("subject"))
+                if not candidate_subject:
+                    continue
+                exact_subject_mentioned = candidate_subject in reference_text
+                if len(candidate_subject) < 6:
+                    exact_subject_mentioned = item_subject == candidate_subject
+                if exact_subject_mentioned:
+                    add_source_link(source_mid, candidate_source)
+
+            item["mail_links"] = safe_links
 
     return result
 
@@ -505,6 +603,7 @@ async def run_ask_pipeline(
 
     # ── 3. Merge candidates ─────────────────────────────────────────
     all_candidates: list[MessageLite] = []
+    candidate_mailboxes: dict[str, str] = {}
     seen_ids: set[str] = set()
     total_scanned = 0
 
@@ -515,6 +614,8 @@ async def run_ask_pipeline(
             if cid not in seen_ids:
                 seen_ids.add(cid)
                 all_candidates.append(c)
+                if c.message_id:
+                    candidate_mailboxes[c.message_id] = _mbox
 
     if not all_candidates:
         return {
@@ -529,6 +630,7 @@ async def run_ask_pipeline(
     # ── 4. Context ──────────────────────────────────────────────────
     enriched = await _read_candidate_context(
         all_candidates, primary_mailbox,
+        mailbox_by_message_id=candidate_mailboxes,
         sampling_create_message=sampling_create_message,
         progress_callback=progress_callback,
     )
@@ -543,7 +645,19 @@ async def run_ask_pipeline(
     # ── 6. Guard ────────────────────────────────────────────────────
     valid_ids = {c.message_id or "" for c in all_candidates if c.message_id}
     valid_thread_ids = {c.thread_id or "" for c in all_candidates if c.thread_id}
-    result = _apply_guard(result, valid_ids, valid_thread_ids)
+    valid_sources = {
+        str(entry.get("message_id") or ""): {
+            "mailbox": str(entry.get("mailbox") or ""),
+            "thread_id": str(entry.get("thread_id") or ""),
+            "subject": str(entry.get("subject") or ""),
+            "from": str(entry.get("from") or ""),
+            "date": str(entry.get("date") or ""),
+            "snippet": str(entry.get("snippet") or ""),
+        }
+        for entry in enriched
+        if entry.get("message_id")
+    }
+    result = _apply_guard(result, valid_ids, valid_thread_ids, valid_sources)
 
     result.setdefault("plan_id", plan.plan_id)
     result.setdefault("plan_title", plan.title)

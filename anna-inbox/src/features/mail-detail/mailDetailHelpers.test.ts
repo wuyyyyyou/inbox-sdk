@@ -7,6 +7,7 @@ import {
   isPreviewableAttachment,
   materializeAttachmentAccess,
   matchesDraftArtifact,
+  mergeDraftArtifactBody,
   normalizeAttachmentKind,
   parseSnoozeInput,
   resolveAttachmentAccess,
@@ -67,6 +68,13 @@ describe("mailDetailHelpers", () => {
       body: "Draft",
       source_prompt: "Prompt",
     })).toBe(true);
+  });
+
+  it("appends generated drafts with an explicit paragraph break", () => {
+    expect(mergeDraftArtifactBody("Existing draft\n", "Generated draft", "append"))
+      .toBe("Existing draft\n\nGenerated draft");
+    expect(mergeDraftArtifactBody("Existing draft", "Generated draft", "replace"))
+      .toBe("Generated draft");
   });
 
   it("builds the visible quick-reply prompt", () => {

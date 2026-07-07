@@ -162,6 +162,77 @@ def test_guard_empty_sections():
     print("[PASS] test_guard_empty_sections")
 
 
+def test_guard_validates_and_materializes_mail_links():
+    """Only candidate-backed links survive and display metadata comes from Gmail data."""
+    from mail_agent.ask.answer import _apply_guard
+
+    result = {"sections": [{"items": [{
+        "subject": "Group",
+        "mail_links": [
+            {"label": "Invented", "mailbox": "me@example.com", "thread_id": "t1", "message_id": "m1"},
+            {"label": "Fake", "mailbox": "me@example.com", "thread_id": "fake", "message_id": "m1"},
+            {"label": "Fake", "mailbox": "me@example.com", "thread_id": "t2", "message_id": "fake"},
+        ],
+    }]}]}
+    sources = {"m1": {
+        "mailbox": "me@example.com", "thread_id": "t1", "subject": "Real subject",
+        "from": "Alice <alice@example.com>", "date": "Jul 07", "snippet": "Preview",
+    }}
+    guarded = _apply_guard(result, {"m1"}, {"t1"}, sources)
+    links = guarded["sections"][0]["items"][0]["mail_links"]
+    assert links == [{
+        "label": "Real subject", "mailbox": "me@example.com", "thread_id": "t1", "message_id": "m1",
+        "from": "Alice <alice@example.com>", "date": "Jul 07", "snippet": "Preview",
+    }]
+    print("[PASS] test_guard_validates_and_materializes_mail_links")
+
+
+def test_guard_backfills_mail_link_from_item_id():
+    """A cited result item remains navigable when the model omits mail_links."""
+    from mail_agent.ask.answer import _apply_guard
+
+    result = {"sections": [{"items": [{
+        "subject": "Model-generated label",
+        "context": "This thread needs your reply.",
+        "message_id": "m1",
+        "thread_id": "t1",
+    }]}]}
+    sources = {"m1": {
+        "mailbox": "me@example.com", "thread_id": "t1", "subject": "Partnership Opportunities",
+        "from": "Bri <bri@example.com>", "date": "Jul 07", "snippet": "Preview",
+    }}
+    guarded = _apply_guard(result, {"m1"}, {"t1"}, sources)
+    item = guarded["sections"][0]["items"][0]
+    assert item["subject"] == "Partnership Opportunities"
+    assert item["mail_links"][0]["message_id"] == "m1"
+    print("[PASS] test_guard_backfills_mail_link_from_item_id")
+
+
+def test_guard_backfills_mail_link_from_exact_subject_mention():
+    """An exact candidate subject in narrative text is linked without fuzzy guessing."""
+    from mail_agent.ask.answer import _apply_guard
+
+    result = {"sections": [{"items": [{
+        "subject": "No Action Required",
+        "context": "The thread regarding 'Exploring Browserless as a creative engine partner' is not awaiting your reply.",
+    }]}]}
+    sources = {
+        "m1": {
+            "mailbox": "me@example.com", "thread_id": "t1",
+            "subject": "Exploring Browserless as a creative engine partner",
+            "from": "Joel <joel@example.com>", "date": "Jul 06", "snippet": "Pilot recap",
+        },
+        "m2": {
+            "mailbox": "me@example.com", "thread_id": "t2", "subject": "Unrelated subject",
+            "from": "Other <other@example.com>", "date": "Jul 05", "snippet": "Other",
+        },
+    }
+    guarded = _apply_guard(result, {"m1", "m2"}, {"t1", "t2"}, sources)
+    links = guarded["sections"][0]["items"][0]["mail_links"]
+    assert [link["message_id"] for link in links] == ["m1"]
+    print("[PASS] test_guard_backfills_mail_link_from_exact_subject_mention")
+
+
 # ── Rendering tests ────────────────────────────────────────────────────
 
 def test_render_candidates_basic():
@@ -253,6 +324,9 @@ def main():
     test_guard_false_positive_sender_not_flagged()
     test_guard_safe_content_passes_through()
     test_guard_empty_sections()
+    test_guard_validates_and_materializes_mail_links()
+    test_guard_backfills_mail_link_from_item_id()
+    test_guard_backfills_mail_link_from_exact_subject_mention()
 
     print("\n--- Rendering ---\n")
     test_render_candidates_basic()

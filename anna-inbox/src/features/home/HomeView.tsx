@@ -13,6 +13,8 @@ import {
 import { useApp } from "../../app/AppContext";
 import type {
   AiChatMessage,
+  AiMailContextRef,
+  AskMailLink,
   DraftReplyArtifact,
   CustomRunResult,
   InboxMessage,
@@ -969,14 +971,19 @@ function AnimatedAssistantText({
 
 function AiAssistantMessage({
   message,
-  onInsertArtifact,
+  currentMailContext,
+  onUseArtifact,
+  onOpenMail,
 }: {
   message: AiChatMessage;
-  onInsertArtifact: (artifact: DraftReplyArtifact) => void;
+  currentMailContext: AiMailContextRef | null;
+  onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
+  onOpenMail: (target: AskMailLink) => void;
 }) {
   const { actions } = useApp();
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [submittingGap, setSubmittingGap] = useState(false);
+  const [clarificationInput, setClarificationInput] = useState("");
   const [assistantTextComplete, setAssistantTextComplete] = useState(
     () => !shouldAnimateAssistantText(message.timestamp),
   );
@@ -988,7 +995,7 @@ function AiAssistantMessage({
         aria-live="polite"
         aria-busy="true"
       >
-        <p>Thinking</p>
+        <p>{message.content || "Thinking"}</p>
       </div>
     );
   }
@@ -1001,6 +1008,13 @@ function AiAssistantMessage({
       message.artifact && (!animate || assistantTextComplete)
         ? message.artifact
         : null;
+    const clarification = message.clarification;
+    const targetThreadOpen = Boolean(
+      draftArtifact &&
+      currentMailContext &&
+      currentMailContext.mailbox.trim().toLowerCase() === draftArtifact.mailbox.trim().toLowerCase() &&
+      currentMailContext.thread_id === draftArtifact.thread_id,
+    );
     const submitReplyGap = async () => {
       if (
         !message.mailContext ||
@@ -1038,19 +1052,67 @@ function AiAssistantMessage({
           animate={animate}
           onComplete={() => setAssistantTextComplete(true)}
         />
+        {clarification ? (
+          <div className={`ai-clarification is-${clarification.status}`}>
+            {clarification.status === "pending" ? (
+              <>
+                {clarification.freeform_enabled ? (
+                  <input
+                    value={clarificationInput}
+                    placeholder="Add details (optional)"
+                    onChange={(event) => setClarificationInput(event.target.value)}
+                  />
+                ) : null}
+                <div className="ai-clarification-actions">
+                  {clarification.actions.map((action) => (
+                    <button
+                      key={action.id}
+                      onClick={() => void actions.sendAiChatMessage({
+                        currentMailContext,
+                        forcedKind: action.id,
+                        prompt: clarificationInput.trim() || clarification.original_input,
+                        clarificationMessageId: message.id,
+                      })}
+                    >
+                      {action.label}
+                    </button>
+                  ))}
+                  <button className="is-dismiss" onClick={() => actions.dismissAiClarification(message.id)}>
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : (
+              <span>{clarification.status === "dismissed" ? "Dismissed" : "Resolved"}</span>
+            )}
+          </div>
+        ) : null}
         {draftArtifact ? (
           <div className="ai-draft-artifact">
             <pre>{draftArtifact.body}</pre>
             <div className="ai-draft-artifact-actions">
-              <button
-                className="is-primary"
-                onClick={() => onInsertArtifact(draftArtifact)}
-              >
-                Insert draft reply
-              </button>
-              <button className="is-secondary" disabled title="Coming later">
-                Insert into new email
-              </button>
+              {targetThreadOpen ? (
+                <>
+                  <button className="is-primary" onClick={() => onUseArtifact(draftArtifact, "append")}>
+                    Append to draft reply
+                  </button>
+                  <button className="is-secondary" onClick={() => onUseArtifact(draftArtifact, "replace")}>
+                    Replace draft reply
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="is-primary"
+                  onClick={() => onOpenMail({
+                    label: "Draft thread",
+                    mailbox: draftArtifact.mailbox,
+                    thread_id: draftArtifact.thread_id,
+                    message_id: message.mailContext?.latest_message_id || message.mailContext?.anchor_message_id || "",
+                  })}
+                >
+                  Go to thread
+                </button>
+              )}
               <button
                 className="is-secondary"
                 onClick={() => void actions.copyDraft(draftArtifact.body)}
@@ -1059,6 +1121,9 @@ function AiAssistantMessage({
               </button>
             </div>
           </div>
+        ) : null}
+        {draftArtifact && message.assistantFollowupText ? (
+          <AnimatedAssistantText text={message.assistantFollowupText} animate={animate} />
         ) : null}
         {message.replyGaps?.needs_user_input ? (
           <div className="ai-reply-gaps">
@@ -1121,7 +1186,33 @@ function AiAssistantMessage({
                 <div className="ai-answer-items">
                   {section.items.slice(0, 4).map((item, itemIndex) => (
                     <span key={`${item.subject || "item"}-${itemIndex}`}>
-                      {item.subject ? <b>{item.subject}</b> : null}
+                      {item.mail_links?.length ? (
+                        <span className="ai-mail-links">
+                          {item.mail_links.slice(0, 5).map((link) => (
+                            <button
+                              key={`${link.mailbox}:${link.message_id}`}
+                              title={[link.label, link.from, link.date, link.snippet].filter(Boolean).join(" · ")}
+                              onClick={() => onOpenMail(link)}
+                            >
+                              {link.label}
+                            </button>
+                          ))}
+                        </span>
+                      ) : item.subject && item.mailbox && item.thread_id && item.message_id ? (
+                        <button
+                          className="ai-single-mail-link"
+                          title={item.subject}
+                          onClick={() => onOpenMail({
+                            label: item.subject || "Email",
+                            mailbox: item.mailbox || "",
+                            thread_id: item.thread_id || "",
+                            message_id: item.message_id || "",
+                            from: item.from,
+                          })}
+                        >
+                          {item.subject}
+                        </button>
+                      ) : item.subject ? <b>{item.subject}</b> : null}
                       {item.context || item.suggestion
                         ? ` ${item.context || item.suggestion}`
                         : null}
@@ -1140,27 +1231,40 @@ function AiAssistantMessage({
 
 function AiMessageBubble({
   message,
-  onInsertArtifact,
+  currentMailContext,
+  onUseArtifact,
+  onOpenMail,
 }: {
   message: AiChatMessage;
-  onInsertArtifact: (artifact: DraftReplyArtifact) => void;
+  currentMailContext: AiMailContextRef | null;
+  onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
+  onOpenMail: (target: AskMailLink) => void;
 }) {
   if (message.role === "user") {
     return <div className="ai-message is-user">{message.content}</div>;
   }
   return (
-    <AiAssistantMessage message={message} onInsertArtifact={onInsertArtifact} />
+    <AiAssistantMessage
+      message={message}
+      currentMailContext={currentMailContext}
+      onUseArtifact={onUseArtifact}
+      onOpenMail={onOpenMail}
+    />
   );
 }
 
 function AiSidebar({
   collapsed,
   onToggle,
-  onInsertArtifact,
+  currentMailContext,
+  onUseArtifact,
+  onOpenMail,
 }: {
   collapsed: boolean;
   onToggle: () => void;
-  onInsertArtifact: (artifact: DraftReplyArtifact) => void;
+  currentMailContext: AiMailContextRef | null;
+  onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
+  onOpenMail: (target: AskMailLink) => void;
 }) {
   const { state, actions } = useApp();
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -1180,7 +1284,7 @@ function AiSidebar({
   const submit = () => {
     if (!state.customScanInput.trim() || running) return;
     setHistoryOpen(false);
-    void actions.sendAiChatMessage();
+    void actions.sendAiChatMessage({ currentMailContext });
   };
 
   const startNewChat = () => {
@@ -1213,7 +1317,9 @@ function AiSidebar({
               <AiMessageBubble
                 key={message.id}
                 message={message}
-                onInsertArtifact={onInsertArtifact}
+                currentMailContext={currentMailContext}
+                onUseArtifact={onUseArtifact}
+                onOpenMail={onOpenMail}
               />
             ))}
           </div>
@@ -1513,7 +1619,9 @@ export function HomeView() {
   const [insertRequest, setInsertRequest] = useState<{
     nonce: string;
     artifact: DraftReplyArtifact;
+    mode: "append" | "replace";
   } | null>(null);
+  const [externalDetailMessage, setExternalDetailMessage] = useState<InboxMessage | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
@@ -2384,10 +2492,12 @@ export function HomeView() {
       state.inboxSnapshotMessages.find((item) => item.id === selectedId) ||
       state.inboxMessages.find((item) => item.id === selectedId) ||
       flags.saved[selectedId] ||
+      (externalDetailMessage?.id === selectedId ? externalDetailMessage : null) ||
       null
     );
   }, [
     flags.saved,
+    externalDetailMessage,
     selectedId,
     sourceMessages,
     state.inboxDraftMessages,
@@ -2442,9 +2552,23 @@ export function HomeView() {
     state.inboxSnapshotMessages,
   ]);
 
+  const currentMailContext = useMemo<AiMailContextRef | null>(() => {
+    if (!selectedMessage) return null;
+    const detailMailbox = selectedMessage.mailbox || mailbox;
+    const threadId = selectedMessage.thread_id || selectedMessage.id;
+    return {
+      kind: "gmail_thread",
+      mailbox: detailMailbox,
+      thread_id: threadId,
+      anchor_message_id: selectedMessage.id,
+      latest_message_id: latestSelectedThreadMessage?.id || selectedMessage.id,
+    };
+  }, [latestSelectedThreadMessage?.id, mailbox, selectedMessage]);
+
   const closeDetailDrawer = useCallback(() => {
     const currentId = selectedId;
     setSelectedId("");
+    setExternalDetailMessage(null);
     requestAnimationFrame(() => {
       const row = document.querySelector<HTMLButtonElement>(
         `[data-mail-row-id="${CSS.escape(currentId)}"]`,
@@ -2455,6 +2579,7 @@ export function HomeView() {
 
   const openMessageDetail = useCallback(
     (message: InboxMessage) => {
+      setExternalDetailMessage(null);
       setSelectedId(message.id);
       if (
         !(message.unread || hasMessageLabel(message, "UNREAD")) ||
@@ -2462,7 +2587,7 @@ export function HomeView() {
       )
         return;
       void actions
-        .updateInboxThreadState(mailbox, message.thread_id, "mark_read")
+        .updateInboxThreadState(message.mailbox || mailbox, message.thread_id, "mark_read")
         .catch((reason) => {
           actions.showToast(
             reason instanceof Error ? reason.message : String(reason),
@@ -2471,6 +2596,58 @@ export function HomeView() {
     },
     [actions, mailbox],
   );
+
+  const openMailDetailFromAi = useCallback(async (target: AskMailLink) => {
+    const targetMailbox = target.mailbox.trim().toLowerCase();
+    if (!targetMailbox || !target.thread_id) {
+      actions.showToast("This email reference is incomplete.");
+      return;
+    }
+    try {
+      if (targetMailbox !== mailbox.trim().toLowerCase()) {
+        await actions.switchMailbox(targetMailbox);
+      }
+      const known = [
+        ...state.inboxMessages,
+        ...state.inboxSnapshotMessages,
+        ...state.inboxDraftMessages,
+        ...Object.values(flags.saved),
+      ].find((item) =>
+        (item.mailbox || targetMailbox).trim().toLowerCase() === targetMailbox &&
+        (target.message_id ? item.id === target.message_id : (item.thread_id || item.id) === target.thread_id),
+      );
+      if (known) {
+        setExternalDetailMessage(null);
+        setSelectedId(known.id);
+        return;
+      }
+      const page = await actions.loadInboxThreadPage(targetMailbox, target.thread_id, {
+        anchorMessageId: target.message_id || undefined,
+        limit: 5,
+        includeDisplayBody: true,
+      });
+      const anchor = page.messages.find((item) => item.id === target.message_id)
+        || page.messages.find((item) => item.id === page.latest_message_id)
+        || page.messages.at(-1);
+      if (!anchor) throw new Error("The referenced thread could not be loaded.");
+      const placeholder: InboxMessage = {
+        id: anchor.id,
+        thread_id: page.thread_id || target.thread_id,
+        mailbox: targetMailbox,
+        internal_date: anchor.internal_date,
+        from: anchor.from,
+        to: anchor.to,
+        subject: anchor.subject || page.subject,
+        label_ids: anchor.label_ids || [],
+        snippet: anchor.body_text || "",
+      };
+      setExternalDetailMessage(placeholder);
+      setSelectedId(placeholder.id);
+      setMailboxView("inbox");
+    } catch (reason) {
+      actions.showToast(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, [actions, flags.saved, mailbox, state.inboxDraftMessages, state.inboxMessages, state.inboxSnapshotMessages]);
 
   const handleGmailThreadAction = useCallback(
     async (operation: InboxThreadStateOperation, message: InboxMessage) => {
@@ -2794,9 +2971,11 @@ export function HomeView() {
       <AiSidebar
         collapsed={sidebarCollapsed}
         onToggle={() => setSidebarCollapsed((value) => !value)}
-        onInsertArtifact={(artifact) =>
-          setInsertRequest({ nonce: crypto.randomUUID(), artifact })
+        currentMailContext={currentMailContext}
+        onUseArtifact={(artifact, mode) =>
+          setInsertRequest({ nonce: crypto.randomUUID(), artifact, mode })
         }
+        onOpenMail={(target) => void openMailDetailFromAi(target)}
       />
       <div
         className="ai-sidebar-resizer"
@@ -3030,9 +3209,9 @@ export function HomeView() {
           ) : null}
         </section>
         <MailDetailDrawer
-          key={`${mailbox}:${selectedMessage?.id || "closed"}`}
+          key={`${selectedMessage?.mailbox || mailbox}:${selectedMessage?.id || "closed"}`}
           open={Boolean(selectedMessage)}
-          mailbox={mailbox}
+          mailbox={selectedMessage?.mailbox || mailbox}
           message={selectedMessage}
           flags={detailFlags}
           aiBusy={state.aiChatLoading || state.isCustomScanning}

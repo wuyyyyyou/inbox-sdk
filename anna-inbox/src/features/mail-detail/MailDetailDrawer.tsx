@@ -24,6 +24,7 @@ import {
   isPreviewableAttachment,
   materializeAttachmentAccess,
   matchesDraftArtifact,
+  mergeDraftArtifactBody,
   normalizeAttachmentKind,
   resolveAttachmentAccess,
   senderParts,
@@ -41,6 +42,7 @@ type MailUiFlags = {
 type InsertRequest = {
   nonce: string;
   artifact: DraftReplyArtifact;
+  mode: "append" | "replace";
 } | null;
 
 type PreviewAttachmentRef = {
@@ -721,13 +723,13 @@ export function MailDetailDrawer({
 
   useEffect(() => {
     if (!insertRequest || !message || !threadId) return;
-    const { artifact, nonce } = insertRequest;
+    const { artifact, mode, nonce } = insertRequest;
     if (!matchesDraftArtifact(mailbox, threadId, artifact)) return;
     onConsumeInsertRequest(nonce);
-    if (draft.trim() && !window.confirm("Replace the current draft reply?")) return;
+    if (mode === "replace" && draft.trim() && !window.confirm("Replace the current draft reply?")) return;
     setComposerOpen(true);
     setComposerExpanded(true);
-    setDraft(artifact.body);
+    setDraft((current) => mergeDraftArtifactBody(current, artifact.body, mode));
     setDraftDirty(true);
     requestAnimationFrame(() => bodyRef.current?.focus());
   }, [draft, insertRequest, mailbox, message, onConsumeInsertRequest, threadId]);

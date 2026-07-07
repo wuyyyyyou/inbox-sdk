@@ -1342,6 +1342,90 @@ body.is-resizing-ai-sidebar {
   grid-template-columns: 30px minmax(150px, 22%) minmax(0, 1fr) auto var(--mail-time-column, 62px);
   min-height: 40px;
 }
+
+.ai-mail-links {
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.ai-mail-links button,
+.ai-single-mail-link {
+  min-width: 0;
+  max-width: 100%;
+  padding: 3px 8px;
+  overflow: hidden;
+  color: #3157db;
+  font: inherit;
+  font-weight: 650;
+  text-align: left;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  border: 1px solid rgba(49, 87, 219, 0.18);
+  border-radius: 999px;
+  background: rgba(244, 247, 255, 0.92);
+  cursor: pointer;
+}
+
+.ai-single-mail-link {
+  display: inline-block;
+  vertical-align: bottom;
+  padding: 1px 5px;
+}
+
+.ai-mail-links button:hover,
+.ai-single-mail-link:hover {
+  border-color: rgba(49, 87, 219, 0.4);
+  background: #fff;
+}
+
+.ai-clarification {
+  display: grid;
+  gap: 9px;
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid rgba(111, 129, 214, 0.18);
+  border-radius: 12px;
+  background: rgba(244, 247, 255, 0.92);
+}
+
+.ai-clarification input {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid rgba(111, 129, 214, 0.22);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.ai-clarification-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.ai-clarification-actions button {
+  padding: 7px 10px;
+  color: #3d55aa;
+  border: 1px solid rgba(79, 109, 245, 0.2);
+  border-radius: 8px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.ai-clarification-actions .is-dismiss {
+  color: #72798d;
+  border-color: transparent;
+  background: transparent;
+}
+
+.ai-clarification.is-resolved,
+.ai-clarification.is-dismissed {
+  color: #858b9e;
+  font-size: 12px;
+}
 .mail-row .mail-row-main.has-snooze-time {
   --mail-time-column: 104px;
 }

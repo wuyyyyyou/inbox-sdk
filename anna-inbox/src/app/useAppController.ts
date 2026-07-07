@@ -30,6 +30,7 @@ import type {
   RunStatus,
   ScanPlan,
   ScanState,
+  SendAiMessageOptions,
   SubmitMailPromptRequest,
   ThreadContextPayload,
 } from "../types/mail";
@@ -41,6 +42,7 @@ import {
   requestForMode,
 } from "./constants";
 import { createInitialState } from "./state";
+import { buildRevisionPrompt, decideAiRoute, resolveMailContext } from "./aiRoute";
 
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -249,28 +251,8 @@ function upsertInboxThreadDraftPreview(
 }
 
 const AI_ASK_HISTORY_STORAGE_KEY = "anna-inbox:ai-ask-history:v1";
-const CHAT_INTENT_PATTERNS = [
-  /^(你|您)?好[啊呀]?[!.。！\s]*$/i,
-  /^(hi|hello|hey|哈喽|嗨)[!.。！\s]*$/i,
-  /^(在吗|在不在|谢谢|多谢|thanks|thank you)[!.。！\s]*$/i,
-  /^(你是谁|你能做什么|你可以做什么|介绍一下你自己|help|帮助)[?？!.。！\s]*$/i,
-];
-const MAIL_TASK_KEYWORDS = [
-  "邮件", "邮箱", "收件箱", "发件", "回复", "未读", "已读", "紧急", "账单", "发票", "会议", "日程", "附件",
-  "email", "mail", "inbox", "reply", "replied", "unread", "urgent", "invoice", "bill", "attachment", "meeting",
-];
-
 function createId(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
-}
-
-function shouldRouteToChat(input: string) {
-  const text = input.trim();
-  const lower = text.toLowerCase();
-  if (!text) return false;
-  if (MAIL_TASK_KEYWORDS.some((keyword) => lower.includes(keyword.toLowerCase()))) return false;
-  // 中文注释：只有非常明确的寒暄/能力询问才走普通聊天；其余模糊输入按用户要求默认当作邮箱任务。
-  return CHAT_INTENT_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 function prefersChinese(input: string) {
@@ -512,7 +494,8 @@ export interface AppActions {
   openSnoozeReasons(cardId: string): void;
   closeSnoozeReasons(): void;
   openSourcesWithConfig(): void;
-  sendAiChatMessage(): Promise<void>;
+  sendAiChatMessage(options?: SendAiMessageOptions): Promise<void>;
+  dismissAiClarification(messageId: string): void;
   stopAiGeneration(): void;
   startNewAiConversation(): void;
   openAiConversation(index: number): void;
@@ -1908,16 +1891,17 @@ export function useAppController() {
         role: "user",
         content: request.visiblePrompt,
         timestamp: new Date().toISOString(),
-        kind: "chat",
+        kind: "mail_context",
         mailContext: context,
         sourcePrompt: request.visiblePrompt,
       };
-      const baseMessages = !request.forceNewConversation && state.aiChatConversationId === conversationId ? state.aiChatMessages : [];
+      const baseMessages = request.baseMessages
+        ?? (!request.forceNewConversation && state.aiChatConversationId === conversationId ? state.aiChatMessages : []);
       const messagesWithUser = [...baseMessages, userMessage];
       const pendingMessage: AiChatMessage = {
         id: createId("msg"),
         role: "assistant",
-        content: "Thinking",
+        content: "Updating the draft...",
         timestamp: new Date().toISOString(),
         kind: "status",
         pending: true,
@@ -1926,6 +1910,7 @@ export function useAppController() {
       };
       setState((s) => ({
         ...s,
+        customScanInput: "",
         aiChatConversationId: conversationId,
         aiChatMessages: [...messagesWithUser, pendingMessage],
         aiChatLoading: true,
@@ -1936,7 +1921,7 @@ export function useAppController() {
           thread_id: context.thread_id,
           anchor_message_id: context.anchor_message_id,
           latest_message_id: context.latest_message_id,
-          visible_prompt: request.visiblePrompt,
+          visible_prompt: buildRevisionPrompt(request.visiblePrompt, request.draftToRevise),
           expected_artifact: request.expectedArtifact || "draft_reply",
           user_answers: request.userAnswers,
           ai_provider: state.llmProvider,
@@ -1958,12 +1943,15 @@ export function useAppController() {
             role: "assistant",
             content: payload.assistant_text || "I reviewed the thread.",
             timestamp: new Date().toISOString(),
-            kind: "chat",
-            artifact: payload.artifact || null,
+            kind: "mail_context",
+            artifact: payload.artifact
+              ? { ...payload.artifact, source_prompt: request.visiblePrompt }
+              : null,
             replyGaps: payload.reply_gaps,
             mailContext: context,
             fallbackUsed: Boolean(payload.fallback_used),
             sourcePrompt: request.visiblePrompt,
+            assistantFollowupText: payload.assistant_followup_text,
           },
         ];
         upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: request.visiblePrompt });
@@ -2626,9 +2614,122 @@ export function useAppController() {
         customRunProgress: null,
       }));
     },
-    async sendAiChatMessage() {
-      const userRequest = state.customScanInput.trim();
+    dismissAiClarification(messageId) {
+      setState((s) => ({
+        ...s,
+        aiChatMessages: s.aiChatMessages.map((message) =>
+          message.id === messageId && message.clarification?.status === "pending"
+            ? { ...message, clarification: { ...message.clarification, status: "dismissed" } }
+            : message,
+        ),
+      }));
+    },
+    async sendAiChatMessage(options = {}) {
+      const userRequest = String(options.prompt ?? state.customScanInput).trim();
       if (!userRequest || state.isCustomScanning || state.aiChatLoading || aiGenerationRun.current) return;
+      const conversationId = state.aiChatConversationId || createId("chat");
+      const unresolvedBase = state.aiChatConversationId === conversationId ? state.aiChatMessages : [];
+      const baseMessages = options.clarificationMessageId
+        ? unresolvedBase.map((message) =>
+            message.id === options.clarificationMessageId && message.clarification
+              ? {
+                  ...message,
+                  clarification: {
+                    ...message.clarification,
+                    status: "resolved" as const,
+                    resolved_action: options.forcedKind,
+                  },
+                }
+              : message,
+          )
+        : unresolvedBase;
+      const decision = options.forcedKind
+        ? { kind: options.forcedKind, reason: "clarification_action", confidence: "high" as const }
+        : decideAiRoute(userRequest, {
+            messages: baseMessages,
+            currentMailContext: options.currentMailContext,
+          });
+
+      if (decision.kind === "clarify") {
+        const chinese = prefersChinese(userRequest);
+        const userMessage: AiChatMessage = {
+          id: createId("msg"),
+          role: "user",
+          content: userRequest,
+          timestamp: new Date().toISOString(),
+          kind: "clarify",
+        };
+        const clarificationMessage: AiChatMessage = {
+          id: createId("msg"),
+          role: "assistant",
+          content: chinese
+            ? "你想让我修改当前草稿，还是搜索邮箱？"
+            : "Do you want me to revise the current draft, or search your inbox?",
+          timestamp: new Date().toISOString(),
+          kind: "clarify",
+          clarification: {
+            original_input: userRequest,
+            question: chinese
+              ? "你想让我修改当前草稿，还是搜索邮箱？"
+              : "Do you want me to revise the current draft, or search your inbox?",
+            actions: [
+              { id: "mail_context", label: chinese ? "修改当前草稿" : "Revise current draft" },
+              { id: "scan", label: chinese ? "搜索邮箱" : "Search inbox" },
+              { id: "chat", label: chinese ? "普通聊天" : "Just chat" },
+            ],
+            freeform_enabled: true,
+            status: "pending",
+          },
+        };
+        setState((s) => ({
+          ...s,
+          customScanInput: "",
+          aiChatConversationId: conversationId,
+          aiChatMessages: [...baseMessages, userMessage, clarificationMessage],
+        }));
+        return;
+      }
+
+      if (decision.kind === "mail_context") {
+        const resolved = resolveMailContext(baseMessages, options.currentMailContext);
+        if (!resolved) {
+          const finalMessages: AiChatMessage[] = [
+            ...baseMessages,
+            {
+              id: createId("msg"),
+              role: "user",
+              content: userRequest,
+              timestamp: new Date().toISOString(),
+              kind: "mail_context",
+            },
+            {
+              id: createId("msg"),
+              role: "assistant",
+              content: prefersChinese(userRequest)
+                ? "请先打开一封邮件，这样我才知道要修改哪一封草稿。"
+                : "Open an email first so I know what to revise.",
+              timestamp: new Date().toISOString(),
+              kind: "clarify",
+            },
+          ];
+          setState((s) => ({
+            ...s,
+            customScanInput: "",
+            aiChatConversationId: conversationId,
+            aiChatMessages: finalMessages,
+          }));
+          return;
+        }
+        await actions.submitMailContextPrompt({
+          visiblePrompt: userRequest,
+          context: resolved.context,
+          expectedArtifact: "draft_reply",
+          draftToRevise: resolved.draftToRevise,
+          baseMessages,
+        });
+        return;
+      }
+
       const generationRun = {
         runId: createId("generation"),
         cancelled: false,
@@ -2636,8 +2737,7 @@ export function useAppController() {
       };
       aiGenerationRun.current = generationRun;
       const isCurrentGeneration = () => aiGenerationRun.current === generationRun && !generationRun.cancelled;
-      const isChatRequest = shouldRouteToChat(userRequest);
-      const conversationId = state.aiChatConversationId || createId("chat");
+      const isChatRequest = decision.kind === "chat";
       const userMessage: AiChatMessage = {
         id: createId("msg"),
         role: "user",
@@ -2645,7 +2745,6 @@ export function useAppController() {
         timestamp: new Date().toISOString(),
         kind: isChatRequest ? "chat" : "scan",
       };
-      const baseMessages = state.aiChatConversationId === conversationId ? state.aiChatMessages : [];
       const messagesWithUser = [...baseMessages, userMessage];
       const pendingMessage: AiChatMessage = {
         id: createId("msg"),

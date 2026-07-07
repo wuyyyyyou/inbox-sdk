@@ -583,6 +583,7 @@ MAIL_PROMPT_SYSTEM = """You are Anna, an executive email assistant working with 
 Return JSON only:
 {
   "assistant_text": "short assistant response for the sidebar",
+  "assistant_followup_text": "optional short summary of the draft strategy and possible next adjustment",
   "draft_reply": {"body": "plain text reply body"} | null,
   "reply_gaps": {
     "needs_user_input": true | false,
@@ -598,7 +599,9 @@ Rules:
 - If the user prompt requires information that only the user would know, do not guess.
 - In that case, omit draft_reply and return 1-3 specific reply_gaps questions.
 - If enough information is available, return a concise plain-text draft_reply.body.
-- assistant_text should explain what you did or what is needed next.
+- assistant_text should briefly explain your understanding of the thread and the user's intent.
+- assistant_followup_text should briefly summarize the draft strategy and invite a useful adjustment. Omit it when no reliable summary is possible.
+- Do not repeat the draft body in either assistant text field.
 - Do not include email headers in the draft body.
 - Do not invent dates, commitments, prices, or factual claims.
 - Never include HTML.
@@ -1114,6 +1117,7 @@ async def _generate_mail_prompt_result(
         ),
         fallback={
             "assistant_text": fallback_assistant,
+            "assistant_followup_text": "",
             "draft_reply": {"body": ""},
             "reply_gaps": {"needs_user_input": False, "summary": "", "questions": []},
         },
@@ -1159,6 +1163,7 @@ async def _generate_mail_prompt_result(
         "latest_message_id": latest_message_id,
         "visible_prompt": visible_prompt,
         "assistant_text": str(payload.get("assistant_text") or fallback_assistant).strip(),
+        "assistant_followup_text": str(payload.get("assistant_followup_text") or "").strip(),
         "artifact": artifact,
         "reply_gaps": {
             "needs_user_input": needs_user_input,

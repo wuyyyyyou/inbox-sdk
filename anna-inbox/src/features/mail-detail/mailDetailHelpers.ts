@@ -247,6 +247,11 @@ export function matchesDraftArtifact(mailbox: string, threadId: string, artifact
     && artifact.thread_id === threadId;
 }
 
+export function mergeDraftArtifactBody(current: string, generated: string, mode: "append" | "replace") {
+  if (mode === "replace" || !current.trim()) return generated;
+  return `${current.trimEnd()}\n\n${generated}`;
+}
+
 export function nextWeekend(now: Date) {
   const base = new Date(now);
   const weekday = base.getDay();

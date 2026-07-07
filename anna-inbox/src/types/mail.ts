@@ -326,6 +326,17 @@ export interface CustomRunResultItem {
   message_id?: string;
   thread_id?: string;
   from?: string;
+  mail_links?: AskMailLink[];
+}
+
+export interface AskMailLink {
+  label: string;
+  mailbox: string;
+  thread_id: string;
+  message_id: string;
+  from?: string;
+  date?: string;
+  snippet?: string;
 }
 
 export interface CustomRunResultSection {
@@ -475,6 +486,8 @@ export interface SubmitMailPromptRequest {
   expectedArtifact?: "draft_reply";
   forceNewConversation?: boolean;
   userAnswers?: Record<string, string>;
+  draftToRevise?: string;
+  baseMessages?: AiChatMessage[];
 }
 
 export interface DraftReplyArtifact {
@@ -492,6 +505,7 @@ export interface MailPromptRunResult {
   latest_message_id: string;
   visible_prompt: string;
   assistant_text: string;
+  assistant_followup_text?: string;
   artifact?: DraftReplyArtifact | null;
   reply_gaps?: ReplyGaps;
   fallback_used?: boolean;
@@ -690,7 +704,7 @@ export interface AiChatMessage {
   role: "user" | "assistant";
   content: string;
   timestamp: string;
-  kind?: "chat" | "scan" | "status" | "error" | "stopped";
+  kind?: "chat" | "mail_context" | "scan" | "clarify" | "status" | "error" | "stopped";
   result?: CustomRunResult | null;
   pending?: boolean;
   artifact?: DraftReplyArtifact | null;
@@ -698,5 +712,36 @@ export interface AiChatMessage {
   mailContext?: AiMailContextRef;
   fallbackUsed?: boolean;
   sourcePrompt?: string;
+  assistantFollowupText?: string;
+  clarification?: AiClarificationPayload;
+}
+
+export type AiRouteKind = "chat" | "mail_context" | "scan" | "clarify";
+
+export interface AiRouteDecision {
+  kind: AiRouteKind;
+  reason: string;
+  confidence: "high" | "medium" | "low";
+}
+
+export interface AiClarificationAction {
+  id: "mail_context" | "scan" | "chat";
+  label: string;
+}
+
+export interface AiClarificationPayload {
+  original_input: string;
+  question: string;
+  actions: AiClarificationAction[];
+  freeform_enabled: boolean;
+  status: "pending" | "resolved" | "dismissed";
+  resolved_action?: AiClarificationAction["id"];
+}
+
+export interface SendAiMessageOptions {
+  currentMailContext?: AiMailContextRef | null;
+  forcedKind?: Exclude<AiRouteKind, "clarify">;
+  prompt?: string;
+  clarificationMessageId?: string;
 }
 
