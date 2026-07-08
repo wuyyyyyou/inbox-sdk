@@ -107,7 +107,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' | uv --directory inbo
 
 ## 版本与发布
 
-App、Executa manifest、开发 stub 和 Python package 当前统一为 `2.0.4`。
+App、Executa manifest、开发 stub 和 Python package 当前统一为 `2.0.5`。
 
 Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Executa 版本后运行：
 

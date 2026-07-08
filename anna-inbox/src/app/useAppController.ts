@@ -428,7 +428,7 @@ export interface AppActions {
   checkGmailAuth(mailboxOverride?: string): Promise<{ authorized: boolean; source: string }>;
   checkAnyGmailAuth(): Promise<{ authorized: boolean; source: string }>;
   closeGmailErrorPopup(): void;
-  loadMailboxes(): Promise<void>;
+  loadMailboxes(): Promise<{ mailboxes: MailboxInfo[]; selected: string[]; primary: string }>;
   switchMailbox(mailbox: string): Promise<void>;
   setBriefMailboxFilter(mailboxes: string[]): void;
   loadActiveCards(): Promise<void>;
@@ -1511,7 +1511,7 @@ export function useAppController() {
       }
     },
     async loadMailboxes() {
-      await loadMailboxes();
+      return loadMailboxes();
     },
     async switchMailbox(mailbox) {
       const primary = normalizedMailbox(mailbox);

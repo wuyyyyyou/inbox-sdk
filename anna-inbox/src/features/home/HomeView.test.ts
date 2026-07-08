@@ -1,5 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { accountDisplayName, aiSearchStatus, gmailTrashUrl, hasMailboxScanError, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, mergeDraftOverlayMessages, messageParticipant, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+import { accountDisplayName, aiSearchStatus, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, mergeDraftOverlayMessages, messageParticipant, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+
+describe("gmailAuthorizationError", () => {
+  it("includes the source returned by the authorization check", () => {
+    expect(gmailAuthorizationError("none")).toBe(
+      "No authorized mailbox detected (source: none).",
+    );
+    expect(gmailAuthorizationError("runtime")).toBe(
+      "No authorized mailbox detected (source: runtime).",
+    );
+  });
+});
+
+describe("isGmailAuthorizationRequired", () => {
+  it("distinguishes missing authorization from an auth-check error", () => {
+    expect(isGmailAuthorizationRequired({ checked: true, authorized: false, source: "none" })).toBe(true);
+    expect(isGmailAuthorizationRequired({ checked: true, authorized: false, source: "error" })).toBe(false);
+    expect(isGmailAuthorizationRequired({ checked: true, authorized: true, source: "runtime" })).toBe(false);
+  });
+});
 
 describe("gmailTrashUrl", () => {
   it("targets Trash for the selected Gmail account", () => {

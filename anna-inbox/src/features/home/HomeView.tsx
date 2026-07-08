@@ -75,6 +75,18 @@ const DEFAULT_INBOX_FEED_WINDOW: InboxFeedWindow = {
 const INBOX_FEED_PAGE_SIZE = 100;
 const AI_CONVERSATION_BOTTOM_THRESHOLD = 24;
 
+export function gmailAuthorizationError(source?: string) {
+  return `No authorized mailbox detected (source: ${source || "unknown"}).`;
+}
+
+export function isGmailAuthorizationRequired(status: {
+  checked: boolean;
+  authorized: boolean;
+  source?: string;
+}) {
+  return status.checked && !status.authorized && status.source !== "error";
+}
+
 export function isAiConversationNearBottom(
   scroller: Pick<HTMLElement, "scrollHeight" | "scrollTop" | "clientHeight">,
 ) {
@@ -1672,17 +1684,22 @@ function AccountRail() {
   const authorizedMailboxes = state.mailboxes.filter(
     (item) => item.authorized !== false,
   );
-  const mailboxes = state.mailboxes.length
-    ? authorizedMailboxes
-    : mailbox
-      ? [
-          {
-            email: mailbox,
-            provider: "gmail",
-            authorized: state.gmailAuthStatus.authorized,
-          },
-        ]
-      : [];
+  const gmailAuthorizationRequired = isGmailAuthorizationRequired(
+    state.gmailAuthStatus,
+  );
+  const mailboxes = gmailAuthorizationRequired
+    ? []
+    : state.mailboxes.length
+      ? authorizedMailboxes
+      : mailbox
+        ? [
+            {
+              email: mailbox,
+              provider: "gmail",
+              authorized: state.gmailAuthStatus.authorized,
+            },
+          ]
+        : [];
   const scanFailed = hasMailboxScanError(
     activeMailbox?.last_scan_status,
     activeMailbox?.last_error,
@@ -1702,7 +1719,9 @@ function AccountRail() {
           url={activeMailbox?.avatar_url}
           className="account-avatar-image"
         />
-        <i className={scanFailed ? "is-inactive" : ""} />
+        {mailboxes.length ? (
+          <i className={scanFailed ? "is-inactive" : ""} />
+        ) : null}
       </button>
       {menuOpen ? (
         <button
@@ -1720,6 +1739,7 @@ function AccountRail() {
           <small>Switch inbox</small>
         </header>
         <div>
+          {!mailboxes.length ? <p className="account-menu-empty">empty</p> : null}
           {mailboxes.map((item) => {
             const active = item.email.toLowerCase() === mailbox.toLowerCase();
             return (
@@ -1768,6 +1788,7 @@ export function HomeView() {
   } | null>(null);
   const [externalDetailMessage, setExternalDetailMessage] = useState<InboxMessage | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [authChecking, setAuthChecking] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const [folderOpen, setFolderOpen] = useState(false);
@@ -2361,6 +2382,28 @@ export function HomeView() {
     },
     [actions, feedWindow.days, loadRemoteCategory, localCategory, mailbox, mailboxView],
   );
+
+  const gmailAuthorizationRequired = isGmailAuthorizationRequired(
+    state.gmailAuthStatus,
+  );
+  const checkGmailAuthorization = useCallback(async () => {
+    if (authChecking) return;
+    setAuthChecking(true);
+    try {
+      const result = await actions.checkAnyGmailAuth();
+      if (result.authorized) {
+        const mailboxState = await actions.loadMailboxes();
+        const primary = mailboxState.primary.trim().toLowerCase();
+        if (primary && primary !== mailbox.trim().toLowerCase()) {
+          await actions.switchMailbox(primary);
+        } else if (primary) {
+          await actions.loadInboxEmails("inbox", 7, true);
+        }
+      }
+    } finally {
+      setAuthChecking(false);
+    }
+  }, [actions, authChecking, mailbox]);
 
   const loadOlderInbox = useCallback(async () => {
     setFeedAction("older");
@@ -3252,7 +3295,45 @@ export function HomeView() {
               </div>
             </div>
           ) : null}
-          {!localCategory && state.inboxLoading && !sourceMessages.length ? (
+          {gmailAuthorizationRequired ? (
+            <div
+              className="mail-empty mail-auth-guide"
+              aria-label="Gmail authorization required"
+            >
+              <InboxIcon />
+              <h2>Connect your Gmail account</h2>
+              <p>Authorize Anna to read and manage your inbox.</p>
+              <div className="auth-guide-card">
+                <div className="auth-guide-steps">
+                  <div className="auth-step">
+                    <span className="auth-step-num">1</span>
+                    <span>Open <strong>More → Authorizations</strong></span>
+                  </div>
+                  <div className="auth-step">
+                    <span className="auth-step-num">2</span>
+                    <span>Select <strong>Google</strong> → <strong>Connect with OAuth</strong></span>
+                  </div>
+                  <div className="auth-step">
+                    <span className="auth-step-num">3</span>
+                    <span>Tick Gmail Read/Modify/Compose/Send</span>
+                  </div>
+                  <div className="auth-step">
+                    <span className="auth-step-num">4</span>
+                    <span>Click <strong>Authorize</strong> and return here</span>
+                  </div>
+                </div>
+              </div>
+              <button
+                disabled={authChecking}
+                onClick={() => void checkGmailAuthorization()}
+              >
+                {authChecking ? "Checking..." : "Check again"}
+              </button>
+              <p className="assistant-copy is-error mail-auth-error">
+                {gmailAuthorizationError(state.gmailAuthStatus.source)}
+              </p>
+            </div>
+          ) : !localCategory && state.inboxLoading && !sourceMessages.length ? (
             <div className="mail-loading">
               {[1, 2, 3, 4, 5, 6].map((item) => (
                 <span key={item} />
