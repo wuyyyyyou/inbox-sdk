@@ -1288,6 +1288,31 @@ body.is-resizing-ai-sidebar {
   scrollbar-width: thin;
   scrollbar-color: #d8dce8 transparent;
 }
+.mail-feed.is-trash-view {
+  display: flex;
+  flex-direction: column;
+}
+.trash-retention-notice {
+  flex: none;
+  margin-top: auto;
+  padding-top: 32px;
+  color: #a1a5b0;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+}
+.trash-retention-notice p {
+  margin: 0;
+}
+.trash-retention-notice button {
+  padding: 0;
+  color: #3975df;
+  font: inherit;
+  background: transparent;
+}
+.trash-retention-notice button:hover {
+  text-decoration: underline;
+}
 .mail-sync-banner {
   display: flex;
   align-items: center;
@@ -1629,6 +1654,15 @@ body.is-resizing-ai-sidebar {
   color: transparent;
   fill: #d4a428;
 }
+.mail-trash-icon {
+  display: inline-flex;
+  color: #ef3d45;
+}
+.mail-trash-icon svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 2;
+}
 .mail-row-main time {
   color: #8d93a5;
   font-size: 11px;
@@ -1652,7 +1686,7 @@ body.is-resizing-ai-sidebar {
 }
 .mail-row-actions {
   position: absolute;
-  top: 7px;
+  top: 50%;
   right: 9px;
   z-index: 4;
   display: none;
@@ -1662,6 +1696,7 @@ body.is-resizing-ai-sidebar {
   border-radius: 8px;
   background: #f6f8fd;
   box-shadow: 0 2px 9px rgba(53, 60, 87, 0.09);
+  transform: translateY(-50%);
 }
 .mail-row:hover .mail-row-actions {
   display: flex;

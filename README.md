@@ -4,7 +4,7 @@ Anna Inbox 是运行在 Anna App 中的 Gmail 工作台。2.0 以完整收件箱
 
 ## 当前能力
 
-- Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 和 All mail 视图。
+- Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 和 All mail 视图；Trash 邮件仅在 Trash 中展示且排除草稿，恢复时仅移除 Gmail 的 `TRASH` 标签。
 - Important / Other 分类、本地缓存、增量加载和 Gmail 刷新。
 - 星标、重要、Todo、Snooze、已读、完成和移至垃圾箱操作。
 - 线程详情、清洗后的文本或安全 HTML、AI overview、回复草稿与发送。
@@ -107,7 +107,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' | uv --directory inbo
 
 ## 版本与发布
 
-App、Executa manifest、开发 stub 和 Python package 当前统一为 `2.0.3`。
+App、Executa manifest、开发 stub 和 Python package 当前统一为 `2.0.4`。
 
 Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Executa 版本后运行：
 

@@ -1860,7 +1860,6 @@ export function useAppController() {
         }
         if (operation === "untrash") {
           labels.delete("TRASH");
-          labels.add("INBOX");
         }
         return {
           ...message,

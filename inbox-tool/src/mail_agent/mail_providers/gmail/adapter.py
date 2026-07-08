@@ -2198,29 +2198,6 @@ def update_thread_state(mailbox: str, thread_id: str, operation: str) -> dict[st
         raise ValueError(f"Gmail thread {normalized_operation} failed: {exc.code} {detail_json}") from exc
 
     result = json.loads(raw) if raw else {"id": thread_id, "messages": []}
-    if normalized_operation == "untrash":
-        inbox_request = urllib.request.Request(
-            f"{GMAIL_API_BASE}/users/me/threads/{encoded_thread_id}/modify",
-            data=json.dumps({"addLabelIds": ["INBOX"], "removeLabelIds": []}).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(inbox_request, timeout=30) as response:
-                inbox_raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            try:
-                detail = exc.read().decode("utf-8")
-                detail_json = json.loads(detail) if detail else {"status_code": exc.code}
-            except Exception:
-                detail_json = {"status_code": exc.code}
-            raise ValueError(f"Gmail thread move to inbox failed: {exc.code} {detail_json}") from exc
-        if inbox_raw:
-            result = json.loads(inbox_raw)
     message_ids = [
         str(item.get("id") or "")
         for item in (result.get("messages") or [])
@@ -2231,7 +2208,7 @@ def update_thread_state(mailbox: str, thread_id: str, operation: str) -> dict[st
     elif normalized_operation == "trash":
         add_labels, remove_labels = ["TRASH"], ["INBOX"]
     else:
-        add_labels, remove_labels = ["INBOX"], ["TRASH"]
+        add_labels, remove_labels = [], ["TRASH"]
     patch_cached_message_labels(
         mailbox,
         message_ids,

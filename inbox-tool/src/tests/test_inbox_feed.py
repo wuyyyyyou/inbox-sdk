@@ -405,15 +405,14 @@ def main() -> None:
 
     with (
         patch("mail_agent.mail_providers.gmail.adapter.get_access_token", return_value="test-token"),
-        patch("mail_agent.mail_providers.gmail.adapter.urllib.request.urlopen", side_effect=[FakeResponse(thread_payload), FakeResponse(thread_payload)]) as urlopen,
+        patch("mail_agent.mail_providers.gmail.adapter.urllib.request.urlopen", return_value=FakeResponse(thread_payload)) as urlopen,
         patch("mail_agent.mail_providers.gmail.adapter.patch_cached_message_labels") as patch_labels,
     ):
         update_thread_state("user@example.com", "thread-1", "untrash")
     requests = [call.args[0] for call in urlopen.call_args_list]
+    assert len(requests) == 1
     assert requests[0].full_url.endswith("/users/me/threads/thread-1/untrash")
-    assert requests[1].full_url.endswith("/users/me/threads/thread-1/modify")
-    assert json.loads(requests[1].data) == {"addLabelIds": ["INBOX"], "removeLabelIds": []}
-    patch_labels.assert_called_once_with("user@example.com", ["m1", "m2"], add_label_ids=["INBOX"], remove_label_ids=["TRASH"])
+    patch_labels.assert_called_once_with("user@example.com", ["m1", "m2"], add_label_ids=[], remove_label_ids=["TRASH"])
 
     fetched = {"id": "missing", "body_text": "Fetched body"}
     with (

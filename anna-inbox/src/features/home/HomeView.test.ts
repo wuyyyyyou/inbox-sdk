@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { accountDisplayName, aiSearchStatus, hasMailboxScanError, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isImportantMessage, isSentMessage, isStarredMessage, mergeDraftOverlayMessages, messageParticipant, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+import { accountDisplayName, aiSearchStatus, gmailTrashUrl, hasMailboxScanError, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, mergeDraftOverlayMessages, messageParticipant, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+
+describe("gmailTrashUrl", () => {
+  it("targets Trash for the selected Gmail account", () => {
+    expect(gmailTrashUrl(" user+work@example.com ")).toBe(
+      "https://mail.google.com/mail/?authuser=user%2Bwork%40example.com#trash",
+    );
+  });
+});
 
 describe("isAiConversationNearBottom", () => {
   it("allows a small layout tolerance at the bottom", () => {
@@ -101,6 +109,45 @@ describe("cached message label fallbacks", () => {
 });
 
 describe("resolveSourceMessages", () => {
+  it("projects trashed mail only into Trash while preserving its Gmail labels", () => {
+    const trashed = {
+      id: "trashed-1",
+      label_ids: ["TRASH", "STARRED", "IMPORTANT", "SENT"],
+      internal_date: "300",
+    };
+    const flags = {
+      todos: [trashed.id],
+      snoozed: [trashed.id],
+      done: [trashed.id],
+      doneRemoved: [],
+      drafts: [],
+      saved: { [trashed.id]: trashed },
+    };
+
+    expect(isTrashMessage(trashed)).toBe(true);
+    expect(resolveSourceMessages("trash", [], [trashed], flags)).toEqual([trashed]);
+    for (const view of ["inbox", "todos", "starred", "snoozed", "done", "drafts", "sent", "all"] as const) {
+      expect(resolveSourceMessages(view, [], [trashed], flags)).toEqual([]);
+    }
+    expect(trashed.label_ids).toEqual(["TRASH", "STARRED", "IMPORTANT", "SENT"]);
+  });
+
+  it("excludes Gmail and local drafts from Trash", () => {
+    const gmailDraft = { id: "gmail-draft", label_ids: ["TRASH", "DRAFT"], internal_date: "300" };
+    const localDraft = { id: "local-draft", label_ids: ["TRASH"], internal_date: "200", draft_local: true };
+    const flags = { todos: [], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: {} };
+
+    expect(resolveSourceMessages("trash", [], [gmailDraft, localDraft], flags)).toEqual([]);
+  });
+
+  it("uses current Gmail state instead of a stale saved workflow copy", () => {
+    const saved = { id: "message-1", label_ids: ["INBOX"], internal_date: "100" };
+    const current = { ...saved, label_ids: ["TRASH", "STARRED"] };
+    const flags = { todos: [saved.id], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: { [saved.id]: saved } };
+
+    expect(resolveSourceMessages("todos", [], [current], flags)).toEqual([]);
+  });
+
   it("keeps a drafted starred message in both category projections", () => {
     const base = [{ id: "message-1", thread_id: "thread-1", label_ids: ["INBOX", "STARRED"], subject: "Hello" }];
     const drafts = [{ id: "message-1", thread_id: "thread-1", label_ids: ["INBOX", "STARRED", "DRAFT"], draft_local: true, draft_body: "Reply" }];

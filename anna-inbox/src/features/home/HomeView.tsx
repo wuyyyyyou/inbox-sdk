@@ -295,6 +295,11 @@ const TrashIcon = () => (
     <path d="M5 7h14M9 7V4h6v3M7 7l1 13h8l1-13" />
   </Icon>
 );
+const TrashOffIcon = () => (
+  <Icon>
+    <path d="M9 7V4h6v3M7.5 7H19M7 10l1 10h8l.6-6M4 4l16 16" />
+  </Icon>
+);
 const TodoIcon = () => (
   <Icon>
     <rect x="4" y="4" width="16" height="16" rx="4" />
@@ -539,6 +544,31 @@ export function isStarredMessage(message: InboxMessage) {
   return message.starred ?? hasMessageLabel(message, "STARRED");
 }
 
+export function isTrashMessage(message: InboxMessage) {
+  return hasMessageLabel(message, "TRASH");
+}
+
+export function gmailTrashUrl(mailbox: string) {
+  return `https://mail.google.com/mail/?authuser=${encodeURIComponent(mailbox.trim())}#trash`;
+}
+
+async function copyTextToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("Clipboard unavailable");
+}
+
 export function isDraftMessage(message: InboxMessage) {
   return Boolean(message.draft_local || message.draft_body);
 }
@@ -603,59 +633,64 @@ export function resolveSourceMessages(
   inboxSnapshotMessages: InboxMessage[],
   flags: MailUiFlags,
 ) {
+  const source = inboxSnapshotMessages.length
+    ? inboxSnapshotMessages
+    : inboxMessages;
+  const currentMessages = new Map<string, InboxMessage>();
+  for (const message of [
+    ...Object.values(flags.saved),
+    ...inboxSnapshotMessages,
+    ...inboxMessages,
+  ]) {
+    currentMessages.set(message.id, message);
+  }
   if (mailboxView === "todos" || mailboxView === "snoozed") {
     return sortInboxMessagesDesc(
       flags[mailboxView]
-        .map((id) => flags.saved[id])
-        .filter((message): message is InboxMessage => Boolean(message)),
+        .map((id) => currentMessages.get(id))
+        .filter((message): message is InboxMessage => message !== undefined && !isTrashMessage(message)),
     );
   }
   if (mailboxView === "done") {
-    const knownMessages = new Map<string, InboxMessage>();
-    for (const message of [
-      ...inboxSnapshotMessages,
-      ...inboxMessages,
-      ...Object.values(flags.saved),
-    ]) {
-      knownMessages.set(message.id, message);
-    }
     const doneIds = new Set(flags.done);
-    for (const message of knownMessages.values()) {
+    for (const message of currentMessages.values()) {
       if (isDoneMessage(message, flags)) doneIds.add(message.id);
     }
     return sortInboxMessagesDesc(
       [...doneIds]
-        .map((id) => knownMessages.get(id))
-        .filter((message): message is InboxMessage => Boolean(message)),
+        .map((id) => currentMessages.get(id))
+        .filter((message): message is InboxMessage => message !== undefined && !isTrashMessage(message)),
     );
   }
   if (mailboxView === "inbox") {
     return sortInboxMessagesDesc(
-      inboxMessages.filter((message) => hasMessageLabel(message, "INBOX")),
+      inboxMessages.filter((message) => hasMessageLabel(message, "INBOX") && !isTrashMessage(message)),
     );
   }
-  const source = inboxSnapshotMessages.length
-    ? inboxSnapshotMessages
-    : inboxMessages;
   if (mailboxView === "starred")
     return sortInboxMessagesDesc(
-      source.filter((message) => hasMessageLabel(message, "STARRED")),
+      source.filter((message) => hasMessageLabel(message, "STARRED") && !isTrashMessage(message)),
     );
   if (mailboxView === "drafts")
     return sortInboxMessagesDesc(
-      source.filter((message) => isDraftMessage(message)),
+      source.filter((message) => isDraftMessage(message) && !isTrashMessage(message)),
     );
   if (mailboxView === "sent")
     return sortInboxMessagesDesc(
-      source.filter((message) => hasMessageLabel(message, "SENT")),
+      source.filter((message) => hasMessageLabel(message, "SENT") && !isTrashMessage(message)),
     );
   if (mailboxView === "trash")
     return sortInboxMessagesDesc(
-      source.filter((message) => hasMessageLabel(message, "TRASH")),
+      source.filter(
+        (message) =>
+          isTrashMessage(message) &&
+          !hasMessageLabel(message, "DRAFT") &&
+          !isDraftMessage(message),
+      ),
     );
   if (mailboxView === "spam")
     return sortInboxMessagesDesc(
-      source.filter((message) => hasMessageLabel(message, "SPAM")),
+      source.filter((message) => hasMessageLabel(message, "SPAM") && !isTrashMessage(message)),
     );
   if (mailboxView === "all")
     return sortInboxMessagesDesc(
@@ -703,7 +738,8 @@ function InboxRow({
   const isDone = isDoneMessage(message, flags);
   const isTodo = flags.todos.includes(message.id);
   const isSnoozed = flags.snoozed.includes(message.id);
-  const snoozeLabel = mailboxView === "snoozed" ? snoozeUntilLabel(flags.snoozedUntil?.[message.id]) : "";
+  const trashed = isTrashMessage(message);
+  const snoozeLabel = !trashed && mailboxView === "snoozed" ? snoozeUntilLabel(flags.snoozedUntil?.[message.id]) : "";
   const important = isImportantMessage(message);
   const starred = isStarredMessage(message);
   const draft = isDraftMessage(message);
@@ -747,7 +783,7 @@ function InboxRow({
           <strong>{message.subject || "(no subject)"}</strong>
           <span>
             —{" "}
-            {draft ? (
+            {draft && !trashed ? (
               <>
                 <b className="mail-draft-label">Draft:</b> {preview}
               </>
@@ -757,28 +793,33 @@ function InboxRow({
           </span>
         </span>
         <span className="mail-flags">
-          {shouldShowImportantIcon(important, sentView, draft) ? (
+          {trashed ? (
+            <span className="mail-trash-icon" title="Trash">
+              <TrashIcon />
+            </span>
+          ) : null}
+          {!trashed && shouldShowImportantIcon(important, sentView, draft) ? (
             <span className="mail-important-icon" title="Important">
               <ImportantIcon />
             </span>
           ) : null}
-          {draft ? (
+          {!trashed && draft ? (
             <span className="mail-draft-icon" title="Draft">
               <DraftIcon />
             </span>
-          ) : sentMessage ? (
+          ) : !trashed && sentMessage ? (
             <span className="mail-sent-badge" title="Sent and done">
               <SentIcon />
               <span className="mail-sent-check">
                 <CheckIcon />
               </span>
             </span>
-          ) : isDone ? (
+          ) : !trashed && isDone ? (
             <span className="mail-sent-check" title="Done">
               <CheckIcon />
             </span>
           ) : null}
-          {starred ? (
+          {!trashed && starred ? (
             <span className="mail-starred" title="Starred">
               <StarIcon />
             </span>
@@ -802,68 +843,81 @@ function InboxRow({
         )}
       </button>
       <span className="mail-row-actions">
-        <button
-          className={starred ? "is-active is-starred" : ""}
-          aria-label={starred ? "Unstar" : "Star"}
-          data-tooltip={starred ? "Unstar" : "Star"}
-          onClick={() => void actions.setInboxStarred(message.id, !starred)}
-        >
-          <StarIcon />
-        </button>
-        <button
-          className={important ? "is-active is-important" : ""}
-          aria-label={important ? "Mark not important" : "Mark important"}
-          data-tooltip={important ? "Mark not important" : "Mark important"}
-          onClick={() => onThreadAction(important ? "mark_not_important" : "mark_important", message)}
-        >
-          <ImportantIcon />
-        </button>
-        <button
-          className={isTodo ? "is-active is-todo" : ""}
-          aria-label={isTodo ? "Click Done to remove" : "Add to Todo"}
-          data-tooltip={isTodo ? "Click Done to remove" : "Add to Todo"}
-          disabled={isTodo}
-          onClick={() => onFlag("todos", message)}
-        >
-          <TodoIcon />
-        </button>
-        <button
-          className={isSnoozed ? "is-active is-snoozed" : ""}
-          aria-label={isSnoozed ? "Remove from snoozed" : "Snooze"}
-          data-tooltip={isSnoozed ? "Remove from snoozed" : "Snooze"}
-          onClick={() => onSnooze(message)}
-        >
-          <ClockIcon />
-        </button>
-        {message.unread ? (
+        {trashed ? (
           <button
-            aria-label="Mark as read"
-            data-tooltip="Mark as read"
-            onClick={() => void actions.markInboxRead(message.id)}
+            className="is-trashed"
+            aria-label="Remove from trash"
+            data-tooltip="Remove from trash"
+            onClick={() => onThreadAction("untrash", message)}
           >
-            <MailOpenIcon />
+            <TrashOffIcon />
           </button>
-        ) : null}
-        <button
-          aria-label="Move to trash"
-          data-tooltip="Move to trash"
-          onClick={() => void actions.trashInboxMessage(message.id)}
-        >
-          <TrashIcon />
-        </button>
-        <button
-          className={isDone ? "is-active is-done" : ""}
-          aria-label={
-            sentMessage ? "Sent and done" : isDone ? "Move to inbox" : "Done"
-          }
-          data-tooltip={
-            sentMessage ? "Sent and done" : isDone ? "Move to inbox" : "Done"
-          }
-          disabled={sentMessage}
-          onClick={() => onFlag("done", message)}
-        >
-          <CheckIcon />
-        </button>
+        ) : (
+          <>
+            <button
+              className={starred ? "is-active is-starred" : ""}
+              aria-label={starred ? "Unstar" : "Star"}
+              data-tooltip={starred ? "Unstar" : "Star"}
+              onClick={() => void actions.setInboxStarred(message.id, !starred)}
+            >
+              <StarIcon />
+            </button>
+            <button
+              className={important ? "is-active is-important" : ""}
+              aria-label={important ? "Mark not important" : "Mark important"}
+              data-tooltip={important ? "Mark not important" : "Mark important"}
+              onClick={() => onThreadAction(important ? "mark_not_important" : "mark_important", message)}
+            >
+              <ImportantIcon />
+            </button>
+            <button
+              className={isTodo ? "is-active is-todo" : ""}
+              aria-label={isTodo ? "Click Done to remove" : "Add to Todo"}
+              data-tooltip={isTodo ? "Click Done to remove" : "Add to Todo"}
+              disabled={isTodo}
+              onClick={() => onFlag("todos", message)}
+            >
+              <TodoIcon />
+            </button>
+            <button
+              className={isSnoozed ? "is-active is-snoozed" : ""}
+              aria-label={isSnoozed ? "Remove from snoozed" : "Snooze"}
+              data-tooltip={isSnoozed ? "Remove from snoozed" : "Snooze"}
+              onClick={() => onSnooze(message)}
+            >
+              <ClockIcon />
+            </button>
+            {message.unread ? (
+              <button
+                aria-label="Mark as read"
+                data-tooltip="Mark as read"
+                onClick={() => void actions.markInboxRead(message.id)}
+              >
+                <MailOpenIcon />
+              </button>
+            ) : null}
+            <button
+              aria-label="Move to trash"
+              data-tooltip="Move to trash"
+              onClick={() => void actions.trashInboxMessage(message.id)}
+            >
+              <TrashIcon />
+            </button>
+            <button
+              className={isDone ? "is-active is-done" : ""}
+              aria-label={
+                sentMessage ? "Sent and done" : isDone ? "Move to inbox" : "Done"
+              }
+              data-tooltip={
+                sentMessage ? "Sent and done" : isDone ? "Move to inbox" : "Done"
+              }
+              disabled={sentMessage}
+              onClick={() => onFlag("done", message)}
+            >
+              <CheckIcon />
+            </button>
+          </>
+        )}
       </span>
     </article>
   );
@@ -2765,7 +2819,7 @@ export function HomeView() {
         mark_important: "Marked as important.",
         mark_not_important: "Marked as not important.",
         trash: "Moved to trash.",
-        untrash: "Moved to inbox.",
+        untrash: "Removed from trash.",
       };
       try {
         await actions.updateInboxThreadState(
@@ -3172,7 +3226,7 @@ export function HomeView() {
         ) : null}
 
         <section
-          className="mail-feed"
+          className={`mail-feed ${mailboxView === "trash" ? "is-trash-view" : ""}`}
           aria-live="polite"
           ref={mailFeedRef}
           onScroll={handleFeedScroll}
@@ -3298,6 +3352,25 @@ export function HomeView() {
                 ? "Loading older emails..."
                 : "Show emails older than 1 month"}
             </button>
+          ) : null}
+          {mailboxView === "trash" ? (
+            <footer className="trash-retention-notice">
+              <p>Trash is deleted after 30 days.</p>
+              <p>
+                To empty your trash now, {" "}
+                <button
+                  type="button"
+                  onClick={() => {
+                    void copyTextToClipboard(gmailTrashUrl(mailbox))
+                      .then(() => actions.showToast("Gmail link copied. Paste it into your browser."))
+                      .catch(() => actions.showToast("Could not copy the Gmail link."));
+                  }}
+                >
+                  copy Gmail link
+                </button>
+                .
+              </p>
+            </footer>
           ) : null}
         </section>
         <MailDetailDrawer

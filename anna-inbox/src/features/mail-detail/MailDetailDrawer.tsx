@@ -1122,19 +1122,25 @@ export function MailDetailDrawer({
         <header className="mail-detail-header">
           <div className="mail-detail-toolbar">
             <button aria-label="Close thread" data-tooltip="Close thread" onClick={closeThread}><CloseThreadIcon /></button>
-            <button aria-label="Mark unread" data-tooltip="Mark unread" disabled={toolbarPending} onClick={() => void runThreadAction("mark_unread")}><MarkUnreadIcon /></button>
-            <button className={starred ? "is-active is-starred" : ""} aria-label={starred ? "Remove stars" : "Add stars"} data-tooltip={starred ? "Remove stars" : "Add stars"} disabled={toolbarPending} onClick={() => void runThreadAction(starred ? "unstar" : "star")}><StarIcon /></button>
-            <button className={important ? "is-active is-important" : ""} aria-label={important ? "Mark not important" : "Mark important"} data-tooltip={important ? "Mark not important" : "Mark important"} disabled={toolbarPending} onClick={() => void runThreadAction(important ? "mark_not_important" : "mark_important")}><ImportantIcon /></button>
-            <button className={isTodo ? "is-active is-todo" : ""} aria-label={isTodo ? "Click Done to remove" : "Add to Todo"} data-tooltip={isTodo ? "Click Done to remove" : "Add to Todo"} disabled={toolbarPending || isTodo} onClick={() => onTodoMessage(message)}><TodoIcon /></button>
-            <button className={isSnoozed ? "is-active is-snoozed" : ""} aria-label={isSnoozed ? "Remove from snoozed" : "Snooze"} data-tooltip={isSnoozed ? "Remove from snoozed" : "Snooze"} disabled={toolbarPending} onClick={() => onSnoozeMessage(message)}><ClockIcon /></button>
-            <button className={trashed ? "is-active is-trashed" : ""} aria-label={trashed ? "Remove from trash" : "Move to trash"} data-tooltip={trashed ? "Remove from trash" : "Move to trash"} disabled={toolbarPending} onClick={() => void runThreadAction(trashed ? "untrash" : "trash")}>{trashed ? <TrashOffIcon /> : <TrashIcon />}</button>
-            <button
-              className={isDone ? "is-active is-done" : ""}
-              aria-label={isSent ? "Sent and done" : isDone ? "Move to inbox" : "Done"}
-              data-tooltip={isSent ? "Sent and done" : isDone ? "Move to inbox" : "Done"}
-              disabled={toolbarPending || isSent}
-              onClick={() => onDoneMessage(message)}
-            ><DoneIcon /></button>
+            {trashed ? (
+              <button className="is-active is-trashed" aria-label="Remove from trash" data-tooltip="Remove from trash" disabled={toolbarPending} onClick={() => void runThreadAction("untrash")}><TrashOffIcon /></button>
+            ) : (
+              <>
+                <button aria-label="Mark unread" data-tooltip="Mark unread" disabled={toolbarPending} onClick={() => void runThreadAction("mark_unread")}><MarkUnreadIcon /></button>
+                <button className={starred ? "is-active is-starred" : ""} aria-label={starred ? "Remove stars" : "Add stars"} data-tooltip={starred ? "Remove stars" : "Add stars"} disabled={toolbarPending} onClick={() => void runThreadAction(starred ? "unstar" : "star")}><StarIcon /></button>
+                <button className={important ? "is-active is-important" : ""} aria-label={important ? "Mark not important" : "Mark important"} data-tooltip={important ? "Mark not important" : "Mark important"} disabled={toolbarPending} onClick={() => void runThreadAction(important ? "mark_not_important" : "mark_important")}><ImportantIcon /></button>
+                <button className={isTodo ? "is-active is-todo" : ""} aria-label={isTodo ? "Click Done to remove" : "Add to Todo"} data-tooltip={isTodo ? "Click Done to remove" : "Add to Todo"} disabled={toolbarPending || isTodo} onClick={() => onTodoMessage(message)}><TodoIcon /></button>
+                <button className={isSnoozed ? "is-active is-snoozed" : ""} aria-label={isSnoozed ? "Remove from snoozed" : "Snooze"} data-tooltip={isSnoozed ? "Remove from snoozed" : "Snooze"} disabled={toolbarPending} onClick={() => onSnoozeMessage(message)}><ClockIcon /></button>
+                <button aria-label="Move to trash" data-tooltip="Move to trash" disabled={toolbarPending} onClick={() => void runThreadAction("trash")}><TrashIcon /></button>
+                <button
+                  className={isDone ? "is-active is-done" : ""}
+                  aria-label={isSent ? "Sent and done" : isDone ? "Move to inbox" : "Done"}
+                  data-tooltip={isSent ? "Sent and done" : isDone ? "Move to inbox" : "Done"}
+                  disabled={toolbarPending || isSent}
+                  onClick={() => onDoneMessage(message)}
+                ><DoneIcon /></button>
+              </>
+            )}
           </div>
           <div className="mail-detail-summary">
             <h2>{page?.subject || message.subject || "(no subject)"}</h2>
