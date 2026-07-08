@@ -22,6 +22,35 @@ _BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 _SKIP_FILTER_THRESHOLD = 10
 
 
+def _answer_language_instruction(user_request: str) -> str:
+    """Keep generated answer copy aligned with the user's language."""
+    if re.search(r"[\u3400-\u9fff]", user_request):
+        return (
+            "Write all generated natural-language fields in Simplified Chinese. "
+            "Keep email subjects, names, addresses, and quoted source text in their original language."
+        )
+    return (
+        "Write all generated natural-language fields in the same language as the user's request. "
+        "Keep email subjects, names, addresses, and quoted source text in their original language."
+    )
+
+
+def _uses_chinese(user_request: str) -> bool:
+    return bool(re.search(r"[\u3400-\u9fff]", user_request))
+
+
+def _answer_fallback(plan: AskPlan, detail: str = "") -> dict[str, Any]:
+    if _uses_chinese(plan.user_request):
+        summary = "Anna 暂时无法生成可用的回答。"
+        title = plan.title or "扫描未完成"
+    else:
+        summary = "Anna could not produce a usable answer."
+        title = plan.title or "Scan incomplete"
+    if detail:
+        summary = f"{summary} {detail[:240]}"
+    return {"title": title, "summary": summary, "sections": []}
+
+
 # ── Filter ─────────────────────────────────────────────────────────────
 
 # 中文注释：候选数较少时跳过过滤 LLM，避免多消耗一次 sampling 调用。
@@ -299,6 +328,8 @@ async def _generate_answer(
             f"Match by EMAIL ADDRESS (between < >), not by display name.\n\n"
             f"## User request\n"
             f"{plan.user_request}\n\n"
+            f"## Response language\n"
+            f"{_answer_language_instruction(plan.user_request)}\n\n"
             f"## Task\n"
             f"{plan.task_prompt}\n\n"
             f"## Two-phase reply generation\n"
@@ -362,11 +393,7 @@ async def _generate_answer(
                 progress_callback("evaluate", {"variant": variant["name"], "reason": last_error[:200]})
 
     if result is None:
-        return {
-            "title": plan.title or "Scan incomplete",
-            "summary": f"Anna could not produce a usable answer. {last_error[:240]}",
-            "sections": [],
-        }
+        return _answer_fallback(plan, last_error)
 
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
     if not payload:
@@ -618,6 +645,12 @@ async def run_ask_pipeline(
                     candidate_mailboxes[c.message_id] = _mbox
 
     if not all_candidates:
+        if _uses_chinese(plan.user_request):
+            return {
+                "title": plan.title or "未找到结果",
+                "summary": f"已扫描 {len(mailboxes)} 个邮箱中的 {total_scanned} 封邮件，但没有找到符合你要求的内容。",
+                "sections": [],
+            }
         return {
             "title": plan.title or "No results",
             "summary": f"Scanned {total_scanned} emails across {len(mailboxes)} mailbox(es) but none matched your request.",

@@ -14,6 +14,14 @@ function loadSavedAskHistory(): AppState["askHistory"] {
   }
 }
 
+export function removeAskHistoryEntry(
+  history: AppState["askHistory"],
+  index: number,
+) {
+  if (index < 0 || index >= history.length) return history;
+  return history.filter((_, itemIndex) => itemIndex !== index);
+}
+
 export function createInitialState(): AppState {
   const mailbox = getSavedMailbox();
   const savedAskHistory = loadSavedAskHistory();

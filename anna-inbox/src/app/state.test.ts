@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { MAILBOX_STORAGE_KEY } from "./constants";
-import { createInitialState } from "./state";
+import { createInitialState, removeAskHistoryEntry } from "./state";
 
 const AI_ASK_HISTORY_STORAGE_KEY = "anna-inbox:ai-ask-history:v1";
 
@@ -45,5 +45,25 @@ describe("createInitialState", () => {
     expect(state.askHistory).toEqual(savedHistory);
     expect(state.aiChatMessages).toEqual([]);
     expect(state.aiChatConversationId).toBe("");
+  });
+});
+
+describe("removeAskHistoryEntry", () => {
+  it("removes only the selected conversation", () => {
+    const history = [
+      { query: "first", timestamp: "2026-07-08T01:00:00.000Z", result: { title: "first", sections: [] } },
+      { query: "second", timestamp: "2026-07-08T02:00:00.000Z", result: { title: "second", sections: [] } },
+      { query: "third", timestamp: "2026-07-08T03:00:00.000Z", result: { title: "third", sections: [] } },
+    ];
+
+    expect(removeAskHistoryEntry(history, 1).map((entry) => entry.query)).toEqual(["first", "third"]);
+  });
+
+  it("keeps the existing history when the index is invalid", () => {
+    const history = [
+      { query: "first", timestamp: "2026-07-08T01:00:00.000Z", result: { title: "first", sections: [] } },
+    ];
+
+    expect(removeAskHistoryEntry(history, 4)).toBe(history);
   });
 });

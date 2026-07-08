@@ -309,6 +309,32 @@ def test_filter_prompt_format():
     print("[PASS] test_filter_prompt_format")
 
 
+def test_answer_language_instruction():
+    """Chinese requests require Chinese answer copy while preserving source text."""
+    from mail_agent.ask.answer import _answer_language_instruction
+
+    chinese = _answer_language_instruction("整理收件箱")
+    english = _answer_language_instruction("Organize my inbox")
+    assert "Simplified Chinese" in chinese
+    assert "original language" in chinese
+    assert "same language as the user's request" in english
+    print("[PASS] test_answer_language_instruction")
+
+
+def test_answer_fallback_uses_request_language():
+    from mail_agent.ask.answer import _answer_fallback
+    from mail_agent.ask.planner import AskPlan
+
+    base = dict(plan_id="p1", title="", description="", people=[], topics=[], timeframe="7d",
+                direction="inbox", goal="general_qa", task_prompt="", gmail_flags=[])
+    chinese = _answer_fallback(AskPlan(user_request="整理收件箱", **base))
+    english = _answer_fallback(AskPlan(user_request="Organize my inbox", **base))
+    assert chinese["title"] == "扫描未完成"
+    assert "无法生成" in chinese["summary"]
+    assert english["title"] == "Scan incomplete"
+    print("[PASS] test_answer_fallback_uses_request_language")
+
+
 # ── Main ────────────────────────────────────────────────────────────────
 
 def main():
@@ -335,6 +361,8 @@ def main():
 
     print("\n--- Filter prompt ---\n")
     test_filter_prompt_format()
+    test_answer_language_instruction()
+    test_answer_fallback_uses_request_language()
 
     print(f"\n[ALL TESTS PASSED]")
 

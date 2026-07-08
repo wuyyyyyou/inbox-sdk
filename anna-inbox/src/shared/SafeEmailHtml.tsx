@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import DOMPurify from "dompurify";
 
-const EMAIL_PREVIEW_MAX_SCALE = 0.86;
-
 const TEXT_FLOW_BLOCK_SELECTOR = [
   "address", "article", "aside", "blockquote", "details", "dl", "fieldset",
   "figure", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "main", "nav",
@@ -41,16 +39,12 @@ function normalizeDocumentMarkup(root: HTMLElement) {
 }
 
 function hasFixedEmailLayout(root: HTMLElement) {
-  if (root.querySelector("table, tbody, thead, tfoot, tr, td, th, colgroup, col, center, img")) {
+  if (root.querySelector("table, tbody, thead, tfoot, tr, td, th, colgroup, col, center")) {
     return true;
   }
-  return Array.from(root.querySelectorAll("[style], [width]")).some((node) => {
+  return Array.from(root.querySelectorAll("[style]")).some((node) => {
     const style = (node.getAttribute("style") || "").toLowerCase();
-    return Boolean(
-      node.getAttribute("width") ||
-      /(?:^|;)\s*(?:width|min-width|max-width)\s*:/.test(style) ||
-      /(?:^|;)\s*display\s*:\s*(?:table|inline-block|flex|grid)/.test(style),
-    );
+    return /(?:^|;)\s*display\s*:\s*(?:table|inline-block|flex|grid)/.test(style);
   });
 }
 
@@ -146,21 +140,10 @@ function splitParagraphBreaks(root: HTMLElement) {
 }
 
 function normalizeTextEmailBlocks(root: HTMLElement) {
-  Array.from(root.querySelectorAll("div")).reverse().forEach((node) => {
-    if (node.querySelector(TEXT_FLOW_BLOCK_SELECTOR)) return;
-    const hasLineBreak = Boolean(node.querySelector("br"));
-    const hasText = Boolean(node.textContent?.replace(/\u00a0/g, " ").trim());
-    if (!hasText) {
-      node.replaceWith(hasLineBreak ? document.createElement("p") : document.createTextNode(""));
-      return;
-    }
-    const paragraph = document.createElement("p");
-    copyAttributes(node, paragraph);
-    while (node.firstChild) {
-      paragraph.appendChild(node.firstChild);
-    }
-    node.replaceWith(paragraph);
-  });
+  // Gmail commonly uses adjacent divs as visual lines. Keeping those divs
+  // preserves a single line break; converting each one to a paragraph adds
+  // browser paragraph margins that are not present in Gmail (notably in
+  // signatures such as "Best," followed by a name).
   splitParagraphBreaks(root);
 }
 
@@ -213,7 +196,7 @@ export function SafeEmailHtml({ html, className = "", scaleToFit = false }: { ht
       raf = window.requestAnimationFrame(() => {
         const frameWidth = Math.max(1, frame.clientWidth);
         const contentWidth = Math.max(content.scrollWidth, content.offsetWidth, frameWidth);
-        const scale = Math.min(EMAIL_PREVIEW_MAX_SCALE, frameWidth / contentWidth);
+        const scale = Math.min(1, frameWidth / contentWidth);
         setFit({
           scale,
           width: contentWidth,

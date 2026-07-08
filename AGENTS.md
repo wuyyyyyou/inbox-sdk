@@ -1,10 +1,14 @@
 # AGENTS.md
 
-代码编写前先保证对功能和内容的理解与用户完全对齐；存在会改变实现方向的不明确内容时，先沟通再修改。
+## 项目约定
+
+- 开始前先确认需求边界
+- 每次只改和当前任务直接相关的文件
+- 完成前说明验证命令和结果
 
 ## 项目基线
 
-Anna Inbox 当前版本为 `2.0.2`。前端位于 `anna-inbox/`，后端 Executa 位于 `inbox-tool/`。
+Anna Inbox 当前版本为 `2.0.3`。前端位于 `anna-inbox/`，后端 Executa 位于 `inbox-tool/`。
 
 - `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表。
 - `anna-inbox/src/features/mail-detail/`：线程详情、正文、草稿和附件预览。
@@ -43,6 +47,11 @@ cd anna-inbox
 npm test
 npm run build
 ```
+在更改前端代码后，应该要断开开发环境：
+``` sh
+for /f "tokens=5" %a in ('netstat -ano ^| findstr :5180') do taskkill /f /pid %a
+anna-app dev
+```
 
 Anna App 本地开发读取 `anna-inbox/app.json` 和 `anna-inbox/executas/inbox-tool/executa.json`。旧 `anna-inbox/dev-wsl.sh` 不是权威入口。
 
@@ -60,6 +69,7 @@ python scripts/sync/sync_executa_identity.py --check
 - `inbox-tool/src/pyproject.toml`
 - `anna-inbox/executas/inbox-tool/executa.json`
 - `anna-inbox/manifest.json#required_executas[].min_version`
+- `./AGENTS.md`
 
 ## 测试
 
@@ -81,3 +91,4 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' | uv --directory inbo
 - 修改邮件 DTO 时同时核对 `anna-inbox/src/types/mail.ts`、API facade 和后端返回边界。
 - 修改协议、Gmail auth、LLM sampling、存储或卡片 schema 前，先阅读对应当前文档和实现，不凭旧设计记录猜测。
 - 保留无关工作树改动，不覆盖 token、本地缓存、release artifact 或用户密钥。
+- 修改公共工具行为时，同步更新 docs/ 中的文档。

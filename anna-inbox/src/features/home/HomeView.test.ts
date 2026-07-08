@@ -1,5 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { accountDisplayName, hasMailboxScanError, isDoneMessage, isDraftMessage, isImportantMessage, isSentMessage, isStarredMessage, mergeDraftOverlayMessages, messageParticipant, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+import { accountDisplayName, aiSearchStatus, hasMailboxScanError, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isImportantMessage, isSentMessage, isStarredMessage, mergeDraftOverlayMessages, messageParticipant, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+
+describe("isAiConversationNearBottom", () => {
+  it("allows a small layout tolerance at the bottom", () => {
+    expect(isAiConversationNearBottom({ scrollHeight: 1000, scrollTop: 376, clientHeight: 600 })).toBe(true);
+  });
+
+  it("detects when the user has scrolled away from new messages", () => {
+    expect(isAiConversationNearBottom({ scrollHeight: 1000, scrollTop: 300, clientHeight: 600 })).toBe(false);
+  });
+});
+
+describe("aiSearchStatus", () => {
+  it("uses Chinese status copy for Chinese scan results", () => {
+    expect(aiSearchStatus({ title: "收件箱整理", sections: [{ items: [{ subject: "Update" }] }] }))
+      .toBe("找到 1 个相关邮件线程。");
+  });
+
+  it("keeps English status copy for English scan results", () => {
+    expect(aiSearchStatus({ title: "Inbox summary", sections: [{ items: [{ subject: "Update" }] }] }))
+      .toBe("Found 1 relevant thread.");
+  });
+});
 
 describe("senderParts", () => {
   it("accepts null sender values from Gmail Trash", () => {

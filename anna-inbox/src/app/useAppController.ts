@@ -41,7 +41,7 @@ import {
   POLL_LIMIT,
   requestForMode,
 } from "./constants";
-import { createInitialState } from "./state";
+import { createInitialState, removeAskHistoryEntry } from "./state";
 import { buildRevisionPrompt, decideAiRoute, resolveMailContext } from "./aiRoute";
 
 function sleep(ms: number) {
@@ -499,6 +499,7 @@ export interface AppActions {
   stopAiGeneration(): void;
   startNewAiConversation(): void;
   openAiConversation(index: number): void;
+  deleteAiConversation(index: number): void;
   startCustomScan(): Promise<void>;
   reRunCustomPlan(planId: string): Promise<void>;
   deleteCustomPlan(planId: string): Promise<void>;
@@ -2613,6 +2614,42 @@ export function useAppController() {
         scanStatus: "",
         customRunProgress: null,
       }));
+    },
+    deleteAiConversation(index: number) {
+      const entry = state.askHistory[index];
+      if (!entry) return;
+      const deletingCurrent = Boolean(
+        entry.conversationId &&
+        entry.conversationId === state.aiChatConversationId,
+      );
+      if (deletingCurrent) {
+        const run = aiGenerationRun.current;
+        if (run) {
+          run.cancelled = true;
+          run.controller.abort();
+          aiGenerationRun.current = null;
+        }
+      }
+      setState((s) => {
+        const nextHistory = removeAskHistoryEntry(s.askHistory, index);
+        persistAskHistory(nextHistory);
+        return {
+          ...s,
+          askHistory: nextHistory,
+          askHistoryExpanded: {},
+          ...(deletingCurrent
+            ? {
+                customScanInput: "",
+                aiChatMessages: [],
+                aiChatConversationId: "",
+                aiChatLoading: false,
+                isCustomScanning: false,
+                scanStatus: "",
+                customRunProgress: null,
+              }
+            : {}),
+        };
+      });
     },
     dismissAiClarification(messageId) {
       setState((s) => ({

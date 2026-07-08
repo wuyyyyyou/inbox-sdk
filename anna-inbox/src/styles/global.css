@@ -447,7 +447,35 @@ body.is-resizing-ai-sidebar {
 }
 
 .ai-composer-wrap {
+  position: relative;
   padding: 0 28px 18px;
+}
+
+.ai-new-message-prompt {
+  position: absolute;
+  z-index: 4;
+  top: -43px;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 6px 13px;
+  color: #405ad0;
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+  border: 1px solid rgba(79, 109, 245, 0.25);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 8px 22px rgba(63, 70, 112, 0.16);
+  transform: translateX(-50%);
+}
+
+.ai-new-message-prompt:hover {
+  color: #314bc2;
+  border-color: rgba(79, 109, 245, 0.42);
+  background: #fff;
 }
 
 @keyframes aiThinkingGradient {
@@ -680,40 +708,49 @@ body.is-resizing-ai-sidebar {
 }
 .ask-history-list {
   min-height: 0;
+  overflow-x: hidden;
   overflow-y: auto;
   padding: 12px 14px 24px;
 }
-.ask-history-list > button {
+.ask-history-item {
+  position: relative;
   width: 100%;
+  border-radius: 11px;
+}
+.ask-history-item:hover,
+.ask-history-item.is-active {
+  background: rgba(255, 255, 255, 0.7);
+}
+.ask-history-open {
+  width: 100%;
+  min-width: 0;
   display: grid;
   gap: 4px;
-  padding: 12px;
-  border-radius: 11px;
+  padding: 12px 48px 12px 12px;
   color: #363c50;
   text-align: left;
   background: transparent;
-}
-.ask-history-list > button:hover,
-.ask-history-list > button.is-active {
-  background: rgba(255, 255, 255, 0.7);
 }
 .ask-history-row-top {
   display: flex;
   align-items: baseline;
   gap: 12px;
+  min-width: 0;
 }
-.ask-history-list strong,
-.ask-history-list span {
+.ask-history-open strong,
+.ask-history-open > span {
+  display: block;
+  min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
-.ask-history-list strong {
+.ask-history-open strong {
   min-width: 0;
   flex: 1 1 auto;
   font-size: 14px;
 }
-.ask-history-list span {
+.ask-history-open > span {
   color: #7f8598;
   font-size: 14px;
 }
@@ -722,6 +759,39 @@ body.is-resizing-ai-sidebar {
   color: #a2a7b5;
   font-size: 12px;
   text-transform: lowercase;
+}
+.ask-history-delete {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 7px;
+  color: #858b9e;
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-50%);
+  transition: opacity 140ms ease, color 140ms ease, background 140ms ease;
+}
+.ask-history-item:hover .ask-history-delete,
+.ask-history-item:focus-within .ask-history-delete,
+.ask-history-item.is-active .ask-history-delete {
+  opacity: 1;
+  pointer-events: auto;
+}
+.ask-history-delete:hover,
+.ask-history-delete:focus-visible {
+  color: #5068de;
+  background: #e9edfc;
+}
+.ask-history-delete svg {
+  width: 20px;
+  height: 20px;
+  pointer-events: none;
 }
 .ask-history-empty {
   height: 100%;
@@ -1341,13 +1411,12 @@ body.is-resizing-ai-sidebar {
   min-width: 0;
   max-width: 100%;
   padding: 3px 8px;
-  overflow: hidden;
+  overflow-wrap: anywhere;
   color: #3157db;
   font: inherit;
   font-weight: 650;
   text-align: left;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+  white-space: normal;
   border: 1px solid rgba(49, 87, 219, 0.18);
   border-radius: 999px;
   background: rgba(244, 247, 255, 0.92);
@@ -10793,6 +10862,7 @@ body,
   border-color: #7f8799;
 }
 
+.ask-history-delete::after,
 .mail-row-actions button::after,
 .mail-detail-toolbar button::after {
   content: attr(data-tooltip);
@@ -10817,6 +10887,8 @@ body,
     transform 140ms ease;
 }
 
+.ask-history-delete:hover::after,
+.ask-history-delete:focus-visible::after,
 .mail-detail-toolbar button:hover::after,
 .mail-detail-toolbar button:focus-visible::after,
 .mail-row-actions button:hover::after,
@@ -11053,7 +11125,6 @@ body,
 .safe-email-scaled {
   display: inline-block;
   max-width: none;
-  min-width: max-content;
   text-align: initial;
   transform-origin: top center;
 }
@@ -11067,6 +11138,7 @@ body,
   letter-spacing: normal !important;
   word-spacing: normal !important;
   font-kerning: auto;
+  font-size: 14px !important;
 }
 
 .safe-email-text p {
@@ -11093,6 +11165,11 @@ body,
   line-height: 20px !important;
   letter-spacing: normal !important;
   word-spacing: normal !important;
+}
+
+.safe-email-text img {
+  max-width: 100%;
+  height: auto;
 }
 
 .safe-email-text p:last-child {

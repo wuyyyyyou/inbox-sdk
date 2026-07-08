@@ -73,6 +73,16 @@ const DEFAULT_INBOX_FEED_WINDOW: InboxFeedWindow = {
   gmailPageOffset: 0,
 };
 const INBOX_FEED_PAGE_SIZE = 100;
+const AI_CONVERSATION_BOTTOM_THRESHOLD = 24;
+
+export function isAiConversationNearBottom(
+  scroller: Pick<HTMLElement, "scrollHeight" | "scrollTop" | "clientHeight">,
+) {
+  return (
+    scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <=
+    AI_CONVERSATION_BOTTOM_THRESHOLD
+  );
+}
 
 const MAILBOX_VIEWS: Array<{ id: MailboxView; label: string }> = [
   { id: "inbox", label: "Inbox" },
@@ -866,14 +876,23 @@ function aiResultCount(result: CustomRunResult) {
   );
 }
 
-function aiSearchStatus(result: CustomRunResult) {
+export function aiSearchStatus(result: CustomRunResult) {
   const itemCount = aiResultCount(result);
+  const chinese = /[\u3400-\u9fff]/.test([
+    result.title,
+    result.summary,
+    ...(result.sections || []).flatMap((section) => [section.heading, section.body]),
+  ].filter(Boolean).join(" "));
   if (itemCount > 0)
-    return `Found ${itemCount} relevant thread${itemCount === 1 ? "" : "s"}.`;
+    return chinese
+      ? `找到 ${itemCount} 个相关邮件线程。`
+      : `Found ${itemCount} relevant thread${itemCount === 1 ? "" : "s"}.`;
   const queryCount = result.plan_gmail_queries?.length || 0;
   if (queryCount > 0)
-    return `Searched ${queryCount} focused inbox quer${queryCount === 1 ? "y" : "ies"}.`;
-  return "Finished searching your inbox.";
+    return chinese
+      ? `已执行 ${queryCount} 个针对性收件箱查询。`
+      : `Searched ${queryCount} focused inbox quer${queryCount === 1 ? "y" : "ies"}.`;
+  return chinese ? "已完成收件箱搜索。" : "Finished searching your inbox.";
 }
 
 function aiTimeLabel(value?: string) {
@@ -1262,6 +1281,10 @@ function AiSidebar({
 }) {
   const { state, actions } = useApp();
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [showNewMessagePrompt, setShowNewMessagePrompt] = useState(false);
+  const conversationRef = useRef<HTMLDivElement | null>(null);
+  const pinnedToBottomRef = useRef(true);
+  const scrollAfterSubmitRef = useRef(false);
   const running =
     state.aiChatLoading ||
     state.isCustomScanning ||
@@ -1275,9 +1298,60 @@ function AiSidebar({
   ];
   const conversation = state.aiChatMessages;
 
+  const scrollConversationToBottom = useCallback(
+    (behavior: ScrollBehavior = "smooth") => {
+      const scroller = conversationRef.current;
+      if (!scroller) return;
+      scroller.scrollTo({ top: scroller.scrollHeight, behavior });
+      pinnedToBottomRef.current = true;
+      setShowNewMessagePrompt(false);
+    },
+    [],
+  );
+
+  const previousRunningRef = useRef(running);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      if (!pinnedToBottomRef.current && !scrollAfterSubmitRef.current) return;
+      const behavior = scrollAfterSubmitRef.current ? "smooth" : "auto";
+      scrollAfterSubmitRef.current = false;
+      scrollConversationToBottom(behavior);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [conversation, scrollConversationToBottom]);
+
+  useEffect(() => {
+    pinnedToBottomRef.current = true;
+    setShowNewMessagePrompt(false);
+    const frame = window.requestAnimationFrame(() =>
+      scrollConversationToBottom("auto"),
+    );
+    return () => window.cancelAnimationFrame(frame);
+  }, [state.aiChatConversationId, scrollConversationToBottom]);
+
+  useEffect(() => {
+    const wasRunning = previousRunningRef.current;
+    previousRunningRef.current = running;
+    if (!wasRunning || running) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      if (pinnedToBottomRef.current) {
+        scrollConversationToBottom("auto");
+      } else if (conversation.length) {
+        setShowNewMessagePrompt(true);
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [conversation.length, running, scrollConversationToBottom]);
+
   const submit = () => {
     if (!state.customScanInput.trim() || running) return;
     setHistoryOpen(false);
+    setShowNewMessagePrompt(false);
+    pinnedToBottomRef.current = true;
+    scrollAfterSubmitRef.current = true;
+    window.requestAnimationFrame(() => scrollConversationToBottom("smooth"));
     void actions.sendAiChatMessage({ currentMailContext });
   };
 
@@ -1304,7 +1378,15 @@ function AiSidebar({
         </button>
       </div>
 
-      <div className="ai-conversation">
+      <div
+        className="ai-conversation"
+        ref={conversationRef}
+        onScroll={(event) => {
+          const pinned = isAiConversationNearBottom(event.currentTarget);
+          pinnedToBottomRef.current = pinned;
+          if (pinned) setShowNewMessagePrompt(false);
+        }}
+      >
         {conversation.length ? (
           <div className="ai-message-stack" aria-live="polite">
             {conversation.map((message) => (
@@ -1348,33 +1430,46 @@ function AiSidebar({
         </div>
         <div className="ask-history-list">
           {state.askHistory.length ? (
-            state.askHistory.map((entry, index) => (
-              <button
-                key={`${entry.timestamp}-${index}`}
-                className={
-                  state.aiChatConversationId &&
-                  state.aiChatConversationId === entry.conversationId
-                    ? "is-active"
-                    : ""
-                }
-                onClick={() => {
-                  actions.openAiConversation(index);
-                  setHistoryOpen(false);
-                }}
-              >
-                <div className="ask-history-row-top">
-                  <strong>
-                    {entry.query || entry.result.title || "Inbox question"}
-                  </strong>
-                  <time>{relativeTimeLabel(entry.timestamp)}</time>
+            state.askHistory.map((entry, index) => {
+              const active = Boolean(
+                state.aiChatConversationId &&
+                state.aiChatConversationId === entry.conversationId,
+              );
+              return (
+                <div
+                  key={`${entry.timestamp}-${index}`}
+                  className={`ask-history-item ${active ? "is-active" : ""}`}
+                >
+                  <button
+                    className="ask-history-open"
+                    onClick={() => {
+                      actions.openAiConversation(index);
+                      setHistoryOpen(false);
+                    }}
+                  >
+                    <div className="ask-history-row-top">
+                      <strong>
+                        {entry.query || entry.result.title || "Inbox question"}
+                      </strong>
+                      <time>{relativeTimeLabel(entry.timestamp)}</time>
+                    </div>
+                    <span>
+                      {entry.result.summary ||
+                        entry.result.plan_description ||
+                        "Open conversation"}
+                    </span>
+                  </button>
+                  <button
+                    className="ask-history-delete"
+                    aria-label="Delete chat"
+                    data-tooltip="Delete chat"
+                    onClick={() => actions.deleteAiConversation(index)}
+                  >
+                    <TrashIcon />
+                  </button>
                 </div>
-                <span>
-                  {entry.result.summary ||
-                    entry.result.plan_description ||
-                    "Open conversation"}
-                </span>
-              </button>
-            ))
+              );
+            })
           ) : (
             <div className="ask-history-empty">
               <HistoryIcon />
@@ -1385,6 +1480,15 @@ function AiSidebar({
       </section>
 
       <div className="ai-composer-wrap">
+        {showNewMessagePrompt ? (
+          <button
+            className="ai-new-message-prompt"
+            onClick={() => scrollConversationToBottom("smooth")}
+            aria-label="Scroll to new messages"
+          >
+            有新消息 <span aria-hidden="true">↓</span>
+          </button>
+        ) : null}
         <div className={`ai-composer ${running ? "is-running" : ""}`}>
           <textarea
             value={state.customScanInput}
@@ -1440,7 +1544,7 @@ function AiSidebar({
       <div className="ai-sidebar-foot">
         <span>
           <i className={state.runtime.connected ? "is-live" : ""} />
-          {state.runtime.connected ? "LLM Connected" : "LLMOffline"}
+          {state.runtime.connected ? "LLM Connected" : "LLM Offline"}
         </span>
         <div>
           <button
@@ -2451,7 +2555,8 @@ export function HomeView() {
     state.inboxSnapshotLoading,
   ]);
 
-  const isInboxSyncing = state.inboxSnapshotLoading;
+  const isInboxSyncing =
+    state.inboxSnapshotLoading || feedAction === "refresh";
   const days = feedWindow.days;
   const canLoadMoreInbox =
     mailboxView === "inbox" && days === INBOX_LAST_MONTH_DAYS;
@@ -3041,7 +3146,7 @@ export function HomeView() {
             onClick={() => void syncInbox()}
           >
             <RefreshIcon />
-            <span>{feedAction === "refresh" ? "Syncing" : "Refresh"}</span>
+            <span>{isInboxSyncing ? "Syncing" : "Refresh"}</span>
           </button>
         </header>
 
