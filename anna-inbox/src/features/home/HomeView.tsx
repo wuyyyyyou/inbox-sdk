@@ -58,7 +58,7 @@ type InboxFeedWindow = {
 type FeedActionState = "refresh" | "older" | "more" | "category-page" | null;
 
 const AI_SIDEBAR_WIDTH_KEY = "anna-inbox:ai-sidebar-width";
-const AI_SIDEBAR_MIN_WIDTH = 260;
+const AI_SIDEBAR_MIN_WIDTH = 300;
 const AI_SIDEBAR_MAX_WIDTH = 680;
 const CACHED_INBOX_BANNER_SKIP_KEY = "anna-inbox:cached-inbox-banner-skip";
 const INBOX_ALL_TIME_DAYS = 0;
@@ -606,6 +606,25 @@ export function isSentMessage(message: InboxMessage) {
   );
 }
 
+function inboxThreadProjectionKey(message: InboxMessage) {
+  const mailboxKey = String(message.mailbox || "").trim().toLowerCase();
+  const threadKey = String(message.thread_id || "").trim();
+  if (threadKey) return `${mailboxKey}:thread:${threadKey}`;
+  return `${mailboxKey}:message:${message.id}`;
+}
+
+function uniqueLatestInboxThreads<T extends InboxMessage>(messages: T[]) {
+  const seen = new Set<string>();
+  const unique: T[] = [];
+  for (const message of sortInboxMessagesDesc(messages)) {
+    const key = inboxThreadProjectionKey(message);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(message);
+  }
+  return unique;
+}
+
 export function mergeDraftOverlayMessages(
   messages: InboxMessage[],
   drafts: InboxMessage[],
@@ -657,7 +676,7 @@ export function resolveSourceMessages(
     currentMessages.set(message.id, message);
   }
   if (mailboxView === "todos" || mailboxView === "snoozed") {
-    return sortInboxMessagesDesc(
+    return uniqueLatestInboxThreads(
       flags[mailboxView]
         .map((id) => currentMessages.get(id))
         .filter((message): message is InboxMessage => message !== undefined && !isTrashMessage(message)),
@@ -668,31 +687,31 @@ export function resolveSourceMessages(
     for (const message of currentMessages.values()) {
       if (isDoneMessage(message, flags)) doneIds.add(message.id);
     }
-    return sortInboxMessagesDesc(
+    return uniqueLatestInboxThreads(
       [...doneIds]
         .map((id) => currentMessages.get(id))
         .filter((message): message is InboxMessage => message !== undefined && !isTrashMessage(message)),
     );
   }
   if (mailboxView === "inbox") {
-    return sortInboxMessagesDesc(
+    return uniqueLatestInboxThreads(
       inboxMessages.filter((message) => hasMessageLabel(message, "INBOX") && !isTrashMessage(message)),
     );
   }
   if (mailboxView === "starred")
-    return sortInboxMessagesDesc(
+    return uniqueLatestInboxThreads(
       source.filter((message) => hasMessageLabel(message, "STARRED") && !isTrashMessage(message)),
     );
   if (mailboxView === "drafts")
-    return sortInboxMessagesDesc(
+    return uniqueLatestInboxThreads(
       source.filter((message) => isDraftMessage(message) && !isTrashMessage(message)),
     );
   if (mailboxView === "sent")
-    return sortInboxMessagesDesc(
+    return uniqueLatestInboxThreads(
       source.filter((message) => hasMessageLabel(message, "SENT") && !isTrashMessage(message)),
     );
   if (mailboxView === "trash")
-    return sortInboxMessagesDesc(
+    return uniqueLatestInboxThreads(
       source.filter(
         (message) =>
           isTrashMessage(message) &&
@@ -701,11 +720,11 @@ export function resolveSourceMessages(
       ),
     );
   if (mailboxView === "spam")
-    return sortInboxMessagesDesc(
+    return uniqueLatestInboxThreads(
       source.filter((message) => hasMessageLabel(message, "SPAM") && !isTrashMessage(message)),
     );
   if (mailboxView === "all")
-    return sortInboxMessagesDesc(
+    return uniqueLatestInboxThreads(
       source.filter(
         (message) =>
           !["TRASH", "SPAM", "CHAT"].some((label) =>
@@ -713,7 +732,7 @@ export function resolveSourceMessages(
           ),
       ),
     );
-  return sortInboxMessagesDesc(source);
+  return uniqueLatestInboxThreads(source);
 }
 
 function InboxRow({
@@ -2177,7 +2196,7 @@ export function HomeView() {
             if (!avatarPermissionNoticeShown.current) {
               avatarPermissionNoticeShown.current = true;
               actions.showToast(
-                "Reconnect Google to load contact photos from saved and other contacts.",
+                "Required permission to load contact photos from saved and other contacts.",
               );
             }
             return;
@@ -3416,7 +3435,7 @@ export function HomeView() {
             <button
               className="older-mail-btn"
               onClick={() => void loadOlderInbox()}
-              disabled={isInboxSyncing}
+              disabled={isInboxSyncing || feedAction !== null}
             >
               {feedAction === "older"
                 ? "Loading older emails..."
@@ -3427,7 +3446,7 @@ export function HomeView() {
             <button
               className="older-mail-btn"
               onClick={() => void loadMoreInbox()}
-              disabled={isInboxSyncing}
+              disabled={isInboxSyncing || feedAction !== null}
             >
               {feedAction === "more"
                 ? "Loading older emails..."

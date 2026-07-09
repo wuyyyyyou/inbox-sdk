@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from anna_inbox_executa.common import *
 from anna_inbox_executa.card_tools import _handle_generate_draft_background, _handle_summarize_background, _serialize_card_for_frontend
 from anna_inbox_executa.gmail_tools import _dedup_body, _resolve_cid_images, _sanitize_email_html
@@ -603,9 +605,23 @@ Rules:
 - assistant_followup_text should briefly summarize the draft strategy and invite a useful adjustment. Omit it when no reliable summary is possible.
 - Do not repeat the draft body in either assistant text field.
 - Do not include email headers in the draft body.
+- Keep the sign-off and sender name on consecutive lines with no blank line between them.
 - Do not invent dates, commitments, prices, or factual claims.
 - Never include HTML.
 """
+
+
+_DRAFT_SIGNOFF_BLANK_LINE_RE = re.compile(
+    r"(?im)^(?P<signoff>[ \t]*(?:all the best|best(?: regards)?|cheers|kind regards|"
+    r"many thanks|regards|respectfully|sincerely|thanks|thank you|warm regards)"
+    r"[,.!，。！]?[ \t]*)\n(?:[ \t]*\n)+(?=[^\n]+\Z)"
+)
+
+
+def _normalize_generated_draft_body(value: Any) -> str:
+    """Remove an accidental blank line between a closing and final signature line."""
+    body = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return _DRAFT_SIGNOFF_BLANK_LINE_RE.sub(r"\g<signoff>\n", body)
 
 
 def _inbox_sort_key(message: dict[str, Any]) -> tuple[int, str]:
@@ -1145,7 +1161,7 @@ async def _generate_mail_prompt_result(
         })
 
     draft_payload = payload.get("draft_reply") if isinstance(payload.get("draft_reply"), dict) else {}
-    draft_body = str(draft_payload.get("body") or "").strip()
+    draft_body = _normalize_generated_draft_body(draft_payload.get("body"))
     artifact = None
     if expected_artifact == "draft_reply" and draft_body and not needs_user_input:
         artifact = {

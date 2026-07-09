@@ -1846,8 +1846,12 @@ body.is-resizing-ai-sidebar {
   font-weight: 600;
   background: #edf2ff;
 }
-.older-mail-btn:hover {
+.older-mail-btn:hover:not(:disabled) {
   background: #e2eaff;
+}
+.older-mail-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
 }
 
 @media (max-width: 900px) {

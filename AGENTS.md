@@ -8,7 +8,7 @@
 
 ## 项目基线
 
-Anna Inbox 当前版本为 `2.0.5`。前端位于 `anna-inbox/`，后端 Executa 位于 `inbox-tool/`。
+Anna Inbox 当前版本为 `2.0.6`。前端位于 `anna-inbox/`，后端 Executa 位于 `inbox-tool/`。
 
 - `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表。
 - `anna-inbox/src/features/mail-detail/`：线程详情、正文、草稿和附件预览。
@@ -48,7 +48,7 @@ npm test
 npm run build
 ```
 在更改前端代码后，应该要断开开发环境：
-``` sh
+``` cmd
 for /f "tokens=5" %a in ('netstat -ano ^| findstr :5180') do taskkill /f /pid %a
 anna-app dev
 ```

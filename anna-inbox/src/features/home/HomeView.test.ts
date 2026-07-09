@@ -201,6 +201,17 @@ describe("resolveSourceMessages", () => {
     expect(resolveSourceMessages("all", [], snapshot, flags).map((message) => message.id)).toEqual(["newest", "middle", "older"]);
   });
 
+  it("keeps only the latest message for a thread projection", () => {
+    const inbox = [
+      { id: "thread-1-old", thread_id: "thread-1", label_ids: ["INBOX"], internal_date: "1719360000000", subject: "Re: Feature Invite" },
+      { id: "thread-1-new", thread_id: "thread-1", label_ids: ["INBOX"], internal_date: "1720051200000", subject: "Re: Feature Invite" },
+      { id: "thread-2", thread_id: "thread-2", label_ids: ["INBOX"], internal_date: "1719446400000", subject: "Other" },
+    ];
+    const flags = { todos: [], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: {} };
+
+    expect(resolveSourceMessages("inbox", inbox, [], flags).map((message) => message.id)).toEqual(["thread-1-new", "thread-2"]);
+  });
+
   it("treats sent mail as done by default", () => {
     const snapshot = [
       { id: "sent-1", label_ids: ["SENT"], internal_date: "300" },
