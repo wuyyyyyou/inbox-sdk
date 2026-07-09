@@ -1106,6 +1106,7 @@ function AiAssistantMessage({
       message.artifact && (!animate || assistantTextComplete)
         ? message.artifact
         : null;
+    const summaryLink = message.mailSummaryLink;
     const clarification = message.clarification;
     const targetThreadOpen = Boolean(
       draftArtifact &&
@@ -1145,6 +1146,18 @@ function AiAssistantMessage({
       <div
         className={`ai-message is-assistant ${message.kind === "error" ? "is-error" : ""} ${message.kind === "stopped" ? "is-stopped" : ""}`}
       >
+        {summaryLink ? (
+          <div className="ai-mail-summary-title">
+            <span>Here's a summary of</span>
+            <button
+              type="button"
+              title={summaryLink.label}
+              onClick={() => onOpenMail(summaryLink)}
+            >
+              {summaryLink.label}
+            </button>
+          </div>
+        ) : null}
         <AnimatedAssistantText
           text={text}
           animate={animate}
@@ -2183,6 +2196,25 @@ export function HomeView() {
       void actions
         .loadContactAvatars(emails, mailbox)
         .then(({ avatars, permissionRequired, serviceDisabled }) => {
+          const missing = permissionRequired || serviceDisabled
+            ? []
+            : emails.filter((email) => !avatars[email]);
+          for (const email of missing) avatarMisses.current.add(email);
+          if (Object.keys(avatars).length || missing.length) {
+            setContactAvatars((current) => {
+              const next = { ...current, ...avatars };
+              window.localStorage.setItem(
+                `anna-inbox:contact-avatars:${mailbox}`,
+                JSON.stringify({
+                  avatars: next,
+                  missing: [...avatarMisses.current],
+                  avatarsUpdatedAt: Date.now(),
+                  missingUpdatedAt: Date.now(),
+                }),
+              );
+              return next;
+            });
+          }
           if (serviceDisabled) {
             if (!avatarPermissionNoticeShown.current) {
               avatarPermissionNoticeShown.current = true;
@@ -2201,21 +2233,6 @@ export function HomeView() {
             }
             return;
           }
-          const missing = emails.filter((email) => !avatars[email]);
-          for (const email of missing) avatarMisses.current.add(email);
-          setContactAvatars((current) => {
-            const next = { ...current, ...avatars };
-            window.localStorage.setItem(
-              `anna-inbox:contact-avatars:${mailbox}`,
-              JSON.stringify({
-                avatars: next,
-                missing: [...avatarMisses.current],
-                avatarsUpdatedAt: Date.now(),
-                missingUpdatedAt: Date.now(),
-              }),
-            );
-            return next;
-          });
         })
         .catch(() => undefined);
     }, 320);

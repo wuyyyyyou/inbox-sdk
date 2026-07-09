@@ -483,7 +483,8 @@ export interface AiMailContextRef {
 export interface SubmitMailPromptRequest {
   visiblePrompt: string;
   context: AiMailContextRef;
-  expectedArtifact?: "draft_reply";
+  expectedArtifact?: "draft_reply" | "summary";
+  contextTitle?: string;
   forceNewConversation?: boolean;
   userAnswers?: Record<string, string>;
   draftToRevise?: string;
@@ -504,6 +505,7 @@ export interface MailPromptRunResult {
   anchor_message_id: string;
   latest_message_id: string;
   visible_prompt: string;
+  thread_title?: string;
   assistant_text: string;
   assistant_followup_text?: string;
   artifact?: DraftReplyArtifact | null;
@@ -710,6 +712,7 @@ export interface AiChatMessage {
   artifact?: DraftReplyArtifact | null;
   replyGaps?: ReplyGaps;
   mailContext?: AiMailContextRef;
+  mailSummaryLink?: AskMailLink;
   fallbackUsed?: boolean;
   sourcePrompt?: string;
   assistantFollowupText?: string;

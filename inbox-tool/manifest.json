@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.0.6",
+  "version": "2.0.7",
   "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Brief workflows, Ask, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
@@ -295,7 +295,7 @@
     },
     {
       "name": "resolve_contact_avatars",
-      "description": "Resolve saved Google Contact avatar URLs for email addresses. Returns permission_required when Contacts scope is unavailable.",
+      "description": "Resolve Google Contact avatar URLs for email addresses, falling back to Gravatar. Returns permission_required when Contacts scope is unavailable.",
       "parameters": [
         {
           "name": "mailbox",
@@ -1015,7 +1015,7 @@
     },
     {
       "name": "start_inbox_thread_assist",
-      "description": "Start AI overview and quick-reply generation for an Inbox thread. Returns run_id immediately; poll with get_mail_agent_run.",
+      "description": "Start AI overview generation for an Inbox thread. Returns run_id immediately on cache miss; poll with get_mail_agent_run.",
       "parameters": [
         {
           "name": "mailbox",
@@ -1087,7 +1087,7 @@
         {
           "name": "expected_artifact",
           "type": "string",
-          "description": "Expected artifact type, such as draft_reply.",
+          "description": "Expected artifact type: draft_reply or summary.",
           "required": false
         },
         {

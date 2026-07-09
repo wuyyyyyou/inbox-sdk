@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from anna_inbox_executa.common import *
 
 def repo_root() -> Path:
@@ -668,6 +670,11 @@ def resolve_contact_avatars(mailbox_arg: str, emails_arg: Any) -> dict[str, Any]
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
     emails = [str(item) for item in emails_arg] if isinstance(emails_arg, list) else []
+    print(
+        f"[contact_avatars] tool_invoked mailbox={mailbox} requested={len(emails)}",
+        file=sys.stderr,
+        flush=True,
+    )
     return {"mailbox": mailbox, **resolve_contact_avatar_urls(mailbox, emails)}
 
 

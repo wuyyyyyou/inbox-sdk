@@ -74,6 +74,13 @@ _display_name_cache: dict[str, str] = {}
 _avatar_url_cache: dict[str, str] = {}
 _contact_avatar_cache: dict[str, dict[str, str]] = {}
 _contact_avatar_loaded: set[str] = set()
+GRAVATAR_AVATAR_BASE = "https://www.gravatar.com/avatar"
+
+
+def _avatar_debug(message: str, **fields: Any) -> None:
+    detail = " ".join(f"{key}={value}" for key, value in fields.items())
+    suffix = f" {detail}" if detail else ""
+    print(f"[contact_avatars] {message}{suffix}", file=sys.stderr, flush=True)
 
 
 def _looks_like_email(value: str) -> bool:
@@ -944,6 +951,62 @@ def _cache_people_photo_urls(cached: dict[str, str], people: list[Any]) -> None:
             email = str(item.get("value") or "").strip().lower() if isinstance(item, dict) else ""
             if email:
                 cached[email] = photo_url
+                _avatar_debug(
+                    "people_photo_cached",
+                    email_hash=hashlib.md5(email.encode("utf-8")).hexdigest()[:8],
+                    url_present=True,
+                    url_host=urllib.parse.urlparse(photo_url).netloc or "unknown",
+                )
+
+
+def _gravatar_avatar_url(email: str) -> str:
+    normalized = str(email or "").strip().lower()
+    if not _looks_like_email(normalized):
+        _avatar_debug("gravatar_url_skipped", reason="invalid_email")
+        return ""
+    digest = hashlib.md5(normalized.encode("utf-8")).hexdigest()
+    url = f"{GRAVATAR_AVATAR_BASE}/{digest}?s=96&d=404"
+    _avatar_debug("gravatar_url_generated", email_hash=digest[:8], url_present=bool(url), url_host="www.gravatar.com")
+    return url
+
+
+def _gravatar_avatar_exists(url: str) -> bool:
+    if not url:
+        _avatar_debug("gravatar_head_skipped", reason="empty_url")
+        return False
+    request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Anna-Inbox/2.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            exists = 200 <= int(response.status) < 400
+            _avatar_debug("gravatar_head_result", status=int(response.status), exists=exists)
+            return exists
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            _avatar_debug("gravatar_head_result", status=404, exists=False)
+            return False
+        _avatar_debug("gravatar_head_error", status=exc.code)
+        raise
+
+
+def _resolve_gravatar_avatar_url(email: str) -> str:
+    url = _gravatar_avatar_url(email)
+    if not url:
+        return ""
+    try:
+        return url if _gravatar_avatar_exists(url) else ""
+    except Exception as exc:
+        _avatar_debug("gravatar_resolve_failed", error=type(exc).__name__)
+        return ""
+
+
+def _cache_gravatar_photo_urls(cached: dict[str, str], requested: set[str]) -> None:
+    for email in sorted(requested):
+        if email in cached:
+            continue
+        gravatar_url = _resolve_gravatar_avatar_url(email)
+        if gravatar_url:
+            cached[email] = gravatar_url
+            _avatar_debug("gravatar_cached", email_hash=hashlib.md5(email.encode("utf-8")).hexdigest()[:8])
 
 
 def _http_error_json(exc: urllib.error.HTTPError) -> dict[str, Any]:
@@ -955,7 +1018,7 @@ def _http_error_json(exc: urllib.error.HTTPError) -> dict[str, Any]:
 
 
 def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, Any]:
-    """Resolve saved Google Contact photos for a bounded set of email addresses."""
+    """Resolve Google Contact photos, then Gravatar photos, for a bounded email set."""
     normalized_mailbox = normalize_mailbox(mailbox)
     requested = {
         str(email or "").strip().lower()
@@ -963,6 +1026,13 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
         if "@" in str(email or "")
     }
     cached = _contact_avatar_cache.setdefault(normalized_mailbox, {})
+    _avatar_debug(
+        "adapter_invoked",
+        mailbox_hash=hashlib.md5(normalized_mailbox.encode("utf-8")).hexdigest()[:8],
+        requested=len(requested),
+        cached=len(cached),
+        loaded=normalized_mailbox in _contact_avatar_loaded,
+    )
     if normalized_mailbox not in _contact_avatar_loaded:
         token = get_access_token(normalized_mailbox)
         try:
@@ -976,6 +1046,11 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
                 if page_token:
                     params["pageToken"] = page_token
                 payload = _people_api_get(token, "people/me/connections", params)
+                _avatar_debug(
+                    "people_connections_page",
+                    count=len(payload.get("connections") or []),
+                    next=bool(payload.get("nextPageToken")),
+                )
                 _cache_people_photo_urls(cached, payload.get("connections") or [])
                 page_token = str(payload.get("nextPageToken") or "")
                 if not page_token:
@@ -991,6 +1066,11 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
                 if page_token:
                     params["pageToken"] = page_token
                 payload = _people_api_get(token, "otherContacts", params)
+                _avatar_debug(
+                    "people_other_contacts_page",
+                    count=len(payload.get("otherContacts") or []),
+                    next=bool(payload.get("nextPageToken")),
+                )
                 _cache_people_photo_urls(cached, payload.get("otherContacts") or [])
                 page_token = str(payload.get("nextPageToken") or "")
                 if not page_token:
@@ -1010,6 +1090,9 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
             )
             if service_disabled:
                 metadata = service_disabled.get("metadata") if isinstance(service_disabled.get("metadata"), dict) else {}
+                _cache_gravatar_photo_urls(cached, requested)
+                result_count = len([email for email in requested if email in cached])
+                _avatar_debug("adapter_return", path="service_disabled", returned=result_count)
                 return {
                     "avatars": {email: cached[email] for email in requested if email in cached},
                     "permission_required": False,
@@ -1019,6 +1102,9 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
                     "warning": str(((error_payload.get("error") or {}).get("message") or "People API is disabled.")),
                 }
             if exc.code in (401, 403):
+                _cache_gravatar_photo_urls(cached, requested)
+                result_count = len([email for email in requested if email in cached])
+                _avatar_debug("adapter_return", path="permission_required", returned=result_count)
                 return {
                     "avatars": {email: cached[email] for email in requested if email in cached},
                     "permission_required": True,
@@ -1029,11 +1115,17 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
                 }
             raise ValueError(f"Google People API request failed: HTTP {exc.code}") from exc
         except Exception as exc:
+            _cache_gravatar_photo_urls(cached, requested)
+            result_count = len([email for email in requested if email in cached])
+            _avatar_debug("adapter_return", path="warning", returned=result_count, error=type(exc).__name__)
             return {"avatars": {email: cached[email] for email in requested if email in cached}, "warning": str(exc)}
 
     own_avatar = get_account_avatar_url(normalized_mailbox)
     if own_avatar:
         cached[normalized_mailbox] = own_avatar
+    _cache_gravatar_photo_urls(cached, requested)
+    result_count = len([email for email in requested if email in cached])
+    _avatar_debug("adapter_return", path="ok", returned=result_count, cached=len(cached))
     return {
         "avatars": {email: cached[email] for email in requested if email in cached},
         "permission_required": False,

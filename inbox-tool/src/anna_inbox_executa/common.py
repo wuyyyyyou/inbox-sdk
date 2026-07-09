@@ -341,7 +341,7 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "resolve_contact_avatars",
-            "description": "Resolve saved Google Contact avatar URLs for email addresses. Returns permission_required when Contacts scope is unavailable.",
+            "description": "Resolve Google Contact avatar URLs for email addresses, falling back to Gravatar. Returns permission_required when Contacts scope is unavailable.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
                 {"name": "emails", "type": "array", "description": "Contact email addresses.", "required": True},
@@ -416,7 +416,7 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "start_inbox_thread_assist",
-            "description": "Start AI overview and quick-reply generation for an Inbox thread. Returns run_id immediately; poll with get_mail_agent_run.",
+            "description": "Start AI overview generation for an Inbox thread. Returns run_id immediately on cache miss; poll with get_mail_agent_run.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
                 {"name": "thread_id", "type": "string", "description": "Gmail thread ID.", "required": True},
@@ -446,7 +446,7 @@ DEFAULT_MANIFEST = {
                 {"name": "anchor_message_id", "type": "string", "description": "Message initially opened from the Inbox list.", "required": True},
                 {"name": "latest_message_id", "type": "string", "description": "Latest thread message ID.", "required": True},
                 {"name": "visible_prompt", "type": "string", "description": "Prompt visible in the left Anna sidebar.", "required": True},
-                {"name": "expected_artifact", "type": "string", "description": "Expected artifact type, such as draft_reply.", "required": False},
+                {"name": "expected_artifact", "type": "string", "description": "Expected artifact type: draft_reply or summary.", "required": False},
                 {"name": "user_answers", "type": "object", "description": "Optional answers to reply-gap questions.", "required": False},
                 {"name": "ai_provider", "type": "string", "description": "LLM provider.", "required": False},
             ],

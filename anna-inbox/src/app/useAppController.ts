@@ -1898,10 +1898,13 @@ export function useAppController() {
       const baseMessages = request.baseMessages
         ?? (!request.forceNewConversation && state.aiChatConversationId === conversationId ? state.aiChatMessages : []);
       const messagesWithUser = [...baseMessages, userMessage];
+      const requestedArtifact = request.expectedArtifact
+        || (/\bsummar(?:ize|ise|y|ization|isation)\b/i.test(request.visiblePrompt) ? "summary" : "draft_reply");
+      const isDraftRequest = requestedArtifact === "draft_reply";
       const pendingMessage: AiChatMessage = {
         id: createId("msg"),
         role: "assistant",
-        content: "Updating the draft...",
+        content: isDraftRequest ? "Updating the draft..." : "Summarizing the thread...",
         timestamp: new Date().toISOString(),
         kind: "status",
         pending: true,
@@ -1922,7 +1925,7 @@ export function useAppController() {
           anchor_message_id: context.anchor_message_id,
           latest_message_id: context.latest_message_id,
           visible_prompt: buildRevisionPrompt(request.visiblePrompt, request.draftToRevise),
-          expected_artifact: request.expectedArtifact || "draft_reply",
+          expected_artifact: requestedArtifact,
           user_answers: request.userAnswers,
           ai_provider: state.llmProvider,
           storage_provider: state.storageProvider,
@@ -1936,6 +1939,7 @@ export function useAppController() {
           throw new Error(completed.error || "Mail prompt failed");
         }
         const payload = (completed.result || {}) as unknown as MailPromptRunResult;
+        const summaryTitle = String(payload.thread_title || request.contextTitle || "").trim();
         const finalMessages: AiChatMessage[] = [
           ...messagesWithUser,
           {
@@ -1944,11 +1948,17 @@ export function useAppController() {
             content: payload.assistant_text || "I reviewed the thread.",
             timestamp: new Date().toISOString(),
             kind: "mail_context",
-            artifact: payload.artifact
+            artifact: isDraftRequest && payload.artifact
               ? { ...payload.artifact, source_prompt: request.visiblePrompt }
               : null,
             replyGaps: payload.reply_gaps,
             mailContext: context,
+            mailSummaryLink: !isDraftRequest ? {
+              label: summaryTitle || "Current thread",
+              mailbox: normalizedMailbox(context.mailbox),
+              thread_id: context.thread_id,
+              message_id: context.anchor_message_id || context.latest_message_id,
+            } : undefined,
             fallbackUsed: Boolean(payload.fallback_used),
             sourcePrompt: request.visiblePrompt,
             assistantFollowupText: payload.assistant_followup_text,
@@ -1958,7 +1968,7 @@ export function useAppController() {
         return payload;
       } catch (error) {
         if (!isCurrentGeneration() || isAbortError(error)) return null;
-        const message = sanitizeToolError(error, request.visiblePrompt) || "Anna couldn't finish that reply.";
+        const message = sanitizeToolError(error, request.visiblePrompt) || (isDraftRequest ? "Anna couldn't finish that reply." : "Anna couldn't finish that summary.");
         const failedMessages: AiChatMessage[] = [
           ...messagesWithUser,
           {

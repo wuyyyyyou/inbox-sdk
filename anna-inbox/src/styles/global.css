@@ -372,6 +372,43 @@ body.is-resizing-ai-sidebar {
   line-height: 1.4;
 }
 
+.ai-mail-summary-title {
+  display: inline-flex;
+  align-items: baseline;
+  max-width: 100%;
+  gap: 5px;
+  margin: 0 0 8px;
+  color: #22283b;
+  font-size: 14px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.ai-mail-summary-title span {
+  flex: 0 0 auto;
+}
+
+.ai-mail-summary-title button {
+  min-width: 0;
+  max-width: min(360px, 58vw);
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+  color: #2f5df5;
+  font: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.ai-mail-summary-title button:hover,
+.ai-mail-summary-title button:focus-visible {
+  color: #2448c7;
+  text-decoration: underline;
+}
+
 .ai-answer-meta {
   display: flex;
   flex-wrap: wrap;
@@ -10962,7 +10999,8 @@ body,
 
 .ask-history-delete::after,
 .mail-row-actions button::after,
-.mail-detail-toolbar button::after {
+.mail-detail-toolbar button::after,
+.mail-detail-overview-result::after {
   content: attr(data-tooltip);
   position: absolute;
   z-index: 20;
@@ -10990,7 +11028,9 @@ body,
 .mail-detail-toolbar button:hover::after,
 .mail-detail-toolbar button:focus-visible::after,
 .mail-row-actions button:hover::after,
-.mail-row-actions button:focus-visible::after {
+.mail-row-actions button:focus-visible::after,
+.mail-detail-overview-result:hover::after,
+.mail-detail-overview-result:focus-visible::after {
   opacity: 1;
   transform: translateX(-50%) translateY(0);
 }
@@ -11009,15 +11049,41 @@ body,
 }
 
 .mail-detail-overview-result {
+  position: relative;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
+  max-width: 100%;
+  margin: 5px 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #2d3242;
+  font-family: inherit;
+  line-height: 20px;
+  font-weight: 400;
+  text-align: left;
+  white-space: nowrap;
   gap: 6px;
+  cursor: pointer;
+}
+
+.mail-detail-overview-result:hover,
+.mail-detail-overview-result:focus-visible {
+  color: #4f46d5;
+}
+
+.mail-detail-overview-result:focus-visible {
+  outline: 2px solid rgba(79, 109, 245, 0.28);
+  outline-offset: 3px;
+}
+
+.mail-detail-overview-result span {
+  min-width: 0;
 }
 
 .mail-detail-overview-result > svg {
   width: 16px;
   height: 16px;
-  margin-top: 2px;
   flex: none;
   color: #6a63d8;
 }

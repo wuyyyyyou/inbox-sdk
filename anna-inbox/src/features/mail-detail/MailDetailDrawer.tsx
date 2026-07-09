@@ -286,8 +286,9 @@ function AiSparkleIcon() {
   );
 }
 
-function AnimatedMailOverview({ text }: { text: string }) {
+function MailOverviewAction({ text, onClick }: { text: string; onClick: () => void }) {
   const [visibleText, setVisibleText] = useState("");
+  const fontSize = text.length > 150 ? 11 : text.length > 120 ? 12 : text.length > 95 ? 13 : 14;
 
   useEffect(() => {
     setVisibleText("");
@@ -305,10 +306,17 @@ function AnimatedMailOverview({ text }: { text: string }) {
   }, [text]);
 
   return (
-    <p className="mail-detail-overview-result">
+    <button
+      type="button"
+      className="mail-detail-overview-result"
+      data-tooltip="Expand and discuss summary"
+      aria-label="Expand and discuss summary"
+      style={{ fontSize }}
+      onClick={onClick}
+    >
       <AiSparkleIcon />
       <span>{visibleText}</span>
-    </p>
+    </button>
   );
 }
 
@@ -1061,9 +1069,29 @@ export function MailDetailDrawer({
     }
   };
 
-  const submitPrompt = async (visiblePrompt: string, expectedArtifact: "draft_reply" = "draft_reply", forceNewConversation = false) => {
+  const submitPrompt = async (visiblePrompt: string, expectedArtifact: "draft_reply" | "summary" = "draft_reply", forceNewConversation = false) => {
     if (!context) return;
-    await submitMailContextPrompt({ visiblePrompt, context, expectedArtifact, forceNewConversation });
+    await submitMailContextPrompt({
+      visiblePrompt,
+      context,
+      expectedArtifact,
+      contextTitle: page?.subject || message?.subject || "",
+      forceNewConversation,
+    });
+  };
+
+  const expandOverview = () => {
+    void submitPrompt("Summarize this thread", "summary", true);
+  };
+
+  const retryOverview = () => {
+    if (!context) return;
+    setAssistError("");
+    setAssistLoading(true);
+    void loadInboxThreadAssist(mailbox, context.thread_id, context.latest_message_id, context.anchor_message_id)
+      .then(setAssist)
+      .catch((reason) => setAssistError(reason instanceof Error ? reason.message : String(reason)))
+      .finally(() => setAssistLoading(false));
   };
 
   const sendReply = async () => {
@@ -1151,7 +1179,7 @@ export function MailDetailDrawer({
               </div>
             ) : null}
             <div className="mail-detail-overview">
-              {assistLoading ? <p className="mail-detail-overview-loading">Loading AI overview…</p> : assist?.overview ? <AnimatedMailOverview text={assist.overview} /> : assistError ? <p>AI is unavailable. <button onClick={() => context && void loadInboxThreadAssist(mailbox, context.thread_id, context.latest_message_id, context.anchor_message_id).then(setAssist).catch((reason) => setAssistError(reason instanceof Error ? reason.message : String(reason)))}>Retry</button></p> : null}
+              {assistLoading ? <p className="mail-detail-overview-loading">Generating overview...</p> : assist?.overview ? <MailOverviewAction text={assist.overview} onClick={expandOverview} /> : assistError ? <p>AI is unavailable. <button onClick={retryOverview}>Retry</button></p> : null}
             </div>
             {fromAddress || toAddress ? (
               <div className="mail-detail-participants">

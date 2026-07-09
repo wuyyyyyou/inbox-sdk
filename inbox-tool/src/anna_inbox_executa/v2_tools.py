@@ -565,18 +565,14 @@ THREAD_ASSIST_SYSTEM = """You are Anna's inbox thread assistant.
 
 Return JSON only:
 {
-  "overview": "1-2 factual sentences that do not repeat the subject",
-  "quick_replies": [
-    {"id": "short_id", "label": "2-4 words", "intent": "one short sentence"}
-  ]
+  "overview": "one short factual sentence"
 }
 
 Rules:
 - Use the full thread context, not just the latest snippet.
-- quick_replies: at most 3 items.
-- Keep labels short and action-oriented.
+- Keep overview to one line, ideally 8-12 words.
 - Do not invent facts or user commitments.
-- If there is little to say, leave overview empty and quick_replies empty.
+- If there is little to say, summarize the sender's visible intent.
 - Never include HTML.
 """
 
@@ -606,6 +602,22 @@ Rules:
 - Do not repeat the draft body in either assistant text field.
 - Do not include email headers in the draft body.
 - Keep the sign-off and sender name on consecutive lines with no blank line between them.
+- Do not invent dates, commitments, prices, or factual claims.
+- Never include HTML.
+"""
+
+MAIL_SUMMARY_SYSTEM = """You are Anna, an executive email assistant summarizing a Gmail thread.
+
+Return JSON only:
+{
+  "assistant_text": "concise factual summary of the thread"
+}
+
+Rules:
+- Summarize the email conversation only.
+- Do not write or offer a draft reply.
+- Do not mention drafting, draft buttons, or reply artifacts.
+- Include concrete participants, asks, decisions, deadlines, and current status when available.
 - Do not invent dates, commitments, prices, or factual claims.
 - Never include HTML.
 """
@@ -908,6 +920,30 @@ def _thread_prompt_excerpt(messages: list[dict[str, Any]], *, max_messages: int 
     return "\n\n---\n\n".join(parts)
 
 
+def _one_line_overview(value: Any, *, max_chars: int = 72) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars].rsplit(" ", 1)[0].strip()
+    return clipped or text[:max_chars].strip()
+
+
+def _fallback_thread_overview(messages: list[dict[str, Any]], anchor_message_id: str = "") -> str:
+    if not messages:
+        return ""
+    anchor_message = _find_thread_message(messages, anchor_message_id) if anchor_message_id else None
+    target = anchor_message or messages[-1]
+    subject = str(target.get("subject") or messages[-1].get("subject") or "").strip()
+    snippet = str(target.get("snippet") or messages[-1].get("snippet") or "").strip()
+    if not snippet:
+        display = _display_body_payload(target, limit=260, prefer_html=False)
+        snippet = str(display.get("body_text") or "").strip()
+    candidate = snippet or subject
+    if subject and candidate and subject.lower() not in candidate.lower():
+        candidate = f"{subject}: {candidate}"
+    return _one_line_overview(candidate, max_chars=72)
+
+
 async def _load_contact_context_for_thread(
     *,
     mailbox: str,
@@ -1015,72 +1051,38 @@ async def _generate_thread_assist_result(
     anchor_message_id: str,
     sampling_create_message: Any,
 ) -> dict[str, Any]:
-    from mail_agent.actions.service import summarize_thread
     from mail_agent.llm_runtime.service import call_llm_json_safe
 
     messages = _load_thread_messages(mailbox, thread_id)
     if not messages:
         raise ValueError(f"Thread {thread_id} not found")
-    pseudo_card = _build_pseudo_card_for_thread(mailbox, thread_id, messages, anchor_message_id)
-    summary_result = await summarize_thread(pseudo_card, mailbox, sampling_create_message=sampling_create_message)
-    summary = summary_result.get("summary") if isinstance(summary_result, dict) else {}
-    overview_parts = [
-        str(summary.get("headline") or "").strip(),
-        str(summary.get("reply_focus") or "").strip(),
-    ]
-    fallback_overview = " ".join(part for part in overview_parts if part).strip()
-    latest_display = _display_body_payload(messages[-1], limit=INBOX_PROMPT_BODY_LIMIT, prefer_html=False)
-    contact_context_text, related_lines = await _load_contact_context_for_thread(
-        mailbox=mailbox,
-        thread_id=thread_id,
-        subject=str(messages[-1].get("subject") or ""),
-        latest_from=str(messages[-1].get("from") or ""),
-        latest_body=str(latest_display.get("body_text") or ""),
-        purpose="thread_summary",
-        sampling_create_message=sampling_create_message,
-    )
-
-    quick_result = await call_llm_json_safe(
+    fallback_overview = _fallback_thread_overview(messages, anchor_message_id)
+    overview_result = await call_llm_json_safe(
         sampling_create_message,
         system_prompt=THREAD_ASSIST_SYSTEM,
         user_message=(
             f"Subject: {messages[-1].get('subject', '')}\n"
             f"Participants: {'; '.join(_thread_participants(messages))}\n"
-            f"Latest summary: {fallback_overview}\n"
-            f"Related contact context: {contact_context_text}\n"
             f"Thread messages:\n{_thread_prompt_excerpt(messages)}\n"
         ),
-        fallback={"overview": fallback_overview, "quick_replies": []},
+        fallback={"overview": fallback_overview},
         temperature=0.2,
-        max_tokens=700,
-        timeout=120.0,
+        max_tokens=120,
+        timeout=45.0,
         metadata={"tool": "inbox_thread_assist", "thread_id": thread_id},
+        max_attempts=1,
     )
-    payload = quick_result.get("payload") if isinstance(quick_result.get("payload"), dict) else {}
-    overview = str(payload.get("overview") or fallback_overview).strip()
-    quick_replies_raw = payload.get("quick_replies") if isinstance(payload.get("quick_replies"), list) else []
-    quick_replies: list[dict[str, Any]] = []
-    for index, item in enumerate(quick_replies_raw[:3], start=1):
-        if not isinstance(item, dict):
-            continue
-        label = str(item.get("label") or "").strip()
-        intent = str(item.get("intent") or "").strip()
-        if not label or not intent:
-            continue
-        quick_replies.append({
-            "id": str(item.get("id") or f"reply_{index}").strip() or f"reply_{index}",
-            "label": label[:40],
-            "intent": intent[:200],
-        })
+    payload = overview_result.get("payload") if isinstance(overview_result.get("payload"), dict) else {}
+    overview = _one_line_overview(payload.get("overview") or fallback_overview)
 
     return {
         "thread_id": thread_id,
         "latest_message_id": latest_message_id,
         "overview": overview,
-        "quick_replies": quick_replies,
-        "summary": summary,
-        "related_context": related_lines,
-        "fallback_used": bool(summary_result.get("fallback_used")) or bool(quick_result.get("fallback_used")),
+        "quick_replies": [],
+        "summary": {},
+        "related_context": [],
+        "fallback_used": bool(overview_result.get("fallback_used")),
     }
 
 
@@ -1097,10 +1099,12 @@ async def _generate_mail_prompt_result(
 ) -> dict[str, Any]:
     from mail_agent.llm_runtime.service import call_llm_json_safe
 
+    expected_artifact = "draft_reply" if expected_artifact == "draft_reply" else "summary"
     messages = _load_thread_messages(mailbox, thread_id)
     if not messages:
         raise ValueError(f"Thread {thread_id} not found")
     latest = messages[-1]
+    thread_title = str(latest.get("subject") or "").strip() or "(no subject)"
     latest_display = _display_body_payload(latest, limit=INBOX_PROMPT_BODY_LIMIT, prefer_html=False)
     contact_context_text, _ = await _load_contact_context_for_thread(
         mailbox=mailbox,
@@ -1108,15 +1112,49 @@ async def _generate_mail_prompt_result(
         subject=str(latest.get("subject") or ""),
         latest_from=str(latest.get("from") or ""),
         latest_body=str(latest_display.get("body_text") or ""),
-        purpose="draft_generation",
+        purpose="draft_generation" if expected_artifact == "draft_reply" else "thread_summary",
         sampling_create_message=sampling_create_message,
     )
+    if expected_artifact == "summary":
+        result = await call_llm_json_safe(
+            sampling_create_message,
+            system_prompt=MAIL_SUMMARY_SYSTEM,
+            user_message=(
+                f"Visible prompt: {visible_prompt}\n"
+                f"Mailbox: {mailbox}\n"
+                f"Thread ID: {thread_id}\n"
+                f"Anchor message ID: {anchor_message_id}\n"
+                f"Latest message ID: {latest_message_id}\n"
+                f"Contact context: {contact_context_text}\n"
+                f"Thread messages:\n{_thread_prompt_excerpt(messages)}\n"
+            ),
+            fallback={"assistant_text": "I reviewed the thread, but could not generate a detailed summary."},
+            temperature=0.2,
+            max_tokens=1200,
+            timeout=90.0,
+            metadata={"tool": "inbox_mail_summary", "thread_id": thread_id},
+        )
+        payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+        return {
+            "mailbox": mailbox,
+            "thread_id": thread_id,
+            "anchor_message_id": anchor_message_id,
+            "latest_message_id": latest_message_id,
+            "visible_prompt": visible_prompt,
+            "thread_title": thread_title,
+            "assistant_text": str(payload.get("assistant_text") or "I reviewed the thread.").strip(),
+            "assistant_followup_text": "",
+            "artifact": None,
+            "reply_gaps": {"needs_user_input": False, "summary": "", "questions": []},
+            "fallback_used": bool(result.get("fallback_used")),
+        }
+
     answers_text = "\n".join(
         f"- {key}: {value}"
         for key, value in (user_answers or {}).items()
         if str(value).strip()
     ) or "None"
-    fallback_assistant = "I drafted a reply for this thread." if expected_artifact == "draft_reply" else "I reviewed the thread."
+    fallback_assistant = "I drafted a reply for this thread."
     result = await call_llm_json_safe(
         sampling_create_message,
         system_prompt=MAIL_PROMPT_SYSTEM,
@@ -1178,6 +1216,7 @@ async def _generate_mail_prompt_result(
         "anchor_message_id": anchor_message_id,
         "latest_message_id": latest_message_id,
         "visible_prompt": visible_prompt,
+        "thread_title": thread_title,
         "assistant_text": str(payload.get("assistant_text") or fallback_assistant).strip(),
         "assistant_followup_text": str(payload.get("assistant_followup_text") or "").strip(),
         "artifact": artifact,
@@ -1646,6 +1685,18 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         latest_message_id = str(arguments.get("latest_message_id", "")).strip()
         if not mailbox or not thread_id or not latest_message_id:
             return {"error": "mailbox, thread_id, and latest_message_id are required"}
+        try:
+            from mail_agent.storage.ops import get_inbox_thread_assist
+
+            cached = await get_inbox_thread_assist(mailbox, thread_id, latest_message_id)
+            if cached.get("exists") and isinstance(cached.get("value"), dict) and cached.get("value"):
+                return {
+                    "success": True,
+                    "status": "done",
+                    "result": {**cached.get("value"), "cached": True},
+                }
+        except Exception as exc:
+            log(f"inbox thread assist cache lookup skipped: {type(exc).__name__}: {exc}")
         run_id = f"bg_{uuid.uuid4().hex[:12]}"
         MAIL_AGENT_RUNS[run_id] = {"run_id": run_id, "status": "queued", "stage": "inbox_thread_assist", "progress": {}, "warnings": [], "started_at": beijing_now(), "updated_at": beijing_now(), "result": None, "error": "", "partial": {}}
         _save_run_checkpoint(run_id)
