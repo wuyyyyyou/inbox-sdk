@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   AiMailContextRef,
   AttachmentDownloadPayload,
@@ -12,6 +12,13 @@ import type {
   SubmitMailPromptRequest,
 } from "../../types/mail";
 import { SafeEmailHtml, SafeEmailText } from "../../shared/SafeEmailHtml";
+import {
+  getCachedMessageBody,
+  getCachedThreadPage,
+  setCachedMessageBody,
+  setCachedThreadPage,
+} from "../../shared/browserStorage";
+import { mailAvatarFallback } from "../../shared/mailIdentity";
 import { PdfAttachmentPreview } from "./PdfAttachmentPreview";
 import {
   buildQuickReplyPrompt,
@@ -54,6 +61,7 @@ type PreviewTransition = "idle" | "exit-previous" | "exit-next" | "enter-previou
 
 const PREVIEW_EXIT_MS = 170;
 const PREVIEW_ENTER_MS = 240;
+const COMPOSER_TRANSITION_MS = 300;
 
 function waitForPreviewAnimation(duration: number) {
   const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
@@ -151,34 +159,74 @@ function PreviewArrow({ direction, onClick, disabled }: { direction: "previous" 
   );
 }
 
-function messageAvatar(sender: string) {
-  const parts = senderParts(sender);
-  const label = parts.name || parts.email || "?";
-  const initial = (label.match(/[A-Za-z0-9]/)?.[0] || label.slice(0, 1) || "?").toUpperCase();
-  const tone = (initial.charCodeAt(0) || 65) % 5;
-  return { initial, tone };
-}
-
-function ThreadMessageAvatar({ sender, avatarUrl }: { sender: string; avatarUrl?: string }) {
+function ThreadMessageAvatar({
+  identity,
+  label,
+  avatarUrl,
+}: {
+  identity: string;
+  label?: string;
+  avatarUrl?: string;
+}) {
   const [failed, setFailed] = useState(false);
-  const avatar = messageAvatar(sender);
+  const avatar = mailAvatarFallback(identity, label);
   return avatarUrl && !failed
     ? <img className="sender-avatar is-photo" src={avatarUrl} alt="" referrerPolicy="no-referrer" onError={() => setFailed(true)} />
     : <span className={`sender-avatar tone-${avatar.tone}`} aria-hidden="true">{avatar.initial}</span>;
 }
 
+function MailDetailLoadingSkeleton() {
+  return (
+    <div className="mail-detail-loading-skeleton" role="status" aria-label="Loading thread">
+      <article className="mail-detail-loading-card">
+        <div className="mail-detail-loading-head">
+          <span className="mail-detail-loading-avatar" />
+          <span className="mail-detail-loading-line is-author" />
+          <span className="mail-detail-loading-line is-date" />
+        </div>
+        <div className="mail-detail-loading-body">
+          <span className="mail-detail-loading-line" />
+          <span className="mail-detail-loading-line" />
+          <span className="mail-detail-loading-line is-short" />
+        </div>
+      </article>
+    </div>
+  );
+}
+
 function AttachmentSection({
   attachments,
+  expectedAttachmentCount = 0,
+  onRefresh,
   onPreview,
   onDownload,
   isDownloading,
 }: {
   attachments: MailAttachmentMeta[];
+  expectedAttachmentCount?: number;
+  onRefresh?: () => void;
   onPreview: (attachment: MailAttachmentMeta) => void;
   onDownload: (attachment: MailAttachmentMeta) => void;
   isDownloading: (attachment: MailAttachmentMeta) => boolean;
 }) {
-  if (!attachments.length) return null;
+  if (!attachments.length) {
+    if (!expectedAttachmentCount) return null;
+    return (
+      <div className="mail-detail-attachments">
+        <article className="mail-detail-attachment is-pending">
+          <div>
+            <strong>{expectedAttachmentCount > 1 ? `${expectedAttachmentCount} attachments` : "Attachment"}</strong>
+            <span>Attachment metadata is loading.</span>
+          </div>
+          {onRefresh ? (
+            <div className="mail-detail-attachment-actions">
+              <button type="button" onClick={onRefresh}>Refresh</button>
+            </div>
+          ) : null}
+        </article>
+      </div>
+    );
+  }
   return (
     <div className="mail-detail-attachments">
       {attachments.map((attachment) => {
@@ -226,6 +274,14 @@ function displayAddress(parts: { name: string; email: string } | null) {
   };
 }
 
+function normalizeComparableSubject(value: unknown) {
+  return String(value || "")
+    .trim()
+    .replace(/^(?:(?:re|fw|fwd):\s*)+/i, "")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
 function isLocalDraftMessage(message: Pick<InboxMessage, "draft_body" | "draft_local"> | null | undefined) {
   return Boolean(message?.draft_local || message?.draft_body);
 }
@@ -245,7 +301,7 @@ function HeaderContactRow({
     <div className="mail-detail-contact-row">
       <span className="mail-detail-contact-label">{label}:</span>
       <span className="mail-detail-contact-avatar">
-        <ThreadMessageAvatar sender={sender} avatarUrl={avatarUrl} />
+        <ThreadMessageAvatar identity={address?.name || address?.email || sender} label={address?.name || sender} avatarUrl={avatarUrl} />
       </span>
       <span className="mail-detail-contact-text">
         <strong>{display.title}</strong>
@@ -266,13 +322,157 @@ function buildMailContext(mailbox: string, message: InboxMessage, page: InboxThr
   };
 }
 
-function scrollToLatestMessage(container: HTMLDivElement | null, latestMessageId: string) {
+function inboxMessageAttachments(message: InboxMessage): MailAttachmentMeta[] {
+  const attachments = (message as InboxMessage & { attachments?: MailAttachmentMeta[] }).attachments;
+  return Array.isArray(attachments) ? attachments : [];
+}
+
+function hasInboxMessageAttachment(message: InboxMessage | null | undefined) {
+  if (!message) return false;
+  return Boolean(
+    message.has_attachment
+    || Number(message.attachment_count || 0) > 0
+    || inboxMessageAttachments(message).length > 0
+  );
+}
+
+function singleMessagePageFromBody(
+  mailbox: string,
+  anchorMessage: InboxMessage,
+  body: { body_text?: string; body_html?: string; body_truncated?: boolean; attachments?: MailAttachmentMeta[] },
+): InboxThreadPagePayload {
+  const messageId = anchorMessage.id;
+  const threadId = anchorMessage.thread_id || messageId;
+  const attachments = body.attachments?.length ? body.attachments : inboxMessageAttachments(anchorMessage);
+  return {
+    mailbox,
+    thread_id: threadId,
+    subject: anchorMessage.subject || "(no subject)",
+    latest_subject: anchorMessage.subject || "(no subject)",
+    latest_message_id: messageId,
+    returned_count: 1,
+    has_earlier: false,
+    next_before_index: null,
+    messages: [{
+      id: messageId,
+      thread_id: threadId,
+      internal_date: anchorMessage.internal_date || "",
+      from: anchorMessage.from || "",
+      to: anchorMessage.to || "",
+      subject: anchorMessage.subject || "(no subject)",
+      label_ids: anchorMessage.label_ids || [],
+      body_html: body.body_html || "",
+      body_text: body.body_text || "",
+      body_truncated: Boolean(body.body_truncated),
+      attachments,
+    }],
+  };
+}
+
+function expectedAttachmentCountForMessage(item: InboxThreadMessage, anchorMessage: InboxMessage | null) {
+  if (!anchorMessage || item.id !== anchorMessage.id || item.attachments.length) return 0;
+  if (!hasInboxMessageAttachment(anchorMessage)) return 0;
+  return Math.max(1, Number(anchorMessage.attachment_count || 0));
+}
+
+function pageMayBeMissingAnchorAttachments(page: InboxThreadPagePayload, anchorMessage: InboxMessage) {
+  if (!hasInboxMessageAttachment(anchorMessage)) return false;
+  const anchor = page.messages.find((item) => item.id === anchorMessage.id);
+  return Boolean(anchor && !anchor.attachments.length);
+}
+
+function pageMayBeMissingThreadContext(page: InboxThreadPagePayload, anchorMessage: InboxMessage) {
+  if (!anchorMessage.thread_id) return false;
+  if (page.has_earlier) return false;
+  return page.messages.length <= 1 && page.messages.some((item) => item.id === anchorMessage.id);
+}
+
+function isGmailDraftThreadMessage(message: InboxThreadMessage) {
+  return (message.label_ids || []).some((label) => label.toUpperCase() === "DRAFT");
+}
+
+function withoutGmailDraftThreadMessages(page: InboxThreadPagePayload): InboxThreadPagePayload {
+  const messages = (page.messages || []).filter((item) => !isGmailDraftThreadMessage(item));
+  if (messages.length === (page.messages || []).length) return page;
+  const latest = messages[messages.length - 1];
+  return {
+    ...page,
+    messages,
+    returned_count: messages.length,
+    latest_message_id: latest?.id || "",
+    latest_subject: latest?.subject || page.latest_subject || page.subject,
+  };
+}
+
+function threadMessageToInboxMessage(message: InboxThreadMessage, mailbox: string): InboxMessage {
+  return {
+    id: message.id,
+    thread_id: message.thread_id,
+    mailbox,
+    internal_date: message.internal_date,
+    from: message.from,
+    to: message.to,
+    subject: message.subject,
+    label_ids: message.label_ids,
+    has_attachment: Boolean(message.attachments?.length),
+    attachment_count: message.attachments?.length || 0,
+  };
+}
+
+async function cacheThreadPage(mailbox: string, page: InboxThreadPagePayload) {
+  const visiblePage = withoutGmailDraftThreadMessages(page);
+  await setCachedThreadPage(mailbox, visiblePage);
+  await Promise.all((visiblePage.messages || []).map((item) =>
+    setCachedMessageBody(mailbox, threadMessageToInboxMessage(item, mailbox), {
+      body_text: item.body_text || "",
+      body_html: item.body_html || "",
+      body_truncated: Boolean(item.body_truncated),
+      attachments: item.attachments || [],
+    }),
+  ));
+}
+
+async function hydrateCachedThreadPageBodies(mailbox: string, page: InboxThreadPagePayload): Promise<InboxThreadPagePayload> {
+  const visiblePage = withoutGmailDraftThreadMessages(page);
+  const messages = await Promise.all((visiblePage.messages || []).map(async (item) => {
+    const cached = await getCachedMessageBody(mailbox, item.id, item.internal_date);
+    if (!cached || (!cached.body_text && !cached.body_html)) return item;
+    if (!cached.body_html && (item.body_html || item.body_text)) return item;
+    if (
+      cached.body_text === item.body_text
+      && (cached.body_html || "") === (item.body_html || "")
+      && Boolean(cached.body_truncated) === Boolean(item.body_truncated)
+    ) return item;
+    return {
+      ...item,
+      body_text: cached.body_text || "",
+      body_html: cached.body_html || "",
+      body_truncated: Boolean(cached.body_truncated),
+      attachments: item.attachments,
+    };
+  }));
+  return messages.every((item, index) => item === visiblePage.messages[index])
+    ? visiblePage
+    : { ...visiblePage, messages };
+}
+
+function scrollToLatestMessage(
+  container: HTMLDivElement | null,
+  latestMessageId: string,
+  behavior: ScrollBehavior = "auto",
+) {
   if (!container || !latestMessageId) return;
   const target = Array.from(container.querySelectorAll<HTMLElement>("[data-message-id]"))
     .find((element) => element.dataset.messageId === latestMessageId);
   if (target) {
-    target.scrollIntoView({ block: "start", behavior: "auto" });
+    target.scrollIntoView({ block: "start", behavior });
   }
+}
+
+function scrollTargetForPage(page: InboxThreadPagePayload, fallbackMessageId: string) {
+  return page.messages.some((item) => item.id === page.latest_message_id)
+    ? page.latest_message_id
+    : fallbackMessageId;
 }
 
 const TEXT_PREVIEW_MAX_BYTES = 256 * 1024;
@@ -288,7 +488,6 @@ function AiSparkleIcon() {
 
 function MailOverviewAction({ text, onClick }: { text: string; onClick: () => void }) {
   const [visibleText, setVisibleText] = useState("");
-  const fontSize = text.length > 150 ? 11 : text.length > 120 ? 12 : text.length > 95 ? 13 : 14;
 
   useEffect(() => {
     setVisibleText("");
@@ -311,7 +510,6 @@ function MailOverviewAction({ text, onClick }: { text: string; onClick: () => vo
       className="mail-detail-overview-result"
       data-tooltip="Expand and discuss summary"
       aria-label="Expand and discuss summary"
-      style={{ fontSize }}
       onClick={onClick}
     >
       <AiSparkleIcon />
@@ -406,6 +604,7 @@ export function MailDetailDrawer({
   const [assistLoading, setAssistLoading] = useState(false);
   const [assistError, setAssistError] = useState("");
   const [composerOpen, setComposerOpen] = useState(false);
+  const [composerClosing, setComposerClosing] = useState(false);
   const [composerExpanded, setComposerExpanded] = useState(false);
   const [draft, setDraft] = useState("");
   const [draftDirty, setDraftDirty] = useState(false);
@@ -429,6 +628,7 @@ export function MailDetailDrawer({
   const [, setPreviewCacheRevision] = useState(0);
   const [resolvedAvatars, setResolvedAvatars] = useState<Record<string, string>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const footerRef = useRef<HTMLElement | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLTextAreaElement | null>(null);
   const loadInboxEmailBodyRef = useRef(loadInboxEmailBody);
@@ -447,6 +647,11 @@ export function MailDetailDrawer({
   const renderedPreviewKeysRef = useRef<Set<string>>(new Set());
   const previewRenderWaitersRef = useRef<Map<string, () => void>>(new Map());
   const attachmentDownloadsRef = useRef<Set<string>>(new Set());
+  const pendingThreadScrollTargetRef = useRef("");
+  const draftLoadSequenceRef = useRef(0);
+  const draftEditSequenceRef = useRef(0);
+  const pendingDraftSavesRef = useRef(new Set<Promise<void>>());
+  const composerCloseTimerRef = useRef<number | null>(null);
 
   const clearPreviewAccess = () => {
     previewAccessRef.current = null;
@@ -467,6 +672,21 @@ export function MailDetailDrawer({
   };
 
   const notifyPreviewCacheChanged = () => setPreviewCacheRevision((value) => value + 1);
+
+  const queueThreadScroll = (nextPage: InboxThreadPagePayload, fallbackMessageId: string) => {
+    pendingThreadScrollTargetRef.current = scrollTargetForPage(nextPage, fallbackMessageId);
+  };
+
+  const closeComposer = () => {
+    if (!composerOpen) return;
+    setComposerOpen(false);
+    setComposerClosing(true);
+    if (composerCloseTimerRef.current) window.clearTimeout(composerCloseTimerRef.current);
+    composerCloseTimerRef.current = window.setTimeout(() => {
+      setComposerClosing(false);
+      composerCloseTimerRef.current = null;
+    }, COMPOSER_TRANSITION_MS);
+  };
 
   const threadId = message?.thread_id || "";
   const messageId = message?.id || "";
@@ -497,15 +717,68 @@ export function MailDetailDrawer({
       }))) || [],
     [visibleThreadMessages],
   );
-  const showQuickReplies = Boolean(
-    assist?.quick_replies?.length
-    && latestMessage
-    && !isOutboundMessageForMailbox(latestMessage.from, mailbox),
+  const replyPromptTarget = useMemo(
+    () => [...visibleThreadMessages].reverse().find((item) => !isOutboundMessageForMailbox(item.from, mailbox))
+      || (message && !isOutboundMessageForMailbox(message.from || undefined, mailbox) ? message : null),
+    [mailbox, message, visibleThreadMessages],
   );
+  const quickReplySuggestions = useMemo(() => {
+    const generated = (assist?.quick_replies || []).filter((item) => item.label && item.intent);
+    return generated;
+  }, [assist?.quick_replies]);
+  const showQuickReplies = Boolean(
+    context
+    && quickReplySuggestions.length
+    && replyPromptTarget
+  );
+  const quickReplyRenderKey = quickReplySuggestions
+    .map((item) => `${item.id}:${item.label}:${item.intent}`)
+    .join("|");
   const fromAddress = useMemo(() => firstAddress(message?.from || undefined), [message?.from]);
   const toAddress = useMemo(() => firstAddress(message?.to || undefined, mailbox), [mailbox, message?.to]);
   const fromAvatarUrl = fromAddress ? (resolvedAvatars[fromAddress.email.toLowerCase()] || contactAvatars?.[fromAddress.email.toLowerCase()]) : undefined;
   const toAvatarUrl = toAddress ? (resolvedAvatars[toAddress.email.toLowerCase()] || contactAvatars?.[toAddress.email.toLowerCase()]) : undefined;
+  const displaySubject = page?.subject || message?.subject || "(no subject)";
+  const latestSubject = page?.latest_subject || message?.latest_subject || "";
+  const subjectWasModified = Boolean(
+    latestSubject
+    && displaySubject
+    && normalizeComparableSubject(latestSubject) !== normalizeComparableSubject(displaySubject)
+  );
+
+  useLayoutEffect(() => {
+    const targetMessageId = pendingThreadScrollTargetRef.current;
+    if (!targetMessageId) return;
+    pendingThreadScrollTargetRef.current = "";
+    scrollToLatestMessage(scrollRef.current, targetMessageId, "smooth");
+  }, [page]);
+
+  useLayoutEffect(() => {
+    if (!open || !showQuickReplies) return;
+    const scroller = scrollRef.current;
+    if (!scroller) return;
+    // AI prompts arrive after the thread page. They are part of the detail's
+    // destination, so always reveal them even if the user scrolled elsewhere.
+    scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
+  }, [assistLoading, open, quickReplyRenderKey, showQuickReplies]);
+
+  useLayoutEffect(() => {
+    if (!composerOpen) return;
+    const scroller = scrollRef.current;
+    const footer = footerRef.current;
+    if (!scroller || !footer) return;
+    // The composer reduces the context viewport. Keep the latest thread content
+    // (including delayed AI prompts) above it throughout the transition.
+    scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
+    const ResizeObserverCtor = window.ResizeObserver;
+    const observer = ResizeObserverCtor
+      ? new ResizeObserver(() => {
+        scroller.scrollTop = scroller.scrollHeight;
+      })
+      : null;
+    observer?.observe(footer);
+    return () => observer?.disconnect();
+  }, [composerExpanded, composerOpen]);
 
   useEffect(() => {
     loadInboxEmailBodyRef.current = loadInboxEmailBody;
@@ -523,6 +796,7 @@ export function MailDetailDrawer({
     previewCacheRef.current.clear();
     previewAccessRef.current = null;
     attachmentDownloadsRef.current.clear();
+    if (composerCloseTimerRef.current) window.clearTimeout(composerCloseTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -533,9 +807,13 @@ export function MailDetailDrawer({
     setLoading(true);
     setError("");
     setAssist(null);
-    setAssistLoading(Boolean(threadId));
+    setAssistLoading(false);
     setAssistError("");
+    assistRequestKeyRef.current = "";
+    if (composerCloseTimerRef.current) window.clearTimeout(composerCloseTimerRef.current);
+    composerCloseTimerRef.current = null;
     setComposerOpen(false);
+    setComposerClosing(false);
     setComposerExpanded(false);
     setDraft("");
     setDraftDirty(false);
@@ -547,10 +825,15 @@ export function MailDetailDrawer({
     setPreviewError("");
     setPreviewTextTruncated(false);
     const requestAssist = (latestMessageId: string) => {
-      if (!threadId) return;
+      if (!threadId || !latestMessageId) {
+        setAssistLoading(false);
+        return;
+      }
       const requestKey = `${mailbox}:${threadId}:${latestMessageId}:${messageId}`;
       if (assistRequestKeyRef.current === requestKey) return;
       assistRequestKeyRef.current = requestKey;
+      setAssistError("");
+      setAssistLoading(true);
       void loadInboxThreadAssistRef.current(mailbox, threadId, latestMessageId, messageId)
         .then((result) => {
           if (!cancelled && assistRequestKeyRef.current === requestKey) setAssist(result);
@@ -565,35 +848,46 @@ export function MailDetailDrawer({
     const load = async () => {
       try {
         if (threadId) {
+          const cachedPage = await getCachedThreadPage(mailbox, threadId, latestThreadMessageId || messageId);
+          if (cancelled) return;
+          if (cachedPage) {
+            const visibleCachedPage = withoutGmailDraftThreadMessages(cachedPage);
+            queueThreadScroll(visibleCachedPage, messageId);
+            setPage(visibleCachedPage);
+            requestAssist(visibleCachedPage.latest_message_id || messageId);
+            if (
+              !pageMayBeMissingAnchorAttachments(visibleCachedPage, anchorMessage)
+              && !pageMayBeMissingThreadContext(visibleCachedPage, anchorMessage)
+            ) {
+              void hydrateCachedThreadPageBodies(mailbox, visibleCachedPage)
+                .then((hydratedPage) => {
+                  if (cancelled || hydratedPage === visibleCachedPage) return;
+                  queueThreadScroll(hydratedPage, messageId);
+                  setPage(hydratedPage);
+                })
+                .catch(() => undefined);
+              return;
+            }
+          }
           const nextPage = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: messageId, limit: 5, includeDisplayBody: true });
           if (cancelled) return;
-          setPage(nextPage);
-          requestAnimationFrame(() => scrollToLatestMessage(scrollRef.current, nextPage.latest_message_id));
-          setAssistLoading(true);
-          requestAssist(nextPage.latest_message_id || messageId);
+          const visiblePage = withoutGmailDraftThreadMessages(nextPage);
+          queueThreadScroll(visiblePage, messageId);
+          setPage(visiblePage);
+          void cacheThreadPage(mailbox, visiblePage);
+          requestAssist(visiblePage.latest_message_id || messageId);
         } else {
+          const cachedBody = await getCachedMessageBody(mailbox, messageId, anchorMessage.internal_date);
+          if (cancelled) return;
+          if (cachedBody) {
+            setPage(singleMessagePageFromBody(mailbox, anchorMessage, cachedBody));
+            return;
+          }
           const body = await loadInboxEmailBodyRef.current(messageId, mailbox);
           if (cancelled) return;
-          setPage({
-            mailbox,
-            thread_id: anchorMessage.thread_id || messageId,
-            subject: anchorMessage.subject || "(no subject)",
-            latest_message_id: messageId,
-            returned_count: 1,
-            has_earlier: false,
-            next_before_index: null,
-            messages: [{
-              id: messageId,
-              thread_id: anchorMessage.thread_id || messageId,
-              internal_date: anchorMessage.internal_date || "",
-              from: anchorMessage.from || "",
-              to: anchorMessage.to || "",
-              subject: anchorMessage.subject || "(no subject)",
-              label_ids: anchorMessage.label_ids || [],
-              body_text: body,
-              attachments: [],
-            }],
-          });
+          const nextPage = singleMessagePageFromBody(mailbox, anchorMessage, { body_text: body, attachments: inboxMessageAttachments(anchorMessage) });
+          setPage(nextPage);
+          void setCachedMessageBody(mailbox, anchorMessage, { body_text: body, attachments: inboxMessageAttachments(anchorMessage) });
         }
       } catch (reason) {
         if (cancelled) return;
@@ -602,30 +896,19 @@ export function MailDetailDrawer({
           try {
             const display = await loadInboxMessageDisplayBodyRef.current(mailbox, messageId);
             if (cancelled) return;
-            setPage({
-              mailbox,
-              thread_id: threadId,
-              subject: anchorMessage.subject || "(no subject)",
-              latest_message_id: messageId,
-              returned_count: 1,
-              has_earlier: false,
-              next_before_index: null,
-              messages: [{
-                id: messageId,
-                thread_id: threadId,
-                internal_date: anchorMessage.internal_date || "",
-                from: anchorMessage.from || "",
-                to: anchorMessage.to || "",
-                subject: anchorMessage.subject || "(no subject)",
-                label_ids: anchorMessage.label_ids || [],
-                body_html: display.body_html || "",
-                body_text: display.body_text || "",
-                body_truncated: Boolean(display.body_truncated),
-                attachments: [],
-              }],
+            setPage(singleMessagePageFromBody(mailbox, anchorMessage, {
+              body_html: display.body_html || "",
+              body_text: display.body_text || "",
+              body_truncated: Boolean(display.body_truncated),
+              attachments: inboxMessageAttachments(anchorMessage),
+            }));
+            void setCachedMessageBody(mailbox, anchorMessage, {
+              body_html: display.body_html || "",
+              body_text: display.body_text || "",
+              body_truncated: Boolean(display.body_truncated),
+              attachments: inboxMessageAttachments(anchorMessage),
             });
             setError("");
-            setAssistLoading(true);
             requestAssist(messageId);
           } catch {
             setError(threadError);
@@ -641,7 +924,10 @@ export function MailDetailDrawer({
     return () => {
       cancelled = true;
     };
-  }, [mailbox, messageId, open, threadId]);
+  // A saved local draft overlays the selected inbox message with a new object. That
+  // is not a navigation event, so avoid using the whole message as a dependency:
+  // doing so would reload the thread and reset the composer after an AI insertion.
+  }, [latestThreadMessageId, mailbox, messageId, open, threadId]);
 
   useEffect(() => {
     setResolvedAvatars(contactAvatars || {});
@@ -672,10 +958,11 @@ export function MailDetailDrawer({
 
   useEffect(() => {
     if ((!composerOpen && !selectedIsDraft) || !threadId || !mailbox) return;
+    const requestId = ++draftLoadSequenceRef.current;
     let cancelled = false;
     void getInboxThreadDraftRef.current(mailbox, threadId)
       .then((stored) => {
-        if (cancelled) return;
+        if (cancelled || requestId !== draftLoadSequenceRef.current) return;
         const storedBody = stored.body || "";
         const fallbackBody = message?.draft_body || "";
         const nextDraft = storedBody || fallbackBody;
@@ -693,27 +980,35 @@ export function MailDetailDrawer({
 
   useEffect(() => {
     if (!composerOpen || !threadId || !mailbox || !draftDirty) return;
+    const editSequence = draftEditSequenceRef.current;
     const timer = window.setTimeout(() => {
-      void saveInboxThreadDraftRef.current(mailbox, threadId, draft, draftEtag || undefined, {
-        id: latestMessage?.id || message?.id || "",
-        thread_id: threadId,
-        mailbox,
-        internal_date: latestMessage?.internal_date || message?.internal_date || "",
-        date: message?.date || "",
-        from: latestMessage?.from || message?.from || "",
-        to: latestMessage?.to || message?.to || "",
-        subject: latestMessage?.subject || message?.subject || "",
-        label_ids: (latestMessage?.label_ids || message?.label_ids || []).filter((label) => label.toUpperCase() !== "DRAFT"),
-        important: Boolean(message?.important || latestMessage?.label_ids?.includes("IMPORTANT")),
-        starred: Boolean(message?.starred || latestMessage?.label_ids?.includes("STARRED")),
-        has_attachment: Boolean(message?.has_attachment),
-        attachment_count: Number(message?.attachment_count || 0),
-      })
-        .then((result) => {
+      const persistDraft = async () => {
+        try {
+          const result = await saveInboxThreadDraftRef.current(mailbox, threadId, draft, draftEtag || undefined, {
+            id: latestMessage?.id || message?.id || "",
+            thread_id: threadId,
+            mailbox,
+            internal_date: latestMessage?.internal_date || message?.internal_date || "",
+            date: message?.date || "",
+            from: latestMessage?.from || message?.from || "",
+            to: latestMessage?.to || message?.to || "",
+            subject: latestMessage?.subject || message?.subject || "",
+            label_ids: (latestMessage?.label_ids || message?.label_ids || []).filter((label) => label.toUpperCase() !== "DRAFT"),
+            important: Boolean(message?.important || latestMessage?.label_ids?.includes("IMPORTANT")),
+            starred: Boolean(message?.starred || latestMessage?.label_ids?.includes("STARRED")),
+            has_attachment: Boolean(message?.has_attachment),
+            attachment_count: Number(message?.attachment_count || 0),
+          });
+          if (editSequence !== draftEditSequenceRef.current) return;
           setDraftDirty(false);
           if (result.etag) setDraftEtag(result.etag);
-        })
-        .catch(() => undefined);
+        } catch {
+          // The next edit can retry the save; keep the editor usable meanwhile.
+        }
+      };
+      const pendingSave = persistDraft();
+      pendingDraftSavesRef.current.add(pendingSave);
+      void pendingSave.finally(() => pendingDraftSavesRef.current.delete(pendingSave));
     }, 500);
     return () => window.clearTimeout(timer);
   }, [composerOpen, draft, draftDirty, draftEtag, latestMessage, mailbox, message, threadId]);
@@ -722,7 +1017,7 @@ export function MailDetailDrawer({
     if (!composerOpen) return;
     const handlePointerDown = (event: MouseEvent) => {
       if (!composerRef.current?.contains(event.target as Node) && !draft.trim() && !sending && !aiBusy) {
-        setComposerOpen(false);
+        closeComposer();
       }
     };
     document.addEventListener("mousedown", handlePointerDown);
@@ -736,7 +1031,7 @@ export function MailDetailDrawer({
     onConsumeInsertRequest(nonce);
     if (mode === "replace" && draft.trim() && !window.confirm("Replace the current draft reply?")) return;
     setComposerOpen(true);
-    setComposerExpanded(true);
+    draftEditSequenceRef.current += 1;
     setDraft((current) => mergeDraftArtifactBody(current, artifact.body, mode));
     setDraftDirty(true);
     requestAnimationFrame(() => bodyRef.current?.focus());
@@ -748,12 +1043,15 @@ export function MailDetailDrawer({
     setError("");
     try {
       const refreshed = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: messageId, limit: 5, includeDisplayBody: true });
-      setPage(refreshed);
-      if (refreshed.latest_message_id) {
+      const visiblePage = withoutGmailDraftThreadMessages(refreshed);
+      queueThreadScroll(visiblePage, messageId);
+      setPage(visiblePage);
+      void cacheThreadPage(mailbox, visiblePage);
+      if (visiblePage.latest_message_id) {
         setAssistLoading(true);
-        const requestKey = `${mailbox}:${threadId}:${refreshed.latest_message_id}:${messageId}`;
+        const requestKey = `${mailbox}:${threadId}:${visiblePage.latest_message_id}:${messageId}`;
         assistRequestKeyRef.current = requestKey;
-        void loadInboxThreadAssistRef.current(mailbox, threadId, refreshed.latest_message_id, messageId)
+        void loadInboxThreadAssistRef.current(mailbox, threadId, visiblePage.latest_message_id, messageId)
           .then((result) => {
             if (assistRequestKeyRef.current === requestKey) setAssist(result);
           })
@@ -764,7 +1062,6 @@ export function MailDetailDrawer({
             if (assistRequestKeyRef.current === requestKey) setAssistLoading(false);
           });
       }
-      requestAnimationFrame(() => scrollToLatestMessage(scrollRef.current, refreshed.latest_message_id));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -782,10 +1079,12 @@ export function MailDetailDrawer({
       limit: 5,
       includeDisplayBody: true,
     });
+    const visibleOlder = withoutGmailDraftThreadMessages(older);
+    void cacheThreadPage(mailbox, visibleOlder);
     setPage((current) => current ? {
-      ...older,
-      messages: [...older.messages, ...current.messages.filter((item) => !older.messages.some((olderItem) => olderItem.id === item.id))],
-    } : older);
+      ...visibleOlder,
+      messages: [...visibleOlder.messages, ...current.messages.filter((item) => !visibleOlder.messages.some((olderItem) => olderItem.id === item.id))],
+    } : visibleOlder);
     requestAnimationFrame(() => {
       if (!scroller) return;
       scroller.scrollTop += scroller.scrollHeight - previousHeight;
@@ -797,7 +1096,27 @@ export function MailDetailDrawer({
     setDisplayBodyLoading((current) => new Set(current).add(item.id));
     setDisplayBodyErrors((current) => ({ ...current, [item.id]: "" }));
     try {
+      const cached = await getCachedMessageBody(mailbox, item.id, item.internal_date);
+      if (cached && !cached.body_truncated && (cached.body_html || (!item.body_html && cached.body_text))) {
+        setPage((current) => current ? {
+          ...current,
+          messages: current.messages.map((message) => message.id === item.id ? {
+            ...message,
+            body_html: cached.body_html || "",
+            body_text: cached.body_text || "",
+            body_truncated: false,
+          } : message),
+        } : current);
+        setDisplayBodyLoaded((current) => new Set(current).add(item.id));
+        return;
+      }
       const display = await loadInboxMessageDisplayBody(mailbox, item.id);
+      void setCachedMessageBody(mailbox, threadMessageToInboxMessage(item, mailbox), {
+        body_html: display.body_html || "",
+        body_text: display.body_text || "",
+        body_truncated: Boolean(display.body_truncated),
+        attachments: item.attachments || [],
+      });
       setPage((current) => current ? {
         ...current,
         messages: current.messages.map((message) => message.id === item.id ? {
@@ -1110,8 +1429,9 @@ export function MailDetailDrawer({
       setDraftDirty(false);
       showToast("Reply sent.");
       const refreshed = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: message?.id, limit: 5, includeDisplayBody: true });
-      setPage(refreshed);
-      requestAnimationFrame(() => scrollToLatestMessage(scrollRef.current, refreshed.latest_message_id));
+      const visiblePage = withoutGmailDraftThreadMessages(refreshed);
+      queueThreadScroll(visiblePage, message?.id || "");
+      setPage(visiblePage);
     } catch (reason) {
       showToast(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -1120,15 +1440,19 @@ export function MailDetailDrawer({
   };
 
   const discardDraft = async () => {
+    // Ignore any in-flight draft read that began before the discard action.
+    draftLoadSequenceRef.current += 1;
+    draftEditSequenceRef.current += 1;
     setDraft("");
     setDraftDirty(false);
-    setComposerOpen(false);
+    closeComposer();
     setComposerExpanded(false);
+    await Promise.allSettled([...pendingDraftSavesRef.current]);
     if (threadId) await deleteInboxThreadDraft(mailbox, threadId);
   };
 
   const closeThread = () => {
-    if (draft.trim()) showToast("Draft saved to Drafts.");
+    if (draftDirty && draft.trim()) showToast("Draft saved to Drafts.");
     onClose();
   };
 
@@ -1142,7 +1466,9 @@ export function MailDetailDrawer({
     }
   };
 
-  if (!open || !message) return null;
+  if (!message) return null;
+
+  const composerVisible = composerOpen || composerClosing;
 
   return (
     <>
@@ -1171,7 +1497,10 @@ export function MailDetailDrawer({
             )}
           </div>
           <div className="mail-detail-summary">
-            <h2>{page?.subject || message.subject || "(no subject)"}</h2>
+            <h2>{displaySubject}</h2>
+            {subjectWasModified ? (
+              <p className="mail-detail-subject-note">Latest message subject: {latestSubject}</p>
+            ) : null}
             {hasThreadUpdate ? (
               <div className="mail-detail-update-banner" role="status">
                 <span>Newer mail is available in this thread.</span>
@@ -1192,7 +1521,7 @@ export function MailDetailDrawer({
 
         <div className="mail-detail-context" ref={scrollRef}>
           {page?.has_earlier ? <button className="mail-detail-load-earlier" onClick={() => void loadEarlier()}>Load earlier messages</button> : null}
-          {loading ? <div className="mail-detail-loading">Loading thread…</div> : null}
+          {loading && !page ? <MailDetailLoadingSkeleton /> : null}
           {error ? <div className="mail-detail-error">Thread failed to load. {error}</div> : null}
           {(visibleThreadMessages.length ? visibleThreadMessages : []).map((item) => (
             <article key={item.id} className="mail-thread-message" data-message-id={item.id}>
@@ -1204,7 +1533,11 @@ export function MailDetailDrawer({
                     return (
                       <>
                         <span className="mail-thread-message-avatar">
-                          <ThreadMessageAvatar sender={item.from} avatarUrl={resolvedAvatars[email] || contactAvatars?.[email]} />
+                          <ThreadMessageAvatar
+                            identity={sender.name || sender.email || item.from}
+                            label={sender.name}
+                            avatarUrl={resolvedAvatars[email] || contactAvatars?.[email]}
+                          />
                         </span>
                         <strong>{sender.name || sender.email || "Unknown sender"}</strong>
                       </>
@@ -1227,6 +1560,8 @@ export function MailDetailDrawer({
               {displayBodyErrors[item.id] ? <p className="mail-thread-message-notice is-error">{displayBodyErrors[item.id]}</p> : null}
               <AttachmentSection
                 attachments={item.attachments}
+                expectedAttachmentCount={expectedAttachmentCountForMessage(item, message)}
+                onRefresh={() => void refreshThread()}
                 onPreview={(attachment) => void openAttachmentPreview({ attachment, messageId: attachment.message_id || item.id })}
                 onDownload={(attachment) => void downloadAttachment({ attachment, messageId: attachment.message_id || item.id }).catch((reason) => showToast(reason instanceof Error ? reason.message : String(reason)))}
                 isDownloading={(attachment) => isAttachmentDownloading({ attachment, messageId: attachment.message_id || item.id })}
@@ -1235,7 +1570,7 @@ export function MailDetailDrawer({
           ))}
           {showQuickReplies ? (
             <section className="mail-detail-quick-replies" aria-label="Quick reply prompts">
-              {assist!.quick_replies.map((item) => (
+              {quickReplySuggestions.map((item) => (
                 <button key={item.id} onClick={() => void submitPrompt(buildQuickReplyPrompt(item))}>
                   <AiSparkleIcon />
                   <span>{item.label}</span>
@@ -1245,9 +1580,9 @@ export function MailDetailDrawer({
           ) : null}
         </div>
 
-        <footer className={`mail-detail-footer ${composerOpen ? "is-composer-open" : ""} ${composerExpanded ? "is-expanded" : ""}`}>
+        <footer ref={footerRef} className={`mail-detail-footer ${composerVisible ? "is-composer-open" : ""} ${composerClosing ? "is-composer-closing" : ""} ${composerExpanded ? "is-expanded" : ""}`}>
           <div className="mail-detail-reply">
-            {!composerOpen ? (
+            {!composerVisible ? (
               <button className="mail-detail-reply-toggle" onClick={() => {
                 setComposerOpen(true);
                 requestAnimationFrame(() => bodyRef.current?.focus());
@@ -1291,6 +1626,7 @@ export function MailDetailDrawer({
                   ref={bodyRef}
                   value={draft}
                   onChange={(event) => {
+                    draftEditSequenceRef.current += 1;
                     setDraft(event.target.value);
                     setDraftDirty(true);
                   }}

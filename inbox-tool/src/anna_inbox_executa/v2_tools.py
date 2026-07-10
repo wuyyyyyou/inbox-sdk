@@ -565,12 +565,18 @@ THREAD_ASSIST_SYSTEM = """You are Anna's inbox thread assistant.
 
 Return JSON only:
 {
-  "overview": "one short factual sentence"
+  "overview": "one short factual sentence",
+  "quick_replies": [
+    {"id": "short_stable_id", "label": "button text", "intent": "instruction for the assistant"}
+  ]
 }
 
 Rules:
 - Use the full thread context, not just the latest snippet.
 - Keep overview to one line, ideally 8-12 words.
+- Generate 2-3 quick_replies tailored to this exact thread.
+- quick_replies labels must be short button text, 2-5 words.
+- quick_replies intents must be concrete assistant instructions grounded in the thread.
 - Do not invent facts or user commitments.
 - If there is little to say, summarize the sender's visible intent.
 - Never include HTML.
@@ -648,6 +654,50 @@ def _normalize_label_ids(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(label).strip().upper() for label in value if str(label).strip()]
+
+
+def _is_gmail_draft_message(message: dict[str, Any]) -> bool:
+    return "DRAFT" in _normalize_label_ids(message.get("label_ids"))
+
+
+def _visible_thread_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [message for message in messages if not _is_gmail_draft_message(message)]
+
+
+def _thread_original_subject(messages: list[dict[str, Any]]) -> str:
+    for message in messages:
+        subject = str(message.get("subject") or "").strip()
+        if subject:
+            return subject
+    return "(no subject)"
+
+
+def _normalize_quick_replies(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    replies: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value[:4], start=1):
+        if not isinstance(item, dict):
+            continue
+        label = re.sub(r"\s+", " ", str(item.get("label") or "")).strip()
+        intent = re.sub(r"\s+", " ", str(item.get("intent") or "")).strip()
+        if not label or not intent:
+            continue
+        key = label.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        raw_id = str(item.get("id") or label).strip().lower()
+        reply_id = re.sub(r"[^a-z0-9]+", "_", raw_id).strip("_") or f"quick_reply_{index}"
+        replies.append({
+            "id": reply_id[:64],
+            "label": label[:48],
+            "intent": intent[:240],
+        })
+        if len(replies) >= 3:
+            break
+    return replies
 
 
 def _compact_body_text(text: str, *, limit: int) -> tuple[str, bool]:
@@ -752,6 +802,7 @@ def _inbox_thread_page_payload(
     mailbox: str,
     thread_id: str,
     subject: str,
+    latest_subject: str,
     messages: list[dict[str, Any]],
     start_index: int,
     latest_message_id: str,
@@ -762,6 +813,7 @@ def _inbox_thread_page_payload(
         "mailbox": mailbox,
         "thread_id": thread_id,
         "subject": subject,
+        "latest_subject": latest_subject,
         "messages": [
             _serialize_inbox_thread_message(
                 message,
@@ -817,11 +869,12 @@ def _build_inbox_thread_page(
     mailbox: str,
     thread_id: str,
     *,
+    anchor_message_id: str = "",
     before_index: int | None = None,
     limit: int = INBOX_THREAD_PAGE_SIZE,
     include_display_body: bool = True,
 ) -> dict[str, Any]:
-    messages = _load_thread_messages(mailbox, thread_id)
+    messages = _visible_thread_messages(_load_thread_messages(mailbox, thread_id))
     if not messages:
         return {
             "mailbox": mailbox,
@@ -837,15 +890,23 @@ def _build_inbox_thread_page(
     total = len(messages)
     page_limit = _clamp_int(limit, INBOX_THREAD_PAGE_SIZE, 1, INBOX_THREAD_PAGE_MAX)
     end_index = total if before_index is None else _clamp_int(before_index, total, 0, total)
+    if before_index is None and anchor_message_id:
+        anchor = str(anchor_message_id or "")
+        for index, message in enumerate(messages):
+            if str(message.get("id") or "") == anchor:
+                end_index = index + 1
+                break
     start_index = max(0, end_index - page_limit)
     latest = messages[-1]
-    subject = str(latest.get("subject") or "") or "(no subject)"
+    subject = _thread_original_subject(messages)
+    latest_subject = str(latest.get("subject") or "") or subject
     latest_message_id = str(latest.get("id") or "")
     if end_index <= 0:
         return {
             "mailbox": mailbox,
             "thread_id": thread_id,
             "subject": subject,
+            "latest_subject": latest_subject,
             "messages": [],
             "returned_count": 0,
             "has_earlier": False,
@@ -864,6 +925,7 @@ def _build_inbox_thread_page(
                 mailbox=mailbox,
                 thread_id=thread_id,
                 subject=subject,
+                latest_subject=latest_subject,
                 messages=fitted_messages,
                 start_index=fitted_start,
                 latest_message_id=latest_message_id,
@@ -880,6 +942,7 @@ def _build_inbox_thread_page(
         "mailbox": mailbox,
         "thread_id": thread_id,
         "subject": subject,
+        "latest_subject": latest_subject,
         "messages": [],
         "returned_count": 0,
         "has_earlier": True,
@@ -1014,7 +1077,7 @@ def _build_pseudo_card_for_thread(mailbox: str, thread_id: str, messages: list[d
     target = anchor_message or latest
     latest_body = _display_body_payload(target, limit=INBOX_PROMPT_BODY_LIMIT, prefer_html=False).get("body_text") or str(target.get("snippet") or "")
     participants = _thread_participants(messages)
-    title = str(latest.get("subject") or "") or "(no subject)"
+    title = _thread_original_subject(messages)
     summary = str(target.get("snippet") or latest_body or "")[:220]
     recommendation = f"Reply with context from {len(participants)} participant(s)." if participants else "Reply with context from the thread."
     return PersistentCard(
@@ -1053,7 +1116,7 @@ async def _generate_thread_assist_result(
 ) -> dict[str, Any]:
     from mail_agent.llm_runtime.service import call_llm_json_safe
 
-    messages = _load_thread_messages(mailbox, thread_id)
+    messages = _visible_thread_messages(_load_thread_messages(mailbox, thread_id))
     if not messages:
         raise ValueError(f"Thread {thread_id} not found")
     fallback_overview = _fallback_thread_overview(messages, anchor_message_id)
@@ -1061,25 +1124,27 @@ async def _generate_thread_assist_result(
         sampling_create_message,
         system_prompt=THREAD_ASSIST_SYSTEM,
         user_message=(
-            f"Subject: {messages[-1].get('subject', '')}\n"
+            f"Subject: {_thread_original_subject(messages)}\n"
+            f"Latest message subject: {messages[-1].get('subject', '')}\n"
             f"Participants: {'; '.join(_thread_participants(messages))}\n"
             f"Thread messages:\n{_thread_prompt_excerpt(messages)}\n"
         ),
-        fallback={"overview": fallback_overview},
+        fallback={"overview": fallback_overview, "quick_replies": []},
         temperature=0.2,
-        max_tokens=120,
+        max_tokens=320,
         timeout=45.0,
         metadata={"tool": "inbox_thread_assist", "thread_id": thread_id},
         max_attempts=1,
     )
     payload = overview_result.get("payload") if isinstance(overview_result.get("payload"), dict) else {}
     overview = _one_line_overview(payload.get("overview") or fallback_overview)
+    quick_replies = [] if overview_result.get("fallback_used") else _normalize_quick_replies(payload.get("quick_replies"))
 
     return {
         "thread_id": thread_id,
         "latest_message_id": latest_message_id,
         "overview": overview,
-        "quick_replies": [],
+        "quick_replies": quick_replies,
         "summary": {},
         "related_context": [],
         "fallback_used": bool(overview_result.get("fallback_used")),
@@ -1100,7 +1165,7 @@ async def _generate_mail_prompt_result(
     from mail_agent.llm_runtime.service import call_llm_json_safe
 
     expected_artifact = "draft_reply" if expected_artifact == "draft_reply" else "summary"
-    messages = _load_thread_messages(mailbox, thread_id)
+    messages = _visible_thread_messages(_load_thread_messages(mailbox, thread_id))
     if not messages:
         raise ValueError(f"Thread {thread_id} not found")
     latest = messages[-1]
@@ -1241,10 +1306,17 @@ async def _handle_inbox_thread_assist_background(run_id: str, arguments: dict[st
     anchor_message_id = str(arguments.get("anchor_message_id", "")).strip()
     try:
         cached = await get_inbox_thread_assist(mailbox, thread_id, latest_message_id)
-        if cached.get("exists") and isinstance(cached.get("value"), dict) and cached.get("value"):
+        cached_value = cached.get("value") if isinstance(cached.get("value"), dict) else {}
+        cached_quick_replies = cached_value.get("quick_replies") if isinstance(cached_value, dict) else None
+        if (
+            cached.get("exists")
+            and cached_value
+            and isinstance(cached_quick_replies, list)
+            and len(cached_quick_replies) > 0
+        ):
             MAIL_AGENT_RUNS[run_id].update(
                 status="done",
-                result={**cached.get("value"), "cached": True},
+                result={**cached_value, "cached": True},
                 updated_at=beijing_now(),
             )
             _save_run_checkpoint(run_id)
@@ -1384,6 +1456,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             _build_inbox_thread_page,
             mailbox,
             thread_id,
+            anchor_message_id=str(arguments.get("anchor_message_id", "")).strip(),
             before_index=before_index,
             limit=limit,
             include_display_body=include_display_body,

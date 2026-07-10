@@ -86,6 +86,77 @@ def main() -> None:
     assert tools._inbox_thread_rpc_frame_size(bounded) <= tools.INBOX_THREAD_RESPONSE_MAX_BYTES
     assert all("body_html" not in item for item in bounded["messages"])
 
+    with (
+        patch.object(tools, "_load_thread_messages", return_value=messages),
+        patch.object(
+            tools,
+            "_display_body_payload",
+            side_effect=lambda _message, *, limit: {
+                "body_text": str(_message.get("body_text") or ""),
+                "body_truncated": False,
+            },
+        ),
+    ):
+        anchored = tools._build_inbox_thread_page(
+            "user@example.com",
+            "thread-1",
+            anchor_message_id="m6",
+        )
+    assert anchored["returned_count"] == 5
+    assert [item["id"] for item in anchored["messages"]] == ["m2", "m3", "m4", "m5", "m6"]
+    assert anchored["has_earlier"] is True
+    assert anchored["next_before_index"] == 2
+
+    subject_changed_messages = [
+        _message(1, subject="Original invite title"),
+        _message(2, subject="Changed latest title"),
+    ]
+    with (
+        patch.object(tools, "_load_thread_messages", return_value=subject_changed_messages),
+        patch.object(
+            tools,
+            "_display_body_payload",
+            side_effect=lambda message, *, limit: {
+                "body_text": str(message.get("body_text") or ""),
+                "body_truncated": False,
+            },
+        ),
+    ):
+        subject_page = tools._build_inbox_thread_page("user@example.com", "thread-1")
+    assert subject_page["subject"] == "Original invite title"
+    assert subject_page["latest_subject"] == "Changed latest title"
+
+    quick_replies = tools._normalize_quick_replies([
+        {"label": "Reply with timing", "intent": "Draft a reply that asks about timing."},
+        {"label": "Reply with timing", "intent": "Duplicate label should be ignored."},
+        {"id": "summarize_thread", "label": "Summarize", "intent": "Summarize the thread."},
+        {"label": "", "intent": "Ignore missing label."},
+    ])
+    assert [item["label"] for item in quick_replies] == ["Reply with timing", "Summarize"]
+    assert quick_replies[0]["id"] == "reply_with_timing"
+
+    thread_with_draft = [
+        _message(1),
+        _message(2),
+        _message(3, label_ids=["DRAFT"], body_text="Unsent Gmail draft"),
+    ]
+    with (
+        patch.object(tools, "_load_thread_messages", return_value=thread_with_draft),
+        patch.object(
+            tools,
+            "_display_body_payload",
+            side_effect=lambda message, *, limit: {
+                "body_text": str(message.get("body_text") or ""),
+                "body_truncated": False,
+            },
+        ),
+    ):
+        visible_page = tools._build_inbox_thread_page("user@example.com", "thread-1")
+    assert visible_page["returned_count"] == 2
+    assert [item["id"] for item in visible_page["messages"]] == ["m1", "m2"]
+    assert visible_page["latest_message_id"] == "m2"
+    assert all("DRAFT" not in item["label_ids"] for item in visible_page["messages"])
+
     metadata_heavy = [_message(index, **{"from": "x" * 100_000}) for index in range(12)]
     with patch.object(tools, "_load_thread_messages", return_value=metadata_heavy):
         reduced_page = tools._build_inbox_thread_page(

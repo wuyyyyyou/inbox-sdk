@@ -8,7 +8,7 @@
 
 ## 项目基线
 
-Anna Inbox 当前版本为 `2.0.7`。前端位于 `anna-inbox/`，后端 Executa 位于 `inbox-tool/`。
+Anna Inbox 当前版本为 `2.0.8`。前端位于 `anna-inbox/`，后端 Executa 位于 `inbox-tool/`。
 
 - `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表。
 - `anna-inbox/src/features/mail-detail/`：线程详情、正文、草稿和附件预览。
@@ -47,6 +47,16 @@ cd anna-inbox
 npm test
 npm run build
 ```
+
+前端启动：
+
+```sh
+cd anna-inbox
+anna-app dev
+```
+
+- 若5180端口被占用，应该终止相应进程后再通过 `anna-app dev` 命令启动
+- 不能使用 `npm run dev` 命令启动
 
 
 Anna App 本地开发读取 `anna-inbox/app.json` 和 `anna-inbox/executas/inbox-tool/executa.json`。旧 `anna-inbox/dev-wsl.sh` 不是权威入口。

@@ -78,9 +78,7 @@ GRAVATAR_AVATAR_BASE = "https://www.gravatar.com/avatar"
 
 
 def _avatar_debug(message: str, **fields: Any) -> None:
-    detail = " ".join(f"{key}={value}" for key, value in fields.items())
-    suffix = f" {detail}" if detail else ""
-    print(f"[contact_avatars] {message}{suffix}", file=sys.stderr, flush=True)
+    return
 
 
 def _looks_like_email(value: str) -> bool:
@@ -482,33 +480,54 @@ def _internal_date_sort_key(item: dict[str, Any]) -> int:
         return 0
 
 
-def _compact_feed_message(message: dict[str, Any], mailbox: str) -> dict[str, Any]:
+def _thread_original_subjects(messages: list[dict[str, Any]]) -> dict[str, str]:
+    subjects: dict[str, str] = {}
+    for item in sorted(messages, key=_internal_date_sort_key):
+        thread_id = str(item.get("thread_id") or "").strip()
+        subject = str(item.get("subject") or "").strip()
+        if thread_id and subject and thread_id not in subjects:
+            subjects[thread_id] = subject
+    return subjects
+
+
+def _compact_feed_message(message: dict[str, Any], mailbox: str, thread_subjects: dict[str, str] | None = None) -> dict[str, Any]:
     labels = [str(label)[:80] for label in (message.get("label_ids") or [])][:32]
     attachments = message.get("attachments") if isinstance(message.get("attachments"), list) else []
+    try:
+        stored_attachment_count = int(message.get("attachment_count") or 0)
+    except (TypeError, ValueError):
+        stored_attachment_count = 0
+    attachment_count = max(len(attachments), stored_attachment_count)
+    has_attachment = bool(attachments) or bool(message.get("has_attachment")) or attachment_count > 0
+    latest_subject = str(message.get("subject") or "").strip()
+    thread_id = str(message.get("thread_id") or "").strip()
+    subject = str((thread_subjects or {}).get(thread_id) or message.get("original_subject") or latest_subject)
     return {
         "id": str(message.get("id") or "")[:128],
-        "thread_id": str(message.get("thread_id") or "")[:128],
+        "thread_id": thread_id[:128],
         "mailbox": mailbox,
         "internal_date": str(message.get("internal_date") or "")[:32],
         "date": str(message.get("date") or "")[:128],
         "from": str(message.get("from") or "")[:512],
         "to": str(message.get("to") or "")[:512],
-        "subject": str(message.get("subject") or "")[:512],
+        "subject": subject[:512],
+        "latest_subject": latest_subject[:512],
         "snippet": str(message.get("snippet") or "")[:HOME_FEED_SNIPPET_MAX_CHARS],
         "body_preview": str(message.get("body_preview") or "")[:HOME_FEED_BODY_PREVIEW_MAX_CHARS],
         "label_ids": labels,
         "unread": "UNREAD" in labels,
         "important": "IMPORTANT" in labels,
         "starred": "STARRED" in labels,
-        "has_attachment": bool(attachments),
-        "attachment_count": len(attachments),
+        "has_attachment": has_attachment,
+        "attachment_count": attachment_count,
         "body_cached": bool(message.get("body_cached")),
     }
 
 
 def _build_feed_page_metadata(mailbox: str, messages: list[dict[str, Any]], updated_at: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     ordered = sorted(messages, key=_internal_date_sort_key, reverse=True)
-    compact_messages = [_compact_feed_message(message, mailbox) for message in ordered]
+    thread_subjects = _thread_original_subjects(messages)
+    compact_messages = [_compact_feed_message(message, mailbox, thread_subjects) for message in ordered]
     pages: list[dict[str, Any]] = []
     page_payloads: list[dict[str, Any]] = []
     for page_number, start in enumerate(range(0, len(compact_messages), CACHED_FEED_PAGE_SIZE)):
@@ -606,7 +625,10 @@ def _read_cached_feed_page(mailbox: str, page_number: int) -> dict[str, Any] | N
 def ensure_cached_feed_index(mailbox: str) -> dict[str, Any]:
     meta = _read_cached_feed_meta(mailbox)
     if isinstance(meta, dict):
-        return meta
+        first_page = _read_cached_feed_page(mailbox, 0)
+        first_messages = first_page.get("messages") if isinstance(first_page, dict) and isinstance(first_page.get("messages"), list) else []
+        if not first_messages or "latest_subject" in first_messages[0]:
+            return meta
     cached = read_cache(mailbox)
     messages = cached.get("messages") if isinstance(cached, dict) and isinstance(cached.get("messages"), list) else []
     updated_at = str(cached.get("updated_at") or beijing_now())

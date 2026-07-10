@@ -483,26 +483,52 @@ def read_primary_emails(mailbox_arg: str, limit_arg: Any) -> dict[str, Any]:
     }
 
 
-def _compact_inbox_message(item: dict[str, Any], mailbox: str) -> dict[str, Any]:
+def _thread_original_subjects(messages: list[dict[str, Any]]) -> dict[str, str]:
+    def sort_key(item: dict[str, Any]) -> int:
+        try:
+            return int(item.get("internal_date") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    subjects: dict[str, str] = {}
+    for item in sorted(messages, key=sort_key):
+        thread_id = str(item.get("thread_id") or "").strip()
+        subject = str(item.get("subject") or "").strip()
+        if thread_id and subject and thread_id not in subjects:
+            subjects[thread_id] = subject
+    return subjects
+
+
+def _compact_inbox_message(item: dict[str, Any], mailbox: str, thread_subjects: dict[str, str] | None = None) -> dict[str, Any]:
     labels = [str(label)[:80] for label in (item.get("label_ids") or [])][:32]
     attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
+    try:
+        stored_attachment_count = int(item.get("attachment_count") or 0)
+    except (TypeError, ValueError):
+        stored_attachment_count = 0
+    attachment_count = max(len(attachments), stored_attachment_count)
+    has_attachment = bool(attachments) or bool(item.get("has_attachment")) or attachment_count > 0
+    latest_subject = str(item.get("subject") or "").strip()
+    thread_id = str(item.get("thread_id") or "").strip()
+    subject = str((thread_subjects or {}).get(thread_id) or item.get("original_subject") or latest_subject)
     return {
         "id": str(item.get("id") or "")[:128],
-        "thread_id": str(item.get("thread_id") or "")[:128],
+        "thread_id": thread_id[:128],
         "mailbox": mailbox,
         "internal_date": str(item.get("internal_date") or "")[:32],
         "date": str(item.get("date") or "")[:128],
         "from": str(item.get("from") or "")[:512],
         "to": str(item.get("to") or "")[:512],
-        "subject": str(item.get("subject") or "")[:512],
+        "subject": subject[:512],
+        "latest_subject": latest_subject[:512],
         "snippet": str(item.get("snippet") or "")[:HOME_FEED_SNIPPET_MAX_CHARS],
         "body_preview": str(item.get("body_preview") or "")[:HOME_FEED_BODY_PREVIEW_MAX_CHARS],
         "label_ids": labels,
         "unread": "UNREAD" in labels,
         "important": "IMPORTANT" in labels,
         "starred": "STARRED" in labels,
-        "has_attachment": bool(attachments),
-        "attachment_count": len(attachments),
+        "has_attachment": has_attachment,
+        "attachment_count": attachment_count,
         "body_cached": bool(item.get("body_cached")),
     }
 
@@ -644,13 +670,14 @@ def list_inbox_emails(
         for item in list_messages(mailbox)
         if isinstance(item, dict) and item.get("id")
     }
+    thread_subjects = _thread_original_subjects(list(by_id.values()))
 
     messages: list[dict[str, Any]] = []
     for message_id in matched_ids:
         item = by_id.get(str(message_id))
         if not item:
             continue
-        messages.append(_compact_inbox_message(item, mailbox))
+        messages.append(_compact_inbox_message(item, mailbox, thread_subjects))
     messages.sort(key=_inbox_message_sort_key)
 
     return {
@@ -670,11 +697,6 @@ def resolve_contact_avatars(mailbox_arg: str, emails_arg: Any) -> dict[str, Any]
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
     emails = [str(item) for item in emails_arg] if isinstance(emails_arg, list) else []
-    print(
-        f"[contact_avatars] tool_invoked mailbox={mailbox} requested={len(emails)}",
-        file=sys.stderr,
-        flush=True,
-    )
     return {"mailbox": mailbox, **resolve_contact_avatar_urls(mailbox, emails)}
 
 
@@ -880,12 +902,13 @@ def list_gmail_emails_page(
                         if isinstance(summary, dict) and summary.get("id"):
                             summaries[position] = summary
 
+            thread_subjects = _thread_original_subjects(list(summaries.values()))
             for position in range(index, batch_end):
                 message_id = refs[position]
                 summary = summaries.get(position)
                 if message_id in excluded or not summary:
                     continue
-                compact = _compact_inbox_message(summary, mailbox)
+                compact = _compact_inbox_message(summary, mailbox, thread_subjects)
                 candidate_messages = [*messages, compact]
                 next_position = position + 1
                 cursor_token = request_token if next_position < len(refs) else api_next_token

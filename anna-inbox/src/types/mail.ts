@@ -154,6 +154,7 @@ export interface InboxMessage {
   from?: string | null;
   to?: string | null;
   subject?: string | null;
+  latest_subject?: string | null;
   snippet?: string | null;
   body_preview?: string | null;
   draft_body?: string | null;
@@ -439,6 +440,7 @@ export interface InboxThreadPagePayload {
   mailbox: string;
   thread_id: string;
   subject: string;
+  latest_subject?: string;
   messages: InboxThreadMessage[];
   returned_count: number;
   has_earlier: boolean;

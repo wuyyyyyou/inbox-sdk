@@ -23,6 +23,19 @@ import type {
 import { SnoozePicker } from "./SnoozePicker";
 import { MailDetailDrawer } from "../mail-detail/MailDetailDrawer";
 import { sortInboxMessagesDesc } from "./inboxMessageOrder";
+import {
+  getCachedMessageBody,
+  getContactAvatarCache,
+  getMailFlags,
+  setCachedMessageBody,
+  setContactAvatarCache,
+  setMailFlags,
+} from "../../shared/browserStorage";
+import {
+  mailAvatarFallback,
+  senderParts as parseMailSenderParts,
+  splitAddresses as splitMailAddresses,
+} from "../../shared/mailIdentity";
 
 type FeedFilter = "important" | "other";
 type MailboxView =
@@ -74,6 +87,7 @@ const DEFAULT_INBOX_FEED_WINDOW: InboxFeedWindow = {
 };
 const INBOX_FEED_PAGE_SIZE = 100;
 const AI_CONVERSATION_BOTTOM_THRESHOLD = 24;
+const DETAIL_DRAWER_TRANSITION_MS = 360;
 
 export function gmailAuthorizationError(source?: string) {
   return `No authorized mailbox detected (source: ${source || "unknown"}).`;
@@ -373,34 +387,11 @@ function FolderIcon({ view }: { view: MailboxView }) {
 }
 
 export function senderParts(value: unknown) {
-  const text = String(value ?? "");
-  const match = text.match(/^\s*"?([^"<]+?)"?\s*<([^>]+)>/);
-  if (match) return { name: match[1].trim(), email: match[2].trim() };
-  if (text.includes("@"))
-    return { name: text.split("@")[0], email: text.trim() };
-  return { name: text.trim() || "Unknown sender", email: text.trim() };
+  return parseMailSenderParts(value);
 }
 
 function splitAddresses(value: unknown): string[] {
-  const text = String(value ?? "").trim();
-  if (!text) return [];
-  const parts: string[] = [];
-  let start = 0;
-  let quoted = false;
-  let angleDepth = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    const character = text[index];
-    if (character === '"') quoted = !quoted;
-    else if (!quoted && character === "<") angleDepth += 1;
-    else if (!quoted && character === ">")
-      angleDepth = Math.max(0, angleDepth - 1);
-    else if (!quoted && angleDepth === 0 && character === ",") {
-      parts.push(text.slice(start, index).trim());
-      start = index + 1;
-    }
-  }
-  parts.push(text.slice(start).trim());
-  return parts.filter(Boolean);
+  return splitMailAddresses(value);
 }
 
 export function messageParticipant(
@@ -639,12 +630,14 @@ export function mergeDraftOverlayMessages(
     draftsByThread.delete(threadKey);
     return {
       ...message,
-      ...draft,
-      id: message.id,
-      thread_id: message.thread_id || draft.thread_id,
-      label_ids: [...new Set([...(message.label_ids || []), ...(draft.label_ids || [])])],
-      important: Boolean(message.important || draft.important),
-      starred: Boolean(message.starred || draft.starred),
+      // Draft metadata may describe a different message in the same thread.
+      // Preserve the inbox message identity so sender/recipient and sent-state
+      // continue to reflect the selected thread message.
+      draft_body: draft.draft_body,
+      draft_local: true,
+      body_preview: draft.draft_body || draft.body_preview || message.body_preview,
+      snippet: draft.draft_body || draft.snippet || message.snippet,
+      label_ids: [...new Set([...(message.label_ids || []), "DRAFT"])],
     };
   });
   return [...merged, ...draftsByThread.values()];
@@ -735,6 +728,15 @@ export function resolveSourceMessages(
   return uniqueLatestInboxThreads(source);
 }
 
+function hasInboxMessageAttachment(message: InboxMessage) {
+  const attachments = (message as InboxMessage & { attachments?: unknown[] }).attachments;
+  return Boolean(
+    message.has_attachment
+    || Number(message.attachment_count || 0) > 0
+    || (Array.isArray(attachments) && attachments.length > 0)
+  );
+}
+
 function InboxRow({
   message,
   selected,
@@ -762,8 +764,8 @@ function InboxRow({
 }) {
   const { actions } = useApp();
   const [avatarFailed, setAvatarFailed] = useState(false);
-  const sender = senderParts(message.from);
   const participant = messageParticipant(message, mailboxView, mailbox);
+  const fallbackAvatar = mailAvatarFallback(participant.name || participant.email || participant.initial, participant.name || participant.initial);
   const sentView = participant.outgoing;
   const sentMessage = isSentMessage(message);
   const isDone = isDoneMessage(message, flags);
@@ -798,13 +800,9 @@ function InboxRow({
           />
         ) : (
           <span
-            className={`sender-avatar tone-${(participant.initial.charCodeAt(0) || 65) % 5}`}
+            className={`sender-avatar tone-${fallbackAvatar.tone}`}
           >
-            {(
-              participant.initial.match(/[A-Za-z0-9]/)?.[0] ||
-              participant.initial.slice(0, 1) ||
-              "?"
-            ).toUpperCase()}
+            {fallbackAvatar.initial}
           </span>
         )}
         <span className="mail-sender" title={participant.title}>
@@ -855,7 +853,7 @@ function InboxRow({
               <StarIcon />
             </span>
           ) : null}
-          {message.has_attachment ? (
+          {hasInboxMessageAttachment(message) ? (
             <span
               className="mail-attachment"
               title={`${message.attachment_count || 1} attachment(s)`}
@@ -1819,11 +1817,14 @@ export function HomeView() {
     mode: "append" | "replace";
   } | null>(null);
   const [externalDetailMessage, setExternalDetailMessage] = useState<InboxMessage | null>(null);
+  const [drawerMessage, setDrawerMessage] = useState<InboxMessage | null>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [authChecking, setAuthChecking] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const [folderOpen, setFolderOpen] = useState(false);
+  const [refreshChoiceOpen, setRefreshChoiceOpen] = useState(false);
   const [mailboxView, setMailboxView] = useState<MailboxView>("inbox");
   const mailboxViewRef = useRef<MailboxView>("inbox");
   const [feedWindow, setFeedWindow] = useState<InboxFeedWindow>(
@@ -1834,14 +1835,19 @@ export function HomeView() {
     Record<string, { status: "loading" | "ready" | "error"; body: string }>
   >({});
   const bodyRequests = useRef(new Set<string>());
+  const bodyPreheatSession = useRef(0);
+  const bodyPreheatSeen = useRef(new Set<string>());
+  const loadInboxEmailBodyRef = useRef(actions.loadInboxEmailBody);
   const pageLoadInFlight = useRef(false);
   const requestedGmailCursors = useRef(new Set<string>());
   const mailFeedRef = useRef<HTMLElement | null>(null);
   const avatarRequestKey = useRef("");
   const avatarMisses = useRef(new Set<string>());
   const avatarPermissionNoticeShown = useRef(false);
+  const drawerCloseTimer = useRef<number | null>(null);
   const mailbox = state.selectedMailboxes[0] || state.mailbox;
   const flagsKey = `anna-inbox:mail-flags:${mailbox}`;
+  const contactAvatarsKey = `anna-inbox:contact-avatars:${mailbox}`;
   const [flags, setFlags] = useState<MailUiFlags>({
     todos: [],
     snoozed: [],
@@ -1877,6 +1883,10 @@ export function HomeView() {
   useEffect(() => {
     sidebarWidthRef.current = sidebarWidth;
   }, [sidebarWidth]);
+
+  useEffect(() => {
+    loadInboxEmailBodyRef.current = actions.loadInboxEmailBody;
+  }, [actions.loadInboxEmailBody]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -1940,42 +1950,29 @@ export function HomeView() {
   };
 
   useEffect(() => {
-    try {
-      const saved = JSON.parse(window.localStorage.getItem(flagsKey) || "{}");
-      setFlags({
-        todos: Array.isArray(saved.todos) ? saved.todos : [],
-        snoozed: Array.isArray(saved.snoozed) ? saved.snoozed : [],
-        snoozedUntil:
-          saved.snoozedUntil && typeof saved.snoozedUntil === "object"
-            ? saved.snoozedUntil
-            : {},
-        done: Array.isArray(saved.done) ? saved.done : [],
-        doneRemoved: Array.isArray(saved.doneRemoved) ? saved.doneRemoved : [],
-        drafts: Array.isArray(saved.drafts) ? saved.drafts : [],
-        saved:
-          saved.saved && typeof saved.saved === "object" ? saved.saved : {},
-      });
-    } catch {
-      setFlags({
-        todos: [],
-        snoozed: [],
-        snoozedUntil: {},
-        done: [],
-        doneRemoved: [],
-        drafts: [],
-        saved: {},
-      });
-    }
-    try {
-      const cached = JSON.parse(
-        window.localStorage.getItem(`anna-inbox:contact-avatars:${mailbox}`) ||
-          "{}",
-      );
+    let cancelled = false;
+    setFlags({
+      todos: [],
+      snoozed: [],
+      snoozedUntil: {},
+      done: [],
+      doneRemoved: [],
+      drafts: [],
+      saved: {},
+    });
+    setContactAvatars({});
+    avatarMisses.current = new Set();
+    void getMailFlags(mailbox, flagsKey).then((saved) => {
+      if (cancelled || !saved) return;
+      setFlags(saved);
+    });
+    void getContactAvatarCache(mailbox, contactAvatarsKey).then((cached) => {
+      if (cancelled || !cached) return;
       const avatarsFresh =
-        Number(cached?.avatarsUpdatedAt || cached?.updatedAt || 0) >
+        Number(cached.avatarsUpdatedAt || 0) >
         Date.now() - 7 * 24 * 60 * 60 * 1000;
       const missesFresh =
-        Number(cached?.missingUpdatedAt || 0) >
+        Number(cached.missingUpdatedAt || 0) >
         Date.now() - 24 * 60 * 60 * 1000;
       setContactAvatars(
         avatarsFresh && cached.avatars && typeof cached.avatars === "object"
@@ -1985,18 +1982,20 @@ export function HomeView() {
       avatarMisses.current = new Set(
         missesFresh && Array.isArray(cached.missing) ? cached.missing : [],
       );
-    } catch {
-      setContactAvatars({});
-      avatarMisses.current = new Set();
-    }
+    });
     avatarRequestKey.current = "";
     avatarPermissionNoticeShown.current = false;
+    bodyPreheatSeen.current.clear();
+    bodyPreheatSession.current += 1;
     requestedGmailCursors.current.clear();
     mailboxViewRef.current = "inbox";
     setMailboxView("inbox");
     setFilter("important");
     setFeedWindow(DEFAULT_INBOX_FEED_WINDOW);
-  }, [flagsKey]);
+    return () => {
+      cancelled = true;
+    };
+  }, [contactAvatarsKey, flagsKey, mailbox]);
 
   useEffect(() => {
     try {
@@ -2108,11 +2107,11 @@ export function HomeView() {
           next.doneRemoved = current.doneRemoved;
         }
         for (const item of messages) next.saved[item.id] = item;
-        window.localStorage.setItem(flagsKey, JSON.stringify(next));
+        void setMailFlags(mailbox, next);
         return next;
       });
     },
-    [flagsKey],
+    [mailbox],
   );
 
   const restoreWorkflowFlags = useCallback(
@@ -2134,16 +2133,17 @@ export function HomeView() {
           ...current.doneRemoved.filter((id) => !ids.has(id)),
           ...previous.doneRemoved.filter((id) => ids.has(id)),
         ];
-        window.localStorage.setItem(flagsKey, JSON.stringify(next));
+        void setMailFlags(mailbox, next);
         return next;
       });
     },
-    [flagsKey],
+    [mailbox],
   );
 
   const prefetchMessageBody = async (message: InboxMessage) => {
     if (message.id === selectedId) return;
-    const key = `${message.mailbox || mailbox}:${message.id}`;
+    const bodyMailbox = message.mailbox || mailbox;
+    const key = `${bodyMailbox}:${message.id}:${message.internal_date || ""}`;
     if (bodyRequests.current.has(key) || messageBodies[key]?.status === "ready")
       return;
     bodyRequests.current.add(key);
@@ -2152,10 +2152,19 @@ export function HomeView() {
       [key]: { status: "loading", body: current[key]?.body || "" },
     }));
     try {
-      const body = await actions.loadInboxEmailBody(
+      const cached = await getCachedMessageBody(bodyMailbox, message.id, message.internal_date);
+      if (cached) {
+        setMessageBodies((current) => ({
+          ...current,
+          [key]: { status: "ready", body: cached.body_text },
+        }));
+        return;
+      }
+      const body = await loadInboxEmailBodyRef.current(
         message.id,
-        message.mailbox || mailbox,
+        bodyMailbox,
       );
+      void setCachedMessageBody(bodyMailbox, message, { body_text: body });
       setMessageBodies((current) => ({
         ...current,
         [key]: { status: "ready", body },
@@ -2203,15 +2212,12 @@ export function HomeView() {
           if (Object.keys(avatars).length || missing.length) {
             setContactAvatars((current) => {
               const next = { ...current, ...avatars };
-              window.localStorage.setItem(
-                `anna-inbox:contact-avatars:${mailbox}`,
-                JSON.stringify({
-                  avatars: next,
-                  missing: [...avatarMisses.current],
-                  avatarsUpdatedAt: Date.now(),
-                  missingUpdatedAt: Date.now(),
-                }),
-              );
+              void setContactAvatarCache(mailbox, {
+                avatars: next,
+                missing: [...avatarMisses.current],
+                avatarsUpdatedAt: Date.now(),
+                missingUpdatedAt: Date.now(),
+              });
               return next;
             });
           }
@@ -2277,10 +2283,49 @@ export function HomeView() {
     () => (localCategory ? visible.slice(0, feedWindow.localLimit) : visible),
     [feedWindow.localLimit, localCategory, visible],
   );
-  const sourceMessagesRef = useRef(sourceMessages);
   useEffect(() => {
-    sourceMessagesRef.current = sourceMessages;
-  }, [sourceMessages]);
+    if (!mailbox || !displayedVisible.length) return;
+    const session = ++bodyPreheatSession.current;
+    const start = Math.max(0, displayedVisible.length - INBOX_FEED_PAGE_SIZE);
+    const pageMessages = displayedVisible.slice(start).filter((message) => message.id);
+    if (!pageMessages.length) return;
+    const cleanup = scheduleDeferredWork(() => {
+      let cursor = 0;
+      let active = 0;
+      const runNext = () => {
+        if (session !== bodyPreheatSession.current) return;
+        while (active < 5 && cursor < pageMessages.length) {
+          const message = pageMessages[cursor++];
+          const bodyMailbox = message.mailbox || mailbox;
+          const key = `${bodyMailbox}:${message.id}:${message.internal_date || ""}`;
+          if (bodyPreheatSeen.current.has(key) || bodyRequests.current.has(key)) continue;
+          bodyPreheatSeen.current.add(key);
+          bodyRequests.current.add(key);
+          active += 1;
+          void (async () => {
+            try {
+              const cached = await getCachedMessageBody(bodyMailbox, message.id, message.internal_date);
+              if (cached || session !== bodyPreheatSession.current) return;
+              const body = await loadInboxEmailBodyRef.current(message.id, bodyMailbox);
+              if (session !== bodyPreheatSession.current) return;
+              await setCachedMessageBody(bodyMailbox, message, { body_text: body });
+            } catch {
+              bodyPreheatSeen.current.delete(key);
+            } finally {
+              bodyRequests.current.delete(key);
+              active -= 1;
+              runNext();
+            }
+          })();
+        }
+      };
+      runNext();
+    }, 520);
+    return () => {
+      cleanup();
+      bodyPreheatSession.current += 1;
+    };
+  }, [displayedVisible, mailbox, mailboxView]);
 
   const dismissCachedInboxBanner = () => {
     setCachedInboxBannerDismissed(true);
@@ -2374,8 +2419,92 @@ export function HomeView() {
     [actions, loadGmailPage],
   );
 
+  const loadRemainingAllTimeInbox = useCallback(
+    async (
+      source: InboxFeedWindow["source"],
+      nextOffset: number,
+      gmailPageToken: string,
+      gmailPageOffset: number,
+      excludeMessageIds: string[],
+    ) => {
+      const excludeIds = new Set(excludeMessageIds.filter(Boolean));
+      let currentSource = source;
+      let currentNextOffset = nextOffset;
+      let currentGmailPageToken = gmailPageToken;
+      let currentGmailPageOffset = gmailPageOffset;
+      while (mailboxViewRef.current === "inbox") {
+        if (currentSource === "gmail") {
+          await new Promise((resolve) => window.setTimeout(resolve, 0));
+        }
+        const result =
+          currentSource === "cache"
+            ? await actions.loadCachedInboxEmails(
+                "inbox",
+                INBOX_ALL_TIME_DAYS,
+                currentNextOffset,
+                true,
+              )
+            : await loadGmailPage(
+                "inbox",
+                INBOX_ALL_TIME_DAYS,
+                currentGmailPageToken,
+                currentGmailPageOffset,
+                [...excludeIds],
+              );
+        if (mailboxViewRef.current !== "inbox") return false;
+        if (!result?.ok) return false;
+        for (const message of result.messages || []) {
+          if (message.id) excludeIds.add(message.id);
+        }
+        if (currentSource === "cache") {
+          currentNextOffset = "nextOffset" in result ? result.nextOffset : currentNextOffset;
+          if (result.hasMore) {
+            setFeedWindow({
+              days: INBOX_ALL_TIME_DAYS,
+              nextOffset: currentNextOffset,
+              hasMore: true,
+              localLimit: INBOX_FEED_PAGE_SIZE,
+              source: "cache",
+              gmailPageToken: "",
+              gmailPageOffset: 0,
+            });
+            continue;
+          }
+          currentSource = "gmail";
+          setFeedWindow({
+            days: INBOX_ALL_TIME_DAYS,
+            nextOffset: currentNextOffset,
+            hasMore: true,
+            localLimit: INBOX_FEED_PAGE_SIZE,
+            source: currentSource,
+            gmailPageToken: currentGmailPageToken,
+            gmailPageOffset: currentGmailPageOffset,
+          });
+          continue;
+        }
+        currentGmailPageToken =
+          "pageToken" in result ? result.pageToken : currentGmailPageToken;
+        currentGmailPageOffset =
+          "pageOffset" in result ? result.pageOffset : currentGmailPageOffset;
+        setFeedWindow({
+          days: INBOX_ALL_TIME_DAYS,
+          nextOffset: currentNextOffset,
+          hasMore: result.hasMore,
+          localLimit: INBOX_FEED_PAGE_SIZE,
+          source: "gmail",
+          gmailPageToken: currentGmailPageToken,
+          gmailPageOffset: currentGmailPageOffset,
+        });
+        if (!result.hasMore) break;
+      }
+      return true;
+    },
+    [actions, loadGmailPage],
+  );
+
   const syncInbox = useCallback(
-    async (targetDays = feedWindow.days) => {
+    async (targetDays = feedWindow.days, clearCache = false) => {
+      requestedGmailCursors.current.clear();
       setFeedAction("refresh");
       try {
         if (localCategory) {
@@ -2384,7 +2513,7 @@ export function HomeView() {
             setFeedWindow((current) => ({ ...current, localLimit: INBOX_FEED_PAGE_SIZE }));
             return true;
           }
-          const result = await actions.refreshInboxEmails("inbox", 7);
+          const result = await actions.refreshInboxEmails("inbox", 7, clearCache);
           if (result.ok) {
             setFeedWindow((current) => ({
               ...current,
@@ -2393,12 +2522,46 @@ export function HomeView() {
           }
           return result.ok;
         }
-        if (targetDays > 7) {
+        if (targetDays > 7 && !clearCache) {
           return loadRemoteCategory(mailboxView, targetDays);
+        }
+        if (mailboxView === "inbox" && targetDays === INBOX_ALL_TIME_DAYS) {
+          const result = await actions.refreshInboxEmails(
+            "inbox",
+            INBOX_ALL_TIME_DAYS,
+            clearCache,
+          );
+          if (!result.ok) return false;
+          const source: InboxFeedWindow["source"] = result.hasMore
+            ? "cache"
+            : "gmail";
+          const excludeMessageIds = (result.messages || [])
+            .map((message) => message.id)
+            .filter(Boolean);
+          setFeedWindow({
+            days: INBOX_ALL_TIME_DAYS,
+            nextOffset: result.nextOffset,
+            hasMore: result.hasMore,
+            localLimit: INBOX_FEED_PAGE_SIZE,
+            source,
+            gmailPageToken: "",
+            gmailPageOffset: 0,
+          });
+          if (!result.hasMore) return true;
+          const loadedAll = await loadRemainingAllTimeInbox(
+            source,
+            result.nextOffset,
+            "",
+            0,
+            excludeMessageIds,
+          );
+          if (loadedAll) actions.showToast("Loaded all inbox emails.");
+          return loadedAll;
         }
         const result = await actions.refreshInboxEmails(
           mailboxView,
           targetDays,
+          clearCache,
         );
         if (result.ok) {
           setFeedWindow({
@@ -2416,8 +2579,64 @@ export function HomeView() {
         setFeedAction((current) => (current === "refresh" ? null : current));
       }
     },
-    [actions, feedWindow.days, loadRemoteCategory, localCategory, mailbox, mailboxView],
+    [actions, feedWindow.days, loadRemainingAllTimeInbox, loadRemoteCategory, localCategory, mailbox, mailboxView],
   );
+
+  const reloadInboxFromEmpty = useCallback(async () => {
+    setRefreshChoiceOpen(false);
+    setSelectedId("");
+    setMessageBodies({});
+    setContactAvatars({});
+    avatarMisses.current.clear();
+    bodyRequests.current.clear();
+    bodyPreheatSeen.current.clear();
+    bodyPreheatSession.current += 1;
+    pageLoadInFlight.current = false;
+    requestedGmailCursors.current.clear();
+    actions.resetInboxFeed();
+    setFeedWindow((current) => ({
+      ...DEFAULT_INBOX_FEED_WINDOW,
+      days: current.days,
+    }));
+    await syncInbox(feedWindow.days, true);
+  }, [actions, feedWindow.days, syncInbox]);
+
+  const continueLoadingInbox = useCallback(async () => {
+    setRefreshChoiceOpen(false);
+    requestedGmailCursors.current.clear();
+    setFeedAction("refresh");
+    try {
+      if (localCategory) {
+        await syncInbox(feedWindow.days);
+        return;
+      }
+      const category = mailboxView;
+      const targetDays = feedWindow.days;
+      const excludeIds = sourceMessages.map((message) => message.id).filter(Boolean);
+      const result = await loadGmailPage(
+        category,
+        targetDays,
+        "",
+        0,
+        excludeIds,
+      );
+      if (!result?.ok) {
+        actions.showToast("Failed to load new emails.");
+        return;
+      }
+      setFeedWindow((current) => ({
+        ...current,
+        days: targetDays,
+        hasMore: result.hasMore,
+        source: "gmail",
+        gmailPageToken: result.pageToken,
+        gmailPageOffset: result.pageOffset,
+      }));
+      actions.showToast(result.count ? `${result.count} new email${result.count === 1 ? "" : "s"} loaded.` : "No new emails found.");
+    } finally {
+      setFeedAction((current) => (current === "refresh" ? null : current));
+    }
+  }, [actions, feedWindow.days, loadGmailPage, localCategory, mailboxView, sourceMessages, syncInbox]);
 
   const gmailAuthorizationRequired = isGmailAuthorizationRequired(
     state.gmailAuthStatus,
@@ -2497,6 +2716,9 @@ export function HomeView() {
       let nextOffset = initial.nextOffset;
       let gmailPageToken = "";
       let gmailPageOffset = 0;
+      const excludeMessageIds = (initial.messages || [])
+        .map((message) => message.id)
+        .filter(Boolean);
       setFeedWindow({
         days: INBOX_ALL_TIME_DAYS,
         nextOffset,
@@ -2506,77 +2728,23 @@ export function HomeView() {
         gmailPageToken,
         gmailPageOffset,
       });
-      while (mailboxViewRef.current === "inbox") {
-        if (source === "gmail") {
-          await new Promise((resolve) => window.setTimeout(resolve, 0));
-        }
-        const result =
-          source === "cache"
-            ? await actions.loadCachedInboxEmails(
-                "inbox",
-                INBOX_ALL_TIME_DAYS,
-                nextOffset,
-                true,
-              )
-            : await loadGmailPage(
-                "inbox",
-                INBOX_ALL_TIME_DAYS,
-                gmailPageToken,
-                gmailPageOffset,
-                sourceMessagesRef.current.map((message) => message.id),
-              );
-        if (mailboxViewRef.current !== "inbox") return;
-        if (!result?.ok) {
-          actions.showToast("Failed to load emails older than 1 month.");
-          return;
-        }
-        if (source === "cache") {
-          nextOffset = "nextOffset" in result ? result.nextOffset : nextOffset;
-          if (result.hasMore) {
-            setFeedWindow({
-              days: INBOX_ALL_TIME_DAYS,
-              nextOffset,
-              hasMore: true,
-              localLimit: INBOX_FEED_PAGE_SIZE,
-              source: "cache",
-              gmailPageToken: "",
-              gmailPageOffset: 0,
-            });
-            continue;
-          }
-          source = "gmail";
-          setFeedWindow({
-            days: INBOX_ALL_TIME_DAYS,
-            nextOffset,
-            hasMore: true,
-            localLimit: INBOX_FEED_PAGE_SIZE,
-            source,
-            gmailPageToken,
-            gmailPageOffset,
-          });
-          continue;
-        }
-        gmailPageToken =
-          "pageToken" in result ? result.pageToken : gmailPageToken;
-        gmailPageOffset =
-          "pageOffset" in result ? result.pageOffset : gmailPageOffset;
-        setFeedWindow({
-          days: INBOX_ALL_TIME_DAYS,
-          nextOffset,
-          hasMore: result.hasMore,
-          localLimit: INBOX_FEED_PAGE_SIZE,
-          source: "gmail",
-          gmailPageToken,
-          gmailPageOffset,
-        });
-        if (!result.hasMore) break;
+      const loadedAll = await loadRemainingAllTimeInbox(
+        source,
+        nextOffset,
+        gmailPageToken,
+        gmailPageOffset,
+        excludeMessageIds,
+      );
+      if (!loadedAll) {
+        actions.showToast("Failed to load emails older than 1 month.");
+        return;
       }
       actions.showToast("Loaded all inbox emails.");
     } finally {
       pageLoadInFlight.current = false;
       setFeedAction((current) => (current === "more" ? null : current));
     }
-  }, [actions, feedWindow.days, loadGmailPage, mailboxView]);
+  }, [actions, feedWindow.days, loadRemainingAllTimeInbox, mailboxView]);
 
   const loadNextCategoryPage = useCallback(async () => {
     if (mailboxView === "inbox" || pageLoadInFlight.current) return;
@@ -2730,6 +2898,37 @@ export function HomeView() {
     state.inboxSnapshotMessages,
   ]);
 
+  useEffect(() => {
+    if (!selectedMessage) return;
+    if (drawerCloseTimer.current) {
+      window.clearTimeout(drawerCloseTimer.current);
+      drawerCloseTimer.current = null;
+    }
+    setDrawerMessage(selectedMessage);
+    let enterFrame = 0;
+    const mountFrame = window.requestAnimationFrame(() => {
+      enterFrame = window.requestAnimationFrame(() => setDrawerOpen(true));
+    });
+    return () => {
+      window.cancelAnimationFrame(mountFrame);
+      window.cancelAnimationFrame(enterFrame);
+    };
+  }, [selectedMessage]);
+
+  useEffect(() => {
+    if (selectedMessage || !drawerMessage || !drawerOpen) return;
+    setDrawerOpen(false);
+    if (drawerCloseTimer.current) window.clearTimeout(drawerCloseTimer.current);
+    drawerCloseTimer.current = window.setTimeout(() => {
+      setDrawerMessage(null);
+      drawerCloseTimer.current = null;
+    }, DETAIL_DRAWER_TRANSITION_MS);
+  }, [drawerMessage, drawerOpen, selectedMessage]);
+
+  useEffect(() => () => {
+    if (drawerCloseTimer.current) window.clearTimeout(drawerCloseTimer.current);
+  }, []);
+
   const detailFlags = useMemo(
     () => ({
       todos: flags.todos,
@@ -2792,14 +2991,18 @@ export function HomeView() {
 
   const closeDetailDrawer = useCallback(() => {
     const currentId = selectedId;
+    setDrawerOpen(false);
     setSelectedId("");
     setExternalDetailMessage(null);
-    requestAnimationFrame(() => {
+    if (drawerCloseTimer.current) window.clearTimeout(drawerCloseTimer.current);
+    drawerCloseTimer.current = window.setTimeout(() => {
+      setDrawerMessage(null);
+      drawerCloseTimer.current = null;
       const row = document.querySelector<HTMLButtonElement>(
         `[data-mail-row-id="${CSS.escape(currentId)}"]`,
       );
       row?.focus();
-    });
+    }, DETAIL_DRAWER_TRANSITION_MS);
   }, [selectedId]);
 
   const openMessageDetail = useCallback(
@@ -3276,12 +3479,46 @@ export function HomeView() {
           <button
             className={`refresh-mail-btn ${isInboxSyncing ? "is-syncing" : ""}`}
             disabled={isInboxSyncing}
-            onClick={() => void syncInbox()}
+            onClick={() => setRefreshChoiceOpen(true)}
           >
             <RefreshIcon />
             <span>{isInboxSyncing ? "Syncing" : "Refresh"}</span>
           </button>
         </header>
+
+        {refreshChoiceOpen ? (
+          <div className="confirm-overlay refresh-choice-overlay" role="presentation">
+            <section
+              className="confirm-dialog refresh-choice-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="refresh-choice-title"
+            >
+              <h3 id="refresh-choice-title">Refresh inbox</h3>
+              <p>Choose how Anna should refresh the current mailbox cache and view.</p>
+              <div className="refresh-choice-actions">
+                <button
+                  className="danger-btn"
+                  type="button"
+                  disabled={isInboxSyncing}
+                  onClick={() => void reloadInboxFromEmpty()}
+                >
+                  Clear cache and reload
+                </button>
+                <button
+                  type="button"
+                  disabled={isInboxSyncing}
+                  onClick={() => void continueLoadingInbox()}
+                >
+                  Continue loading new mail
+                </button>
+                <button type="button" onClick={() => setRefreshChoiceOpen(false)}>
+                  Cancel
+                </button>
+              </div>
+            </section>
+          </div>
+        ) : null}
 
         {mailboxView === "inbox" ? (
           <nav className="mail-tabs" aria-label="Inbox filters">
@@ -3491,10 +3728,10 @@ export function HomeView() {
           ) : null}
         </section>
         <MailDetailDrawer
-          key={`${selectedMessage?.mailbox || mailbox}:${selectedMessage?.id || "closed"}`}
-          open={Boolean(selectedMessage)}
-          mailbox={selectedMessage?.mailbox || mailbox}
-          message={selectedMessage}
+          key={`${drawerMessage?.mailbox || mailbox}:${drawerMessage?.id || "closed"}`}
+          open={drawerOpen}
+          mailbox={drawerMessage?.mailbox || mailbox}
+          message={drawerMessage}
           flags={detailFlags}
           aiBusy={state.aiChatLoading || state.isCustomScanning}
           insertRequest={insertRequest}

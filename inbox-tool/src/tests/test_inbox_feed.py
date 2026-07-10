@@ -79,6 +79,42 @@ def main() -> None:
     assert all_mail["cache_reset"] == {"mailbox": "user@example.com"}
     clear_cache.assert_called_once_with("user@example.com")
 
+    thread_subject_messages = [
+        {
+            "id": "thread-original",
+            "thread_id": "thread-title",
+            "internal_date": "10",
+            "from": "User <user@example.com>",
+            "subject": "Original invite title",
+            "snippet": "Original",
+            "label_ids": ["SENT"],
+            "attachments": [],
+        },
+        {
+            "id": "thread-latest",
+            "thread_id": "thread-title",
+            "internal_date": "20",
+            "from": "Sender <sender@example.com>",
+            "subject": "Changed latest title",
+            "snippet": "Latest",
+            "label_ids": ["INBOX"],
+            "has_attachment": True,
+            "attachment_count": 1,
+            "attachments": [],
+        },
+    ]
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+        patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"emailAddress": "user@example.com"}),
+        patch("mail_agent.mail_providers.gmail.adapter.live_search_metadata_and_cache", return_value=["thread-latest"]),
+        patch("mail_agent.mail_providers.gmail.adapter.list_messages", return_value=thread_subject_messages),
+    ):
+        thread_title_feed = list_inbox_emails("USER@example.com", 7, 100)
+    assert thread_title_feed["messages"][0]["subject"] == "Original invite title"
+    assert thread_title_feed["messages"][0]["latest_subject"] == "Changed latest title"
+    assert thread_title_feed["messages"][0]["has_attachment"] is True
+    assert thread_title_feed["messages"][0]["attachment_count"] == 1
+
     with tempfile.TemporaryDirectory() as temp_dir:
         cache_root = Path(temp_dir)
         target = cache_root / "user_example.com"

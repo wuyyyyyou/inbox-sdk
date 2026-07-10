@@ -177,6 +177,36 @@ describe("resolveSourceMessages", () => {
     expect(resolveSourceMessages("drafts", [], merged, flags).map((message) => message.id)).toEqual(["message-1"]);
   });
 
+  it("preserves the inbox message direction when applying a draft from the same thread", () => {
+    const inboxMessage = {
+      id: "received-1",
+      thread_id: "thread-1",
+      mailbox: "owner@example.com",
+      from: "World of AI <team@worldofai.example>",
+      to: "Owner <owner@example.com>",
+      label_ids: ["INBOX"],
+      internal_date: "100",
+    };
+    const draft = {
+      id: "sent-1",
+      thread_id: "thread-1",
+      mailbox: "owner@example.com",
+      from: "Owner <owner@example.com>",
+      to: "World of AI <team@worldofai.example>",
+      draft_body: "Thanks for the update.",
+      draft_local: true,
+      label_ids: ["DRAFT", "SENT"],
+      internal_date: "200",
+    };
+
+    const [merged] = mergeDraftOverlayMessages([inboxMessage], [draft]);
+
+    expect(merged.from).toBe(inboxMessage.from);
+    expect(merged.to).toBe(inboxMessage.to);
+    expect(merged.draft_body).toBe(draft.draft_body);
+    expect(isSentMessage(merged)).toBe(false);
+  });
+
   it("prefers live inbox messages over stale snapshot data in inbox view", () => {
     const liveInbox = [
       { id: "live-1", label_ids: ["INBOX", "IMPORTANT"], internal_date: "200" },

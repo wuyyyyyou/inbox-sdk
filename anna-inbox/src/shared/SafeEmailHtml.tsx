@@ -6,6 +6,7 @@ const TEXT_FLOW_BLOCK_SELECTOR = [
   "figure", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "main", "nav",
   "ol", "p", "pre", "section", "table", "ul",
 ].join(",");
+const MIN_FIXED_EMAIL_SCALE = 0.72;
 
 function normalizeLinks(root: DocumentFragment | HTMLElement) {
   root.querySelectorAll("a[href]").forEach((node) => {
@@ -42,9 +43,17 @@ function hasFixedEmailLayout(root: HTMLElement) {
   if (root.querySelector("table, tbody, thead, tfoot, tr, td, th, colgroup, col, center")) {
     return true;
   }
+  if (Array.from(root.querySelectorAll("[width]")).some((node) => {
+    const width = Number((node.getAttribute("width") || "").replace(/px$/i, ""));
+    return Number.isFinite(width) && width >= 320;
+  })) {
+    return true;
+  }
   return Array.from(root.querySelectorAll("[style]")).some((node) => {
     const style = (node.getAttribute("style") || "").toLowerCase();
-    return /(?:^|;)\s*display\s*:\s*(?:table|inline-block|flex|grid)/.test(style);
+    return /(?:^|;)\s*display\s*:\s*(?:table|inline-block|flex|grid)/.test(style)
+      || /(?:^|;)\s*(?:width|min-width|max-width)\s*:\s*(?:[3-9]\d{2,}|[1-9]\d{3,})px/.test(style)
+      || /(?:^|;)\s*margin(?:-left|-right)?\s*:\s*auto/.test(style);
   });
 }
 
@@ -196,7 +205,8 @@ export function SafeEmailHtml({ html, className = "", scaleToFit = false }: { ht
       raf = window.requestAnimationFrame(() => {
         const frameWidth = Math.max(1, frame.clientWidth);
         const contentWidth = Math.max(content.scrollWidth, content.offsetWidth, frameWidth);
-        const scale = Math.min(1, frameWidth / contentWidth);
+        const rawScale = Math.min(1, frameWidth / contentWidth);
+        const scale = rawScale < MIN_FIXED_EMAIL_SCALE ? 1 : rawScale;
         setFit({
           scale,
           width: contentWidth,

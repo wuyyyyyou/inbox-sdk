@@ -5,6 +5,13 @@ import { buildDraftPreferencesInstruction, resolveDraftPreferences } from "../fe
 import { sortInboxMessagesDesc } from "../features/home/inboxMessageOrder";
 import { connectRuntime } from "../runtime/runtimeLoader";
 import { triggerBrowserDownload } from "../shared/browserDownload";
+import {
+  cacheMailboxes,
+  clearMailboxCacheData,
+  clearMailboxDatabase,
+  migrateSelectedMailboxFromLocalStorage,
+  setSelectedMailbox,
+} from "../shared/browserStorage";
 import type {
   ActiveCardsPayload,
   AiChatMessage,
@@ -37,6 +44,7 @@ import type {
 import {
   CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
+  MAILBOX_STORAGE_KEY,
   POLL_INTERVAL_MS,
   POLL_LIMIT,
   requestForMode,
@@ -401,8 +409,8 @@ type ToastOptions = {
   onSecondaryAction?: () => void;
 };
 
-type InboxPageResult = { ok: boolean; count: number; hasMore: boolean; nextOffset: number };
-type GmailInboxPageResult = { ok: boolean; count: number; hasMore: boolean; pageToken: string; pageOffset: number };
+type InboxPageResult = { ok: boolean; count: number; hasMore: boolean; nextOffset: number; messages?: InboxMessage[] };
+type GmailInboxPageResult = { ok: boolean; count: number; hasMore: boolean; pageToken: string; pageOffset: number; messages?: InboxMessage[] };
 
 export interface AppActions {
   showToast(message: string, options?: ToastOptions): void;
@@ -433,7 +441,7 @@ export interface AppActions {
   setBriefMailboxFilter(mailboxes: string[]): void;
   loadActiveCards(): Promise<void>;
   loadInboxEmails(category?: string, days?: number, force?: boolean): Promise<boolean>;
-  refreshInboxEmails(category?: string, days?: number): Promise<InboxPageResult>;
+  refreshInboxEmails(category?: string, days?: number, clearCache?: boolean): Promise<InboxPageResult>;
   loadCachedInboxEmails(category?: string, days?: number, offset?: number, append?: boolean): Promise<InboxPageResult>;
   loadGmailInboxEmailsPage(category: string, days: number, pageToken: string, pageOffset: number, excludeMessageIds: string[]): Promise<GmailInboxPageResult>;
   resetInboxFeed(): void;
@@ -536,6 +544,7 @@ export function useAppController() {
   const aiGenerationRun = useRef<{ runId: string; cancelled: boolean; controller: AbortController } | null>(null);
   const inboxFeedCache = useRef(new Map<string, { payload: InboxFeedPayload; loadedAt: number }>());
   const inboxRequestSequence = useRef(0);
+  const draftRequestSequence = useRef(0);
   const snapshotRequestMailbox = useRef("");
   const snapshotPromise = useRef<Promise<boolean> | null>(null);
 
@@ -582,6 +591,26 @@ export function useAppController() {
     });
   }, []);
 
+  const loadInboxThreadDrafts = useCallback(async (mailbox: string, limit = 100) => {
+    const normalized = normalizedMailbox(mailbox);
+    if (!normalized || normalized === "all") {
+      return { mailbox: normalized, messages: [] } as InboxFeedPayload;
+    }
+    const requestId = ++draftRequestSequence.current;
+    const payload = await client.listInboxThreadDrafts(normalized, limit);
+    if (requestId !== draftRequestSequence.current) return payload;
+    setState((s) => {
+      const currentMailbox = normalizedMailbox(s.selectedMailboxes[0] || s.mailbox);
+      if (currentMailbox !== normalized) return s;
+      return {
+        ...s,
+        inboxDraftMessages: Array.isArray(payload.messages) ? payload.messages : [],
+        inboxUpdatedAt: String(payload.updated_at || s.inboxUpdatedAt || ""),
+      };
+    });
+    return payload;
+  }, [client]);
+
   const preloadMailboxSnapshot = useCallback(async (mailboxOverride?: string, days = 7, force = false) => {
     const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
     if (!mailbox || mailbox === "all") return false;
@@ -591,7 +620,11 @@ export function useAppController() {
       const startedAt = performance.now();
       setState((s) => ({ ...s, inboxSnapshotLoading: true }));
       try {
-        const cached = await client.listCachedEmails(mailbox, days, 100, "inbox", 0);
+        const [cached] = await Promise.all([
+          client.listCachedEmails(mailbox, days, 100, "inbox", 0),
+          // A draft-index failure must not prevent the Inbox cache from opening.
+          loadInboxThreadDrafts(mailbox).catch(() => undefined),
+        ]);
         if (snapshotRequestMailbox.current !== mailbox) return false;
         applyInboxSnapshotPayload(cached);
         setState((s) => ({ ...s, inboxSnapshotLoading: false }));
@@ -614,7 +647,7 @@ export function useAppController() {
       if (snapshotRequestMailbox.current === mailbox) snapshotPromise.current = null;
     });
     return snapshotPromise.current;
-  }, [applyInboxSnapshotPayload, client, state.mailbox, state.selectedMailboxes]);
+  }, [applyInboxSnapshotPayload, client, loadInboxThreadDrafts, state.mailbox, state.selectedMailboxes]);
 
   const completeAiChat = useCallback(async (messages: AiChatMessage[], signal: AbortSignal): Promise<string> => {
     if (signal.aborted) throw new DOMException("The request was aborted.", "AbortError");
@@ -765,7 +798,7 @@ export function useAppController() {
     return false;
   }, [client, state.mailbox, state.selectedMailboxes]);
 
-  const refreshInboxEmails = useCallback(async (category = "inbox", days = 7): Promise<InboxPageResult> => {
+  const refreshInboxEmails = useCallback(async (category = "inbox", days = 7, clearCache = false): Promise<InboxPageResult> => {
     const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
     if (!mailbox || mailbox === "all") {
       setState((s) => ({ ...s, inboxMessages: [], inboxSnapshotMessages: [], inboxLoading: false, inboxSnapshotLoading: false, inboxError: "Connect a Gmail mailbox to load your inbox." }));
@@ -778,24 +811,30 @@ export function useAppController() {
     for (const key of inboxFeedCache.current.keys()) {
       if (key.startsWith(`${mailbox}|`)) inboxFeedCache.current.delete(key);
     }
+    if (clearCache) {
+      await clearMailboxCacheData(mailbox);
+    }
     setState((s) => ({
       ...s,
-      inboxLoading: s.inboxSnapshotMessages.length || s.inboxMessages.length ? false : true,
+      inboxMessages: clearCache ? [] : s.inboxMessages,
+      inboxSnapshotMessages: clearCache ? [] : s.inboxSnapshotMessages,
+      inboxLoading: clearCache || !(s.inboxSnapshotMessages.length || s.inboxMessages.length),
       inboxSnapshotLoading: true,
       inboxSnapshotComplete: false,
       inboxError: "",
     }));
 
     try {
-      const payload = await client.listInboxEmails(mailbox, days, 100, category, false);
+      const payload = await client.listInboxEmails(mailbox, days, 100, category, clearCache);
       if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
       inboxFeedCache.current.set(`${mailbox}|${category}|${days}`, { payload, loadedAt: Date.now() });
       applyInboxSnapshotPayload(payload);
-      const count = Array.isArray(payload.messages) ? payload.messages.length : 0;
+      const messages = Array.isArray(payload.messages) ? payload.messages : [];
+      const count = messages.length;
       showToast(days > 7
         ? `Inbox synced for the last ${days} days. ${count} messages loaded.`
         : `Inbox refreshed. ${count} messages loaded.`);
-      return { ok: true, count, hasMore: count >= 100, nextOffset: count };
+      return { ok: true, count, hasMore: count >= 100, nextOffset: count, messages };
     } catch (error) {
       if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
       const detail = error instanceof Error ? error.message : String(error);
@@ -1212,6 +1251,8 @@ export function useAppController() {
       const primary = selectedOrPrimary(selectedCandidates, mailboxes.find((item) => item.authorized !== false)?.email || state.mailbox);
       const selected = primary ? [primary] : [];
       const normalizedMailboxes = mailboxes.map((item) => ({ ...item, selected: normalizedMailbox(item.email) === primary }));
+      void cacheMailboxes(normalizedMailboxes);
+      if (primary) void setSelectedMailbox(primary);
       if (selectedCandidates.length !== selected.length || selectedCandidates[0] !== primary) {
         for (const item of mailboxes) {
           const shouldSelect = normalizedMailbox(item.email) === primary;
@@ -1255,6 +1296,8 @@ export function useAppController() {
       const primary = selectedOrPrimary(selectedCandidates, mailboxes.find((item) => item.authorized !== false)?.email || state.mailbox);
       const selected = primary ? [primary] : [];
       const normalizedMailboxes = mailboxes.map((item) => ({ ...item, selected: normalizedMailbox(item.email) === primary }));
+      void cacheMailboxes(normalizedMailboxes);
+      if (primary) void setSelectedMailbox(primary);
       setState((s) => ({
         ...s,
         mailboxes: normalizedMailboxes.length ? normalizedMailboxes : s.mailboxes,
@@ -1336,7 +1379,16 @@ export function useAppController() {
       setState((s) => ({ ...s, runtime, loading: runtime.connected ? s.loading : false }));
       if (runtime.connected) {
         void refreshSamplingStatus();
-        const bootMailbox = normalizedMailbox(state.mailbox);
+        const restoredMailbox = normalizedMailbox(await migrateSelectedMailboxFromLocalStorage(MAILBOX_STORAGE_KEY));
+        const bootMailbox = restoredMailbox || normalizedMailbox(state.mailbox);
+        if (restoredMailbox && restoredMailbox !== normalizedMailbox(state.mailbox)) {
+          setState((s) => ({
+            ...s,
+            mailbox: restoredMailbox,
+            selectedMailboxes: [restoredMailbox],
+            briefMailboxFilter: [restoredMailbox],
+          }));
+        }
         let inboxAvailable = bootMailbox ? await preloadMailboxSnapshot(bootMailbox, 7) : false;
         const mailboxState = await loadMailboxRegistry();
         let currentMailbox = mailboxState.primary || bootMailbox;
@@ -1547,10 +1599,12 @@ export function useAppController() {
           if (normalizedMailbox(item.email) === primary || item.selected === false) continue;
           await client.setMailboxSelected(item.email, false, state.storageProvider);
         }
-        const payload = await client.setMailboxSelected(primary, true, state.storageProvider);
-        const returnedMailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : state.mailboxes;
-        const mailboxes = returnedMailboxes.map((item) => ({ ...item, selected: normalizedMailbox(item.email) === primary }));
-        const visibleCards = filterCardsByMailboxes(state.allCards, [primary]);
+      const payload = await client.setMailboxSelected(primary, true, state.storageProvider);
+      const returnedMailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : state.mailboxes;
+      const mailboxes = returnedMailboxes.map((item) => ({ ...item, selected: normalizedMailbox(item.email) === primary }));
+      void cacheMailboxes(mailboxes);
+      void setSelectedMailbox(primary);
+      const visibleCards = filterCardsByMailboxes(state.allCards, [primary]);
         setState((s) => ({
           ...s,
           mailboxes,
@@ -1637,12 +1691,14 @@ export function useAppController() {
           return { ok: false, count: 0, hasMore: false, nextOffset: offset };
         }
         applyInboxSnapshotPayload(cached, { append });
-        const count = Array.isArray(cached.messages) ? cached.messages.length : 0;
+        const messages = Array.isArray(cached.messages) ? cached.messages : [];
+        const count = messages.length;
         return {
           ok: true,
           count,
           hasMore: Boolean(cached.has_more),
           nextOffset: Number(cached.next_offset ?? offset + count),
+          messages,
         };
       } catch (error) {
         if (requestId !== inboxRequestSequence.current) {
@@ -1684,13 +1740,15 @@ export function useAppController() {
           return { ok: false, count: 0, hasMore: false, pageToken, pageOffset };
         }
         applyInboxSnapshotPayload(page, { append: true });
-        const count = Array.isArray(page.messages) ? page.messages.length : 0;
+        const messages = Array.isArray(page.messages) ? page.messages : [];
+        const count = messages.length;
         return {
           ok: true,
           count,
           hasMore: Boolean(page.has_more),
           pageToken: String(page.page_token || ""),
           pageOffset: Number(page.page_offset || 0),
+          messages,
         };
       } catch (error) {
         if (requestId !== inboxRequestSequence.current) {
@@ -1765,18 +1823,7 @@ export function useAppController() {
       return client.getInboxThreadDraft(normalizedMailbox(mailbox), threadId);
     },
     async listInboxThreadDrafts(mailbox, limit = 100) {
-      const normalized = normalizedMailbox(mailbox);
-      const payload = await client.listInboxThreadDrafts(normalized, limit);
-      setState((s) => ({
-        ...s,
-        inboxDraftMessages: Array.isArray(payload.messages) ? payload.messages : [],
-        inboxUpdatedAt: String(payload.updated_at || ""),
-        inboxLoading: false,
-        inboxSnapshotLoading: false,
-        inboxSnapshotComplete: true,
-        inboxError: "",
-      }));
-      return payload;
+      return loadInboxThreadDrafts(mailbox, limit);
     },
     async saveInboxThreadDraft(mailbox, threadId, body, ifMatch, message) {
       const normalized = normalizedMailbox(mailbox);
@@ -3157,6 +3204,7 @@ export function useAppController() {
         const normalized = normalizedMailbox(mailbox);
         const result = await client.deleteMailboxData(normalized);
         if (result.ok) {
+          await clearMailboxDatabase(normalized);
           const deleted = result.deleted || {};
           const remainingMailboxes = state.mailboxes.filter((m) => normalizedMailbox(m.email) !== normalized);
           const remainingSelected = state.selectedMailboxes.filter((m) => normalizedMailbox(m) !== normalized);

@@ -7,6 +7,14 @@ import type {
   QuickReplySuggestion,
 } from "../../types/mail";
 import { triggerBrowserDownload } from "../../shared/browserDownload";
+import {
+  senderParts,
+  splitAddresses,
+  type AddressParts,
+} from "../../shared/mailIdentity";
+
+export { senderParts, splitAddresses };
+export type { AddressParts };
 
 export type AttachmentKind = "pdf" | "image" | "text" | "audio" | "video" | "download";
 
@@ -18,11 +26,6 @@ export interface ResolvedAttachmentAccess {
   externalPreview: boolean;
   sourceUrl?: string;
   revoke?: () => void;
-}
-
-export interface AddressParts {
-  name: string;
-  email: string;
 }
 
 export interface SnoozePreset {
@@ -41,35 +44,6 @@ export function hasNewerThreadMessage(
   const loadedTime = Number(loadedLatest?.internal_date || 0);
   const knownTime = Number(latestThreadInternalDate || 0);
   return Number.isFinite(loadedTime) && Number.isFinite(knownTime) && knownTime > loadedTime;
-}
-
-export function senderParts(value: unknown): AddressParts {
-  const text = String(value ?? "");
-  const match = text.match(/^\s*"?([^"<]+?)"?\s*<([^>]+)>/);
-  if (match) return { name: match[1].trim(), email: match[2].trim() };
-  if (text.includes("@")) return { name: text.split("@")[0].trim() || text.trim(), email: text.trim() };
-  return { name: text.trim() || "Unknown sender", email: text.trim() };
-}
-
-export function splitAddresses(value: unknown): string[] {
-  const text = String(value ?? "").trim();
-  if (!text) return [];
-  const parts: string[] = [];
-  let start = 0;
-  let quoted = false;
-  let angleDepth = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    const character = text[index];
-    if (character === "\"") quoted = !quoted;
-    else if (!quoted && character === "<") angleDepth += 1;
-    else if (!quoted && character === ">") angleDepth = Math.max(0, angleDepth - 1);
-    else if (!quoted && angleDepth === 0 && character === ",") {
-      parts.push(text.slice(start, index).trim());
-      start = index + 1;
-    }
-  }
-  parts.push(text.slice(start).trim());
-  return parts.filter(Boolean);
 }
 
 export function parseMessageDate(value?: string) {
