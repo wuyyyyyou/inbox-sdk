@@ -995,7 +995,13 @@ def _check_gmail_auth(mailbox: str) -> dict[str, Any]:
                     return {"authorized": True, "source": "local_file", "mode": "any"}
         return {"authorized": False, "source": "none", "mode": "any"}
 
-    # Platform path — check for injected OAuth credential
+    # The multi-token snapshot is authoritative when it includes this mailbox.
+    # Check it before the legacy platform singleton so an extra account does not
+    # appear unauthorized merely because a Default account is also injected.
+    if requested in get_multi_token_map():
+        return {"authorized": True, "source": "platform_multi", "authorized_email": requested}
+
+    # Legacy platform path — check the injected single OAuth credential.
     platform_token = _os.environ.get("GMAIL_ACCESS_TOKEN") or _os.environ.get("GOOGLE_ACCESS_TOKEN")
     if platform_token and platform_token.strip():
         authorized_email = get_authorized_email().strip().lower()
@@ -1005,10 +1011,6 @@ def _check_gmail_auth(mailbox: str) -> dict[str, Any]:
             "source": "platform",
             "authorized_email": authorized_email,
         }
-
-    # Multi-token path — check in-memory map
-    if requested in get_multi_token_map():
-        return {"authorized": True, "source": "platform_multi", "authorized_email": requested}
 
     # Local dev path — check for token file existence only
     token_dir = _token_dir()

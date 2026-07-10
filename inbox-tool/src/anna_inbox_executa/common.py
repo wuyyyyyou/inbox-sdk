@@ -112,8 +112,8 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "GMAIL_MULTI_TOKENS",
-            "display_name": "Gmail Multi-Mailbox Tokens",
-            "description": "JSON array of {email, access_token, refresh_token, client_id, client_secret, expires_at} for additional mailboxes.",
+            "display_name": "Gmail Mailbox Token Snapshot",
+            "description": "JSON array containing every authorized Gmail mailbox, including the default one: {email, access_token, refresh_token, client_id, client_secret, expires_at}. When present, this is the authoritative mailbox source.",
             "required": False,
             "sensitive": True,
         },
@@ -446,6 +446,7 @@ DEFAULT_MANIFEST = {
                 {"name": "anchor_message_id", "type": "string", "description": "Message initially opened from the Inbox list.", "required": True},
                 {"name": "latest_message_id", "type": "string", "description": "Latest thread message ID.", "required": True},
                 {"name": "visible_prompt", "type": "string", "description": "Prompt visible in the left Anna sidebar.", "required": True},
+                {"name": "run_id", "type": "string", "description": "Client-generated ID used to safely retry the same AI task.", "required": False},
                 {"name": "expected_artifact", "type": "string", "description": "Expected artifact type: draft_reply or summary.", "required": False},
                 {"name": "user_answers", "type": "object", "description": "Optional answers to reply-gap questions.", "required": False},
                 {"name": "ai_provider", "type": "string", "description": "LLM provider.", "required": False},

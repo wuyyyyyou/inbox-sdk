@@ -24,6 +24,11 @@ import { SnoozePicker } from "./SnoozePicker";
 import { MailDetailDrawer } from "../mail-detail/MailDetailDrawer";
 import { sortInboxMessagesDesc } from "./inboxMessageOrder";
 import {
+  parseAiMessageInline,
+  parseAiMessageMarkdown,
+  type AiMessageInline,
+} from "./aiMessageFormatting";
+import {
   getCachedMessageBody,
   getContactAvatarCache,
   getMailFlags,
@@ -1020,14 +1025,76 @@ function shouldAnimateAssistantText(timestamp?: string) {
   return Date.now() - createdAt < 15_000;
 }
 
+function AiMessageInlineContent({
+  content,
+  onOpenThread,
+}: {
+  content: AiMessageInline[];
+  onOpenThread?: (threadId: string) => void;
+}) {
+  return content.map((node, index) => {
+    const key = `${node.type}-${index}`;
+    if (node.type === "bold") return <strong key={key}>{node.value}</strong>;
+    if (node.type === "link") {
+      return (
+        <a key={key} href={node.href} target="_blank" rel="noreferrer noopener">
+          <AiMessageInlineContent content={parseAiMessageInline(node.label)} onOpenThread={onOpenThread} />
+        </a>
+      );
+    }
+    if (node.type === "thread_ref") {
+      return (
+        <button
+          key={key}
+          type="button"
+          className="ai-thread-reference"
+          onClick={() => onOpenThread?.(node.threadId)}
+        >
+          Open email thread
+        </button>
+      );
+    }
+    return node.value;
+  });
+}
+
+function RichAssistantText({
+  text,
+  onOpenThread,
+}: {
+  text: string;
+  onOpenThread?: (threadId: string) => void;
+}) {
+  return (
+    <div className="ai-message-rich-text">
+      {parseAiMessageMarkdown(text).map((block, index) => {
+        const key = `${block.type}-${index}`;
+        if (block.type === "heading") {
+          const Heading = (`h${block.level + 2}` as "h3" | "h4" | "h5");
+          return <Heading key={key}><AiMessageInlineContent content={block.content} onOpenThread={onOpenThread} /></Heading>;
+        }
+        if (block.type === "unordered_list") {
+          return <ul key={key}>{block.items.map((item, itemIndex) => <li key={itemIndex}><AiMessageInlineContent content={item} onOpenThread={onOpenThread} /></li>)}</ul>;
+        }
+        if (block.type === "ordered_list") {
+          return <ol key={key}>{block.items.map((item, itemIndex) => <li key={itemIndex}><AiMessageInlineContent content={item} onOpenThread={onOpenThread} /></li>)}</ol>;
+        }
+        return <p key={key}><AiMessageInlineContent content={block.content} onOpenThread={onOpenThread} /></p>;
+      })}
+    </div>
+  );
+}
+
 function AnimatedAssistantText({
   text,
   animate,
   onComplete,
+  onOpenThread,
 }: {
   text: string;
   animate: boolean;
   onComplete?: () => void;
+  onOpenThread?: (threadId: string) => void;
 }) {
   const [visibleText, setVisibleText] = useState(animate ? "" : text);
   const onCompleteRef = useRef(onComplete);
@@ -1062,7 +1129,7 @@ function AnimatedAssistantText({
     return () => window.clearInterval(timer);
   }, [animate, text]);
 
-  return <p>{visibleText}</p>;
+  return <RichAssistantText text={visibleText} onOpenThread={onOpenThread} />;
 }
 
 function AiAssistantMessage({
@@ -1076,13 +1143,27 @@ function AiAssistantMessage({
   onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
   onOpenMail: (target: AskMailLink) => void;
 }) {
-  const { actions } = useApp();
+  const { state, actions } = useApp();
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [submittingGap, setSubmittingGap] = useState(false);
   const [clarificationInput, setClarificationInput] = useState("");
   const [assistantTextComplete, setAssistantTextComplete] = useState(
     () => !shouldAnimateAssistantText(message.timestamp),
   );
+  const openThreadReference = (threadId: string) => {
+    const context = message.mailContext || currentMailContext;
+    const referenceMailbox = context?.mailbox || state.mailbox;
+    if (!referenceMailbox) {
+      actions.showToast("This email reference is unavailable.");
+      return;
+    }
+    onOpenMail({
+      label: "Referenced thread",
+      mailbox: referenceMailbox,
+      thread_id: threadId,
+      message_id: "",
+    });
+  };
 
   if (message.pending) {
     return (
@@ -1160,6 +1241,7 @@ function AiAssistantMessage({
           text={text}
           animate={animate}
           onComplete={() => setAssistantTextComplete(true)}
+          onOpenThread={openThreadReference}
         />
         {clarification ? (
           <div className={`ai-clarification is-${clarification.status}`}>
@@ -1232,9 +1314,9 @@ function AiAssistantMessage({
           </div>
         ) : null}
         {draftArtifact && message.assistantFollowupText ? (
-          <AnimatedAssistantText text={message.assistantFollowupText} animate={animate} />
+          <AnimatedAssistantText text={message.assistantFollowupText} animate={animate} onOpenThread={openThreadReference} />
         ) : null}
-        {message.replyGaps?.needs_user_input ? (
+        {assistantTextComplete && message.replyGaps?.needs_user_input ? (
           <div className="ai-reply-gaps">
             {message.replyGaps.summary ? (
               <p>{message.replyGaps.summary}</p>
@@ -1281,7 +1363,7 @@ function AiAssistantMessage({
           <code>{result.plan_gmail_queries[0].query}</code>
         ) : null}
       </div>
-      <AnimatedAssistantText text={summaryText} animate={animate} />
+      <AnimatedAssistantText text={summaryText} animate={animate} onOpenThread={openThreadReference} />
       {result.title || result.plan_title ? (
         <h2>{result.title || result.plan_title}</h2>
       ) : null}
@@ -2233,9 +2315,6 @@ export function HomeView() {
           if (permissionRequired) {
             if (!avatarPermissionNoticeShown.current) {
               avatarPermissionNoticeShown.current = true;
-              actions.showToast(
-                "Required permission to load contact photos from saved and other contacts.",
-              );
             }
             return;
           }
@@ -3684,16 +3763,14 @@ export function HomeView() {
           )}
           {days === 7 &&
           !state.inboxLoading &&
-          sourceMessages.length > 0 &&
+          feedAction !== "older" &&
           mailboxView === "inbox" ? (
             <button
               className="older-mail-btn"
               onClick={() => void loadOlderInbox()}
               disabled={isInboxSyncing || feedAction !== null}
             >
-              {feedAction === "older"
-                ? "Loading older emails..."
-                : "Show emails older than 7 days"}
+              Show emails older than 7 days
             </button>
           ) : null}
           {canLoadMoreInbox ? (

@@ -50,7 +50,7 @@ import {
   requestForMode,
 } from "./constants";
 import { createInitialState, removeAskHistoryEntry } from "./state";
-import { buildRevisionPrompt, decideAiRoute, resolveMailContext } from "./aiRoute";
+import { buildRevisionPrompt, buildScanFollowupRequest, decideAiRoute, resolveMailContext } from "./aiRoute";
 
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -281,12 +281,16 @@ function chatPendingText(input: string) {
 
 function sanitizeToolError(error: unknown, input: string) {
   const raw = error instanceof Error ? error.message : String(error);
-  if (raw.includes("executa process exited") || raw.includes("[tool_failed]")) {
+  const unavailable = prefersChinese(input)
+    ? "Anna 暂时无法完成这项邮箱任务，请稍后重试。"
+    : "Anna couldn't complete that inbox task right now. Please try again shortly.";
+  if (/unexpected token\s+['"]?<|<!doctype html|text\/html|failed to fetch|network(?:error| request)?|fetch failed|econnreset|enotfound|etimedout|timeout|\b5\d\d\b|\[tool_failed\]|executa process exited/i.test(raw)) {
     return prefersChinese(input)
-      ? "邮箱扫描进程中断了。我已经保留了这次问题，你可以稍后重试。"
-      : "The inbox scan was interrupted. I kept this question here so you can retry in a moment.";
+      ? "连接 Anna 服务时出现问题。我已经自动重试；请稍后再试。"
+      : "There was a problem connecting to Anna. I retried automatically; please try again shortly.";
   }
-  return raw.replace(/^\[tool:[^\]]+\]\s*/i, "").trim();
+  // 工具和后台任务的错误细节可能含协议、供应商或 HTML 文本，不能直接出现在对话中。
+  return unavailable;
 }
 
 function persistAskHistory(history: AskHistoryEntry[]) {
@@ -663,6 +667,7 @@ export function useAppController() {
         "Answer in the same language as the user's latest message.",
         "For greetings, capability questions, and ordinary chat, answer naturally without claiming that you scanned email.",
         "If the user asks for inbox-specific work, tell them you can search the inbox when they ask a concrete mail task.",
+        "For formatting, use only Markdown headings, bold text, ordered or unordered lists, and HTTPS/HTTP links in the form [label](https://example.com). Do not use HTML, tables, images, code blocks, or block quotes. If the user requests an unsupported format, say so plainly and offer an equivalent using the supported formats.",
       ].join("\n"),
       maxTokens: 500,
       temperature: 0.4,
@@ -1976,6 +1981,7 @@ export function useAppController() {
           user_answers: request.userAnswers,
           ai_provider: state.llmProvider,
           storage_provider: state.storageProvider,
+          run_id: generationRun.runId,
         });
         if (!isCurrentGeneration()) return null;
         const completed = started.status === "done" && started.result
@@ -2831,6 +2837,7 @@ export function useAppController() {
       aiGenerationRun.current = generationRun;
       const isCurrentGeneration = () => aiGenerationRun.current === generationRun && !generationRun.cancelled;
       const isChatRequest = decision.kind === "chat";
+      const scanRequest = isChatRequest ? userRequest : buildScanFollowupRequest(baseMessages, userRequest);
       const userMessage: AiChatMessage = {
         id: createId("msg"),
         role: "user",
@@ -2902,7 +2909,7 @@ export function useAppController() {
       try {
         const runId = `cs_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
         const scanPromise = client.startCustomScan({
-          user_request: userRequest,
+          user_request: scanRequest,
           mailbox: selectedOrPrimary(state.selectedMailboxes, state.mailbox),
           primary_count: CUSTOM_SCAN_MESSAGE_LIMIT,
           max_messages: CUSTOM_SCAN_MESSAGE_LIMIT,
@@ -2949,7 +2956,6 @@ export function useAppController() {
         ];
         upsertAiConversationHistory(conversationId, finalMessages, { kind: "scan", query: userRequest, result });
         setState((s) => ({ ...s, scanStatus: "", customRunProgress: null }));
-        showToast("Custom scan complete.");
       } catch (error) {
         if (!isCurrentGeneration() || isAbortError(error)) return;
         const message = sanitizeToolError(error, userRequest);
@@ -3027,7 +3033,6 @@ export function useAppController() {
             customRunProgress: null,
           };
         });
-        showToast("Custom scan complete.");
       } catch (error) {
         const message = sanitizeToolError(error, userRequest);
         setState((s) => ({ ...s, scanError: message, customRunProgress: s.customRunProgress ? { ...s.customRunProgress, status: "failed", stageKey: "failed" } : s.customRunProgress }));

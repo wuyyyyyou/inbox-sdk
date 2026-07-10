@@ -362,6 +362,52 @@ body.is-resizing-ai-sidebar {
   margin: 0 0 10px;
 }
 
+.ai-message-rich-text > :last-child {
+  margin-bottom: 0;
+}
+
+.ai-message-rich-text h3,
+.ai-message-rich-text h4,
+.ai-message-rich-text h5 {
+  margin: 0 0 8px;
+  color: #22283b;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+.ai-message-rich-text ul,
+.ai-message-rich-text ol {
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+
+.ai-message-rich-text li + li {
+  margin-top: 2px;
+}
+
+.ai-message-rich-text a,
+.ai-thread-reference {
+  color: #2f5df5;
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.ai-message-rich-text a:hover,
+.ai-message-rich-text a:focus-visible,
+.ai-thread-reference:hover,
+.ai-thread-reference:focus-visible {
+  color: #2448c7;
+}
+
+.ai-thread-reference {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
 .ai-message.is-thinking-inline p {
   margin: 0;
 }

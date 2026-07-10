@@ -78,7 +78,7 @@ def _discover_mailboxes() -> list[dict[str, Any]]:
             "last_auth_checked_at": beijing_now(),
         })
 
-    # 2. 多 token 邮箱 — auth_source="platform_multi"，去重跳过 platform 已覆盖的
+    # 2. 平台的全量多账号快照 — auth_source="platform_multi"，去重跳过兼容单 token 已覆盖的邮箱
     multi_token_map = get_multi_token_map()
     for multi_email in get_multi_token_emails():
         if multi_email not in seen:

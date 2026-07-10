@@ -47,6 +47,16 @@ function getRequiredExecutaToolId(): string {
 
 const TOOL_ID = getRequiredExecutaToolId();
 const INVOKE_TIMEOUT_MS = 180000;
+const SAFE_RETRY_DELAYS_MS = [500, 1000];
+
+export function isRetryableToolInvocationError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /unexpected token\s+['"]?<|<!doctype html|text\/html|failed to fetch|network(?:error| request)?|fetch failed|econnreset|enotfound|etimedout|timeout|\b(?:429|5\d\d)\b/i.test(message);
+}
+
+function waitForRetry(delayMs: number) {
+  return new Promise<void>((resolve) => globalThis.setTimeout(resolve, delayMs));
+}
 
 export function unwrapToolResult(result: unknown): unknown {
   const envelope = result && typeof result === "object" && "result" in result && "jsonrpc" in result
@@ -70,7 +80,7 @@ export function unwrapToolResult(result: unknown): unknown {
 export class MailAgentClient {
   constructor(private readonly getRuntime: () => Promise<RuntimeState>) {}
 
-  async invoke<T = unknown>(method: string, args: Record<string, unknown> = {}, options: { timeoutMs?: number } = {}): Promise<T> {
+  async invoke<T = unknown>(method: string, args: Record<string, unknown> = {}, options: { timeoutMs?: number; retry?: "safe" } = {}): Promise<T> {
     const runtime = await this.getRuntime();
     if (!runtime.connected || !runtime.client) {
       throw new Error(runtime.error || "Anna runtime is not connected.");
@@ -81,19 +91,26 @@ export class MailAgentClient {
       method,
       args,
     };
-    try {
-      const result = runtime.client.tools && typeof runtime.client.tools.invoke === "function"
-        ? await runtime.client.tools.invoke(invokeArgs, { timeoutMs })
-        : await runtime.client.call?.("tools", "invoke", invokeArgs, { timeout: timeoutMs, timeoutMs });
-      return unwrapToolResult(result) as T;
-    } catch (error) {
-      const err = error as { details?: Record<string, unknown>; data?: Record<string, unknown>; code?: string | number; message?: string };
-      const details = err.details || err.data || {};
-      const data = details.data as Record<string, unknown> | undefined;
-      const traceback = String(details.traceback || data?.traceback || "");
-      const code = err.code !== undefined ? `[${err.code}] ` : "";
-      const message = err.message || String(error);
-      throw new Error(`[tool:${method}] ${code}${message}${traceback ? `\n\n${traceback}` : ""}`);
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const result = runtime.client.tools && typeof runtime.client.tools.invoke === "function"
+          ? await runtime.client.tools.invoke(invokeArgs, { timeoutMs })
+          : await runtime.client.call?.("tools", "invoke", invokeArgs, { timeout: timeoutMs, timeoutMs });
+        return unwrapToolResult(result) as T;
+      } catch (error) {
+        const err = error as { details?: Record<string, unknown>; data?: Record<string, unknown>; code?: string | number; message?: string };
+        const details = err.details || err.data || {};
+        const data = details.data as Record<string, unknown> | undefined;
+        const traceback = String(details.traceback || data?.traceback || "");
+        const code = err.code !== undefined ? `[${err.code}] ` : "";
+        const message = err.message || String(error);
+        const wrapped = new Error(`[tool:${method}] ${code}${message}${traceback ? `\n\n${traceback}` : ""}`);
+        if (options.retry === "safe" && attempt < SAFE_RETRY_DELAYS_MS.length && isRetryableToolInvocationError(wrapped)) {
+          await waitForRetry(SAFE_RETRY_DELAYS_MS[attempt]);
+          continue;
+        }
+        throw wrapped;
+      }
     }
   }
 
@@ -159,7 +176,7 @@ export class MailAgentClient {
   }
 
   getRun(runId: string) {
-    return this.invoke<RunStatus>("get_mail_agent_run", { run_id: runId });
+    return this.invoke<RunStatus>("get_mail_agent_run", { run_id: runId }, { retry: "safe" });
   }
 
   getCardDetail(mailbox: string, cardId: string, storageProvider: string, includeBody = false) {
@@ -231,7 +248,7 @@ export class MailAgentClient {
   }
 
   startInboxMailPrompt(args: Record<string, unknown>) {
-    return this.invoke<RunStatus>("start_inbox_mail_prompt", args);
+    return this.invoke<RunStatus>("start_inbox_mail_prompt", args, { retry: "safe" });
   }
 
   getInboxThreadDraft(mailbox: string, threadId: string) {
@@ -363,7 +380,7 @@ export class MailAgentClient {
   }
 
   startCustomScan(args: Record<string, unknown>) {
-    return this.invoke<RunStatus>("start_custom_scan", args, { timeoutMs: 600_000 });
+    return this.invoke<RunStatus>("start_custom_scan", args, { timeoutMs: 600_000, retry: "safe" });
   }
 
   reRunCustomScan(args: Record<string, unknown>) {

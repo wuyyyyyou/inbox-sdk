@@ -135,6 +135,9 @@ def main() -> None:
     assert [item["label"] for item in quick_replies] == ["Reply with timing", "Summarize"]
     assert quick_replies[0]["id"] == "reply_with_timing"
 
+    complete_overview = "Mitce has suspended your Basic service because an overdue payment remains outstanding."
+    assert tools._one_line_overview(complete_overview) == complete_overview
+
     thread_with_draft = [
         _message(1),
         _message(2),

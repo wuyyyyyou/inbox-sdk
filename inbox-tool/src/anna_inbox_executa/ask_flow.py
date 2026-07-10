@@ -111,6 +111,21 @@ def start_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, An
     run_id = str(arguments.get("run_id") or "").strip()
     if not run_id or len(run_id) < 8:
         run_id = f"bg_{uuid.uuid4().hex[:12]}"
+    existing = MAIL_AGENT_RUNS.get(run_id)
+    if existing:
+        # 同一个客户端 run_id 的重试必须复用已有后台任务，避免响应丢失时重复扫描邮箱。
+        return {
+            "success": existing.get("status") == "done",
+            "run_id": run_id,
+            "status": existing.get("status", "queued"),
+            "stage": existing.get("stage", ""),
+            "progress": existing.get("progress", {}),
+            "partial": existing.get("partial", {}),
+            "started_at": existing.get("started_at"),
+            "updated_at": existing.get("updated_at"),
+            "result": _compact_run_result(existing.get("result")),
+            "error": existing.get("error", ""),
+        }
     MAIL_AGENT_RUNS[run_id] = {
         "run_id": run_id,
         "status": "queued",

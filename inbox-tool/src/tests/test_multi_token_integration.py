@@ -129,6 +129,7 @@ class TestMultiTokenIntegration:
         self.test_single_token_backward_compat()
         self.test_multi_token_only()
         self.test_mixed_platform_and_multi()
+        self.test_full_snapshot_is_authoritative()
         self.test_dedup_platform_in_multi()
         self.test_malformed_json_graceful_degrade()
         self.test_removed_token_is_pruned()
@@ -238,6 +239,34 @@ class TestMultiTokenIntegration:
             # Multi-token should be used for extra@gmail.com
             tok2 = adapter.get_access_token("extra@gmail.com")
             check("extra email uses multi token", tok2, "tok_extra")
+
+        clear_env()
+        clear_adapter_state()
+
+    # ── 3a. Full snapshot takes precedence over legacy singleton ─
+
+    def test_full_snapshot_is_authoritative(self):
+        section("3a. Full multi-token snapshot is authoritative")
+        clear_env()
+        clear_adapter_state()
+
+        os.environ["GMAIL_ACCESS_TOKEN"] = "legacy_default_token"
+        from mail_agent.mail_providers.gmail import adapter
+        from anna_inbox_executa.gmail_tools import _check_gmail_auth
+
+        adapter.set_multi_tokens([
+            {"email": "primary@gmail.com", "access_token": "snapshot_primary_token"},
+            {"email": "extra@gmail.com", "access_token": "snapshot_extra_token"},
+        ])
+
+        with patch.object(adapter, "get_authorized_email", return_value="primary@gmail.com"):
+            check("primary uses snapshot token", adapter.get_access_token("primary@gmail.com"), "snapshot_primary_token")
+            check("extra uses snapshot token", adapter.get_access_token("extra@gmail.com"), "snapshot_extra_token")
+            primary_auth = _check_gmail_auth("primary@gmail.com")
+            extra_auth = _check_gmail_auth("extra@gmail.com")
+            check("primary snapshot auth", primary_auth["authorized"], True)
+            check("extra snapshot auth", extra_auth["authorized"], True)
+            check("extra snapshot source", extra_auth["source"], "platform_multi")
 
         clear_env()
         clear_adapter_state()

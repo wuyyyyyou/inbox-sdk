@@ -20,10 +20,20 @@ const SCAN_PATTERN = /\b(email|emails|mail|inbox|find|search|look for|organize|s
 const SEARCH_CONSTRAINT_PATTERN = /\bfrom\s+\S+|\babout\s+[^?]+|\b(last|this)\s+(week|month|year)|上周|本周|上个月|关于\S+/u;
 const SCAN_INTENT_PATTERN = /\b(plan my day|what needs my reply)\b|安排(一下)?今天/u;
 const VAGUE_COMMAND_PATTERN = /^(do it|help me|handle it|go ahead|那这个呢|帮我弄一下|帮我处理|就这样)[.!！。?？\s]*$/iu;
+const SCAN_FOLLOWUP_PATTERN = /\b(continue|only|just|within|past|last|this)\b|继续|最近|近[一二三四五六七八九十\d]+天|只看|仅看|限定|范围|以内|之内|上周|本周|上个月|这个月|发件人|来自/u;
 
 function wordCount(input: string) {
   const latin = input.match(/[\p{L}\p{N}]+/gu)?.length || 0;
   return latin;
+}
+
+function latestUserMessage(messages: AiChatMessage[]) {
+  return [...messages].reverse().find((message) => message.role === "user");
+}
+
+function isScanFollowup(input: string, messages: AiChatMessage[]) {
+  const previousUser = latestUserMessage(messages);
+  return previousUser?.kind === "scan" && SCAN_FOLLOWUP_PATTERN.test(input.trim().toLowerCase());
 }
 
 export function hasUsableMailContext(context: AiRouteContext) {
@@ -59,6 +69,10 @@ export function decideAiRoute(input: string, context: AiRouteContext): AiRouteDe
     return { kind: "scan", reason: "explicit_inbox_scan_signal", confidence: "high" };
   }
 
+  if (isScanFollowup(text, context.messages)) {
+    return { kind: "scan", reason: "scan_followup_constraint", confidence: "high" };
+  }
+
   if (!hasMailContext && (pronoun || rewrite || VAGUE_COMMAND_PATTERN.test(normalized))) {
     return { kind: "clarify", reason: "context_required_but_missing", confidence: "low" };
   }
@@ -72,6 +86,14 @@ export function decideAiRoute(input: string, context: AiRouteContext): AiRouteDe
   }
 
   return { kind: "chat", reason: "no_explicit_inbox_scan_signal", confidence: "medium" };
+}
+
+export function buildScanFollowupRequest(messages: AiChatMessage[], latestInput: string) {
+  const latest = latestInput.trim();
+  const previousUser = latestUserMessage(messages);
+  if (!latest || previousUser?.kind !== "scan" || !isScanFollowup(latest, messages)) return latest;
+  if (/^(continue|继续)[.!！。?？\s]*$/iu.test(latest)) return previousUser.content;
+  return `Original inbox request:\n${previousUser.content}\n\nAdditional constraint:\n${latest}`;
 }
 
 export function resolveMailContext(

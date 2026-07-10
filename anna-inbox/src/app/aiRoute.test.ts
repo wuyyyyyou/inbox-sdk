@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AiChatMessage, AiMailContextRef } from "../types/mail";
-import { buildRevisionPrompt, decideAiRoute, resolveMailContext } from "./aiRoute";
+import { buildRevisionPrompt, buildScanFollowupRequest, decideAiRoute, resolveMailContext } from "./aiRoute";
 
 const mailContext: AiMailContextRef = {
   kind: "gmail_thread",
@@ -47,6 +47,29 @@ describe("decideAiRoute", () => {
   });
   it("keeps an explicit search request on scan even when it contains a pronoun", () => {
     expect(decideAiRoute("Find this email", { messages: [draftMessage] }).kind).toBe("scan");
+  });
+  it("keeps a time constraint in the preceding inbox scan", () => {
+    const messages: AiChatMessage[] = [{
+      id: "scan-1",
+      role: "user",
+      content: "找出最近需要回复的邮件",
+      timestamp: "2026-07-07T00:00:00Z",
+      kind: "scan",
+    }];
+    expect(decideAiRoute("最近五天内", { messages }).kind).toBe("scan");
+    expect(buildScanFollowupRequest(messages, "最近五天内")).toContain("找出最近需要回复的邮件");
+    expect(buildScanFollowupRequest(messages, "最近五天内")).toContain("最近五天内");
+  });
+  it("reuses the preceding request when the user continues a scan", () => {
+    const messages: AiChatMessage[] = [{
+      id: "scan-1",
+      role: "user",
+      content: "Find unanswered follow-ups",
+      timestamp: "2026-07-07T00:00:00Z",
+      kind: "scan",
+    }];
+    expect(decideAiRoute("继续", { messages }).kind).toBe("scan");
+    expect(buildScanFollowupRequest(messages, "继续")).toBe("Find unanswered follow-ups");
   });
 });
 

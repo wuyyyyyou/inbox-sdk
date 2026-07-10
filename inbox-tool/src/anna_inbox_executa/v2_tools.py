@@ -560,6 +560,7 @@ INBOX_THREAD_RESPONSE_MAX_BYTES = 256 * 1024
 INBOX_PAGE_BODY_LIMIT_STEPS = (200000, 120000, 80000, 48000, 24000, 12000, 6000, 3000, 1500, 750, 320)
 INBOX_PROMPT_MESSAGE_LIMIT = 8
 INBOX_PROMPT_BODY_LIMIT = 1200
+THREAD_ASSIST_CACHE_VERSION = 2
 
 THREAD_ASSIST_SYSTEM = """You are Anna's inbox thread assistant.
 
@@ -573,7 +574,7 @@ Return JSON only:
 
 Rules:
 - Use the full thread context, not just the latest snippet.
-- Keep overview to one line, ideally 8-12 words.
+- Write one complete, self-contained factual sentence of up to 24 words. Never end with a dangling preposition, unfinished clause, or ellipsis.
 - Generate 2-3 quick_replies tailored to this exact thread.
 - quick_replies labels must be short button text, 2-5 words.
 - quick_replies intents must be concrete assistant instructions grounded in the thread.
@@ -605,6 +606,8 @@ Rules:
 - If enough information is available, return a concise plain-text draft_reply.body.
 - assistant_text should briefly explain your understanding of the thread and the user's intent.
 - assistant_followup_text should briefly summarize the draft strategy and invite a useful adjustment. Omit it when no reliable summary is possible.
+- In assistant_text and assistant_followup_text, use only Markdown headings, bold text, ordered or unordered lists, and HTTP/HTTPS links in the form [label](https://example.com). Do not use HTML, tables, images, code blocks, or block quotes. If the user requests an unsupported format, say so and offer an equivalent using the supported formats.
+- When referring to this Gmail thread, replace <Thread ID> with the Thread ID from the prompt and use the exact token [THREAD_REF_<Thread ID>] so the sidebar can open it.
 - Do not repeat the draft body in either assistant text field.
 - Do not include email headers in the draft body.
 - Keep the sign-off and sender name on consecutive lines with no blank line between them.
@@ -624,6 +627,8 @@ Rules:
 - Do not write or offer a draft reply.
 - Do not mention drafting, draft buttons, or reply artifacts.
 - Include concrete participants, asks, decisions, deadlines, and current status when available.
+- Use only Markdown headings, bold text, ordered or unordered lists, and HTTP/HTTPS links in the form [label](https://example.com). Do not use HTML, tables, images, code blocks, or block quotes. If the user requests an unsupported format, say so and offer an equivalent using the supported formats.
+- When referring to this Gmail thread, replace <Thread ID> with the Thread ID from the prompt and use the exact token [THREAD_REF_<Thread ID>] so the sidebar can open it.
 - Do not invent dates, commitments, prices, or factual claims.
 - Never include HTML.
 """
@@ -983,7 +988,7 @@ def _thread_prompt_excerpt(messages: list[dict[str, Any]], *, max_messages: int 
     return "\n\n---\n\n".join(parts)
 
 
-def _one_line_overview(value: Any, *, max_chars: int = 72) -> str:
+def _one_line_overview(value: Any, *, max_chars: int = 220) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if len(text) <= max_chars:
         return text
@@ -1004,7 +1009,7 @@ def _fallback_thread_overview(messages: list[dict[str, Any]], anchor_message_id:
     candidate = snippet or subject
     if subject and candidate and subject.lower() not in candidate.lower():
         candidate = f"{subject}: {candidate}"
-    return _one_line_overview(candidate, max_chars=72)
+    return _one_line_overview(candidate)
 
 
 async def _load_contact_context_for_thread(
@@ -1141,6 +1146,7 @@ async def _generate_thread_assist_result(
     quick_replies = [] if overview_result.get("fallback_used") else _normalize_quick_replies(payload.get("quick_replies"))
 
     return {
+        "format_version": THREAD_ASSIST_CACHE_VERSION,
         "thread_id": thread_id,
         "latest_message_id": latest_message_id,
         "overview": overview,
@@ -1311,6 +1317,7 @@ async def _handle_inbox_thread_assist_background(run_id: str, arguments: dict[st
         if (
             cached.get("exists")
             and cached_value
+            and cached_value.get("format_version") == THREAD_ASSIST_CACHE_VERSION
             and isinstance(cached_quick_replies, list)
             and len(cached_quick_replies) > 0
         ):
@@ -1762,11 +1769,16 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             from mail_agent.storage.ops import get_inbox_thread_assist
 
             cached = await get_inbox_thread_assist(mailbox, thread_id, latest_message_id)
-            if cached.get("exists") and isinstance(cached.get("value"), dict) and cached.get("value"):
+            cached_value = cached.get("value") if isinstance(cached.get("value"), dict) else {}
+            if (
+                cached.get("exists")
+                and cached_value
+                and cached_value.get("format_version") == THREAD_ASSIST_CACHE_VERSION
+            ):
                 return {
                     "success": True,
                     "status": "done",
-                    "result": {**cached.get("value"), "cached": True},
+                    "result": {**cached_value, "cached": True},
                 }
         except Exception as exc:
             log(f"inbox thread assist cache lookup skipped: {type(exc).__name__}: {exc}")
@@ -1783,7 +1795,17 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         visible_prompt = str(arguments.get("visible_prompt", "")).strip()
         if not mailbox or not thread_id or not anchor_message_id or not latest_message_id or not visible_prompt:
             return {"error": "mailbox, thread_id, anchor_message_id, latest_message_id, and visible_prompt are required"}
-        run_id = f"bg_{uuid.uuid4().hex[:12]}"
+        run_id = str(arguments.get("run_id") or "").strip() or f"bg_{uuid.uuid4().hex[:12]}"
+        existing = MAIL_AGENT_RUNS.get(run_id)
+        if existing:
+            # 前端会用同一 run_id 重试瞬时网络故障；复用任务而不是启动第二次生成。
+            return {
+                "success": existing.get("status") == "done",
+                "run_id": run_id,
+                "status": existing.get("status", "queued"),
+                "result": _compact_run_result(existing.get("result")),
+                "error": existing.get("error", ""),
+            }
         MAIL_AGENT_RUNS[run_id] = {"run_id": run_id, "status": "queued", "stage": "inbox_mail_prompt", "progress": {}, "warnings": [], "started_at": beijing_now(), "updated_at": beijing_now(), "result": None, "error": "", "partial": {}}
         _save_run_checkpoint(run_id)
         asyncio.ensure_future(_handle_inbox_mail_prompt_background(run_id, arguments, invoke_id))

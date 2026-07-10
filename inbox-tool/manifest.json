@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.0.8",
+  "version": "2.0.9",
   "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Brief workflows, Ask, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
@@ -43,8 +43,8 @@
     },
     {
       "name": "GMAIL_MULTI_TOKENS",
-      "display_name": "Gmail Multi-Mailbox Tokens",
-      "description": "JSON array of {email, access_token, refresh_token, client_id, client_secret, expires_at} for additional mailboxes. Leave empty for single-mailbox mode.",
+      "display_name": "Gmail Mailbox Token Snapshot",
+      "description": "JSON array containing every authorized Gmail mailbox, including the default one: {email, access_token, refresh_token, client_id, client_secret, expires_at}. When present, this is the authoritative mailbox source.",
       "required": false,
       "sensitive": true
     }
@@ -1083,6 +1083,12 @@
           "type": "string",
           "description": "Prompt visible in the left Anna sidebar.",
           "required": true
+        },
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "Client-generated ID used to safely retry the same AI task.",
+          "required": false
         },
         {
           "name": "expected_artifact",

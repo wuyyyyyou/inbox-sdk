@@ -777,16 +777,9 @@ def _refresh_access_token(record: dict[str, Any]) -> None:
 def get_access_token(mailbox: str) -> str:
     normalized = str(mailbox or "").strip().lower()
 
-    # Platform-injected credential — auto-refreshed by platform, highest priority.
-    platform_token = os.environ.get("GMAIL_ACCESS_TOKEN") or os.environ.get("GOOGLE_ACCESS_TOKEN")
-    if platform_token and platform_token.strip():
-        global _discovered_email
-        if not _discovered_email or normalized != _discovered_email:
-            _discovered_email = get_authorized_email().lower()
-        if normalized == _discovered_email or not _discovered_email:
-            return str(platform_token).strip()
-
-    # Multi-token path — lookup by email, with one refresh in flight per mailbox.
+    # The multi-token credential is the full mailbox snapshot when present.  Check
+    # it before the legacy platform singleton so every mailbox, including Default,
+    # is resolved from the same account set.
     with _multi_token_lock:
         has_multi_token = normalized in _multi_token_map
     if has_multi_token:
@@ -834,6 +827,15 @@ def get_access_token(mailbox: str) -> str:
             if not token:
                 raise ValueError(f"Gmail access token is missing for multi-token mailbox {mailbox}")
             return str(token)
+
+    # Legacy single-account fallback. Platform refreshes this credential for us.
+    platform_token = os.environ.get("GMAIL_ACCESS_TOKEN") or os.environ.get("GOOGLE_ACCESS_TOKEN")
+    if platform_token and platform_token.strip():
+        global _discovered_email
+        if not _discovered_email or normalized != _discovered_email:
+            _discovered_email = get_authorized_email().lower()
+        if normalized == _discovered_email or not _discovered_email:
+            return str(platform_token).strip()
 
     # Local dev — read from JSON token file with refresh support.
     record = _load_token_record(mailbox)

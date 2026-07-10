@@ -2,7 +2,7 @@
   "slug": "inbox-executa",
   "tool_id": "tool-riazm4777-inbox-executa-dnsb9fqu",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.0.8",
+  "version": "2.0.9",
   "type": "python",
   "enabled": true,
   "description": "Anna Inbox Gmail backend for sync, thread actions, drafts, attachments, Brief workflows, Ask, and Executa Sampling LLM.",
@@ -43,8 +43,8 @@
     },
     {
       "name": "GMAIL_MULTI_TOKENS",
-      "display_name": "Gmail Multi-Mailbox Tokens",
-      "description": "JSON array of {email, access_token, refresh_token, client_id, client_secret, expires_at} for additional mailboxes.",
+      "display_name": "Gmail Mailbox Token Snapshot",
+      "description": "JSON array containing every authorized Gmail mailbox, including the default one: {email, access_token, refresh_token, client_id, client_secret, expires_at}. When present, this is the authoritative mailbox source.",
       "required": false,
       "sensitive": true
     }
