@@ -522,11 +522,71 @@ body.is-resizing-ai-sidebar {
   font-weight: 650;
 }
 
+.ai-message-footer {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 8px;
+}
+
 .ai-message time {
   display: block;
-  margin-top: 8px;
+  margin: 0;
   color: #949aaa;
   font-size: 12px;
+}
+
+.ai-retry-button {
+  position: relative;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  color: #8d3443;
+  background: transparent;
+}
+
+.ai-retry-button:hover,
+.ai-retry-button:focus-visible {
+  color: #6f2230;
+  background: rgba(141, 52, 67, 0.1);
+}
+
+.ai-retry-button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.ai-retry-button::after,
+.ai-composer.is-offline::after {
+  position: absolute;
+  z-index: 20;
+  padding: 6px 8px;
+  border-radius: 8px;
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.2;
+  white-space: nowrap;
+  background: rgba(24, 24, 28, 0.96);
+  content: attr(data-tooltip);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.ai-retry-button::after {
+  bottom: calc(100% + 7px);
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.ai-retry-button:hover::after,
+.ai-retry-button:focus-visible::after,
+.ai-composer.is-offline:hover::after {
+  opacity: 1;
 }
 
 .ai-composer-wrap {
@@ -584,6 +644,16 @@ body.is-resizing-ai-sidebar {
 .ai-composer.is-running {
   background: rgba(250, 251, 255, 0.82);
 }
+.ai-composer.is-offline {
+  position: relative;
+  border-color: rgba(141, 52, 67, 0.18);
+  background: rgba(244, 245, 249, 0.92);
+}
+.ai-composer.is-offline::after {
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+}
 .ai-composer textarea {
   width: 100%;
   min-height: 62px;
@@ -598,6 +668,10 @@ body.is-resizing-ai-sidebar {
 }
 .ai-composer textarea::placeholder {
   color: #9095a7;
+}
+.ai-composer textarea:disabled {
+  color: #9095a7;
+  cursor: not-allowed;
 }
 .ai-composer-footer {
   display: flex;
@@ -8569,6 +8643,11 @@ textarea::placeholder {
   font-size: 14px;
   line-height: 1.5;
   color: var(--text-main);
+}
+.ai-starters button:disabled {
+  color: #a1a6b4;
+  border-color: #d9dce5;
+  cursor: not-allowed;
 }
 
 .refresh-choice-dialog h3 {

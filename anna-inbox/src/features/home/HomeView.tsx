@@ -1344,7 +1344,20 @@ function AiAssistantMessage({
             </button>
           </div>
         ) : null}
-        <time>{aiTimeLabel(message.timestamp)}</time>
+        <div className="ai-message-footer">
+          <time>{aiTimeLabel(message.timestamp)}</time>
+          {message.kind === "error" ? (
+            <button
+              type="button"
+              className="ai-retry-button"
+              aria-label="Retry"
+              data-tooltip="Retry"
+              onClick={() => actions.retryAiMessage(message.id)}
+            >
+              <RefreshIcon />
+            </button>
+          ) : null}
+        </div>
       </div>
     );
   }
@@ -1469,6 +1482,7 @@ function AiSidebar({
     Boolean(
       state.customRunProgress && state.customRunProgress.status !== "failed",
     );
+  const llmOffline = !state.runtime.connected;
   const starters = [
     "What needs my reply?",
     "Find urgent emails",
@@ -1524,6 +1538,10 @@ function AiSidebar({
   }, [conversation.length, running, scrollConversationToBottom]);
 
   const submit = () => {
+    if (llmOffline) {
+      actions.showToast("LLM is offline. Please try again when it reconnects.");
+      return;
+    }
     if (!state.customScanInput.trim() || running) return;
     setHistoryOpen(false);
     setShowNewMessagePrompt(false);
@@ -1667,11 +1685,15 @@ function AiSidebar({
             有新消息 <span aria-hidden="true">↓</span>
           </button>
         ) : null}
-        <div className={`ai-composer ${running ? "is-running" : ""}`}>
+        <div
+          className={`ai-composer ${running ? "is-running" : ""} ${llmOffline ? "is-offline" : ""}`}
+          data-tooltip={llmOffline ? "LLM is offline. Please try again when it reconnects." : undefined}
+        >
           <textarea
             value={state.customScanInput}
             placeholder="Find, organize, ask anything…"
             rows={3}
+            disabled={llmOffline}
             onChange={(event) =>
               actions.setInput("customScanInput", event.target.value)
             }
@@ -1696,7 +1718,7 @@ function AiSidebar({
                 </button>
               ) : null}
               <button
-                disabled={running || !state.customScanInput.trim()}
+                disabled={llmOffline || running || !state.customScanInput.trim()}
                 onClick={submit}
                 aria-label="Ask Anna"
               >
@@ -1710,6 +1732,7 @@ function AiSidebar({
             {starters.map((starter) => (
               <button
                 key={starter}
+                disabled={llmOffline}
                 onClick={() => actions.setInput("customScanInput", starter)}
               >
                 {starter}

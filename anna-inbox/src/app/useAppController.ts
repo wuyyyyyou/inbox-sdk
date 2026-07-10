@@ -279,12 +279,16 @@ function chatPendingText(input: string) {
     : "thinking";
 }
 
-function sanitizeToolError(error: unknown, input: string) {
+function isTransientConnectionError(error: unknown) {
   const raw = error instanceof Error ? error.message : String(error);
+  return /unexpected token\s+['"]?<|<!doctype html|text\/html|failed to fetch|network(?:error| request)?|fetch failed|econnreset|enotfound|etimedout|timeout|\b5\d\d\b|\[tool_failed\]|executa process exited/i.test(raw);
+}
+
+function sanitizeToolError(error: unknown, input: string) {
   const unavailable = prefersChinese(input)
     ? "Anna 暂时无法完成这项邮箱任务，请稍后重试。"
     : "Anna couldn't complete that inbox task right now. Please try again shortly.";
-  if (/unexpected token\s+['"]?<|<!doctype html|text\/html|failed to fetch|network(?:error| request)?|fetch failed|econnreset|enotfound|etimedout|timeout|\b5\d\d\b|\[tool_failed\]|executa process exited/i.test(raw)) {
+  if (isTransientConnectionError(error)) {
     return prefersChinese(input)
       ? "连接 Anna 服务时出现问题。我已经自动重试；请稍后再试。"
       : "There was a problem connecting to Anna. I retried automatically; please try again shortly.";
@@ -507,6 +511,7 @@ export interface AppActions {
   closeSnoozeReasons(): void;
   openSourcesWithConfig(): void;
   sendAiChatMessage(options?: SendAiMessageOptions): Promise<void>;
+  retryAiMessage(messageId: string): void;
   dismissAiClarification(messageId: string): void;
   stopAiGeneration(): void;
   startNewAiConversation(): void;
@@ -1937,6 +1942,10 @@ export function useAppController() {
     },
     async submitMailContextPrompt(request) {
       const context = request.context;
+      if (!state.runtime.connected) {
+        showToast("LLM is offline. Please try again when it reconnects.");
+        return null;
+      }
       if (!context?.mailbox || !context.thread_id || !request.visiblePrompt.trim() || aiGenerationRun.current) return null;
       const generationRun = {
         runId: createId("generation"),
@@ -1946,7 +1955,7 @@ export function useAppController() {
       aiGenerationRun.current = generationRun;
       const isCurrentGeneration = () => aiGenerationRun.current === generationRun && !generationRun.cancelled;
       const conversationId = request.forceNewConversation ? createId("chat") : state.aiChatConversationId || createId("chat");
-      const userMessage: AiChatMessage = {
+      const userMessage: AiChatMessage = request.retryUserMessage ?? {
         id: createId("msg"),
         role: "user",
         content: request.visiblePrompt,
@@ -2733,9 +2742,14 @@ export function useAppController() {
     },
     async sendAiChatMessage(options = {}) {
       const userRequest = String(options.prompt ?? state.customScanInput).trim();
+      if (!state.runtime.connected) {
+        showToast("LLM is offline. Please try again when it reconnects.");
+        return;
+      }
       if (!userRequest || state.isCustomScanning || state.aiChatLoading || aiGenerationRun.current) return;
       const conversationId = state.aiChatConversationId || createId("chat");
-      const unresolvedBase = state.aiChatConversationId === conversationId ? state.aiChatMessages : [];
+      const unresolvedBase = options.baseMessages
+        ?? (state.aiChatConversationId === conversationId ? state.aiChatMessages : []);
       const baseMessages = options.clarificationMessageId
         ? unresolvedBase.map((message) =>
             message.id === options.clarificationMessageId && message.clarification
@@ -2798,7 +2812,9 @@ export function useAppController() {
       }
 
       if (decision.kind === "mail_context") {
-        const resolved = resolveMailContext(baseMessages, options.currentMailContext);
+        const resolved = options.retryUserMessage?.mailContext
+          ? { context: options.retryUserMessage.mailContext, draftToRevise: undefined }
+          : resolveMailContext(baseMessages, options.currentMailContext);
         if (!resolved) {
           const finalMessages: AiChatMessage[] = [
             ...baseMessages,
@@ -2833,6 +2849,7 @@ export function useAppController() {
           expectedArtifact: "draft_reply",
           draftToRevise: resolved.draftToRevise,
           baseMessages,
+          retryUserMessage: options.retryUserMessage,
         });
         return;
       }
@@ -2846,7 +2863,7 @@ export function useAppController() {
       const isCurrentGeneration = () => aiGenerationRun.current === generationRun && !generationRun.cancelled;
       const isChatRequest = decision.kind === "chat";
       const scanRequest = isChatRequest ? userRequest : buildScanFollowupRequest(baseMessages, userRequest);
-      const userMessage: AiChatMessage = {
+      const userMessage: AiChatMessage = options.retryUserMessage ?? {
         id: createId("msg"),
         role: "user",
         content: userRequest,
@@ -2987,6 +3004,37 @@ export function useAppController() {
         }
       }
     },
+    retryAiMessage(messageId) {
+      if (!state.runtime.connected) {
+        showToast("LLM is offline. Please try again when it reconnects.");
+        return;
+      }
+      if (state.isCustomScanning || state.aiChatLoading || aiGenerationRun.current) return;
+      const errorIndex = state.aiChatMessages.findIndex((message) => message.id === messageId && message.kind === "error");
+      if (errorIndex < 0) return;
+      const userIndex = state.aiChatMessages
+        .slice(0, errorIndex)
+        .map((message, index) => ({ message, index }))
+        .reverse()
+        .find(({ message }) => message.role === "user")?.index;
+      if (userIndex === undefined) {
+        showToast("This message can't be retried.");
+        return;
+      }
+      const userMessage = state.aiChatMessages[userIndex];
+      const forcedKind = userMessage.kind === "scan"
+        ? "scan"
+        : userMessage.kind === "mail_context"
+          ? "mail_context"
+          : "chat";
+      void actions.sendAiChatMessage({
+        prompt: userMessage.content,
+        currentMailContext: userMessage.mailContext,
+        forcedKind,
+        baseMessages: state.aiChatMessages.slice(0, userIndex),
+        retryUserMessage: userMessage,
+      });
+    },
     async startCustomScan() {
       const userRequest = state.customScanInput.trim();
       if (!userRequest || state.isCustomScanning) return;
@@ -3044,7 +3092,7 @@ export function useAppController() {
       } catch (error) {
         const message = sanitizeToolError(error, userRequest);
         setState((s) => ({ ...s, scanError: message, customRunProgress: s.customRunProgress ? { ...s.customRunProgress, status: "failed", stageKey: "failed" } : s.customRunProgress }));
-        showToast(message);
+        if (!isTransientConnectionError(error)) showToast(message);
       } finally {
         setState((s) => ({ ...s, isCustomScanning: false }));
       }
@@ -3102,7 +3150,7 @@ export function useAppController() {
       } catch (error) {
         const message = sanitizeToolError(error, question);
         setState((s) => ({ ...s, scanError: message }));
-        showToast(message);
+        if (!isTransientConnectionError(error)) showToast(message);
       } finally {
         setState((s) => ({ ...s, isCustomScanning: false }));
       }

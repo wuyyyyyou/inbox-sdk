@@ -15,6 +15,10 @@ const unorderedListPattern = /^[-*]\s+(.+)$/;
 const orderedListPattern = /^\d+[.)]\s+(.+)$/;
 const inlinePattern = /\[THREAD_REF_([^\]\s]+)\]|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*/g;
 
+function splitInlineUnorderedListItems(line: string): string[] {
+  return Array.from(line.matchAll(/(?:^|\s+)\*\s+(.+?)(?=\s+\*\s+|$)/g), (match) => match[1].trim());
+}
+
 function isSupportedUrl(value: string) {
   try {
     const url = new URL(value);
@@ -73,7 +77,10 @@ export function parseAiMessageMarkdown(text: string): AiMessageBlock[] {
       while (index < lines.length) {
         const item = lines[index].match(unorderedListPattern);
         if (!item) break;
-        items.push(parseAiMessageInline(item[1]));
+        const inlineItems = splitInlineUnorderedListItems(lines[index]);
+        for (const inlineItem of inlineItems.length ? inlineItems : [item[1]]) {
+          items.push(parseAiMessageInline(inlineItem));
+        }
         index += 1;
       }
       blocks.push({ type: "unordered_list", items });

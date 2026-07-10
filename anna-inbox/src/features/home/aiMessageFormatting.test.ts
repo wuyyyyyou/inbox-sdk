@@ -31,4 +31,17 @@ describe("parseAiMessageMarkdown", () => {
       },
     ]);
   });
+
+  it("splits multiple unordered items written on one line", () => {
+    expect(parseAiMessageMarkdown("* Access to Enterprise APIs requires monthly fees. * The Self-Service team cannot assist with migration. * Expect response delays.")).toEqual([
+      {
+        type: "unordered_list",
+        items: [
+          [{ type: "text", value: "Access to Enterprise APIs requires monthly fees." }],
+          [{ type: "text", value: "The Self-Service team cannot assist with migration." }],
+          [{ type: "text", value: "Expect response delays." }],
+        ],
+      },
+    ]);
+  });
 });

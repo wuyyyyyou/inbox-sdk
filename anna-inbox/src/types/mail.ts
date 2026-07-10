@@ -491,6 +491,7 @@ export interface SubmitMailPromptRequest {
   userAnswers?: Record<string, string>;
   draftToRevise?: string;
   baseMessages?: AiChatMessage[];
+  retryUserMessage?: AiChatMessage;
 }
 
 export interface DraftReplyArtifact {
@@ -748,5 +749,7 @@ export interface SendAiMessageOptions {
   forcedKind?: Exclude<AiRouteKind, "clarify">;
   prompt?: string;
   clarificationMessageId?: string;
+  baseMessages?: AiChatMessage[];
+  retryUserMessage?: AiChatMessage;
 }
 
