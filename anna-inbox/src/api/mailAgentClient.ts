@@ -6,6 +6,9 @@ import type {
   ContactMemoryDetailPayload,
   ContactMemorySummary,
   ContactAvatarPayload,
+  ComposeContact,
+  ComposeDraft,
+  ComposeDraftListPayload,
   CustomPlanSummary,
   LlmStatus,
   InboxFeedPayload,
@@ -272,6 +275,26 @@ export class MailAgentClient {
 
   resolveContactAvatars(mailbox: string, emails: string[]) {
     return this.invoke<ContactAvatarPayload>("resolve_contact_avatars", { mailbox, emails }, { timeoutMs: 120_000 });
+  }
+
+  searchComposeContacts(mailbox: string, query: string, limit = 10, storageProvider?: string) {
+    return this.invoke<{ contacts?: ComposeContact[]; permission_required?: boolean }>("search_compose_contacts", { mailbox, query, limit, storage_provider: storageProvider });
+  }
+
+  listComposeDrafts(mailbox: string, limit = 100, storageProvider?: string) {
+    return this.invoke<ComposeDraftListPayload>("list_compose_drafts", { mailbox, limit, storage_provider: storageProvider });
+  }
+
+  saveComposeDraft(mailbox: string, draft: Partial<ComposeDraft>, ifMatch?: string, storageProvider?: string) {
+    return this.invoke<{ ok?: boolean; etag?: string; draft: ComposeDraft }>("create_or_update_compose_draft", { mailbox, draft, if_match: ifMatch, storage_provider: storageProvider });
+  }
+
+  deleteComposeDraft(mailbox: string, draftId: string, storageProvider?: string) {
+    return this.invoke<{ ok?: boolean }>("delete_compose_draft", { mailbox, draft_id: draftId, storage_provider: storageProvider });
+  }
+
+  sendComposeEmails(mailbox: string, messages: ComposeDraft[], storageProvider?: string) {
+    return this.invoke<{ ok?: boolean; results?: Array<{ id: string; ok: boolean; error?: string }> }>("send_compose_emails", { mailbox, messages, storage_provider: storageProvider });
   }
 
   setMessageStarred(mailbox: string, messageId: string, starred: boolean) {

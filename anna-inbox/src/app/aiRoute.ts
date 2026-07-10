@@ -15,6 +15,7 @@ const CHAT_PATTERNS = [
 
 const REWRITE_PATTERN = /\b(change|revise|rewrite|edit|adjust|shorten|shorter|warmer|more direct|try again|too long|make it)\b|修改|改一下|改写|重写|润色|短一点|更短|更礼貌|再试一次|太长/u;
 const CONTEXT_ACTION_PATTERN = /\b(insert it|copy it|use this draft|draft (a )?reply|write (a )?(first )?draft|reply to (this|it))\b|帮我回|写回复|写一封回复|起草回复/u;
+const SEND_PLAN_PATTERN = /\b(send|email|mail)\b|发送|发邮件|寄出/u;
 const PRONOUN_PATTERN = /\b(it|this|that)\b|这个|那个|它|上面|刚才那封/u;
 const SCAN_PATTERN = /\b(email|emails|mail|inbox|find|search|look for|organize|scan|unread|needs? (a )?reply|urgent|attachment|invoice)\b|summari[sz]e\s+(my\s+)?emails?|邮件|邮箱|收件箱|找|搜索|汇总|整理|未读|待回复|紧急|附件|发票/u;
 const SEARCH_CONSTRAINT_PATTERN = /\bfrom\s+\S+|\babout\s+[^?]+|\b(last|this)\s+(week|month|year)|上周|本周|上个月|关于\S+/u;
@@ -56,7 +57,7 @@ export function decideAiRoute(input: string, context: AiRouteContext): AiRouteDe
   }
 
   const rewrite = REWRITE_PATTERN.test(normalized);
-  const contextAction = CONTEXT_ACTION_PATTERN.test(normalized);
+  const contextAction = CONTEXT_ACTION_PATTERN.test(normalized) || (Boolean(context.currentMailContext) && SEND_PLAN_PATTERN.test(normalized));
   const pronoun = PRONOUN_PATTERN.test(normalized);
   const explicitScan = SCAN_PATTERN.test(normalized) || SEARCH_CONSTRAINT_PATTERN.test(normalized) || SCAN_INTENT_PATTERN.test(normalized);
   const shortCommand = wordCount(text) <= 5 && (rewrite || pronoun || VAGUE_COMMAND_PATTERN.test(normalized));
@@ -105,13 +106,13 @@ export function resolveMailContext(
   if (lastAssistant?.mailContext && (lastAssistant.artifact || lastAssistant.mailContext)) {
     return {
       context: lastAssistant.mailContext,
-      draftToRevise: lastAssistant.artifact?.body || "",
+      draftToRevise: lastAssistant.artifact?.type === "draft_reply" ? lastAssistant.artifact.body : "",
     };
   }
   if (currentMailContext) return { context: currentMailContext, draftToRevise: "" };
   const recent = [...messages].reverse().find((message) => message.mailContext);
   return recent?.mailContext
-    ? { context: recent.mailContext, draftToRevise: recent.artifact?.body || "" }
+    ? { context: recent.mailContext, draftToRevise: recent.artifact?.type === "draft_reply" ? recent.artifact.body : "" }
     : null;
 }
 

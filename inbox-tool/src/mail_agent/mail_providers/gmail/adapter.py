@@ -2157,6 +2157,97 @@ async def get_thread_context_async(mailbox: str, thread_id: str, max_messages: i
 
 # ── Send reply via Gmail API ────────────────────────────────────────
 
+def send_compose_email(mailbox: str, recipients: list[str], subject: str, body: str) -> dict[str, Any]:
+    """Send a plain-text compose message after an explicit frontend confirmation."""
+    from email.mime.text import MIMEText
+    import base64 as b64
+
+    normalized_recipients = [str(item).strip() for item in recipients if str(item).strip()]
+    if not normalized_recipients:
+        raise ValueError("At least one recipient is required")
+    if not str(subject).strip() or not str(body).strip():
+        raise ValueError("Subject and content are required")
+
+    msg = MIMEText(str(body), "plain", "utf-8")
+    msg["To"] = ", ".join(normalized_recipients)
+    msg["Subject"] = str(subject)
+    raw_b64 = b64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+    request = urllib.request.Request(
+        f"{GMAIL_API_BASE}/users/me/messages/send",
+        data=json.dumps({"raw": raw_b64}).encode("utf-8"),
+        headers={"Authorization": f"Bearer {get_access_token(mailbox)}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"Gmail compose send failed: HTTP {exc.code}") from exc
+    return {"id": str(result.get("id") or ""), "thread_id": str(result.get("threadId") or "")}
+
+
+def search_contacts(mailbox: str, query: str, *, limit: int = 10) -> dict[str, Any]:
+    """Search both Google contact collections without persisting the directory."""
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        return {"contacts": []}
+    token = get_access_token(normalize_mailbox(mailbox))
+    page_size = max(1, min(int(limit or 10), 25))
+    params = {"query": normalized_query, "readMask": "names,emailAddresses,photos", "pageSize": page_size}
+    contacts: list[dict[str, Any]] = []
+    permission_required = False
+    try:
+        payload = _people_api_get(token, "people:searchContacts", params)
+        candidates = payload.get("results") or []
+        for item in candidates:
+            person = item.get("person") if isinstance(item, dict) else {}
+            if isinstance(person, dict):
+                contacts.append(person)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            permission_required = True
+        else:
+            raise ValueError(f"Google contacts search failed: HTTP {exc.code}") from exc
+    try:
+        payload = _people_api_get(token, "otherContacts:search", params)
+        candidates = payload.get("results") or []
+        for item in candidates:
+            person = item.get("person") if isinstance(item, dict) else {}
+            if isinstance(person, dict):
+                contacts.append(person)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            permission_required = True
+        else:
+            raise ValueError(f"Google other contacts search failed: HTTP {exc.code}") from exc
+
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for person in contacts:
+        names = person.get("names") if isinstance(person.get("names"), list) else []
+        emails = person.get("emailAddresses") if isinstance(person.get("emailAddresses"), list) else []
+        photos = person.get("photos") if isinstance(person.get("photos"), list) else []
+        name = str((names[0] if names else {}).get("displayName") or "") if isinstance(names[0] if names else {}, dict) else ""
+        photo_url = str((photos[0] if photos else {}).get("url") or "") if isinstance(photos[0] if photos else {}, dict) else ""
+        for email_item in emails:
+            email = str(email_item.get("value") or "").strip().lower() if isinstance(email_item, dict) else ""
+            if not email or email in seen:
+                continue
+            seen.add(email)
+            result.append({"email": email, "name": name, "avatar_url": photo_url})
+            if len(result) >= page_size:
+                break
+        if len(result) >= page_size:
+            break
+    return {
+        "contacts": result,
+        "permission_required": permission_required,
+        "required_scopes": [
+            "https://www.googleapis.com/auth/contacts.readonly",
+            "https://www.googleapis.com/auth/contacts.other.readonly",
+        ] if permission_required else [],
+    }
+
 def send_reply(
     mailbox: str,
     thread_id: str,

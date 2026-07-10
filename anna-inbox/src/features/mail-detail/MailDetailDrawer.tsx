@@ -259,11 +259,9 @@ function AttachmentSection({
   );
 }
 
-function firstAddress(value: string | undefined, mailbox?: string) {
+function firstAddress(value: string | undefined) {
   const candidates = splitAddresses(value).map(senderParts);
-  if (!candidates.length) return null;
-  const normalizedMailbox = mailbox?.trim().toLowerCase();
-  return candidates.find((item) => item.email.toLowerCase() !== normalizedMailbox) || candidates[0];
+  return candidates[0] || null;
 }
 
 function displayAddress(parts: { name: string; email: string } | null) {
@@ -307,6 +305,40 @@ function HeaderContactRow({
         <strong>{display.title}</strong>
         {display.subtitle ? <span>{display.subtitle}</span> : null}
       </span>
+    </div>
+  );
+}
+
+function HeaderRecipientRows({
+  label,
+  addresses,
+  avatarUrls,
+}: {
+  label: string;
+  addresses: Array<{ name: string; email: string }>;
+  avatarUrls: Record<string, string | undefined>;
+}) {
+  if (!addresses.length) return null;
+  return (
+    <div className="mail-detail-contact-row mail-detail-contact-row--recipients">
+      <span className="mail-detail-contact-label">{label}:</span>
+      <div className="mail-detail-contact-recipient-list">
+        {addresses.map((address, index) => {
+          const display = displayAddress(address);
+          const sender = address.name || address.email || "Unknown";
+          return (
+            <div className="mail-detail-contact-recipient" key={`${address.email}-${index}`}>
+              <span className="mail-detail-contact-avatar">
+                <ThreadMessageAvatar identity={address.name || address.email || sender} label={address.name || sender} avatarUrl={avatarUrls[address.email.toLowerCase()]} />
+              </span>
+              <span className="mail-detail-contact-text">
+                <strong>{display.title}</strong>
+                {display.subtitle ? <span>{display.subtitle}</span> : null}
+              </span>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -735,9 +767,12 @@ export function MailDetailDrawer({
     .map((item) => `${item.id}:${item.label}:${item.intent}`)
     .join("|");
   const fromAddress = useMemo(() => firstAddress(message?.from || undefined), [message?.from]);
-  const toAddress = useMemo(() => firstAddress(message?.to || undefined, mailbox), [mailbox, message?.to]);
+  const toAddresses = useMemo(() => splitAddresses(message?.to).map(senderParts), [message?.to]);
   const fromAvatarUrl = fromAddress ? (resolvedAvatars[fromAddress.email.toLowerCase()] || contactAvatars?.[fromAddress.email.toLowerCase()]) : undefined;
-  const toAvatarUrl = toAddress ? (resolvedAvatars[toAddress.email.toLowerCase()] || contactAvatars?.[toAddress.email.toLowerCase()]) : undefined;
+  const recipientAvatarUrls = useMemo(() => {
+    const avatars = { ...contactAvatars, ...resolvedAvatars };
+    return Object.fromEntries(toAddresses.map((address) => [address.email.toLowerCase(), avatars[address.email.toLowerCase()]]));
+  }, [contactAvatars, resolvedAvatars, toAddresses]);
   const displaySubject = page?.subject || message?.subject || "(no subject)";
   const latestSubject = page?.latest_subject || message?.latest_subject || "";
   const subjectWasModified = Boolean(
@@ -1510,10 +1545,10 @@ export function MailDetailDrawer({
             <div className="mail-detail-overview">
               {assistLoading ? <p className="mail-detail-overview-loading">Generating overview...</p> : assist?.overview ? <MailOverviewAction text={assist.overview} onClick={expandOverview} /> : assistError ? <p>AI is unavailable. <button onClick={retryOverview}>Retry</button></p> : null}
             </div>
-            {fromAddress || toAddress ? (
+            {fromAddress || toAddresses.length ? (
               <div className="mail-detail-participants">
                 <HeaderContactRow label="From" address={fromAddress} avatarUrl={fromAvatarUrl} />
-                <HeaderContactRow label="To" address={toAddress} avatarUrl={toAvatarUrl} />
+                <HeaderRecipientRows label="To" addresses={toAddresses} avatarUrls={recipientAvatarUrls} />
               </div>
             ) : null}
           </div>

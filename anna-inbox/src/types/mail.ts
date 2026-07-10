@@ -485,7 +485,7 @@ export interface AiMailContextRef {
 export interface SubmitMailPromptRequest {
   visiblePrompt: string;
   context: AiMailContextRef;
-  expectedArtifact?: "draft_reply" | "summary";
+  expectedArtifact?: "draft_reply" | "summary" | "send_plan";
   contextTitle?: string;
   forceNewConversation?: boolean;
   userAnswers?: Record<string, string>;
@@ -511,7 +511,7 @@ export interface MailPromptRunResult {
   thread_title?: string;
   assistant_text: string;
   assistant_followup_text?: string;
-  artifact?: DraftReplyArtifact | null;
+  artifact?: DraftReplyArtifact | SendPlanArtifact | null;
   reply_gaps?: ReplyGaps;
   fallback_used?: boolean;
 }
@@ -523,6 +523,37 @@ export interface InboxThreadDraftPayload {
   etag?: string;
   body: string;
   updated_at?: string;
+}
+
+export interface SendPlanArtifact {
+  type: "send_plan";
+  mailbox: string;
+  thread_id: string;
+  messages: Array<{ recipients: string[]; subject: string; body: string }>;
+  source_prompt: string;
+}
+
+export interface ComposeContact {
+  email: string;
+  name?: string;
+  avatar_url?: string;
+}
+
+export interface ComposeDraft {
+  id: string;
+  mailbox: string;
+  recipients: string[];
+  subject: string;
+  body: string;
+  created_at?: string;
+  updated_at?: string;
+  etag?: string;
+}
+
+export interface ComposeDraftListPayload {
+  mailbox: string;
+  count: number;
+  drafts: ComposeDraft[];
 }
 
 export interface ContactMemorySummary {
@@ -712,7 +743,7 @@ export interface AiChatMessage {
   kind?: "chat" | "mail_context" | "scan" | "clarify" | "status" | "error" | "stopped";
   result?: CustomRunResult | null;
   pending?: boolean;
-  artifact?: DraftReplyArtifact | null;
+  artifact?: DraftReplyArtifact | SendPlanArtifact | null;
   replyGaps?: ReplyGaps;
   mailContext?: AiMailContextRef;
   mailSummaryLink?: AskMailLink;

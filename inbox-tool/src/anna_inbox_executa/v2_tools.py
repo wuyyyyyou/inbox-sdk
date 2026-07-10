@@ -1170,7 +1170,7 @@ async def _generate_mail_prompt_result(
 ) -> dict[str, Any]:
     from mail_agent.llm_runtime.service import call_llm_json_safe
 
-    expected_artifact = "draft_reply" if expected_artifact == "draft_reply" else "summary"
+    expected_artifact = expected_artifact if expected_artifact in {"draft_reply", "send_plan"} else "summary"
     messages = _visible_thread_messages(_load_thread_messages(mailbox, thread_id))
     if not messages:
         raise ValueError(f"Thread {thread_id} not found")
@@ -1278,6 +1278,22 @@ async def _generate_mail_prompt_result(
             "mailbox": mailbox,
             "thread_id": thread_id,
             "body": draft_body,
+            "source_prompt": visible_prompt,
+        }
+    elif expected_artifact == "send_plan" and draft_body and not needs_user_input:
+        import re as _re
+        from_value = str(latest.get("from") or "")
+        match = _re.search(r"<([^>\s]+@[^>\s]+)>", from_value)
+        recipient = (match.group(1) if match else from_value).strip()
+        artifact = {
+            "type": "send_plan",
+            "mailbox": mailbox,
+            "thread_id": thread_id,
+            "messages": [{
+                "recipients": [recipient] if "@" in recipient else [],
+                "subject": str(latest.get("subject") or "").strip() if str(latest.get("subject") or "").lower().startswith("re:") else f"Re: {str(latest.get('subject') or '').strip()}",
+                "body": draft_body,
+            }],
             "source_prompt": visible_prompt,
         }
 
@@ -2187,6 +2203,65 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             return {"ok": True, "dry_run": False, "result": result}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+
+    if tool == "search_compose_contacts":
+        query = str(arguments.get("query", "")).strip()
+        if not mailbox or not query:
+            return {"error": "mailbox and query are required"}
+        from mail_agent.mail_providers.gmail.adapter import search_contacts
+        import asyncio as _asyncio
+        try:
+            return await _asyncio.to_thread(search_contacts, mailbox, query, limit=int(arguments.get("limit") or 10))
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    if tool in {"get_compose_draft", "create_or_update_compose_draft", "delete_compose_draft", "list_compose_drafts"}:
+        draft_id = str(arguments.get("draft_id", "")).strip()
+        from mail_agent.storage.ops import delete_compose_draft, get_compose_draft, list_compose_drafts, set_compose_draft
+        if tool == "get_compose_draft":
+            if not mailbox or not draft_id:
+                return {"error": "mailbox and draft_id are required"}
+            result = await get_compose_draft(mailbox, draft_id)
+            return {"mailbox": mailbox, **result}
+        if tool == "delete_compose_draft":
+            if not mailbox or not draft_id:
+                return {"error": "mailbox and draft_id are required"}
+            await delete_compose_draft(mailbox, draft_id)
+            return {"ok": True, "mailbox": mailbox, "draft_id": draft_id}
+        if tool == "list_compose_drafts":
+            if not mailbox:
+                return {"error": "mailbox is required"}
+            return await list_compose_drafts(mailbox, limit=int(arguments.get("limit") or 100))
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        raw_draft = arguments.get("draft") if isinstance(arguments.get("draft"), dict) else {}
+        result = await set_compose_draft(mailbox, raw_draft, if_match=str(arguments.get("if_match") or "") or None)
+        return {"mailbox": mailbox, **result}
+
+    if tool == "send_compose_emails":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        raw_messages = arguments.get("messages") if isinstance(arguments.get("messages"), list) else []
+        if not raw_messages:
+            return {"error": "messages is required"}
+        from mail_agent.mail_providers.gmail.adapter import send_compose_email
+        import asyncio as _asyncio
+        results: list[dict[str, Any]] = []
+        for item in raw_messages[:100]:
+            draft = item if isinstance(item, dict) else {}
+            draft_id = str(draft.get("id") or "")
+            try:
+                sent = await _asyncio.to_thread(
+                    send_compose_email,
+                    mailbox,
+                    draft.get("recipients") if isinstance(draft.get("recipients"), list) else [],
+                    str(draft.get("subject") or ""),
+                    str(draft.get("body") or ""),
+                )
+                results.append({"id": draft_id, "ok": True, "result": sent})
+            except Exception as exc:
+                results.append({"id": draft_id, "ok": False, "error": str(exc)})
+        return {"ok": all(item.get("ok") for item in results), "results": results}
 
     if tool == "mark_read_from_ask":
         if not mailbox:

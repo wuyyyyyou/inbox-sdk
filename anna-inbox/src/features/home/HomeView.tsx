@@ -15,12 +15,15 @@ import type {
   AiChatMessage,
   AiMailContextRef,
   AskMailLink,
+  ComposeDraft,
   DraftReplyArtifact,
+  SendPlanArtifact,
   CustomRunResult,
   InboxMessage,
   InboxThreadStateOperation,
 } from "../../types/mail";
 import { SnoozePicker } from "./SnoozePicker";
+import { ComposeView } from "./ComposeView";
 import { MailDetailDrawer } from "../mail-detail/MailDetailDrawer";
 import { sortInboxMessagesDesc } from "./inboxMessageOrder";
 import {
@@ -77,7 +80,11 @@ type FeedActionState = "refresh" | "older" | "more" | "category-page" | null;
 
 const AI_SIDEBAR_WIDTH_KEY = "anna-inbox:ai-sidebar-width";
 const AI_SIDEBAR_MIN_WIDTH = 300;
-const AI_SIDEBAR_MAX_WIDTH = 680;
+const AI_SIDEBAR_MAX_WIDTH = 580;
+const DESKTOP_MAIL_WORKSPACE_MIN_WIDTH = 420;
+const COMPACT_MAIL_WORKSPACE_MIN_WIDTH = 160;
+const DESKTOP_ACCOUNT_RAIL_WIDTH = 54;
+const COMPACT_ACCOUNT_RAIL_WIDTH = 48;
 const CACHED_INBOX_BANNER_SKIP_KEY = "anna-inbox:cached-inbox-banner-skip";
 const INBOX_ALL_TIME_DAYS = 0;
 const INBOX_LAST_MONTH_DAYS = 30;
@@ -166,10 +173,21 @@ function scheduleDeferredWork(task: () => void, delayMs = 180) {
 function sidebarWidthBounds() {
   if (typeof window === "undefined")
     return { min: AI_SIDEBAR_MIN_WIDTH, max: AI_SIDEBAR_MAX_WIDTH };
-  const compactMin = window.innerWidth < 520 ? 180 : AI_SIDEBAR_MIN_WIDTH;
+  const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
+  const compact = viewportWidth < 900;
+  const compactMin = viewportWidth < 520 ? 180 : AI_SIDEBAR_MIN_WIDTH;
+  const workspaceMin = compact
+    ? COMPACT_MAIL_WORKSPACE_MIN_WIDTH
+    : DESKTOP_MAIL_WORKSPACE_MIN_WIDTH;
+  const accountRailWidth = compact
+    ? COMPACT_ACCOUNT_RAIL_WIDTH
+    : DESKTOP_ACCOUNT_RAIL_WIDTH;
   const max = Math.max(
     compactMin,
-    Math.min(AI_SIDEBAR_MAX_WIDTH, window.innerWidth - 180),
+    Math.min(
+      AI_SIDEBAR_MAX_WIDTH,
+      viewportWidth - workspaceMin - accountRailWidth,
+    ),
   );
   return { min: compactMin, max };
 }
@@ -275,6 +293,12 @@ const RefreshIcon = () => (
   <Icon>
     <path d="M20 6v5h-5" />
     <path d="M19 11a7.5 7.5 0 1 0 .2 5" />
+  </Icon>
+);
+const ComposeIcon = () => (
+  <Icon>
+    <path d="M4 20h4l10.5-10.5a2.8 2.8 0 0 0-4-4L4 16v4Z" />
+    <path d="m13.5 6.5 4 4" />
   </Icon>
 );
 const HistoryIcon = () => (
@@ -540,6 +564,21 @@ function inboxRangeLabel(days: number) {
   return `Last ${days} days`;
 }
 
+function inboxLastSyncedLabel(value?: string) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const now = new Date();
+  const time = date.toLocaleTimeString("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const datePrefix = date.toDateString() === now.toDateString()
+    ? ""
+    : `${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}, `;
+  return `Last synced: ${datePrefix}${time}`;
+}
+
 export function hasMessageLabel(message: InboxMessage, label: string) {
   return (message.label_ids || []).includes(label);
 }
@@ -754,6 +793,10 @@ function InboxRow({
   onSnooze,
   onPrefetch,
   avatarUrl,
+  selectable = false,
+  selectedForBatch = false,
+  onBatchToggle,
+  onComposeDraftDelete,
 }: {
   message: InboxMessage;
   selected: boolean;
@@ -766,6 +809,10 @@ function InboxRow({
   onSnooze: (message: InboxMessage) => void;
   onPrefetch: () => void;
   avatarUrl?: string;
+  selectable?: boolean;
+  selectedForBatch?: boolean;
+  onBatchToggle?: () => void;
+  onComposeDraftDelete?: () => void;
 }) {
   const { actions } = useApp();
   const [avatarFailed, setAvatarFailed] = useState(false);
@@ -781,12 +828,14 @@ function InboxRow({
   const important = isImportantMessage(message);
   const starred = isStarredMessage(message);
   const draft = isDraftMessage(message);
+  const isComposeDraft = draft && message.id.startsWith("compose:");
   const preview =
     (draft ? message.draft_body : "") || message.snippet || message.body_preview || "No preview available";
   return (
     <article
       className={`mail-row ${mailboxView === "all" ? "is-all-mail" : ""} ${message.unread ? "is-unread" : ""} ${selected ? "is-selected" : ""}`}
     >
+      {selectable ? <button type="button" className="draft-select" aria-label={`Select ${message.subject || "draft"}`} aria-pressed={selectedForBatch} onClick={onBatchToggle}>{selectedForBatch ? "✓" : ""}</button> : null}
       <button
         className={`mail-row-main ${snoozeLabel ? "has-snooze-time" : ""}`}
         data-mail-row-id={message.id}
@@ -877,7 +926,11 @@ function InboxRow({
         )}
       </button>
       <span className="mail-row-actions">
-        {trashed ? (
+        {isComposeDraft ? (
+          <button aria-label="Delete draft" data-tooltip="Delete draft" onClick={onComposeDraftDelete}>
+            <TrashIcon />
+          </button>
+        ) : trashed ? (
           <button
             className="is-trashed"
             aria-label="Remove from trash"
@@ -1137,11 +1190,13 @@ function AiAssistantMessage({
   currentMailContext,
   onUseArtifact,
   onOpenMail,
+  onConfirmSendPlan,
 }: {
   message: AiChatMessage;
   currentMailContext: AiMailContextRef | null;
   onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
   onOpenMail: (target: AskMailLink) => void;
+  onConfirmSendPlan: (plan: SendPlanArtifact) => void;
 }) {
   const { state, actions } = useApp();
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -1172,7 +1227,7 @@ function AiAssistantMessage({
         aria-live="polite"
         aria-busy="true"
       >
-        <p>{message.content || "Thinking"}</p>
+        <p>Thinking...</p>
       </div>
     );
   }
@@ -1182,9 +1237,10 @@ function AiAssistantMessage({
     const text = displayAssistantText(message);
     const animate = shouldAnimateAssistantText(message.timestamp);
     const draftArtifact =
-      message.artifact && (!animate || assistantTextComplete)
+      message.artifact?.type === "draft_reply" && (!animate || assistantTextComplete)
         ? message.artifact
         : null;
+    const sendPlan = message.artifact?.type === "send_plan" && (!animate || assistantTextComplete) ? message.artifact : null;
     const summaryLink = message.mailSummaryLink;
     const clarification = message.clarification;
     const targetThreadOpen = Boolean(
@@ -1313,6 +1369,7 @@ function AiAssistantMessage({
             </div>
           </div>
         ) : null}
+        {sendPlan ? <div className="ai-draft-artifact ai-send-plan"><strong>Review before sending</strong>{sendPlan.messages.map((item, index) => <div key={index}><p><b>To:</b> {item.recipients.join(", ") || "Missing recipient"}</p><p><b>Subject:</b> {item.subject || "Missing subject"}</p><pre>{item.body}</pre></div>)}<div className="ai-draft-artifact-actions"><button className="is-primary" onClick={() => onConfirmSendPlan(sendPlan)}>Confirm and send</button></div></div> : null}
         {draftArtifact && message.assistantFollowupText ? (
           <AnimatedAssistantText text={message.assistantFollowupText} animate={animate} onOpenThread={openThreadReference} />
         ) : null}
@@ -1438,11 +1495,13 @@ function AiMessageBubble({
   currentMailContext,
   onUseArtifact,
   onOpenMail,
+  onConfirmSendPlan,
 }: {
   message: AiChatMessage;
   currentMailContext: AiMailContextRef | null;
   onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
   onOpenMail: (target: AskMailLink) => void;
+  onConfirmSendPlan: (plan: SendPlanArtifact) => void;
 }) {
   if (message.role === "user") {
     return <div className="ai-message is-user">{message.content}</div>;
@@ -1453,6 +1512,7 @@ function AiMessageBubble({
       currentMailContext={currentMailContext}
       onUseArtifact={onUseArtifact}
       onOpenMail={onOpenMail}
+      onConfirmSendPlan={onConfirmSendPlan}
     />
   );
 }
@@ -1463,12 +1523,14 @@ function AiSidebar({
   currentMailContext,
   onUseArtifact,
   onOpenMail,
+  onConfirmSendPlan,
 }: {
   collapsed: boolean;
   onToggle: () => void;
   currentMailContext: AiMailContextRef | null;
   onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
   onOpenMail: (target: AskMailLink) => void;
+  onConfirmSendPlan: (plan: SendPlanArtifact) => void;
 }) {
   const { state, actions } = useApp();
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -1592,6 +1654,7 @@ function AiSidebar({
                 currentMailContext={currentMailContext}
                 onUseArtifact={onUseArtifact}
                 onOpenMail={onOpenMail}
+                onConfirmSendPlan={onConfirmSendPlan}
               />
             ))}
           </div>
@@ -1930,6 +1993,15 @@ export function HomeView() {
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const [folderOpen, setFolderOpen] = useState(false);
   const [refreshChoiceOpen, setRefreshChoiceOpen] = useState(false);
+  const [composeOpen, setComposeOpen] = useState(false);
+  const [composeClosing, setComposeClosing] = useState(false);
+  const [composeResumeDraft, setComposeResumeDraft] = useState<ComposeDraft | null>(null);
+  const [composeDrafts, setComposeDrafts] = useState<ComposeDraft[]>([]);
+  const [selectedComposeDraftIds, setSelectedComposeDraftIds] = useState<Set<string>>(new Set());
+  const [batchConfirmDrafts, setBatchConfirmDrafts] = useState<ComposeDraft[] | null>(null);
+  const pendingComposeTimer = useRef<number | null>(null);
+  const pendingComposeCountdown = useRef<number | null>(null);
+  const composeCloseTimer = useRef<number | null>(null);
   const [mailboxView, setMailboxView] = useState<MailboxView>("inbox");
   const mailboxViewRef = useRef<MailboxView>("inbox");
   const [feedWindow, setFeedWindow] = useState<InboxFeedWindow>(
@@ -2157,14 +2229,30 @@ export function HomeView() {
     [state.inboxDraftMessages, state.inboxSnapshotMessages],
   );
   const sourceMessages = useMemo(
-    () =>
-      resolveSourceMessages(
+    () => {
+      const resolved = resolveSourceMessages(
         mailboxView,
         inboxMessagesWithDrafts,
         inboxSnapshotMessagesWithDrafts,
         flags,
-      ),
-    [flags, inboxMessagesWithDrafts, inboxSnapshotMessagesWithDrafts, mailboxView],
+      );
+      if (mailboxView !== "drafts") return resolved;
+      const composeMessages: InboxMessage[] = composeDrafts.map((draft) => ({
+        id: `compose:${draft.id}`,
+        mailbox,
+        date: draft.updated_at || draft.created_at || "",
+        from: mailbox,
+        to: draft.recipients.join(", "),
+        subject: draft.subject || "(no subject)",
+        snippet: draft.body.slice(0, 120),
+        body_preview: draft.body.slice(0, 120),
+        draft_body: draft.body,
+        draft_local: true,
+        label_ids: ["DRAFT"],
+      }));
+      return [...composeMessages, ...resolved];
+    },
+    [composeDrafts, flags, inboxMessagesWithDrafts, inboxSnapshotMessagesWithDrafts, mailbox, mailboxView],
   );
 
   const messagesInThread = useCallback(
@@ -2961,8 +3049,11 @@ export function HomeView() {
   const isInboxSyncing =
     state.inboxSnapshotLoading || feedAction === "refresh";
   const days = feedWindow.days;
+  const lastSyncedLabel = inboxLastSyncedLabel(state.inboxUpdatedAt);
   const canLoadMoreInbox =
     mailboxView === "inbox" && days === INBOX_LAST_MONTH_DAYS;
+  const canShowOlderInboxActions =
+    !state.inboxError && !state.inboxLoading && !isInboxSyncing && feedAction === null;
 
   const grouped = useMemo(() => {
     if (mailboxView !== "inbox") {
@@ -3109,6 +3200,16 @@ export function HomeView() {
 
   const openMessageDetail = useCallback(
     (message: InboxMessage) => {
+      if (message.id.startsWith("compose:")) {
+        const draft = composeDrafts.find((item) => item.id === message.id.slice("compose:".length));
+        if (draft) {
+          if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current);
+          setComposeClosing(false);
+          setComposeResumeDraft(draft);
+          setComposeOpen(true);
+        }
+        return;
+      }
       setExternalDetailMessage(null);
       setSelectedId(message.id);
       if (
@@ -3124,7 +3225,7 @@ export function HomeView() {
           );
         });
     },
-    [actions, mailbox],
+    [actions, composeDrafts, mailbox],
   );
 
   const openMailDetailFromAi = useCallback(async (target: AskMailLink) => {
@@ -3466,6 +3567,7 @@ export function HomeView() {
       void actions
         .listInboxThreadDrafts(mailbox, 100)
         .catch(() => undefined);
+      void actions.listComposeDrafts(mailbox).then((payload) => setComposeDrafts(payload.drafts || [])).catch(() => setComposeDrafts([]));
       return;
     }
     if (isLocalMailboxView(next)) {
@@ -3493,6 +3595,111 @@ export function HomeView() {
     });
   };
 
+  const scheduleComposeSend = useCallback((draft: ComposeDraft) => {
+    if (pendingComposeTimer.current) window.clearTimeout(pendingComposeTimer.current);
+    if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current);
+    setComposeResumeDraft(null);
+    setComposeOpen(false);
+    setComposeClosing(true);
+    const undo = () => {
+      if (pendingComposeTimer.current) window.clearTimeout(pendingComposeTimer.current);
+      if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current);
+      pendingComposeTimer.current = null;
+      pendingComposeCountdown.current = null;
+      void actions.deleteComposeDraft(mailbox, draft.id).catch(() => undefined);
+      if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current);
+      setComposeClosing(false);
+      setComposeResumeDraft(draft);
+      setComposeOpen(true);
+    };
+    const deadline = Date.now() + 10_000;
+    const updateCountdown = () => {
+      const seconds = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
+      actions.showToast(`Will send in ${seconds} second${seconds === 1 ? "" : "s"}.`, { actionLabel: "Undo", onAction: undo, durationMs: 1_100 });
+    };
+    updateCountdown();
+    pendingComposeCountdown.current = window.setInterval(updateCountdown, 1_000);
+    pendingComposeTimer.current = window.setTimeout(() => {
+      pendingComposeTimer.current = null;
+      if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current);
+      pendingComposeCountdown.current = null;
+      actions.showToast("Sending…", { durationMs: 30_000 });
+      void actions.sendComposeEmails(mailbox, [draft]).then(async (results) => {
+        const result = results[0];
+        if (result?.ok) {
+          await actions.deleteComposeDraft(mailbox, draft.id);
+          actions.showToast("Email sent.");
+        } else {
+          actions.showToast(result?.error || "Email could not be sent. The draft was kept.");
+        }
+      }).catch((reason) => actions.showToast(reason instanceof Error ? reason.message : String(reason)));
+    }, 10_000);
+  }, [actions, mailbox]);
+
+  const closeComposeDrawer = useCallback(() => {
+    setComposeOpen(false);
+    setComposeClosing(true);
+    if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current);
+    composeCloseTimer.current = window.setTimeout(() => {
+      setComposeClosing(false);
+      setComposeResumeDraft(null);
+      composeCloseTimer.current = null;
+    }, 360);
+  }, []);
+
+  const scheduleComposeBatch = useCallback((confirmed = false) => {
+    const selected = composeDrafts.filter((draft) => selectedComposeDraftIds.has(`compose:${draft.id}`));
+    if (!selected.length) {
+      actions.showToast("Select a Compose draft to send.");
+      return;
+    }
+    const incomplete = selected.filter((draft) => !draft.recipients.length || !draft.subject.trim() || !draft.body.trim());
+    if (incomplete.length) {
+      actions.showToast(`Complete ${incomplete.length} selected draft${incomplete.length === 1 ? "" : "s"} before sending.`);
+      return;
+    }
+    if (!confirmed) {
+      setBatchConfirmDrafts(selected);
+      return;
+    }
+    setBatchConfirmDrafts(null);
+    if (pendingComposeTimer.current) window.clearTimeout(pendingComposeTimer.current);
+    if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current);
+    const deadline = Date.now() + 10_000;
+    const undo = () => { if (pendingComposeTimer.current) window.clearTimeout(pendingComposeTimer.current); if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current); pendingComposeTimer.current = null; pendingComposeCountdown.current = null; };
+    const updateCountdown = () => { const seconds = Math.max(1, Math.ceil((deadline - Date.now()) / 1000)); actions.showToast(`${selected.length} drafts will send in ${seconds} second${seconds === 1 ? "" : "s"}.`, { actionLabel: "Undo", onAction: undo, durationMs: 1_100 }); };
+    updateCountdown();
+    pendingComposeCountdown.current = window.setInterval(updateCountdown, 1_000);
+    pendingComposeTimer.current = window.setTimeout(() => {
+      pendingComposeTimer.current = null;
+      if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current);
+      pendingComposeCountdown.current = null;
+      actions.showToast("Sending drafts…", { durationMs: 30_000 });
+      void actions.sendComposeEmails(mailbox, selected).then(async (results) => {
+        const succeeded = results.filter((result) => result.ok).map((result) => result.id);
+        await Promise.all(succeeded.map((id) => actions.deleteComposeDraft(mailbox, id)));
+        setComposeDrafts((drafts) => drafts.filter((draft) => !succeeded.includes(draft.id)));
+        setSelectedComposeDraftIds(new Set());
+        const failures = results.filter((result) => !result.ok);
+        actions.showToast(failures.length ? `${succeeded.length} sent; ${failures.length} draft${failures.length === 1 ? "" : "s"} failed and were kept.` : `${succeeded.length} drafts sent.`);
+      }).catch((reason) => actions.showToast(reason instanceof Error ? reason.message : String(reason)));
+    }, 10_000);
+  }, [actions, composeDrafts, mailbox, selectedComposeDraftIds]);
+
+  const confirmAiSendPlan = useCallback((plan: SendPlanArtifact) => {
+    const item = plan.messages[0];
+    if (!item) return;
+    void actions.saveComposeDraft(mailbox, { recipients: item.recipients, subject: item.subject, body: item.body })
+      .then((draft) => scheduleComposeSend(draft))
+      .catch((reason) => actions.showToast(reason instanceof Error ? reason.message : String(reason)));
+  }, [actions, mailbox, scheduleComposeSend]);
+
+  useEffect(() => () => {
+    if (pendingComposeTimer.current) window.clearTimeout(pendingComposeTimer.current);
+    if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current);
+    if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current);
+  }, []);
+
   return (
     <div
       className={`inbox-home ${sidebarCollapsed ? "is-ai-collapsed" : ""} ${sidebarResizing ? "is-resizing-ai-sidebar" : ""}`}
@@ -3506,6 +3713,7 @@ export function HomeView() {
           setInsertRequest({ nonce: crypto.randomUUID(), artifact, mode })
         }
         onOpenMail={(target) => void openMailDetailFromAi(target)}
+        onConfirmSendPlan={confirmAiSendPlan}
       />
       <div
         className="ai-sidebar-resizer"
@@ -3586,6 +3794,10 @@ export function HomeView() {
             <RefreshIcon />
             <span>{isInboxSyncing ? "Syncing" : "Refresh"}</span>
           </button>
+          <button className="refresh-mail-btn compose-open-btn" type="button" onClick={() => { if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current); setComposeClosing(false); setComposeResumeDraft(null); setComposeOpen(true); }}>
+            <ComposeIcon />
+            <span>Compose</span>
+          </button>
         </header>
 
         {refreshChoiceOpen ? (
@@ -3622,6 +3834,17 @@ export function HomeView() {
           </div>
         ) : null}
 
+        {batchConfirmDrafts ? (
+          <div className="confirm-overlay" role="presentation">
+            <section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="batch-send-title">
+              <h3 id="batch-send-title">Send {batchConfirmDrafts.length} draft{batchConfirmDrafts.length === 1 ? "" : "s"}?</h3>
+              <p>Each email will be sent separately after the 10-second Undo window.</p>
+              <ul className="batch-send-summary">{batchConfirmDrafts.map((draft) => <li key={draft.id}><strong>{draft.subject || "(no subject)"}</strong>&nbsp;<span>{draft.recipients.join(", ")}</span></li>)}</ul>
+              <div className="refresh-choice-actions"><button type="button" onClick={() => setBatchConfirmDrafts(null)}>Cancel</button><button type="button" className="is-primary" onClick={() => scheduleComposeBatch(true)}>Confirm send</button></div>
+            </section>
+          </div>
+        ) : null}
+
         {mailboxView === "inbox" ? (
           <nav className="mail-tabs" aria-label="Inbox filters">
             {(
@@ -3639,7 +3862,10 @@ export function HomeView() {
                 <span>{counts[key]}</span>
               </button>
             ))}
-            <p>{inboxRangeLabel(days)}</p>
+            <div className="mail-tabs-meta">
+              {lastSyncedLabel ? <span>{lastSyncedLabel}</span> : null}
+              <p>{inboxRangeLabel(days)}</p>
+            </div>
           </nav>
         ) : null}
 
@@ -3649,6 +3875,7 @@ export function HomeView() {
           ref={mailFeedRef}
           onScroll={handleFeedScroll}
         >
+          {mailboxView === "drafts" && sourceMessages.length ? <div className="draft-batch-bar"><button type="button" className="draft-select draft-select-all" aria-label="Select all drafts" aria-pressed={sourceMessages.length > 0 && sourceMessages.every((message) => selectedComposeDraftIds.has(message.id))} onClick={() => setSelectedComposeDraftIds((current) => current.size === sourceMessages.length ? new Set() : new Set(sourceMessages.map((message) => message.id)))}>{sourceMessages.length > 0 && sourceMessages.every((message) => selectedComposeDraftIds.has(message.id)) ? "✓" : ""}</button><span>{selectedComposeDraftIds.size} selected</span><button type="button" className="refresh-mail-btn draft-batch-send" disabled={!selectedComposeDraftIds.size} onClick={() => scheduleComposeBatch()}>Send selected</button></div> : null}
           {state.inboxError &&
           sourceMessages.length > 0 &&
           !cachedInboxBannerDismissed ? (
@@ -3778,6 +4005,16 @@ export function HomeView() {
                       onThreadAction={(operation, message) => void handleGmailThreadAction(operation, message)}
                       onSnooze={openSnoozePicker}
                       onSelect={() => openMessageDetail(message)}
+                      selectable={mailboxView === "drafts" && isDraftMessage(message)}
+                      selectedForBatch={selectedComposeDraftIds.has(message.id)}
+                      onBatchToggle={() => setSelectedComposeDraftIds((current) => { const next = new Set(current); const id = message.id; if (next.has(id)) next.delete(id); else next.add(id); return next; })}
+                      onComposeDraftDelete={message.id.startsWith("compose:") ? () => {
+                        const id = message.id.slice("compose:".length);
+                        void actions.deleteComposeDraft(mailbox, id).then(() => {
+                          setComposeDrafts((drafts) => drafts.filter((draft) => draft.id !== id));
+                          setSelectedComposeDraftIds((current) => { const next = new Set(current); next.delete(message.id); return next; });
+                        }).catch((reason) => actions.showToast(reason instanceof Error ? reason.message : String(reason)));
+                      } : undefined}
                     />
                   );
                 })}
@@ -3785,8 +4022,7 @@ export function HomeView() {
             ))
           )}
           {days === 7 &&
-          !state.inboxLoading &&
-          feedAction !== "older" &&
+          canShowOlderInboxActions &&
           mailboxView === "inbox" ? (
             <button
               className="older-mail-btn"
@@ -3796,7 +4032,7 @@ export function HomeView() {
               Show emails older than 7 days
             </button>
           ) : null}
-          {canLoadMoreInbox ? (
+          {canLoadMoreInbox && canShowOlderInboxActions ? (
             <button
               className="older-mail-btn"
               onClick={() => void loadMoreInbox()}
@@ -3864,6 +4100,14 @@ export function HomeView() {
           latestThreadMessageId={latestSelectedThreadMessage?.id || ""}
           latestThreadInternalDate={latestSelectedThreadMessage?.internal_date || ""}
         />
+        {composeOpen || composeClosing ? <ComposeView
+          mailbox={mailbox}
+          initialDraft={composeResumeDraft}
+          open={composeOpen}
+          onClose={closeComposeDrawer}
+          onViewDrafts={() => { closeComposeDrawer(); selectMailboxView("drafts"); }}
+          onScheduleSend={scheduleComposeSend}
+        /> : null}
         <SnoozePicker
           open={Boolean(snoozeTarget)}
           onClose={() => setSnoozeTarget(null)}

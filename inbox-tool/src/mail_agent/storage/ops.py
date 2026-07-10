@@ -7,6 +7,7 @@ Callers must be running inside the asyncio event loop.
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, Sequence
 
 from .client import get_storage, get_files, scope as default_scope
@@ -378,6 +379,63 @@ async def list_inbox_thread_drafts(mailbox: str, *, limit: int = 100) -> dict[st
         })
     drafts.sort(key=lambda draft: draft.get("updated_at") or "", reverse=True)
     return {"mailbox": mailbox, "count": len(drafts), "drafts": drafts, "updated_at": _now()}
+
+
+# ── Compose drafts ──────────────────────────────────────────────────
+
+def _compose_draft_key(mailbox: str, draft_id: str) -> str:
+    return f"{_mailbox_prefix(mailbox)}/compose-drafts/{sanitize_key_part(draft_id)}"
+
+
+async def get_compose_draft(mailbox: str, draft_id: str) -> dict[str, Any]:
+    result = await get_storage().get(_compose_draft_key(mailbox, draft_id), scope=default_scope())
+    value = result.get("value") if result.get("exists") and isinstance(result.get("value"), dict) else {}
+    return {"exists": bool(result.get("exists")), "etag": str(result.get("etag") or ""), "draft": value}
+
+
+async def set_compose_draft(
+    mailbox: str,
+    draft: dict[str, Any],
+    *,
+    if_match: str | None = None,
+) -> dict[str, Any]:
+    draft_id = str(draft.get("id") or uuid.uuid4().hex).strip()
+    key = _compose_draft_key(mailbox, draft_id)
+    existing = await get_storage().get(key, scope=default_scope())
+    if if_match and existing.get("exists") and str(existing.get("etag") or "") != if_match:
+        raise ValueError("Compose draft was changed elsewhere. Refresh and try again.")
+    payload = {
+        "id": draft_id,
+        "mailbox": str(mailbox or "").strip().lower(),
+        "recipients": [str(item).strip() for item in (draft.get("recipients") or []) if str(item).strip()][:100],
+        "subject": str(draft.get("subject") or "")[:998],
+        "body": str(draft.get("body") or ""),
+        "created_at": str(draft.get("created_at") or (existing.get("value") or {}).get("created_at") or _now()),
+        "updated_at": _now(),
+    }
+    result = await get_storage().set(key, payload, scope=default_scope(), if_match=str(existing.get("etag") or "") or None)
+    return {"ok": True, "etag": str(result.get("etag") or ""), "draft": payload}
+
+
+async def delete_compose_draft(mailbox: str, draft_id: str) -> dict[str, Any]:
+    return await get_storage().delete(_compose_draft_key(mailbox, draft_id), scope=default_scope())
+
+
+async def list_compose_drafts(mailbox: str, *, limit: int = 100) -> dict[str, Any]:
+    prefix = f"{_mailbox_prefix(mailbox)}/compose-drafts/"
+    result = await get_storage().list(prefix=prefix, limit=max(1, min(int(limit or 100), 500)), scope=default_scope())
+    drafts: list[dict[str, Any]] = []
+    for item in result.get("items") or []:
+        key = item.get("key") if isinstance(item, dict) else item
+        if not key:
+            continue
+        loaded = await get_storage().get(str(key), scope=default_scope())
+        value = loaded.get("value") if loaded.get("exists") and isinstance(loaded.get("value"), dict) else {}
+        if not value:
+            continue
+        drafts.append({**value, "etag": str(loaded.get("etag") or "")})
+    drafts.sort(key=lambda draft: str(draft.get("updated_at") or ""), reverse=True)
+    return {"mailbox": mailbox, "count": len(drafts), "drafts": drafts}
 
 
 # ── Processed message index ─────────────────────────────────────────

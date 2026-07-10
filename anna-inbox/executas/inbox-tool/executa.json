@@ -2,7 +2,7 @@
   "slug": "inbox-executa",
   "tool_id": "tool-riazm4777-inbox-executa-dnsb9fqu",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.0.11",
+  "version": "2.0.12",
   "type": "python",
   "enabled": true,
   "description": "Anna Inbox Gmail backend for sync, thread actions, drafts, attachments, Brief workflows, Ask, and Executa Sampling LLM.",

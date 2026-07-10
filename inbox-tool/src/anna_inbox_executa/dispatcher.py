@@ -191,7 +191,8 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         "reply_now", "reply_from_ask", "mark_read_from_ask", "trash_from_ask", "get_inbox_thread_draft",
         "list_inbox_thread_drafts",
         "save_inbox_thread_draft", "delete_inbox_thread_draft", "modify_message_labels", "set_message_starred",
-        "update_inbox_thread_state",
+        "update_inbox_thread_state", "search_compose_contacts", "get_compose_draft", "create_or_update_compose_draft",
+        "delete_compose_draft", "list_compose_drafts", "send_compose_emails",
     ):
         future = asyncio.run_coroutine_threadsafe(
             _handle_v2_tool(tool, arguments, invoke_id),

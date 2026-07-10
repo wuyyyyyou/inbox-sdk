@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.0.11",
+  "version": "2.0.12",
   "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Brief workflows, Ask, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
@@ -1907,6 +1907,36 @@
         }
       ],
       "timeout": 60
+    },
+    {
+      "name": "search_compose_contacts",
+      "description": "Search Google contacts for the Compose recipient picker. Results are not persisted.",
+      "parameters": [{"name":"mailbox","type":"string","description":"Mailbox email address.","required":true},{"name":"query","type":"string","description":"Name or email query.","required":true},{"name":"limit","type":"integer","description":"Maximum results.","required":false}],
+      "timeout": 120
+    },
+    {
+      "name": "list_compose_drafts",
+      "description": "List Anna application-managed Compose drafts; these do not sync to Gmail Drafts.",
+      "parameters": [{"name":"mailbox","type":"string","description":"Mailbox email address.","required":true},{"name":"limit","type":"integer","description":"Maximum drafts.","required":false}],
+      "timeout": 120
+    },
+    {
+      "name": "create_or_update_compose_draft",
+      "description": "Create or update an Anna application-managed Compose draft.",
+      "parameters": [{"name":"mailbox","type":"string","description":"Mailbox email address.","required":true},{"name":"draft","type":"object","description":"Compose draft content.","required":true},{"name":"if_match","type":"string","description":"Optional optimistic-concurrency etag.","required":false}],
+      "timeout": 120
+    },
+    {
+      "name": "delete_compose_draft",
+      "description": "Delete an Anna application-managed Compose draft.",
+      "parameters": [{"name":"mailbox","type":"string","description":"Mailbox email address.","required":true},{"name":"draft_id","type":"string","description":"Compose draft ID.","required":true}],
+      "timeout": 120
+    },
+    {
+      "name": "send_compose_emails",
+      "description": "Send one or more reviewed Compose emails. This performs real Gmail sends and must only be called after explicit user confirmation.",
+      "parameters": [{"name":"mailbox","type":"string","description":"Mailbox email address.","required":true},{"name":"messages","type":"array","description":"Reviewed Compose messages.","required":true}],
+      "timeout": 120
     }
   ],
   "runtime": {

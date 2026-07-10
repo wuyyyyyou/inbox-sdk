@@ -19,6 +19,9 @@ import type {
   AskHistoryEntry,
   AttachmentDownloadPayload,
   CleanupMessage,
+  ComposeContact,
+  ComposeDraft,
+  ComposeDraftListPayload,
   CustomRunResult,
   CustomRunResultItem,
   DraftPreferenceField,
@@ -411,6 +414,7 @@ function base64ToBlobUrl(contentB64: string, mimeType: string) {
 }
 
 type ToastOptions = {
+  durationMs?: number;
   actionLabel?: string;
   onAction?: () => void;
   secondaryActionLabel?: string;
@@ -467,6 +471,11 @@ export interface AppActions {
   listInboxThreadDrafts(mailbox: string, limit?: number): Promise<InboxFeedPayload>;
   saveInboxThreadDraft(mailbox: string, threadId: string, body: string, ifMatch?: string, message?: Record<string, unknown>): Promise<{ ok?: boolean; etag?: string; updated?: boolean }>;
   deleteInboxThreadDraft(mailbox: string, threadId: string): Promise<{ ok?: boolean }>;
+  searchComposeContacts(mailbox: string, query: string): Promise<{ contacts: ComposeContact[]; permissionRequired: boolean }>;
+  listComposeDrafts(mailbox: string): Promise<ComposeDraftListPayload>;
+  saveComposeDraft(mailbox: string, draft: Partial<ComposeDraft>, ifMatch?: string): Promise<ComposeDraft>;
+  deleteComposeDraft(mailbox: string, draftId: string): Promise<void>;
+  sendComposeEmails(mailbox: string, messages: ComposeDraft[]): Promise<Array<{ id: string; ok: boolean; error?: string }>>;
   prepareInboxAttachmentAccess(mailbox: string, messageId: string, attachmentId: string, mode: "preview" | "download"): Promise<AttachmentDownloadPayload>;
   modifyInboxMessageLabels(mailbox: string, messageIds: string[], addLabelIds?: string[], removeLabelIds?: string[]): Promise<void>;
   updateInboxThreadState(mailbox: string, threadId: string, operation: InboxThreadStateOperation): Promise<void>;
@@ -569,7 +578,7 @@ export function useAppController() {
   const showToast = useCallback((message: string, options?: ToastOptions) => {
     setToast({ message, ...options });
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToast(null), 3200);
+    toastTimer.current = window.setTimeout(() => setToast(null), options?.durationMs ?? 3200);
   }, []);
 
   const dismissToast = useCallback(() => {
@@ -1969,11 +1978,11 @@ export function useAppController() {
       const messagesWithUser = [...baseMessages, userMessage];
       const requestedArtifact = request.expectedArtifact
         || (/\bsummar(?:ize|ise|y|ization|isation)\b/i.test(request.visiblePrompt) ? "summary" : "draft_reply");
-      const isDraftRequest = requestedArtifact === "draft_reply";
+      const isDraftRequest = requestedArtifact === "draft_reply" || requestedArtifact === "send_plan";
       const pendingMessage: AiChatMessage = {
         id: createId("msg"),
         role: "assistant",
-        content: isDraftRequest ? "Updating the draft..." : "Summarizing the thread...",
+        content: "Thinking...",
         timestamp: new Date().toISOString(),
         kind: "status",
         pending: true,
@@ -2068,6 +2077,24 @@ export function useAppController() {
         reply_mode: replyMode,
         dry_run: dryRun,
       });
+    },
+    async searchComposeContacts(mailbox, query) {
+      const result = await client.searchComposeContacts(normalizedMailbox(mailbox), query, 10, state.storageProvider);
+      return { contacts: result.contacts || [], permissionRequired: Boolean(result.permission_required) };
+    },
+    async listComposeDrafts(mailbox) {
+      return client.listComposeDrafts(normalizedMailbox(mailbox), 100, state.storageProvider);
+    },
+    async saveComposeDraft(mailbox, draft, ifMatch) {
+      const result = await client.saveComposeDraft(normalizedMailbox(mailbox), draft, ifMatch, state.storageProvider);
+      return { ...result.draft, etag: result.etag || result.draft.etag };
+    },
+    async deleteComposeDraft(mailbox, draftId) {
+      await client.deleteComposeDraft(normalizedMailbox(mailbox), draftId, state.storageProvider);
+    },
+    async sendComposeEmails(mailbox, messages) {
+      const result = await client.sendComposeEmails(normalizedMailbox(mailbox), messages, state.storageProvider);
+      return result.results || [];
     },
     async loadContactAvatars(emails, mailboxOverride) {
       const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
@@ -2846,7 +2873,7 @@ export function useAppController() {
         await actions.submitMailContextPrompt({
           visiblePrompt: userRequest,
           context: resolved.context,
-          expectedArtifact: "draft_reply",
+          expectedArtifact: /\b(send|email|mail)\b|发送|发邮件|寄出/i.test(userRequest) ? "send_plan" : "draft_reply",
           draftToRevise: resolved.draftToRevise,
           baseMessages,
           retryUserMessage: options.retryUserMessage,
