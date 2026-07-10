@@ -183,15 +183,15 @@ export class MailAgentClient {
     return this.invoke<CardDetailPayload>("get_card_detail", { mailbox, card_id: cardId, storage_provider: storageProvider, include_body: includeBody });
   }
 
-  listInboxEmails(mailbox: string, days = 7, limit = 100, category = "inbox", clearCache = false) {
+  listInboxEmails(mailbox: string, days = 30, limit = 100, category = "inbox", clearCache = false) {
     return this.invoke<InboxFeedPayload>("list_inbox_emails", { mailbox, days, limit, category, clear_cache: clearCache }, { timeoutMs: 120_000 });
   }
 
-  listCachedEmails(mailbox: string, days = 7, limit = 100, category = "all", offset = 0) {
+  listCachedEmails(mailbox: string, days = 30, limit = 100, category = "all", offset = 0) {
     return this.invoke<InboxFeedPayload>("list_cached_emails", { mailbox, days, limit, category, offset }, { timeoutMs: 30_000 });
   }
 
-  listGmailEmailsPage(mailbox: string, days = 7, limit = 100, category = "all", pageToken = "", pageOffset = 0, excludeMessageIds: string[] = []) {
+  listGmailEmailsPage(mailbox: string, days = 30, limit = 100, category = "all", pageToken = "", pageOffset = 0, excludeMessageIds: string[] = []) {
     return this.invoke<InboxFeedPayload>("list_gmail_emails_page", {
       mailbox,
       days,

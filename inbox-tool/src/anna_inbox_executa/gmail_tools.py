@@ -639,7 +639,7 @@ def _matches_cached_category(item: dict[str, Any], category: str) -> bool:
 
 def list_inbox_emails(
     mailbox_arg: str,
-    days_arg: Any = 7,
+    days_arg: Any = 30,
     limit_arg: Any = 100,
     category_arg: Any = "inbox",
     clear_cache_arg: Any = False,
@@ -659,7 +659,7 @@ def list_inbox_emails(
     if authorized_email and authorized_email != mailbox:
         raise ValueError(f"Gmail credential mismatch: selected {mailbox}, authorized {authorized_email}")
     cache_reset = clear_mailbox_cache(mailbox) if clear_cache_arg is True else None
-    days_input = 7 if days_arg in (None, "") else days_arg
+    days_input = 30 if days_arg in (None, "") else days_arg
     days = max(0, min(int(days_input), 3650))
     limit = max(1, min(int(limit_arg or 100), 500))
     category = _normalize_inbox_category(category_arg)
@@ -702,7 +702,7 @@ def resolve_contact_avatars(mailbox_arg: str, emails_arg: Any) -> dict[str, Any]
 
 def list_cached_emails(
     mailbox_arg: str,
-    days_arg: Any = 7,
+    days_arg: Any = 30,
     limit_arg: Any = 100,
     category_arg: Any = "all",
     offset_arg: Any = 0,
@@ -715,7 +715,7 @@ def list_cached_emails(
     )
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
-    days_input = 7 if days_arg in (None, "") else days_arg
+    days_input = 30 if days_arg in (None, "") else days_arg
     days = max(0, min(int(days_input), 3650))
     limit = max(1, min(int(limit_arg or 100), 100))
     offset = max(0, int(offset_arg or 0))
@@ -816,7 +816,7 @@ def list_cached_emails(
 
 def list_gmail_emails_page(
     mailbox_arg: str,
-    days_arg: Any = 7,
+    days_arg: Any = 30,
     limit_arg: Any = 100,
     category_arg: Any = "all",
     page_token_arg: Any = "",
@@ -832,7 +832,7 @@ def list_gmail_emails_page(
     )
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
-    days_input = 7 if days_arg in (None, "") else days_arg
+    days_input = 30 if days_arg in (None, "") else days_arg
     days = max(0, min(int(days_input), 3650))
     limit = max(1, min(int(limit_arg or 100), 100))
     category = _normalize_inbox_category(category_arg)

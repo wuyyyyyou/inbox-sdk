@@ -82,7 +82,7 @@ const CACHED_INBOX_BANNER_SKIP_KEY = "anna-inbox:cached-inbox-banner-skip";
 const INBOX_ALL_TIME_DAYS = 0;
 const INBOX_LAST_MONTH_DAYS = 30;
 const DEFAULT_INBOX_FEED_WINDOW: InboxFeedWindow = {
-  days: 7,
+  days: 30,
   nextOffset: 100,
   hasMore: false,
   localLimit: 100,
@@ -2731,7 +2731,7 @@ export function HomeView() {
         if (primary && primary !== mailbox.trim().toLowerCase()) {
           await actions.switchMailbox(primary);
         } else if (primary) {
-          await actions.loadInboxEmails("inbox", 7, true);
+          await actions.loadInboxEmails("inbox", 30, true);
         }
       }
     } finally {

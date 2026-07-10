@@ -79,6 +79,22 @@ def main() -> None:
     assert all_mail["cache_reset"] == {"mailbox": "user@example.com"}
     clear_cache.assert_called_once_with("user@example.com")
 
+    default_query: dict[str, object] = {}
+
+    def capture_default_query(mailbox: str, query: str, limit: int) -> list[str]:
+        default_query.update(mailbox=mailbox, query=query, limit=limit)
+        return ["new"]
+
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+        patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"emailAddress": "user@example.com"}),
+        patch("mail_agent.mail_providers.gmail.adapter.live_search_metadata_and_cache", side_effect=capture_default_query),
+        patch("mail_agent.mail_providers.gmail.adapter.list_messages", return_value=messages),
+    ):
+        default_feed = list_inbox_emails("USER@example.com")
+    assert default_feed["days"] == 30
+    assert default_query == {"mailbox": "user@example.com", "query": "in:inbox newer_than:30d", "limit": 100}
+
     thread_subject_messages = [
         {
             "id": "thread-original",

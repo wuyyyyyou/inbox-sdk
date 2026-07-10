@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .sampling_budget import ASK_PLANNER_MAX_TOKENS
+
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
@@ -271,7 +273,7 @@ async def plan_ask_request(
         user_message=user_message,
         fallback={},
         temperature=0.1,
-        max_tokens=8000,
+        max_tokens=ASK_PLANNER_MAX_TOKENS,
         timeout=90.0,
         metadata={"tool": "ask_planner"},
         allow_fallback=False,

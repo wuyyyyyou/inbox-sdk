@@ -14,14 +14,13 @@ from typing import Any
 from ..core.pipeline import _EXECUTION_SYSTEM_PROMPT
 from ..domain.types import MessageLite
 from .planner import AskPlan
+from .sampling_budget import ASK_ANSWER_MAX_TOKENS, ASK_FILTER_MAX_TOKENS, with_ask_sampling_budget
 
 _logger = logging.getLogger(__name__)
 _BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 # 匹配时过滤，≤此值跳过
 _SKIP_FILTER_THRESHOLD = 10
-
-
 def _answer_language_instruction(user_request: str) -> str:
     """Keep generated answer copy aligned with the user's language."""
     if re.search(r"[\u3400-\u9fff]", user_request):
@@ -116,7 +115,7 @@ async def _filter_candidates(
             user_message=user_message,
             fallback={"items": []},
             temperature=0.1,
-            max_tokens=4096,
+            max_tokens=ASK_FILTER_MAX_TOKENS,
             timeout=120.0,
             metadata={"tool": "ask_filter"},
             allow_fallback=True,
@@ -379,7 +378,7 @@ async def _generate_answer(
                 user_message=_build_user_prompt(rendered),
                 fallback={"title": "Scan failed", "summary": "Unable to analyze emails.", "sections": []},
                 temperature=0.2,
-                max_tokens=20480,
+                max_tokens=ASK_ANSWER_MAX_TOKENS,
                 timeout=180.0,
                 metadata={"tool": "ask_answer", "email_count": str(len(enriched)), "variant": variant["name"]},
                 allow_fallback=sampling_create_message is None,
@@ -572,6 +571,9 @@ async def run_ask_pipeline(
 
     if not mailboxes:
         return {"title": "Error", "summary": "No mailbox selected.", "sections": []}
+
+    if sampling_create_message is not None:
+        sampling_create_message = with_ask_sampling_budget(sampling_create_message)
 
     primary_mailbox = mailboxes[0]
 

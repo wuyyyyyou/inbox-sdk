@@ -335,6 +335,46 @@ def test_answer_fallback_uses_request_language():
     print("[PASS] test_answer_fallback_uses_request_language")
 
 
+def test_answer_sampling_token_limit_stays_below_host_cap():
+    """The Ask answer sampling request must fit the Anna Host limit."""
+    from mail_agent.ask.sampling_budget import ASK_ANSWER_MAX_TOKENS
+
+    assert 0 < ASK_ANSWER_MAX_TOKENS < 8192
+    print("[PASS] test_answer_sampling_token_limit_stays_below_host_cap")
+
+
+def test_ask_sampling_budget_is_cumulative_across_calls():
+    """Planner, filter, answer, and repair share one host quota."""
+    from mail_agent.ask.sampling_budget import (
+        ASK_SAMPLING_TOTAL_TOKENS,
+        AskSamplingBudgetExceeded,
+        with_ask_sampling_budget,
+    )
+
+    calls: list[int] = []
+
+    async def fake_sampling(**kwargs):
+        calls.append(kwargs["max_tokens"])
+        return {"content": {"type": "text", "text": "{}"}}
+
+    async def exercise_budget():
+        sampling = with_ask_sampling_budget(fake_sampling)
+        await sampling(max_tokens=8000, metadata={"tool": "ask_planner"})
+        await sampling(max_tokens=4096, metadata={"tool": "ask_filter"})
+        await sampling(max_tokens=8000, metadata={"tool": "ask_answer"})
+        await sampling(max_tokens=4096, metadata={"tool": "json_repair"})
+        try:
+            await sampling(max_tokens=1, metadata={"tool": "ask_answer"})
+        except AskSamplingBudgetExceeded:
+            return
+        raise AssertionError("sampling after the cumulative budget is exhausted must fail locally")
+
+    asyncio.run(exercise_budget())
+    assert calls == [1024, 512, 6144, 512]
+    assert sum(calls) == ASK_SAMPLING_TOTAL_TOKENS
+    print("[PASS] test_ask_sampling_budget_is_cumulative_across_calls")
+
+
 # ── Main ────────────────────────────────────────────────────────────────
 
 def main():
@@ -363,6 +403,8 @@ def main():
     test_filter_prompt_format()
     test_answer_language_instruction()
     test_answer_fallback_uses_request_language()
+    test_answer_sampling_token_limit_stays_below_host_cap()
+    test_ask_sampling_budget_is_cumulative_across_calls()
 
     print(f"\n[ALL TESTS PASSED]")
 

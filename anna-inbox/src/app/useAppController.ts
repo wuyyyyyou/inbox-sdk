@@ -615,7 +615,7 @@ export function useAppController() {
     return payload;
   }, [client]);
 
-  const preloadMailboxSnapshot = useCallback(async (mailboxOverride?: string, days = 7, force = false) => {
+  const preloadMailboxSnapshot = useCallback(async (mailboxOverride?: string, days = 30, force = false) => {
     const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
     if (!mailbox || mailbox === "all") return false;
     if (!force && snapshotPromise.current && snapshotRequestMailbox.current === mailbox) return snapshotPromise.current;
@@ -630,10 +630,18 @@ export function useAppController() {
           loadInboxThreadDrafts(mailbox).catch(() => undefined),
         ]);
         if (snapshotRequestMailbox.current !== mailbox) return false;
-        applyInboxSnapshotPayload(cached);
+        const cachedMessages = Array.isArray(cached.messages) ? cached.messages : [];
+        // The startup snapshot is cache-first. If it has no messages in this
+        // exact window, query Gmail with the same day limit instead of making
+        // users switch to All time to see recent email.
+        const payload = cachedMessages.length
+          ? cached
+          : await client.listInboxEmails(mailbox, days, 100, "inbox");
+        if (snapshotRequestMailbox.current !== mailbox) return false;
+        applyInboxSnapshotPayload(payload);
         setState((s) => ({ ...s, inboxSnapshotLoading: false }));
-        const messageCount = Array.isArray(cached.messages) ? cached.messages.length : 0;
-        console.info(`[inbox-startup] cache-only mailbox=${mailbox} messages=${messageCount} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
+        const messageCount = Array.isArray(payload.messages) ? payload.messages.length : 0;
+        console.info(`[inbox-startup] mailbox=${mailbox} days=${days} source=${cachedMessages.length ? "cache" : "gmail"} messages=${messageCount} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
         return messageCount > 0;
       } catch {
         if (snapshotRequestMailbox.current !== mailbox) return false;
@@ -761,7 +769,7 @@ export function useAppController() {
     }, 220);
   }, []);
 
-  const loadInboxEmails = useCallback(async (mailboxOverride?: string, category = "inbox", days = 7, force = false) => {
+  const loadInboxEmails = useCallback(async (mailboxOverride?: string, category = "inbox", days = 30, force = false) => {
     const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
     const requestId = ++inboxRequestSequence.current;
     if (!mailbox || mailbox === "all") {
@@ -803,7 +811,7 @@ export function useAppController() {
     return false;
   }, [client, state.mailbox, state.selectedMailboxes]);
 
-  const refreshInboxEmails = useCallback(async (category = "inbox", days = 7, clearCache = false): Promise<InboxPageResult> => {
+  const refreshInboxEmails = useCallback(async (category = "inbox", days = 30, clearCache = false): Promise<InboxPageResult> => {
     const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
     if (!mailbox || mailbox === "all") {
       setState((s) => ({ ...s, inboxMessages: [], inboxSnapshotMessages: [], inboxLoading: false, inboxSnapshotLoading: false, inboxError: "Connect a Gmail mailbox to load your inbox." }));
@@ -1394,7 +1402,7 @@ export function useAppController() {
             briefMailboxFilter: [restoredMailbox],
           }));
         }
-        let inboxAvailable = bootMailbox ? await preloadMailboxSnapshot(bootMailbox, 7) : false;
+        let inboxAvailable = bootMailbox ? await preloadMailboxSnapshot(bootMailbox, 30) : false;
         const mailboxState = await loadMailboxRegistry();
         let currentMailbox = mailboxState.primary || bootMailbox;
         if (!currentMailbox) {
@@ -1402,12 +1410,12 @@ export function useAppController() {
           currentMailbox = mailbox || state.mailbox;
         }
         if (currentMailbox && currentMailbox !== bootMailbox) {
-          inboxAvailable = await preloadMailboxSnapshot(currentMailbox, 7, true);
+          inboxAvailable = await preloadMailboxSnapshot(currentMailbox, 30, true);
         }
         void loadMailboxes().then((discoveredState) => {
           const discoveredPrimary = normalizedMailbox(discoveredState.primary);
           if (!discoveredPrimary || discoveredPrimary === currentMailbox) return;
-          void preloadMailboxSnapshot(discoveredPrimary, 7, true);
+          void preloadMailboxSnapshot(discoveredPrimary, 30, true);
           void loadScanPlan(discoveredPrimary);
         }).catch(() => undefined);
         const authResult = await client.checkAnyGmailAuth();
@@ -1420,7 +1428,7 @@ export function useAppController() {
             ...s,
             loading: false,
             inboxLoading: false,
-            inboxError: inboxAvailable ? "" : "Connect Gmail to load the last 7 days of email.",
+            inboxError: inboxAvailable ? "" : "Connect Gmail to load the last 30 days of email.",
           }));
           return;
         }
@@ -1621,7 +1629,7 @@ export function useAppController() {
           actionCount: actionCount(visibleCards),
           inboxLoading: true,
         }));
-        await preloadMailboxSnapshot(primary, 7, true);
+        await preloadMailboxSnapshot(primary, 30, true);
         await loadScanPlan(primary);
       } catch (error) {
         closeAccountSwitchNotice();
@@ -1673,14 +1681,14 @@ export function useAppController() {
       });
     },
     loadActiveCards,
-    async loadInboxEmails(category = "inbox", days = 7, force = false) {
+    async loadInboxEmails(category = "inbox", days = 30, force = false) {
       if (force && (category === "inbox" || category === "all")) {
         return preloadMailboxSnapshot(undefined, days, true);
       }
       return loadInboxEmails(undefined, category, days, force);
     },
     refreshInboxEmails,
-    async loadCachedInboxEmails(category = "inbox", days = 7, offset = 0, append = false): Promise<InboxPageResult> {
+    async loadCachedInboxEmails(category = "inbox", days = 30, offset = 0, append = false): Promise<InboxPageResult> {
       const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
       if (!mailbox || mailbox === "all") return { ok: false, count: 0, hasMore: false, nextOffset: offset };
       const requestId = ++inboxRequestSequence.current;
@@ -1790,7 +1798,7 @@ export function useAppController() {
         inboxError: "",
       }));
     },
-    preloadMailboxSnapshot: (force = false) => preloadMailboxSnapshot(undefined, 7, force),
+    preloadMailboxSnapshot: (force = false) => preloadMailboxSnapshot(undefined, 30, force),
     async loadInboxEmailBody(messageId, mailboxOverride) {
       const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
       if (!messageId || !mailbox) return "";
