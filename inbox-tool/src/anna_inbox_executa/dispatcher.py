@@ -184,7 +184,7 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         "prepare_inbox_attachment_access", "prepare_attachment_download", "summarize_thread",
         "generate_draft_reply", "generate_ask_draft", "revise_draft", "record_card_decision",
         "clear_active_cards", "mark_card_read", "mark_cleanup_read", "record_snooze", "restore_card", "record_learning",
-        "start_summarize_thread", "start_inbox_thread_assist", "start_generate_draft", "start_inbox_mail_prompt",
+        "start_summarize_thread", "start_inbox_thread_assist", "start_generate_draft", "start_inbox_mail_prompt", "start_compose_mail_prompt",
         "delete_custom_plan",
         "clear_cards", "clear_history", "reset_all_data", "reset_mailbox_scan_history", "delete_mailbox_data",
         "get_scan_plan", "set_scan_plan",

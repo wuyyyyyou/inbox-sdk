@@ -1955,7 +1955,12 @@ export function useAppController() {
         showToast("LLM is offline. Please try again when it reconnects.");
         return null;
       }
-      if (!context?.mailbox || !context.thread_id || !request.visiblePrompt.trim() || aiGenerationRun.current) return null;
+      if (
+        !context?.mailbox ||
+        (context.kind === "gmail_thread" && !context.thread_id) ||
+        !request.visiblePrompt.trim() ||
+        aiGenerationRun.current
+      ) return null;
       const generationRun = {
         runId: createId("generation"),
         cancelled: false,
@@ -1977,8 +1982,10 @@ export function useAppController() {
         ?? (!request.forceNewConversation && state.aiChatConversationId === conversationId ? state.aiChatMessages : []);
       const messagesWithUser = [...baseMessages, userMessage];
       const requestedArtifact = request.expectedArtifact
-        || (/\bsummar(?:ize|ise|y|ization|isation)\b/i.test(request.visiblePrompt) ? "summary" : "draft_reply");
-      const isDraftRequest = requestedArtifact === "draft_reply" || requestedArtifact === "send_plan";
+        || (context.kind === "compose"
+          ? "compose_draft"
+          : (/\bsummar(?:ize|ise|y|ization|isation)\b/i.test(request.visiblePrompt) ? "summary" : "draft_reply"));
+      const isDraftRequest = requestedArtifact === "draft_reply" || requestedArtifact === "send_plan" || requestedArtifact === "compose_draft";
       const pendingMessage: AiChatMessage = {
         id: createId("msg"),
         role: "assistant",
@@ -1997,18 +2004,32 @@ export function useAppController() {
         aiChatLoading: true,
       }));
       try {
-        const started = await client.startInboxMailPrompt({
-          mailbox: normalizedMailbox(context.mailbox),
-          thread_id: context.thread_id,
-          anchor_message_id: context.anchor_message_id,
-          latest_message_id: context.latest_message_id,
-          visible_prompt: buildRevisionPrompt(request.visiblePrompt, request.draftToRevise),
-          expected_artifact: requestedArtifact,
-          user_answers: request.userAnswers,
-          ai_provider: state.llmProvider,
-          storage_provider: state.storageProvider,
-          run_id: generationRun.runId,
-        });
+        const started = context.kind === "compose"
+          ? await client.startComposeMailPrompt({
+              mailbox: normalizedMailbox(context.mailbox),
+              draft: {
+                recipients: context.recipients,
+                subject: context.subject,
+                body: context.body,
+              },
+              visible_prompt: request.visiblePrompt,
+              expected_artifact: requestedArtifact,
+              ai_provider: state.llmProvider,
+              storage_provider: state.storageProvider,
+              run_id: generationRun.runId,
+            })
+          : await client.startInboxMailPrompt({
+              mailbox: normalizedMailbox(context.mailbox),
+              thread_id: context.thread_id,
+              anchor_message_id: context.anchor_message_id,
+              latest_message_id: context.latest_message_id,
+              visible_prompt: buildRevisionPrompt(request.visiblePrompt, request.draftToRevise),
+              expected_artifact: requestedArtifact,
+              user_answers: request.userAnswers,
+              ai_provider: state.llmProvider,
+              storage_provider: state.storageProvider,
+              run_id: generationRun.runId,
+            });
         if (!isCurrentGeneration()) return null;
         const completed = started.status === "done" && started.result
           ? started
@@ -2030,9 +2051,9 @@ export function useAppController() {
             artifact: isDraftRequest && payload.artifact
               ? { ...payload.artifact, source_prompt: request.visiblePrompt }
               : null,
-            replyGaps: payload.reply_gaps,
+            replyGaps: context.kind === "compose" ? payload.compose_gaps : payload.reply_gaps,
             mailContext: context,
-            mailSummaryLink: !isDraftRequest ? {
+            mailSummaryLink: !isDraftRequest && context.kind === "gmail_thread" ? {
               label: summaryTitle || "Current thread",
               mailbox: normalizedMailbox(context.mailbox),
               thread_id: context.thread_id,
@@ -2047,7 +2068,7 @@ export function useAppController() {
         return payload;
       } catch (error) {
         if (!isCurrentGeneration() || isAbortError(error)) return null;
-        const message = sanitizeToolError(error, request.visiblePrompt) || (isDraftRequest ? "Anna couldn't finish that reply." : "Anna couldn't finish that summary.");
+        const message = sanitizeToolError(error, request.visiblePrompt) || (isDraftRequest ? "Anna couldn't finish that draft." : "Anna couldn't finish that summary.");
         const failedMessages: AiChatMessage[] = [
           ...messagesWithUser,
           {
@@ -2873,7 +2894,9 @@ export function useAppController() {
         await actions.submitMailContextPrompt({
           visiblePrompt: userRequest,
           context: resolved.context,
-          expectedArtifact: /\b(send|email|mail)\b|发送|发邮件|寄出/i.test(userRequest) ? "send_plan" : "draft_reply",
+          expectedArtifact: resolved.context.kind === "compose"
+            ? "compose_draft"
+            : (/\b(send|email|mail)\b|发送|发邮件|寄出/i.test(userRequest) ? "send_plan" : "draft_reply"),
           draftToRevise: resolved.draftToRevise,
           baseMessages,
           retryUserMessage: options.retryUserMessage,

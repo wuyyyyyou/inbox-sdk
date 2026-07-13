@@ -474,7 +474,7 @@ export interface InboxThreadAssistPayload {
   fallback_used?: boolean;
 }
 
-export interface AiMailContextRef {
+export interface AiGmailThreadContextRef {
   kind: "gmail_thread";
   mailbox: string;
   thread_id: string;
@@ -482,10 +482,21 @@ export interface AiMailContextRef {
   latest_message_id: string;
 }
 
+export interface AiComposeContextRef {
+  kind: "compose";
+  session_id: string;
+  mailbox: string;
+  recipients: string[];
+  subject: string;
+  body: string;
+}
+
+export type AiMailContextRef = AiGmailThreadContextRef | AiComposeContextRef;
+
 export interface SubmitMailPromptRequest {
   visiblePrompt: string;
   context: AiMailContextRef;
-  expectedArtifact?: "draft_reply" | "summary" | "send_plan";
+  expectedArtifact?: "draft_reply" | "summary" | "send_plan" | "compose_draft";
   contextTitle?: string;
   forceNewConversation?: boolean;
   userAnswers?: Record<string, string>;
@@ -511,8 +522,9 @@ export interface MailPromptRunResult {
   thread_title?: string;
   assistant_text: string;
   assistant_followup_text?: string;
-  artifact?: DraftReplyArtifact | SendPlanArtifact | null;
+  artifact?: DraftReplyArtifact | ComposeDraftArtifact | SendPlanArtifact | null;
   reply_gaps?: ReplyGaps;
+  compose_gaps?: ReplyGaps;
   fallback_used?: boolean;
 }
 
@@ -531,6 +543,15 @@ export interface SendPlanArtifact {
   thread_id: string;
   messages: Array<{ recipients: string[]; subject: string; body: string }>;
   source_prompt: string;
+}
+
+export interface ComposeDraftArtifact {
+  type: "compose_draft";
+  mailbox: string;
+  body: string;
+  source_prompt: string;
+  mode: "insert" | "replace";
+  subject?: string;
 }
 
 export interface ComposeContact {
@@ -743,7 +764,7 @@ export interface AiChatMessage {
   kind?: "chat" | "mail_context" | "scan" | "clarify" | "status" | "error" | "stopped";
   result?: CustomRunResult | null;
   pending?: boolean;
-  artifact?: DraftReplyArtifact | SendPlanArtifact | null;
+  artifact?: DraftReplyArtifact | ComposeDraftArtifact | SendPlanArtifact | null;
   replyGaps?: ReplyGaps;
   mailContext?: AiMailContextRef;
   mailSummaryLink?: AskMailLink;

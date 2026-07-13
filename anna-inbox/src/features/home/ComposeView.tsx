@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useApp } from "../../app/AppContext";
-import type { ComposeContact, ComposeDraft } from "../../types/mail";
+import type { ComposeContact, ComposeDraft, ComposeDraftArtifact } from "../../types/mail";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -17,6 +17,9 @@ export function ComposeView({
   onClose,
   onViewDrafts,
   onScheduleSend,
+  insertRequest,
+  onConsumeInsertRequest,
+  onOpenAiDraft,
 }: {
   mailbox: string;
   initialDraft?: ComposeDraft | null;
@@ -24,6 +27,9 @@ export function ComposeView({
   onClose: () => void;
   onViewDrafts: () => void;
   onScheduleSend: (draft: ComposeDraft) => void;
+  insertRequest?: { nonce: string; artifact: ComposeDraftArtifact } | null;
+  onConsumeInsertRequest?: (nonce: string) => void;
+  onOpenAiDraft: (draft: Pick<ComposeDraft, "recipients" | "subject" | "body">) => void;
 }) {
   const { actions } = useApp();
   const [draftId, setDraftId] = useState(initialDraft?.id || "");
@@ -58,6 +64,12 @@ export function ComposeView({
     setError("");
     setExitWithoutSavingConfirmation(false);
   }, [initialDraft, open]);
+
+  useEffect(() => {
+    if (!insertRequest || !open) return;
+    setBody(insertRequest.artifact.body);
+    onConsumeInsertRequest?.(insertRequest.nonce);
+  }, [insertRequest, onConsumeInsertRequest, open]);
 
   useEffect(() => {
     if (!recipientInput.trim()) {
@@ -157,9 +169,9 @@ export function ComposeView({
         {contactOpen && (contacts.length > 0 || canAddRawEmail) ? <div className="compose-contact-menu">{contacts.map((contact) => <button type="button" key={contact.email} onMouseDown={(event) => event.preventDefault()} onClick={() => addRecipient(contact.email)}>{contact.avatar_url ? <img src={contact.avatar_url} alt="" /> : null}<span>{contact.name || contact.email}<small>{contact.name ? contact.email : ""}</small></span></button>)}{canAddRawEmail ? <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => addRecipient(candidateEmail)}>Add <strong>{candidateEmail}</strong></button> : null}</div> : null}
       </div></label>
       <label className="compose-field"><span>Subject</span><input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="Add a subject" /></label>
-      <label className="compose-body"><span>Content</span><textarea value={body} onChange={(event) => setBody(event.target.value)} placeholder="Write your message…" /></label>
+      <label className="compose-body"><span>Content</span><textarea value={body} onChange={(event) => setBody(event.target.value)} placeholder="Write your message or key points…" /></label>
       {error ? <p className="compose-error" role="alert">{error}</p> : null}
-      <footer className="mail-detail-footer compose-footer"><span /><div className="mail-detail-composer-actions compose-toolbar-actions"><button type="button" className="mail-detail-composer-icon-btn" aria-label="AI draft" data-tooltip="AI draft" onClick={() => actions.showToast("AI drafting is not available for new messages yet.")}><AiDraftIcon /></button><button type="button" className="mail-detail-composer-icon-btn" aria-label="Save to drafts" data-tooltip="Save to drafts" disabled={saving} onClick={() => void saveToDrafts()}><SaveDraftIcon /></button><button type="button" className="is-primary compose-send-btn" onClick={() => void send()} disabled={saving || !canSend}>{saving ? "Saving…" : "Send"}</button></div></footer>
+      <footer className="mail-detail-footer compose-footer"><span /><div className="mail-detail-composer-actions compose-toolbar-actions"><button type="button" className="mail-detail-composer-icon-btn" aria-label="AI draft" data-tooltip="Ask Anna to draft or improve this message" disabled={saving} onClick={() => onOpenAiDraft({ recipients, subject, body })}><AiDraftIcon /></button><button type="button" className="mail-detail-composer-icon-btn" aria-label="Save to drafts" data-tooltip="Save to drafts" disabled={saving} onClick={() => void saveToDrafts()}><SaveDraftIcon /></button><button type="button" className="is-primary compose-send-btn" onClick={() => void send()} disabled={saving || !canSend}>{saving ? "Saving…" : "Send"}</button></div></footer>
       </aside>
       {exitWithoutSavingConfirmation ? <div className="confirm-overlay" role="presentation" onClick={() => setExitWithoutSavingConfirmation(false)}>
         <section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="compose-exit-without-saving-title" aria-describedby="compose-exit-without-saving-description" onClick={(event) => event.stopPropagation()}>

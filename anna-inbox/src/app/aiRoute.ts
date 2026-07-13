@@ -56,6 +56,13 @@ export function decideAiRoute(input: string, context: AiRouteContext): AiRouteDe
     return { kind: "chat", reason: "explicit_chat_signal", confidence: "high" };
   }
 
+  // A Compose request is deliberately scoped to the message snapshot. Its
+  // common prompts (for example, "Suggest changes to improve my draft") do
+  // not always contain the reply-oriented terms used for Gmail threads.
+  if (context.currentMailContext?.kind === "compose") {
+    return { kind: "mail_context", reason: "compose_draft_context", confidence: "high" };
+  }
+
   const rewrite = REWRITE_PATTERN.test(normalized);
   const contextAction = CONTEXT_ACTION_PATTERN.test(normalized) || (Boolean(context.currentMailContext) && SEND_PLAN_PATTERN.test(normalized));
   const pronoun = PRONOUN_PATTERN.test(normalized);

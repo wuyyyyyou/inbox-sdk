@@ -1424,7 +1424,7 @@ export function MailDetailDrawer({
   };
 
   const submitPrompt = async (visiblePrompt: string, expectedArtifact: "draft_reply" | "summary" = "draft_reply", forceNewConversation = false) => {
-    if (!context) return;
+    if (!context || context.kind !== "gmail_thread") return;
     await submitMailContextPrompt({
       visiblePrompt,
       context,
@@ -1439,7 +1439,7 @@ export function MailDetailDrawer({
   };
 
   const retryOverview = () => {
-    if (!context) return;
+    if (!context || context.kind !== "gmail_thread") return;
     setAssistError("");
     setAssistLoading(true);
     void loadInboxThreadAssist(mailbox, context.thread_id, context.latest_message_id, context.anchor_message_id)

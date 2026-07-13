@@ -13,8 +13,10 @@ import {
 import { useApp } from "../../app/AppContext";
 import type {
   AiChatMessage,
+  AiComposeContextRef,
   AiMailContextRef,
   AskMailLink,
+  ComposeDraftArtifact,
   ComposeDraft,
   DraftReplyArtifact,
   SendPlanArtifact,
@@ -76,7 +78,8 @@ type InboxFeedWindow = {
   gmailPageToken: string;
   gmailPageOffset: number;
 };
-type FeedActionState = "refresh" | "older" | "more" | "category-page" | null;
+type FeedActionState = "refresh" | "more" | "category-page" | null;
+type CachedInboxRetryAction = "sync" | "load-more";
 
 const AI_SIDEBAR_WIDTH_KEY = "anna-inbox:ai-sidebar-width";
 const AI_SIDEBAR_MIN_WIDTH = 300;
@@ -539,7 +542,7 @@ function snoozeUntilLabel(value: string | undefined) {
 
 function groupLabel(message: InboxMessage) {
   const date = messageDate(message);
-  if (!date) return "LAST 7 DAYS";
+  if (!date) return "LAST 30 DAYS";
   const now = new Date();
   if (date.toDateString() === now.toDateString()) return "TODAY";
   const yesterday = new Date(now);
@@ -548,7 +551,7 @@ function groupLabel(message: InboxMessage) {
   const daysAgo = Math.floor(
     (now.getTime() - date.getTime()) / (24 * 60 * 60 * 1000),
   );
-  if (daysAgo < 7) return "LAST 7 DAYS";
+  if (daysAgo < INBOX_LAST_MONTH_DAYS) return "LAST 30 DAYS";
   const currentMonthLabel = date
     .toLocaleDateString("en-US", { month: "long" })
     .toUpperCase();
@@ -560,7 +563,7 @@ function groupLabel(message: InboxMessage) {
 
 function inboxRangeLabel(days: number) {
   if (days === INBOX_ALL_TIME_DAYS) return "All time";
-  if (days === INBOX_LAST_MONTH_DAYS) return "Last 1 month";
+  if (days === INBOX_LAST_MONTH_DAYS) return "Last 30 days";
   return `Last ${days} days`;
 }
 
@@ -1189,12 +1192,14 @@ function AiAssistantMessage({
   message,
   currentMailContext,
   onUseArtifact,
+  onUseComposeArtifact,
   onOpenMail,
   onConfirmSendPlan,
 }: {
   message: AiChatMessage;
   currentMailContext: AiMailContextRef | null;
   onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
+  onUseComposeArtifact: (artifact: ComposeDraftArtifact, context: AiComposeContextRef | null) => void;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
 }) {
@@ -1240,12 +1245,17 @@ function AiAssistantMessage({
       message.artifact?.type === "draft_reply" && (!animate || assistantTextComplete)
         ? message.artifact
         : null;
+    const composeArtifact =
+      message.artifact?.type === "compose_draft" && (!animate || assistantTextComplete)
+        ? message.artifact
+        : null;
     const sendPlan = message.artifact?.type === "send_plan" && (!animate || assistantTextComplete) ? message.artifact : null;
     const summaryLink = message.mailSummaryLink;
     const clarification = message.clarification;
     const targetThreadOpen = Boolean(
       draftArtifact &&
       currentMailContext &&
+      currentMailContext.kind === "gmail_thread" &&
       currentMailContext.mailbox.trim().toLowerCase() === draftArtifact.mailbox.trim().toLowerCase() &&
       currentMailContext.thread_id === draftArtifact.thread_id,
     );
@@ -1267,6 +1277,17 @@ function AiAssistantMessage({
       }
       setSubmittingGap(true);
       try {
+        if (message.mailContext.kind === "compose") {
+          const details = message.replyGaps.questions
+            .map((question) => `- ${question.question}: ${String(answers[question.id] || "").trim()}`)
+            .join("\n");
+          await actions.submitMailContextPrompt({
+            visiblePrompt: `Create a complete revised draft using these details:\n${details}`,
+            context: message.mailContext,
+            expectedArtifact: "compose_draft",
+          });
+          return;
+        }
         await actions.submitMailContextPrompt({
           visiblePrompt: message.sourcePrompt,
           context: message.mailContext,
@@ -1354,7 +1375,9 @@ function AiAssistantMessage({
                     label: "Draft thread",
                     mailbox: draftArtifact.mailbox,
                     thread_id: draftArtifact.thread_id,
-                    message_id: message.mailContext?.latest_message_id || message.mailContext?.anchor_message_id || "",
+                    message_id: message.mailContext?.kind === "gmail_thread"
+                      ? (message.mailContext.latest_message_id || message.mailContext.anchor_message_id)
+                      : "",
                   })}
                 >
                   Go to thread
@@ -1363,6 +1386,25 @@ function AiAssistantMessage({
               <button
                 className="is-secondary"
                 onClick={() => void actions.copyDraft(draftArtifact.body)}
+              >
+                Copy draft
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {composeArtifact ? (
+          <div className="ai-draft-artifact">
+            <pre>{composeArtifact.body}</pre>
+            <div className="ai-draft-artifact-actions">
+              <button className="is-primary" onClick={() => onUseComposeArtifact(
+                composeArtifact,
+                message.mailContext?.kind === "compose" ? message.mailContext : null,
+              )}>
+                {composeArtifact.mode === "replace" ? "Apply revised draft" : "Insert draft"}
+              </button>
+              <button
+                className="is-secondary"
+                onClick={() => void actions.copyDraft(composeArtifact.body)}
               >
                 Copy draft
               </button>
@@ -1494,12 +1536,14 @@ function AiMessageBubble({
   message,
   currentMailContext,
   onUseArtifact,
+  onUseComposeArtifact,
   onOpenMail,
   onConfirmSendPlan,
 }: {
   message: AiChatMessage;
   currentMailContext: AiMailContextRef | null;
   onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
+  onUseComposeArtifact: (artifact: ComposeDraftArtifact, context: AiComposeContextRef | null) => void;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
 }) {
@@ -1511,6 +1555,7 @@ function AiMessageBubble({
       message={message}
       currentMailContext={currentMailContext}
       onUseArtifact={onUseArtifact}
+      onUseComposeArtifact={onUseComposeArtifact}
       onOpenMail={onOpenMail}
       onConfirmSendPlan={onConfirmSendPlan}
     />
@@ -1522,20 +1567,25 @@ function AiSidebar({
   onToggle,
   currentMailContext,
   onUseArtifact,
+  onUseComposeArtifact,
   onOpenMail,
   onConfirmSendPlan,
+  composerFocusKey,
 }: {
   collapsed: boolean;
   onToggle: () => void;
   currentMailContext: AiMailContextRef | null;
   onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
+  onUseComposeArtifact: (artifact: ComposeDraftArtifact, context: AiComposeContextRef | null) => void;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
+  composerFocusKey: number;
 }) {
   const { state, actions } = useApp();
   const [historyOpen, setHistoryOpen] = useState(false);
   const [showNewMessagePrompt, setShowNewMessagePrompt] = useState(false);
   const conversationRef = useRef<HTMLDivElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const pinnedToBottomRef = useRef(true);
   const scrollAfterSubmitRef = useRef(false);
   const running =
@@ -1583,6 +1633,12 @@ function AiSidebar({
     );
     return () => window.cancelAnimationFrame(frame);
   }, [state.aiChatConversationId, scrollConversationToBottom]);
+
+  useEffect(() => {
+    if (!composerFocusKey) return;
+    const frame = window.requestAnimationFrame(() => composerInputRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [composerFocusKey]);
 
   useEffect(() => {
     const wasRunning = previousRunningRef.current;
@@ -1653,6 +1709,7 @@ function AiSidebar({
                 message={message}
                 currentMailContext={currentMailContext}
                 onUseArtifact={onUseArtifact}
+                onUseComposeArtifact={onUseComposeArtifact}
                 onOpenMail={onOpenMail}
                 onConfirmSendPlan={onConfirmSendPlan}
               />
@@ -1753,6 +1810,7 @@ function AiSidebar({
           data-tooltip={llmOffline ? "LLM is offline. Please try again when it reconnects." : undefined}
         >
           <textarea
+            ref={composerInputRef}
             value={state.customScanInput}
             placeholder="Find, organize, ask anything…"
             rows={3}
@@ -1996,6 +2054,12 @@ export function HomeView() {
   const [composeOpen, setComposeOpen] = useState(false);
   const [composeClosing, setComposeClosing] = useState(false);
   const [composeResumeDraft, setComposeResumeDraft] = useState<ComposeDraft | null>(null);
+  const [composeAiContext, setComposeAiContext] = useState<AiComposeContextRef | null>(null);
+  const [composeInsertRequest, setComposeInsertRequest] = useState<{
+    nonce: string;
+    artifact: ComposeDraftArtifact;
+  } | null>(null);
+  const [aiComposerFocusKey, setAiComposerFocusKey] = useState(0);
   const [composeDrafts, setComposeDrafts] = useState<ComposeDraft[]>([]);
   const [selectedComposeDraftIds, setSelectedComposeDraftIds] = useState<Set<string>>(new Set());
   const [batchConfirmDrafts, setBatchConfirmDrafts] = useState<ComposeDraft[] | null>(null);
@@ -2039,6 +2103,8 @@ export function HomeView() {
   );
   const [cachedInboxBannerDismissed, setCachedInboxBannerDismissed] =
     useState(false);
+  const [cachedInboxRetryAction, setCachedInboxRetryAction] =
+    useState<CachedInboxRetryAction>("sync");
   const sidebarWidthRef = useRef(sidebarWidth);
   const sidebarDragRef = useRef<{
     pointerId: number;
@@ -2189,6 +2255,7 @@ export function HomeView() {
   useEffect(() => {
     if (!state.inboxError) {
       setCachedInboxBannerDismissed(false);
+      setCachedInboxRetryAction("sync");
       try {
         window.localStorage.removeItem(
           cachedInboxBannerSkipStorageKey(mailbox),
@@ -2649,45 +2716,26 @@ export function HomeView() {
         if (currentSource === "cache") {
           currentNextOffset = "nextOffset" in result ? result.nextOffset : currentNextOffset;
           if (result.hasMore) {
-            setFeedWindow({
-              days: INBOX_ALL_TIME_DAYS,
-              nextOffset: currentNextOffset,
-              hasMore: true,
-              localLimit: INBOX_FEED_PAGE_SIZE,
-              source: "cache",
-              gmailPageToken: "",
-              gmailPageOffset: 0,
-            });
             continue;
           }
           currentSource = "gmail";
-          setFeedWindow({
-            days: INBOX_ALL_TIME_DAYS,
-            nextOffset: currentNextOffset,
-            hasMore: true,
-            localLimit: INBOX_FEED_PAGE_SIZE,
-            source: currentSource,
-            gmailPageToken: currentGmailPageToken,
-            gmailPageOffset: currentGmailPageOffset,
-          });
           continue;
         }
         currentGmailPageToken =
           "pageToken" in result ? result.pageToken : currentGmailPageToken;
         currentGmailPageOffset =
           "pageOffset" in result ? result.pageOffset : currentGmailPageOffset;
-        setFeedWindow({
-          days: INBOX_ALL_TIME_DAYS,
-          nextOffset: currentNextOffset,
-          hasMore: result.hasMore,
-          localLimit: INBOX_FEED_PAGE_SIZE,
-          source: "gmail",
-          gmailPageToken: currentGmailPageToken,
-          gmailPageOffset: currentGmailPageOffset,
-        });
         if (!result.hasMore) break;
       }
-      return true;
+      return {
+        days: INBOX_ALL_TIME_DAYS,
+        nextOffset: currentNextOffset,
+        hasMore: false,
+        localLimit: INBOX_FEED_PAGE_SIZE,
+        source: currentSource,
+        gmailPageToken: currentGmailPageToken,
+        gmailPageOffset: currentGmailPageOffset,
+      } satisfies InboxFeedWindow;
     },
     [actions, loadGmailPage],
   );
@@ -2850,35 +2898,6 @@ export function HomeView() {
     }
   }, [actions, authChecking, mailbox]);
 
-  const loadOlderInbox = useCallback(async () => {
-    setFeedAction("older");
-    try {
-      const result = await actions.loadCachedInboxEmails(
-        "inbox",
-        INBOX_LAST_MONTH_DAYS,
-        0,
-        false,
-      );
-      if (mailboxViewRef.current !== "inbox") return;
-      if (result.ok) {
-        setFeedWindow({
-          days: INBOX_LAST_MONTH_DAYS,
-          nextOffset: result.nextOffset,
-          hasMore: true,
-          localLimit: INBOX_FEED_PAGE_SIZE,
-          source: result.hasMore ? "cache" : "gmail",
-          gmailPageToken: "",
-          gmailPageOffset: 0,
-        });
-        actions.showToast("Inbox synced for the last 1 month.");
-      } else {
-        actions.showToast("Failed to sync the last 1 month.");
-      }
-    } finally {
-      setFeedAction((current) => (current === "older" ? null : current));
-    }
-  }, [actions]);
-
   const loadMoreInbox = useCallback(async () => {
     if (
       pageLoadInFlight.current ||
@@ -2897,7 +2916,8 @@ export function HomeView() {
       );
       if (mailboxViewRef.current !== "inbox") return;
       if (!initial.ok) {
-        actions.showToast("Failed to load emails older than 1 month.");
+        setCachedInboxRetryAction("load-more");
+        actions.showToast("Failed to load emails older than 30 days.");
         return;
       }
       let source: InboxFeedWindow["source"] = initial.hasMore
@@ -2909,26 +2929,19 @@ export function HomeView() {
       const excludeMessageIds = (initial.messages || [])
         .map((message) => message.id)
         .filter(Boolean);
-      setFeedWindow({
-        days: INBOX_ALL_TIME_DAYS,
-        nextOffset,
-        hasMore: true,
-        localLimit: INBOX_FEED_PAGE_SIZE,
-        source,
-        gmailPageToken,
-        gmailPageOffset,
-      });
-      const loadedAll = await loadRemainingAllTimeInbox(
+      const allTimeWindow = await loadRemainingAllTimeInbox(
         source,
         nextOffset,
         gmailPageToken,
         gmailPageOffset,
         excludeMessageIds,
       );
-      if (!loadedAll) {
-        actions.showToast("Failed to load emails older than 1 month.");
+      if (!allTimeWindow) {
+        setCachedInboxRetryAction("load-more");
+        actions.showToast("Failed to load emails older than 30 days.");
         return;
       }
+      setFeedWindow(allTimeWindow);
       actions.showToast("Loaded all inbox emails.");
     } finally {
       pageLoadInFlight.current = false;
@@ -3181,6 +3194,29 @@ export function HomeView() {
       latest_message_id: latestSelectedThreadMessage?.id || selectedMessage.id,
     };
   }, [latestSelectedThreadMessage?.id, mailbox, selectedMessage]);
+
+  const sidebarMailContext = composeAiContext || currentMailContext;
+
+  const openComposeAiDraft = useCallback((draft: Pick<ComposeDraft, "recipients" | "subject" | "body">) => {
+    const context: AiComposeContextRef = {
+      kind: "compose",
+      session_id: crypto.randomUUID(),
+      mailbox,
+      recipients: [...draft.recipients],
+      subject: draft.subject,
+      body: draft.body,
+    };
+    setComposeAiContext(context);
+    actions.startNewAiConversation();
+    setSidebarCollapsed(false);
+    actions.setInput(
+      "customScanInput",
+      draft.body.trim()
+        ? "Suggest changes to improve my draft"
+        : `Write a first draft about ${draft.subject}`,
+    );
+    setAiComposerFocusKey((key) => key + 1);
+  }, [actions, mailbox]);
 
   const closeDetailDrawer = useCallback(() => {
     const currentId = selectedId;
@@ -3575,7 +3611,10 @@ export function HomeView() {
     }
     actions.resetInboxFeed();
     if (!isLocalMailboxView(next)) {
-      void loadRemoteCategory(next, 7);
+      void loadRemoteCategory(
+        next,
+        next === "inbox" ? INBOX_LAST_MONTH_DAYS : 7,
+      );
     }
   };
 
@@ -3638,6 +3677,8 @@ export function HomeView() {
 
   const closeComposeDrawer = useCallback(() => {
     setComposeOpen(false);
+    setComposeAiContext(null);
+    setComposeInsertRequest(null);
     setComposeClosing(true);
     if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current);
     composeCloseTimer.current = window.setTimeout(() => {
@@ -3708,12 +3749,25 @@ export function HomeView() {
       <AiSidebar
         collapsed={sidebarCollapsed}
         onToggle={() => setSidebarCollapsed((value) => !value)}
-        currentMailContext={currentMailContext}
+        currentMailContext={sidebarMailContext}
         onUseArtifact={(artifact, mode) =>
           setInsertRequest({ nonce: crypto.randomUUID(), artifact, mode })
         }
+        onUseComposeArtifact={(artifact, sourceContext) => {
+          if (
+            !composeOpen
+            || !composeAiContext
+            || sourceContext?.session_id !== composeAiContext?.session_id
+            || composeAiContext.mailbox.trim().toLowerCase() !== artifact.mailbox.trim().toLowerCase()
+          ) {
+            actions.showToast("Open the matching Compose draft before applying this suggestion.");
+            return;
+          }
+          setComposeInsertRequest({ nonce: crypto.randomUUID(), artifact });
+        }}
         onOpenMail={(target) => void openMailDetailFromAi(target)}
         onConfirmSendPlan={confirmAiSendPlan}
+        composerFocusKey={aiComposerFocusKey}
       />
       <div
         className="ai-sidebar-resizer"
@@ -3889,10 +3943,16 @@ export function HomeView() {
                   Skip
                 </button>
                 <button
-                  onClick={() => void syncInbox(days)}
-                  disabled={isInboxSyncing}
+                  onClick={() => void (
+                    cachedInboxRetryAction === "load-more"
+                      ? loadMoreInbox()
+                      : syncInbox(days)
+                  )}
+                  disabled={isInboxSyncing || feedAction !== null}
                 >
-                  Retry sync
+                  {cachedInboxRetryAction === "load-more"
+                    ? "Retry loading older emails"
+                    : "Retry inbox sync"}
                 </button>
               </div>
             </div>
@@ -4021,17 +4081,6 @@ export function HomeView() {
               </div>
             ))
           )}
-          {days === 7 &&
-          canShowOlderInboxActions &&
-          mailboxView === "inbox" ? (
-            <button
-              className="older-mail-btn"
-              onClick={() => void loadOlderInbox()}
-              disabled={isInboxSyncing || feedAction !== null}
-            >
-              Show emails older than 7 days
-            </button>
-          ) : null}
           {canLoadMoreInbox && canShowOlderInboxActions ? (
             <button
               className="older-mail-btn"
@@ -4040,7 +4089,7 @@ export function HomeView() {
             >
               {feedAction === "more"
                 ? "Loading older emails..."
-                : "Show emails older than 1 month"}
+                : "Show emails older than 30 days"}
             </button>
           ) : null}
           {mailboxView === "trash" ? (
@@ -4107,6 +4156,9 @@ export function HomeView() {
           onClose={closeComposeDrawer}
           onViewDrafts={() => { closeComposeDrawer(); selectMailboxView("drafts"); }}
           onScheduleSend={scheduleComposeSend}
+          insertRequest={composeInsertRequest}
+          onConsumeInsertRequest={(nonce) => setComposeInsertRequest((current) => current?.nonce === nonce ? null : current)}
+          onOpenAiDraft={openComposeAiDraft}
         /> : null}
         <SnoozePicker
           open={Boolean(snoozeTarget)}

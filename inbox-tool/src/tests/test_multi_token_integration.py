@@ -111,6 +111,8 @@ def clear_adapter_state():
 
     adapter._multi_token_map.clear()
     adapter._discovered_email = ""
+    adapter.set_platform_accounts([])
+    adapter.configure_platform_accounts(None, None)
 
 
 def clear_env():
@@ -126,6 +128,7 @@ class TestMultiTokenIntegration:
         self._store = _store
 
     def run(self):
+        self.test_platform_credentials_multi_account_flow()
         self.test_single_token_backward_compat()
         self.test_multi_token_only()
         self.test_mixed_platform_and_multi()
@@ -141,6 +144,41 @@ class TestMultiTokenIntegration:
         self.test_check_gmail_auth_all_sources()
         self.test_discover_mailboxes_merges_all()
         self.test_get_authorized_email_tool()
+
+    # ── 0. Anna Credentials multi-account bridge ────────────────
+
+    def test_platform_credentials_multi_account_flow(self):
+        section("0. Platform credentials multi-account flow")
+        clear_env()
+        clear_adapter_state()
+
+        from mail_agent.mail_providers.gmail import adapter
+        from anna_inbox_executa.mailbox_tools import _discover_mailboxes
+
+        adapter.set_platform_accounts([
+            {"account_id": "account-work", "email": "work@example.com", "label": "Work", "is_default": False, "status": "active"},
+            {"account_id": "account-personal", "email": "personal@example.com", "label": "Personal", "is_default": True, "status": "active"},
+        ])
+        requested_ids: list[str] = []
+
+        def resolve_token(account_id: str) -> str:
+            requested_ids.append(account_id)
+            return f"short-lived-{account_id}"
+
+        adapter.configure_platform_accounts(lambda: [], resolve_token)
+        check("default account first", adapter.get_platform_accounts()[0]["email"], "personal@example.com")
+        check("work uses account id", adapter.get_access_token("work@example.com"), "short-lived-account-work")
+        check("token request id", requested_ids, ["account-work"])
+
+        with patch("anna_inbox_executa.mailbox_tools.refresh_platform_google_accounts", return_value=[]), \
+             patch.object(adapter, "list_available_mailboxes_from_tokens", return_value=[]):
+            discovered = _discover_mailboxes()
+        check("platform account count", len(discovered), 2)
+        check("platform default listed first", discovered[0]["email"], "personal@example.com")
+        check("platform source", discovered[1]["auth_source"], "platform_credentials")
+        check("metadata only display name", discovered[0]["display_name"], "Personal")
+
+        clear_adapter_state()
 
     # ── 1. Single token backward compat ────────────────────────
 

@@ -562,6 +562,51 @@ INBOX_PROMPT_MESSAGE_LIMIT = 8
 INBOX_PROMPT_BODY_LIMIT = 1200
 THREAD_ASSIST_CACHE_VERSION = 2
 
+
+def _uses_chinese_text(value: str) -> bool:
+    return bool(re.search(r"[\u3400-\u9fff]", str(value or "")))
+
+
+def _sidebar_language_instruction(visible_prompt: str) -> str:
+    """Keep the AI conversation in the language used for the request.
+
+    Email drafts intentionally remain outside this rule: a reply or new email should
+    follow the language appropriate to its recipients and source conversation.
+    """
+    if _uses_chinese_text(visible_prompt):
+        return (
+            "The visible prompt is in Chinese. You MUST write every user-facing conversation "
+            "field in Simplified Chinese: assistant_text, assistant_followup_text, "
+            "and every reply_gaps/compose_gaps summary, question, and hint. Do not "
+            "use English for those fields except untranslatable names, addresses, "
+            "identifiers, or quoted source text. Keep draft_reply and compose_draft "
+            "in the language appropriate to the recipients and source email."
+        )
+    return (
+        "You MUST write every user-facing conversation field in the same language as the "
+        "visible prompt: assistant_text, assistant_followup_text, and every "
+        "reply_gaps/compose_gaps summary, question, and hint. Keep draft_reply and "
+        "compose_draft in the language appropriate to the recipients and source email."
+    )
+
+
+def _sidebar_fallback_text(visible_prompt: str, kind: str) -> str:
+    """Return deterministic, request-language fallback copy for the AI sidebar."""
+    if _uses_chinese_text(visible_prompt):
+        return {
+            "summary": "我已查看该邮件线程，但暂时无法生成详细摘要。",
+            "thread_draft": "我已为该邮件线程生成回复草稿。",
+            "compose_analysis": "我已查看你的草稿，并可在改写前提出改进建议。",
+            "compose_draft": "在生成邮件草稿前，我还需要一些补充信息。",
+        }[kind]
+    return {
+        "summary": "I reviewed the thread, but could not generate a detailed summary.",
+        "thread_draft": "I drafted a reply for this thread.",
+        "compose_analysis": "I reviewed your draft and can suggest improvements before rewriting it.",
+        "compose_draft": "I need a little more context before I can propose an email draft.",
+    }[kind]
+
+
 THREAD_ASSIST_SYSTEM = """You are Anna's inbox thread assistant.
 
 Return JSON only:
@@ -600,6 +645,7 @@ Return JSON only:
 }
 
 Rules:
+- Follow the Response language instruction in the user message exactly.
 - draft_reply and reply_gaps.needs_user_input=true are mutually exclusive.
 - If the user prompt requires information that only the user would know, do not guess.
 - In that case, omit draft_reply and return 1-3 specific reply_gaps questions.
@@ -615,6 +661,38 @@ Rules:
 - Never include HTML.
 """
 
+COMPOSE_MAIL_PROMPT_SYSTEM = """You are Anna, an executive email assistant helping the user compose a new email.
+
+Return JSON only:
+{
+  "assistant_text": "clear response for the AI sidebar",
+  "assistant_followup_text": "optional concise next step",
+  "suggested_subject": "optional suggested subject line",
+  "compose_draft": {"body": "plain text email body", "subject": "optional subject line"} | null,
+  "compose_gaps": {
+    "needs_user_input": true | false,
+    "summary": "one short sentence",
+    "questions": [
+      {"id": "q1", "question": "specific question", "hint": "short hint", "required": true}
+    ]
+  }
+}
+
+Rules:
+- Follow the Response language instruction in the user message exactly.
+- This is a new Compose email, not a Gmail thread. Treat the supplied Compose snapshot as the only email context.
+- Never send, save, delete, or modify the Compose email. You may only give advice or return a proposed body for the user to review.
+- Recipient addresses are audience context only. Never reproduce addresses or email headers in assistant text or a proposed body, and never suggest changing recipients.
+- When the requested response mode is analysis, provide concrete, prioritized improvement suggestions and any needed clarifying questions. Set compose_draft to null even if a rewrite would be possible.
+- When the requested response mode is draft or revision, return a proposed compose_draft only if the prompt and snapshot provide enough information. Otherwise set compose_draft to null and ask one to three specific questions.
+- A revision must be a complete replacement body, not a patch or a list of edits.
+- Do not invent dates, commitments, prices, names, or factual claims. Do not silently turn unknown details into facts.
+- Do not repeat the proposed email body in assistant_text or assistant_followup_text.
+- In assistant_text and assistant_followup_text, use only Markdown headings, bold text, ordered or unordered lists, and HTTP/HTTPS links in the form [label](https://example.com). Do not use HTML, tables, images, code blocks, or block quotes.
+- The proposed email body must be plain text without HTML or Markdown fences. Do not include To, Cc, Bcc, or Subject headers in it.
+- Keep a sign-off and sender name on consecutive lines with no blank line between them.
+"""
+
 MAIL_SUMMARY_SYSTEM = """You are Anna, an executive email assistant summarizing a Gmail thread.
 
 Return JSON only:
@@ -623,6 +701,7 @@ Return JSON only:
 }
 
 Rules:
+- Follow the Response language instruction in the user message exactly.
 - Summarize the email conversation only.
 - Do not write or offer a draft reply.
 - Do not mention drafting, draft buttons, or reply artifacts.
@@ -1187,11 +1266,13 @@ async def _generate_mail_prompt_result(
         sampling_create_message=sampling_create_message,
     )
     if expected_artifact == "summary":
+        fallback_assistant = _sidebar_fallback_text(visible_prompt, "summary")
         result = await call_llm_json_safe(
             sampling_create_message,
             system_prompt=MAIL_SUMMARY_SYSTEM,
             user_message=(
                 f"Visible prompt: {visible_prompt}\n"
+                f"Response language: {_sidebar_language_instruction(visible_prompt)}\n"
                 f"Mailbox: {mailbox}\n"
                 f"Thread ID: {thread_id}\n"
                 f"Anchor message ID: {anchor_message_id}\n"
@@ -1199,7 +1280,7 @@ async def _generate_mail_prompt_result(
                 f"Contact context: {contact_context_text}\n"
                 f"Thread messages:\n{_thread_prompt_excerpt(messages)}\n"
             ),
-            fallback={"assistant_text": "I reviewed the thread, but could not generate a detailed summary."},
+            fallback={"assistant_text": fallback_assistant},
             temperature=0.2,
             max_tokens=1200,
             timeout=90.0,
@@ -1213,7 +1294,7 @@ async def _generate_mail_prompt_result(
             "latest_message_id": latest_message_id,
             "visible_prompt": visible_prompt,
             "thread_title": thread_title,
-            "assistant_text": str(payload.get("assistant_text") or "I reviewed the thread.").strip(),
+            "assistant_text": str(payload.get("assistant_text") or fallback_assistant).strip(),
             "assistant_followup_text": "",
             "artifact": None,
             "reply_gaps": {"needs_user_input": False, "summary": "", "questions": []},
@@ -1225,12 +1306,13 @@ async def _generate_mail_prompt_result(
         for key, value in (user_answers or {}).items()
         if str(value).strip()
     ) or "None"
-    fallback_assistant = "I drafted a reply for this thread."
+    fallback_assistant = _sidebar_fallback_text(visible_prompt, "thread_draft")
     result = await call_llm_json_safe(
         sampling_create_message,
         system_prompt=MAIL_PROMPT_SYSTEM,
         user_message=(
             f"Visible prompt: {visible_prompt}\n"
+            f"Response language: {_sidebar_language_instruction(visible_prompt)}\n"
             f"Expected artifact: {expected_artifact or 'none'}\n"
             f"Mailbox: {mailbox}\n"
             f"Thread ID: {thread_id}\n"
@@ -1316,6 +1398,149 @@ async def _generate_mail_prompt_result(
     }
 
 
+_COMPOSE_GENERATION_PROMPT_RE = re.compile(
+    r"(?:\b(?:write|create|compose|redraft|rewrite|revise|polish)\b|\bdraft\s+(?:an?\s+|the\s+|this\s+)?(?:email|draft|message)?|\bturn\b.+\binto\b|重写|改写|起草|写一封|生成(?:一封)?(?:邮件|草稿)|润色)",
+    re.IGNORECASE | re.DOTALL,
+)
+_COMPOSE_ANALYSIS_PROMPT_RE = re.compile(
+    r"(?:\bsuggest\s+changes?\b|\bimprove\b|\bfeedback\b|\breview\b|\bcritique\b|\banaly[sz]e\b|\bdiagnos(?:e|is)\b|\bwhat\b.+\bchange\b|建议|改进|优化|分析|诊断)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _compose_response_mode(*, body: str, visible_prompt: str, expected_artifact: str) -> str:
+    """Choose a conservative Compose response mode from the visible user instruction.
+
+    The expected artifact describes the UI surface, not authorization to overwrite a
+    non-empty draft. An explicit writing instruction is required before returning a
+    replacement draft for a Compose message that already has content.
+    """
+    prompt = str(visible_prompt or "").strip()
+    explicit_generation = bool(_COMPOSE_GENERATION_PROMPT_RE.search(prompt))
+    asks_for_analysis = bool(_COMPOSE_ANALYSIS_PROMPT_RE.search(prompt))
+    if explicit_generation:
+        return "revision" if body else "draft"
+    if body and asks_for_analysis:
+        return "analysis"
+    if body:
+        return "analysis"
+    if expected_artifact == "compose_draft":
+        return "draft"
+    return "analysis"
+
+
+def _normalize_compose_gaps(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    questions_raw = raw.get("questions") if isinstance(raw.get("questions"), list) else []
+    questions: list[dict[str, Any]] = []
+    for index, item in enumerate(questions_raw[:3], start=1):
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question") or "").strip()
+        if not question:
+            continue
+        questions.append({
+            "id": str(item.get("id") or f"q{index}").strip()[:64] or f"q{index}",
+            "question": question[:240],
+            "hint": str(item.get("hint") or "").strip()[:120],
+            "required": bool(item.get("required", True)),
+        })
+    return {
+        "needs_user_input": bool(raw.get("needs_user_input")),
+        "summary": str(raw.get("summary") or "").strip()[:500],
+        "questions": questions,
+    }
+
+
+async def _generate_compose_mail_prompt_result(
+    *,
+    mailbox: str,
+    draft: dict[str, Any],
+    visible_prompt: str,
+    expected_artifact: str,
+    sampling_create_message: Any,
+) -> dict[str, Any]:
+    """Run a read-only Compose-aware sidebar prompt and return an optional artifact.
+
+    This function deliberately has no storage or Gmail calls. The artifact is only a
+    reviewable proposal; applying it remains a frontend action and sending remains a
+    separate explicitly-confirmed Compose tool call.
+    """
+    from mail_agent.llm_runtime.service import call_llm_json_safe
+
+    raw_recipients = draft.get("recipients") if isinstance(draft.get("recipients"), list) else []
+    recipients = [str(item).strip() for item in raw_recipients if str(item).strip()][:100]
+    subject = str(draft.get("subject") or "").strip()[:998]
+    body = str(draft.get("body") or "").strip()[:12000]
+    mode = _compose_response_mode(
+        body=body,
+        visible_prompt=visible_prompt,
+        expected_artifact=expected_artifact,
+    )
+    fallback_text = _sidebar_fallback_text(
+        visible_prompt,
+        "compose_analysis" if mode == "analysis" else "compose_draft",
+    )
+    result = await call_llm_json_safe(
+        sampling_create_message,
+        system_prompt=COMPOSE_MAIL_PROMPT_SYSTEM,
+        user_message=(
+            f"Visible prompt: {visible_prompt}\n"
+            f"Response language: {_sidebar_language_instruction(visible_prompt)}\n"
+            f"Requested response mode: {mode}\n"
+            f"Mailbox: {mailbox}\n"
+            f"Recipients (audience context only; never reproduce or modify): {', '.join(recipients) or '(not yet specified)'}\n"
+            f"Current subject: {subject or '(not yet specified)'}\n"
+            f"Current body:\n{body or '(empty)'}\n"
+        ),
+        fallback={
+            "assistant_text": fallback_text,
+            "assistant_followup_text": "",
+            "suggested_subject": "",
+            "compose_draft": None,
+            "compose_gaps": {"needs_user_input": False, "summary": "", "questions": []},
+        },
+        temperature=0.3,
+        max_tokens=2400,
+        timeout=150.0,
+        metadata={"tool": "compose_mail_prompt", "mode": mode, "recipient_count": len(recipients)},
+    )
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    gaps = _normalize_compose_gaps(payload.get("compose_gaps"))
+    raw_compose_draft = payload.get("compose_draft") if isinstance(payload.get("compose_draft"), dict) else {}
+    proposed_body = _normalize_generated_draft_body(raw_compose_draft.get("body"))
+    suggested_subject = str(
+        raw_compose_draft.get("subject") or payload.get("suggested_subject") or ""
+    ).strip()[:998]
+
+    # A request for feedback must never return an accidental replace/insert control,
+    # even if the model ignored the requested mode. Likewise, unanswered questions
+    # keep a draft proposal out of the UI until the user supplies the missing context.
+    artifact = None
+    if mode in {"draft", "revision"} and proposed_body and not gaps["needs_user_input"]:
+        artifact = {
+            "type": "compose_draft",
+            "mailbox": mailbox,
+            "body": proposed_body,
+            "source_prompt": visible_prompt,
+            "mode": "insert" if mode == "draft" else "replace",
+        }
+        if suggested_subject:
+            artifact["subject"] = suggested_subject
+
+    return {
+        "mailbox": mailbox,
+        "visible_prompt": visible_prompt,
+        "compose": {"recipients": recipients, "subject": subject, "body": body},
+        "response_mode": mode,
+        "assistant_text": str(payload.get("assistant_text") or fallback_text).strip()[:8000],
+        "assistant_followup_text": str(payload.get("assistant_followup_text") or "").strip()[:4000],
+        "artifact": artifact,
+        "compose_gaps": gaps,
+        "fallback_used": bool(result.get("fallback_used")),
+    }
+
+
 async def _handle_inbox_thread_assist_background(run_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
     from mail_agent.storage.ops import get_inbox_thread_assist, set_inbox_thread_assist
 
@@ -1374,6 +1599,30 @@ async def _handle_inbox_mail_prompt_background(run_id: str, arguments: dict[str,
             visible_prompt=visible_prompt,
             expected_artifact=expected_artifact,
             user_answers=user_answers,
+            sampling_create_message=sampling,
+        )
+        MAIL_AGENT_RUNS[run_id].update(status="done", result=result, updated_at=beijing_now())
+    except Exception as exc:
+        MAIL_AGENT_RUNS[run_id].update(status="failed", error=str(exc), updated_at=beijing_now())
+    _save_run_checkpoint(run_id)
+
+
+async def _handle_compose_mail_prompt_background(run_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
+    """Populate a pollable run for a Compose sidebar request without persisting it."""
+    MAIL_AGENT_RUNS[run_id]["status"] = "running"
+    _save_run_checkpoint(run_id)
+
+    mailbox = str(arguments.get("mailbox", "")).strip()
+    draft = arguments.get("draft") if isinstance(arguments.get("draft"), dict) else {}
+    visible_prompt = str(arguments.get("visible_prompt", "")).strip()
+    expected_artifact = str(arguments.get("expected_artifact", "")).strip()
+    try:
+        sampling = _build_sampling_for_run(arguments, invoke_id)
+        result = await _generate_compose_mail_prompt_result(
+            mailbox=mailbox,
+            draft=draft,
+            visible_prompt=visible_prompt,
+            expected_artifact=expected_artifact,
             sampling_create_message=sampling,
         )
         MAIL_AGENT_RUNS[run_id].update(status="done", result=result, updated_at=beijing_now())
@@ -1825,6 +2074,41 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         MAIL_AGENT_RUNS[run_id] = {"run_id": run_id, "status": "queued", "stage": "inbox_mail_prompt", "progress": {}, "warnings": [], "started_at": beijing_now(), "updated_at": beijing_now(), "result": None, "error": "", "partial": {}}
         _save_run_checkpoint(run_id)
         asyncio.ensure_future(_handle_inbox_mail_prompt_background(run_id, arguments, invoke_id))
+        return {"success": True, "run_id": run_id, "status": "queued"}
+
+    if tool == "start_compose_mail_prompt":
+        draft = arguments.get("draft") if isinstance(arguments.get("draft"), dict) else {}
+        visible_prompt = str(arguments.get("visible_prompt", "")).strip()
+        if not mailbox or not visible_prompt:
+            return {"error": "mailbox and visible_prompt are required"}
+        if not draft:
+            return {"error": "draft is required"}
+        run_id = str(arguments.get("run_id") or "").strip() or f"bg_{uuid.uuid4().hex[:12]}"
+        existing = MAIL_AGENT_RUNS.get(run_id)
+        if existing:
+            # Retry of the same client-generated ID is idempotent: never run a
+            # second LLM request that could yield a competing draft proposal.
+            return {
+                "success": existing.get("status") == "done",
+                "run_id": run_id,
+                "status": existing.get("status", "queued"),
+                "result": _compact_run_result(existing.get("result")),
+                "error": existing.get("error", ""),
+            }
+        MAIL_AGENT_RUNS[run_id] = {
+            "run_id": run_id,
+            "status": "queued",
+            "stage": "compose_mail_prompt",
+            "progress": {},
+            "warnings": [],
+            "started_at": beijing_now(),
+            "updated_at": beijing_now(),
+            "result": None,
+            "error": "",
+            "partial": {},
+        }
+        _save_run_checkpoint(run_id)
+        asyncio.ensure_future(_handle_compose_mail_prompt_background(run_id, arguments, invoke_id))
         return {"success": True, "run_id": run_id, "status": "queued"}
 
     if tool == "summarize_thread":

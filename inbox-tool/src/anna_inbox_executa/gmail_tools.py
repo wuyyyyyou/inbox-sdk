@@ -965,18 +965,23 @@ def get_cached_email(mailbox_arg: str, message_id: str) -> dict[str, Any]:
 def _check_gmail_auth(mailbox: str) -> dict[str, Any]:
     """Check Gmail authorization status.
 
-    Platform: GMAIL_ACCESS_TOKEN or GOOGLE_ACCESS_TOKEN env var is set.
-    Multi-token: checks _multi_token_map.
+    Platform: Anna Credentials account metadata and on-demand token access.
+    Legacy platform/local token paths remain available for development.
     Local dev: token file exists on disk (content/expiry not validated).
     """
     import os as _os
-    from mail_agent.mail_providers.gmail.adapter import _token_dir, sanitize_mailbox_id, get_authorized_email, get_multi_token_map
+    from mail_agent.mail_providers.gmail.adapter import _token_dir, sanitize_mailbox_id, get_authorized_email, get_multi_token_map, get_platform_account, get_platform_accounts
     from pathlib import Path as _Path
 
     requested = str(mailbox or "").strip().lower()
+    refresh_platform_google_accounts()
+    platform_accounts = get_platform_accounts()
 
     # 系统级判断：mailbox 为空时，只看 token 有没有，不关心具体邮箱
     if not requested:
+        active_accounts = [item for item in platform_accounts if str(item.get("status") or "active").lower() in {"", "active", "connected"}]
+        if active_accounts:
+            return {"authorized": True, "source": "platform_credentials", "authorized_email": str(active_accounts[0].get("email") or ""), "mode": "any"}
         platform_token = _os.environ.get("GMAIL_ACCESS_TOKEN") or _os.environ.get("GOOGLE_ACCESS_TOKEN")
         if platform_token and platform_token.strip():
             try:
@@ -995,9 +1000,16 @@ def _check_gmail_auth(mailbox: str) -> dict[str, Any]:
                     return {"authorized": True, "source": "local_file", "mode": "any"}
         return {"authorized": False, "source": "none", "mode": "any"}
 
-    # The multi-token snapshot is authoritative when it includes this mailbox.
-    # Check it before the legacy platform singleton so an extra account does not
-    # appear unauthorized merely because a Default account is also injected.
+    platform_account = get_platform_account(requested)
+    if platform_account:
+        status = str(platform_account.get("status") or "active").lower()
+        return {
+            "authorized": status in {"", "active", "connected"},
+            "source": "platform_credentials",
+            "authorized_email": requested,
+        }
+
+    # Legacy multi-token snapshot support.
     if requested in get_multi_token_map():
         return {"authorized": True, "source": "platform_multi", "authorized_email": requested}
 

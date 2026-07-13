@@ -254,6 +254,10 @@ export class MailAgentClient {
     return this.invoke<RunStatus>("start_inbox_mail_prompt", args, { retry: "safe" });
   }
 
+  startComposeMailPrompt(args: Record<string, unknown>) {
+    return this.invoke<RunStatus>("start_compose_mail_prompt", args, { retry: "safe" });
+  }
+
   getInboxThreadDraft(mailbox: string, threadId: string) {
     return this.invoke<InboxThreadDraftPayload>("get_inbox_thread_draft", { mailbox, thread_id: threadId });
   }

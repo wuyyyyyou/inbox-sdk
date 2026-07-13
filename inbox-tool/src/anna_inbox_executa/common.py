@@ -49,6 +49,7 @@ def data_root() -> Path:
     return (Path(__file__).resolve().parents[1] / ".data").resolve()
 
 from executa_sdk import PROTOCOL_VERSION_V2, SamplingClient, SamplingError
+from executa_sdk.credentials import CredentialsClient, CredentialsError
 from executa_sdk.storage import StorageClient, FilesClient, StorageError, make_response_router
 from executa_sdk.host_upload import HostUploadClient
 from mail_agent.storage.keys import app_key
@@ -83,17 +84,10 @@ DEFAULT_MANIFEST = {
     ],
     "credentials": [
         {
-            "name": "GMAIL_ACCESS_TOKEN",
-            "display_name": "Gmail Access Token",
-            "description": "Optional Google OAuth access token. Local token files are used when platform injection is unavailable.",
-            "required": True,
-            "sensitive": True,
-        },
-        {
             "name": "GOOGLE_ACCESS_TOKEN",
-            "display_name": "Google Access Token",
-            "description": "Alternative Google OAuth access token name supported by Anna platform credential mapping.",
-            "required": True,
+            "display_name": "Google Connected Accounts",
+            "description": "Enables Anna's Google multi-account credentials API. Accounts and short-lived tokens are requested on demand; do not paste a token here.",
+            "required": False,
             "sensitive": True,
         },
         {
@@ -110,18 +104,11 @@ DEFAULT_MANIFEST = {
             "required": False,
             "sensitive": False,
         },
-        {
-            "name": "GMAIL_MULTI_TOKENS",
-            "display_name": "Gmail Mailbox Token Snapshot",
-            "description": "JSON array containing every authorized Gmail mailbox, including the default one: {email, access_token, refresh_token, client_id, client_secret, expires_at}. When present, this is the authoritative mailbox source.",
-            "required": False,
-            "sensitive": True,
-        },
     ],
     "tools": [
         {
             "name": "check_google_oauth",
-            "description": "Check whether Anna injected a Google/Gmail OAuth credential for this invocation.",
+            "description": "Check Anna Google connected-account availability through the credentials Reverse RPC without exposing tokens.",
             "parameters": [],
         },
         {
@@ -187,7 +174,7 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "check_gmail_auth",
-            "description": "Check whether Gmail authorization is available. Platform: checks for injected OAuth token. Local: checks for token file existence (does not validate expiry).",
+            "description": "Check whether a Gmail mailbox is authorized. Platform: checks Anna connected-account metadata; local: checks token-file availability.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
             ],
@@ -257,7 +244,7 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "list_mailboxes",
-            "description": "Discover and list registered mailboxes, including selected and authorization state.",
+            "description": "Discover Anna connected Google accounts and list registered mailboxes, including selected and authorization state.",
             "parameters": [],
         },
         {
@@ -449,6 +436,18 @@ DEFAULT_MANIFEST = {
                 {"name": "run_id", "type": "string", "description": "Client-generated ID used to safely retry the same AI task.", "required": False},
                 {"name": "expected_artifact", "type": "string", "description": "Expected artifact type: draft_reply or summary.", "required": False},
                 {"name": "user_answers", "type": "object", "description": "Optional answers to reply-gap questions.", "required": False},
+                {"name": "ai_provider", "type": "string", "description": "LLM provider.", "required": False},
+            ],
+        },
+        {
+            "name": "start_compose_mail_prompt",
+            "description": "Start a read-only Compose-context AI prompt from the Anna sidebar. It may return a reviewable Compose draft artifact but never saves or sends email.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "draft", "type": "object", "description": "Current Compose snapshot: recipients, subject, and body.", "required": True},
+                {"name": "visible_prompt", "type": "string", "description": "Prompt visible in the Anna sidebar.", "required": True},
+                {"name": "run_id", "type": "string", "description": "Client-generated ID used to safely retry the same AI task.", "required": False},
+                {"name": "expected_artifact", "type": "string", "description": "Expected artifact type: compose_draft. Feedback requests for non-empty drafts remain analysis-only.", "required": False},
                 {"name": "ai_provider", "type": "string", "description": "LLM provider.", "required": False},
             ],
         },
@@ -679,7 +678,7 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "get_authorized_email",
-            "description": "Discover the authorized Gmail account from the platform-injected token. Returns empty string in local dev mode.",
+            "description": "Discover the primary authorized Gmail mailbox from Anna connected accounts, with legacy local fallback.",
             "parameters": [],
         },
         {
@@ -937,6 +936,8 @@ def write_frame(message: dict[str, Any]) -> None:
 
 sampling = SamplingClient(write_frame=write_frame)
 host_upload = HostUploadClient(write_frame=write_frame)
+platform_credentials = CredentialsClient(write_frame=write_frame)
+_platform_credentials_ready = False
 
 
 def _normalize_storage_provider(value: Any = "") -> str:
@@ -994,6 +995,54 @@ loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
 loop_thread.start()
 from mail_agent.storage.sync_bridge import bind as bind_storage_sync_bridge
 bind_storage_sync_bridge(loop, loop_thread)
+
+
+def refresh_platform_google_accounts() -> list[dict[str, Any]]:
+    """Refresh in-memory Google account metadata through Anna Credentials.
+
+    Account metadata is safe to retain for the active process; access tokens
+    are intentionally neither stored nor returned from this function.
+    """
+    if not _platform_credentials_ready:
+        return []
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            platform_credentials.list_accounts(provider="google"), loop,
+        )
+        payload = future.result(timeout=12.0)
+    except CredentialsError as exc:
+        log(f"platform Google account listing unavailable: {exc.code}")
+        return []
+    except Exception as exc:
+        log(f"platform Google account listing unavailable: {type(exc).__name__}")
+        return []
+
+    accounts = payload.get("accounts") if isinstance(payload, dict) else []
+    normalized = [item for item in accounts if isinstance(item, dict)] if isinstance(accounts, list) else []
+    from mail_agent.mail_providers.gmail.adapter import set_platform_accounts
+    set_platform_accounts(normalized)
+    return normalized
+
+
+def resolve_platform_google_token(account_id: str) -> str:
+    """Get one short-lived token without logging, returning, or persisting it."""
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            platform_credentials.get_token(provider="google", account_id=account_id), loop,
+        )
+        payload = future.result(timeout=35.0)
+    except CredentialsError as exc:
+        raise ValueError(f"Google authorization is unavailable for this mailbox ({exc.code})") from exc
+    except Exception as exc:
+        raise ValueError("Google authorization token request failed") from exc
+    token = str(payload.get("access_token") or "") if isinstance(payload, dict) else ""
+    if not token:
+        raise ValueError("Google authorization returned no access token for this mailbox")
+    return token
+
+
+from mail_agent.mail_providers.gmail.adapter import configure_platform_accounts
+configure_platform_accounts(refresh_platform_google_accounts, resolve_platform_google_token)
 MAIL_AGENT_RUNS: dict[str, dict[str, Any]] = {}
 RUN_STATE_LOCK = threading.RLock()
 RUN_CHECKPOINT_DIR = data_root() / "anna-inbox" / "runs" / "background"
@@ -1123,8 +1172,10 @@ def _public_run_view(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
+    global _platform_credentials_ready
     protocol_version = str((params or {}).get("protocolVersion") or "1.1")
     v2 = protocol_version == PROTOCOL_VERSION_V2
+    _platform_credentials_ready = v2
     host_caps = (params or {}).get("capabilities") or (params or {}).get("client_capabilities") or {}
     host_cap_list = sorted(host_caps.keys()) if isinstance(host_caps, dict) else []
     sampling.record_init(protocol_version, host_cap_list, params or {})
@@ -1139,6 +1190,7 @@ def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
         ]
         sampling.disable("\n".join(lines))
         host_upload.disable("Host upload unavailable because protocol v2 was not negotiated.")
+        platform_credentials.disable("Platform credentials require Executa protocol 2.0.")
     return {
         "protocolVersion": PROTOCOL_VERSION_V2 if v2 else "1.1",
         "serverInfo": {"name": TOOL_ID, "version": VERSION},
@@ -1213,17 +1265,27 @@ def check_google_oauth(context: dict[str, Any]) -> dict[str, Any]:
     credentials = read_credentials(context)
     has_gmail = bool(credentials["GMAIL_ACCESS_TOKEN"])
     has_google = bool(credentials["GOOGLE_ACCESS_TOKEN"])
+    platform_accounts = refresh_platform_google_accounts()
     from mail_agent.mail_providers.gmail.adapter import get_multi_token_emails
     multi_emails = get_multi_token_emails()
     return {
-        "authorized": has_gmail or has_google or len(multi_emails) > 0,
+        "authorized": has_gmail or has_google or len(platform_accounts) > 0 or len(multi_emails) > 0,
         "credential_names": {
             "gmail": "present" if has_gmail else "missing",
             "google": "present" if has_google else "missing",
         },
-        "multi_token_count": len(multi_emails),
-        "multi_token_emails": multi_emails,
-        "next_step": "Google OAuth credential is available." if has_gmail or has_google or multi_emails else "Authorize Google/Gmail in Anna platform authorizations, then retry.",
+        "platform_account_count": len(platform_accounts),
+        "platform_accounts": [
+            {
+                "account_id": str(item.get("account_id") or ""),
+                "email": str(item.get("email") or ""),
+                "is_default": bool(item.get("is_default")),
+                "status": str(item.get("status") or ""),
+            }
+            for item in platform_accounts
+        ],
+        "legacy_multi_token_count": len(multi_emails),
+        "next_step": "Google OAuth credential is available." if has_gmail or has_google or platform_accounts or multi_emails else "Authorize Google/Gmail in Anna platform authorizations, then retry.",
         "checked_at": beijing_now(),
     }
 
@@ -1258,5 +1320,9 @@ def dispatch_storage_response(message: dict[str, Any]) -> bool:
 
 def dispatch_host_upload_response(message: dict[str, Any]) -> bool:
     return host_upload.dispatch_response(message)
+
+
+def dispatch_platform_credentials_response(message: dict[str, Any]) -> bool:
+    return platform_credentials.dispatch_response(message)
 
 __all__ = [name for name in globals() if not name.startswith("__")]

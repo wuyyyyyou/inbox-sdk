@@ -9,7 +9,7 @@ Anna Inbox 是运行在 Anna App 中的 Gmail 工作台。2.0 以完整收件箱
 - 星标、重要、Todo、Snooze、已读、完成和移至垃圾箱操作。
 - 线程详情、清洗后的文本或安全 HTML、AI overview、回复草稿与发送。
 - 图片、PDF、文本附件预览以及附件下载。
-- 可折叠、可调宽的 Anna AI 侧栏，支持普通对话、邮箱搜索和当前邮件上下文操作。
+- 可折叠、可调宽的 Anna AI 侧栏，支持普通对话、邮箱搜索、当前邮件上下文操作，以及生成可审阅的 Compose 草稿。
 - 多 Gmail 账户发现与切换。
 - 后端保留 Brief 注意力卡片、Ask、自定义扫描和联系人记忆能力。
 
@@ -107,7 +107,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' | uv --directory inbo
 
 ## 版本与发布
 
-App、Executa manifest、开发 stub 和 Python package 当前统一为 `2.0.5`。
+App、Executa manifest、开发 stub 和 Python package 当前统一为 `2.0.13`。
 
 Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Executa 版本后运行：
 

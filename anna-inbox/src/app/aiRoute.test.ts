@@ -10,6 +10,15 @@ const mailContext: AiMailContextRef = {
   latest_message_id: "message-2",
 };
 
+const composeContext: AiMailContextRef = {
+  kind: "compose",
+  session_id: "compose-session-1",
+  mailbox: "me@example.com",
+  recipients: ["reader@example.com"],
+  subject: "Hello",
+  body: "",
+};
+
 const draftMessage: AiChatMessage = {
   id: "assistant-1",
   role: "assistant",
@@ -44,6 +53,10 @@ describe("decideAiRoute", () => {
   );
   it("uses the open thread for a reply request", () => {
     expect(decideAiRoute("写一封回复", { messages: [], currentMailContext: mailContext }).kind).toBe("mail_context");
+  });
+  it("routes Compose first-draft and improvement prompts through the Compose context", () => {
+    expect(decideAiRoute("Write a first draft about Hello", { messages: [], currentMailContext: composeContext }).kind).toBe("mail_context");
+    expect(decideAiRoute("Suggest changes to improve my draft", { messages: [], currentMailContext: { ...composeContext, body: "Hi." } }).kind).toBe("mail_context");
   });
   it("keeps an explicit search request on scan even when it contains a pronoun", () => {
     expect(decideAiRoute("Find this email", { messages: [draftMessage] }).kind).toBe("scan");
@@ -82,5 +95,9 @@ describe("mail context resolution", () => {
     const prompt = buildRevisionPrompt("Make it shorter", "Original draft");
     expect(prompt).toContain("Make it shorter");
     expect(prompt).toContain("Original draft");
+  });
+  it("keeps Compose context separate from Gmail thread identifiers", () => {
+    expect(resolveMailContext([], composeContext)).toEqual({ context: composeContext, draftToRevise: "" });
+    expect("thread_id" in composeContext).toBe(false);
   });
 });

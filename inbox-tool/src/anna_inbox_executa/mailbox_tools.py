@@ -60,25 +60,48 @@ def _discover_mailboxes() -> list[dict[str, Any]]:
         get_authorized_email,
         get_multi_token_emails,
         get_multi_token_map,
+        get_platform_accounts,
         list_available_mailboxes_from_tokens,
     )
 
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    # 1. 平台单 token — 最高优先级，auth_source="platform"
-    email = get_authorized_email().strip().lower()
-    if email and email not in seen:
+    # 1. Anna Credentials API is the platform multi-account source of truth.
+    # It returns metadata only; Gmail tokens are fetched per account on demand.
+    refresh_platform_google_accounts()
+    for account in get_platform_accounts():
+        email = str(account.get("email") or "").strip().lower()
+        if not email or email in seen:
+            continue
         seen.add(email)
+        status = str(account.get("status") or "active").lower()
+        authorized = status in {"", "active", "connected"}
+        display_name = str(account.get("label") or "").strip()
         results.append({
-            "email": email, "provider": "gmail",
-            "auth_source": "platform", "authorized": True,
-            "display_name": get_account_display_name(email),
-            "avatar_url": get_account_avatar_url(email),
+            "email": email,
+            "provider": "gmail",
+            "auth_source": "platform_credentials",
+            "authorized": authorized,
+            "display_name": display_name,
+            "avatar_url": "",
             "last_auth_checked_at": beijing_now(),
         })
 
-    # 2. 平台的全量多账号快照 — auth_source="platform_multi"，去重跳过兼容单 token 已覆盖的邮箱
+    # 2. Compatibility fallback for legacy single-account injection.
+    if not results:
+        email = get_authorized_email().strip().lower()
+        if email and email not in seen:
+            seen.add(email)
+            results.append({
+                "email": email, "provider": "gmail",
+                "auth_source": "platform", "authorized": True,
+                "display_name": get_account_display_name(email),
+                "avatar_url": get_account_avatar_url(email),
+                "last_auth_checked_at": beijing_now(),
+            })
+
+    # 3. Legacy injected multi-token data, retained only for local migration.
     multi_token_map = get_multi_token_map()
     for multi_email in get_multi_token_emails():
         if multi_email not in seen:
@@ -91,7 +114,7 @@ def _discover_mailboxes() -> list[dict[str, Any]]:
                 "last_auth_checked_at": beijing_now(),
             })
 
-    # 3. 本地 dev token 文件兜底
+    # 4. 本地 dev token 文件兜底
     for local in list_available_mailboxes_from_tokens():
         local_email = str(local.get("email", "")).strip().lower()
         if local_email and local_email not in seen:

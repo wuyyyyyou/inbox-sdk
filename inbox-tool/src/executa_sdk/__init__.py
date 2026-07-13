@@ -46,6 +46,12 @@ from .host_upload import (  # noqa: F401
     UploadError,
     METHOD_HOST_UPLOAD_FILE,
 )
+from .credentials import (  # noqa: F401
+    CredentialsClient,
+    CredentialsError,
+    METHOD_CREDENTIALS_LIST_ACCOUNTS,
+    METHOD_CREDENTIALS_GET_TOKEN,
+)
 from .embeddings import (  # noqa: F401
     EmbeddingsClient,
     EmbeddingsError,
@@ -67,6 +73,8 @@ __all__ = [
     "ImageError",
     "HostUploadClient",
     "UploadError",
+    "CredentialsClient",
+    "CredentialsError",
     "EmbeddingsClient",
     "EmbeddingsError",
     "InvokeContext",
@@ -83,5 +91,7 @@ __all__ = [
     "METHOD_IMAGE_GENERATE",
     "METHOD_IMAGE_EDIT",
     "METHOD_HOST_UPLOAD_FILE",
+    "METHOD_CREDENTIALS_LIST_ACCOUNTS",
+    "METHOD_CREDENTIALS_GET_TOKEN",
     "METHOD_EMBEDDINGS_CREATE",
 ]

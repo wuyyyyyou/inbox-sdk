@@ -54,8 +54,8 @@ Output a single valid JSON object. The very first character you write MUST be `{
 
 ## Output format
 {
-  "title": "Short task title (<=12 words, English)",
-  "description": "One sentence summary",
+  "title": "Short user-facing task title (<=12 words, in the same language as the user's request)",
+  "description": "One-sentence user-facing summary in the same language as the user's request",
   "people": [
     {"name_hint": "The name exactly as the user mentioned it", "role": "sender|recipient|either"}
   ],
@@ -75,6 +75,11 @@ Output a single valid JSON object. The very first character you write MUST be `{
 }
 
 ## topics — the core semantic expansion job
+
+## User-facing language
+
+- title and description are shown to the user. Write both in the same language as the user's request. In particular, use Simplified Chinese when the request contains Chinese.
+- Keep concept, relevance_hint, and task_prompt in English because they are internal planning fields.
 
 Users say "job candidates" but emails say "resume", "CV", "interview". Users say "cooperation" but emails say "partnership", "proposal", "demo". Your job: translate the user's abstract concept into concrete searchable terms AND a relevance hint for filtering.
 

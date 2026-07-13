@@ -2,13 +2,23 @@
 
 ## 项目约定
 
-- 开始前先确认需求边界
-- 每次只改和当前任务直接相关的文件
-- 完成前说明验证命令和结果
+- 代码编写前先保证对功能和内容的理解和我完全对齐，发现存在不明确的内容先与我沟通，最后再进行代码编写
+- 每次只改和当前任务直接相关的文件，完成前说明验证命令和结果
+- 对于比较复杂的业务需求，应询问 `是否开启 subagent 进行代码实现，最后由主 agent 进行审查验收`
+- 所有的后端代码编写都要有详细清晰的中文注释，如果读取到的后端代码没有中文注释，应该及时补充
+- 对于`提交前的审核`/`准备提交`的需求，需要完成以下几件事
+  - 更新当前版本号：如果不指定则按小版本加1，存在不明确的内容先与我沟通
+  - 更新项目所有基线文档：包括版本号信息、进度，存在不明确的内容先与我沟通
+  - 根据当前工作树内容生成git commit的中文消息，不要包含测试补充、文档更新、版本同步的消息，最后我审核后手动提交，message格式如下：
+    ```md
+    version: x.x.x
+    - 消息内容...
+    - 消息内容...
+    ```
 
 ## 项目基线
 
-Anna Inbox 当前版本为 `2.0.12`。前端位于 `anna-inbox/`，后端 Executa 位于 `inbox-tool/`。
+Anna Inbox 当前版本为 `2.0.13`。前端位于 `anna-inbox/`，后端 Executa 位于 `inbox-tool/`。
 
 - `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表。
 - `anna-inbox/src/features/mail-detail/`：线程详情、正文、草稿和附件预览。
@@ -55,9 +65,6 @@ cd anna-inbox
 anna-app dev
 ```
 
-- 若5180端口被占用，应该终止相应进程后再通过 `anna-app dev` 命令启动
-- 不能使用 `npm run dev` 命令启动
-
 
 Anna App 本地开发读取 `anna-inbox/app.json` 和 `anna-inbox/executas/inbox-tool/executa.json`。旧 `anna-inbox/dev-wsl.sh` 不是权威入口。
 
@@ -89,12 +96,16 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' | uv --directory inbo
 前端测试使用 Vitest；构建必须先通过 TypeScript typecheck。
 
 ## 实现约束
-
 - 前端组件不得直接散落工具名称；统一通过 `mailAgentClient.ts`。
+- 修改前端UI时，优先复用现有组件和样式，不得随意新增全局样式。
+- 不要引入新的UI库，除非明确要求。
+- 修改组件时，注意 props、状态管理和副作用。
+- 涉及表单、登录、权限判断时，要额外说明风险。
+- 如果修改页面结构，请说明对移动端和响应式布局的影响。
 - 存储调用统一通过 `mail_agent/storage/ops.py`，不要绕过高层入口。
 - 读取 KV 时用 `result.get("exists")` 判断存在性；`null`、`false`、`0`、`[]` 都可能是合法值。
 - 并发存储更新使用 `etag` / `if_match`。
 - 修改邮件 DTO 时同时核对 `anna-inbox/src/types/mail.ts`、API facade 和后端返回边界。
 - 修改协议、Gmail auth、LLM sampling、存储或卡片 schema 前，先阅读对应当前文档和实现，不凭旧设计记录猜测。
 - 保留无关工作树改动，不覆盖 token、本地缓存、release artifact 或用户密钥。
-- 修改公共工具行为时，同步更新 docs/ 中的文档。
+- 修改公共工具行为时，同步更新 `anna-inbox/docs/` 中的文档。

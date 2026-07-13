@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ...domain.types import MessageDetail, MessageLite, ThreadContext
 from ...storage.keys import app_key
@@ -49,6 +49,8 @@ def _is_platform() -> bool:
         return True
     if os.environ.get("GMAIL_ACCESS_TOKEN") or os.environ.get("GOOGLE_ACCESS_TOKEN"):
         return True
+    if globals().get("_platform_account_map"):
+        return True
     return False
 
 
@@ -70,6 +72,10 @@ _discovered_email: str = ""
 _multi_token_map: dict[str, dict[str, Any]] = {}
 _multi_token_lock = threading.RLock()
 _multi_token_refresh_locks: dict[str, threading.Lock] = {}
+_platform_account_map: dict[str, dict[str, Any]] = {}
+_platform_account_lock = threading.RLock()
+_platform_account_lister: Callable[[], list[dict[str, Any]]] | None = None
+_platform_token_resolver: Callable[[str], str] | None = None
 _display_name_cache: dict[str, str] = {}
 _avatar_url_cache: dict[str, str] = {}
 _contact_avatar_cache: dict[str, dict[str, str]] = {}
@@ -83,6 +89,60 @@ def _avatar_debug(message: str, **fields: Any) -> None:
 
 def _looks_like_email(value: str) -> bool:
     return "@" in value and "." in value.split("@")[-1]
+
+
+def configure_platform_accounts(
+    account_lister: Callable[[], list[dict[str, Any]]] | None,
+    token_resolver: Callable[[str], str] | None,
+) -> None:
+    """Configure the Anna Credentials reverse-RPC bridge.
+
+    The bridge exposes account metadata plus an on-demand short-lived access
+    token. It intentionally never persists the returned token.
+    """
+    global _platform_account_lister, _platform_token_resolver
+    with _platform_account_lock:
+        _platform_account_lister = account_lister
+        _platform_token_resolver = token_resolver
+
+
+def set_platform_accounts(accounts: list[dict[str, Any]]) -> None:
+    """Replace the in-memory platform account metadata snapshot."""
+    next_map: dict[str, dict[str, Any]] = {}
+    for raw in accounts:
+        email = str(raw.get("email") or "").strip().lower()
+        account_id = str(raw.get("account_id") or "").strip()
+        if _looks_like_email(email) and account_id:
+            next_map[email] = {
+                "email": email,
+                "account_id": account_id,
+                "label": str(raw.get("label") or raw.get("name") or "").strip(),
+                "is_default": bool(raw.get("is_default")),
+                "status": str(raw.get("status") or "active").strip().lower(),
+                "scopes": list(raw.get("scopes") or []) if isinstance(raw.get("scopes"), list) else [],
+            }
+    with _platform_account_lock:
+        _platform_account_map.clear()
+        _platform_account_map.update(next_map)
+
+
+def get_platform_accounts() -> list[dict[str, Any]]:
+    with _platform_account_lock:
+        accounts = [dict(account) for account in _platform_account_map.values()]
+    return sorted(accounts, key=lambda item: (not bool(item.get("is_default")), str(item.get("email") or "")))
+
+
+def get_platform_account(mailbox: str) -> dict[str, Any]:
+    normalized = str(mailbox or "").strip().lower()
+    with _platform_account_lock:
+        return dict(_platform_account_map.get(normalized) or {})
+
+
+def _ensure_platform_accounts() -> None:
+    with _platform_account_lock:
+        lister = _platform_account_lister
+    if lister is not None:
+        lister()
 
 
 def set_multi_tokens(tokens: list[dict[str, Any]]) -> None:
@@ -143,7 +203,12 @@ def normalize_mailbox(mailbox: str) -> str:
     global _discovered_email
     raw = str(mailbox or "").strip().lower()
 
-    # Multi-token path: accept any registered multi-token email.
+    if not get_platform_account(raw):
+        _ensure_platform_accounts()
+    if get_platform_account(raw):
+        return raw
+
+    # Legacy multi-token path: accept any registered multi-token email.
     with _multi_token_lock:
         if raw in _multi_token_map:
             return raw
@@ -777,9 +842,20 @@ def _refresh_access_token(record: dict[str, Any]) -> None:
 def get_access_token(mailbox: str) -> str:
     normalized = str(mailbox or "").strip().lower()
 
-    # The multi-token credential is the full mailbox snapshot when present.  Check
-    # it before the legacy platform singleton so every mailbox, including Default,
-    # is resolved from the same account set.
+    if not get_platform_account(normalized):
+        _ensure_platform_accounts()
+    platform_account = get_platform_account(normalized)
+    if platform_account:
+        with _platform_account_lock:
+            resolver = _platform_token_resolver
+        if resolver is None:
+            raise ValueError("Platform account is available but credentials/getToken is unavailable")
+        token = resolver(str(platform_account["account_id"]))
+        if token:
+            return token
+        raise ValueError(f"Platform returned no Gmail access token for {mailbox}")
+
+    # Legacy multi-token path, retained for existing local development data.
     with _multi_token_lock:
         has_multi_token = normalized in _multi_token_map
     if has_multi_token:

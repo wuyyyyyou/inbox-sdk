@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.0.12",
+  "version": "2.0.13",
   "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Brief workflows, Ask, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
@@ -14,17 +14,10 @@
   ],
   "credentials": [
     {
-      "name": "GMAIL_ACCESS_TOKEN",
-      "display_name": "Gmail Access Token",
-      "description": "Optional Google OAuth access token. Local token files are used when platform injection is unavailable.",
-      "required": true,
-      "sensitive": true
-    },
-    {
       "name": "GOOGLE_ACCESS_TOKEN",
-      "display_name": "Google Access Token",
-      "description": "Alternative Google OAuth access token name supported by Anna platform credential mapping.",
-      "required": true,
+      "display_name": "Google Connected Accounts",
+      "description": "Enables Anna's Google multi-account credentials API. Accounts and short-lived tokens are requested on demand; do not paste a token here.",
+      "required": false,
       "sensitive": true
     },
     {
@@ -40,19 +33,12 @@
       "description": "DashScope model name (e.g. qwen3-max). Defaults to qwen3-max if not set.",
       "required": false,
       "sensitive": false
-    },
-    {
-      "name": "GMAIL_MULTI_TOKENS",
-      "display_name": "Gmail Mailbox Token Snapshot",
-      "description": "JSON array containing every authorized Gmail mailbox, including the default one: {email, access_token, refresh_token, client_id, client_secret, expires_at}. When present, this is the authoritative mailbox source.",
-      "required": false,
-      "sensitive": true
     }
   ],
   "tools": [
     {
       "name": "check_google_oauth",
-      "description": "Check whether Anna injected a Google/Gmail OAuth credential for this invocation.",
+      "description": "Check Anna Google connected-account availability through the credentials Reverse RPC without exposing tokens.",
       "parameters": [],
       "timeout": 120
     },
@@ -314,7 +300,7 @@
     },
     {
       "name": "check_gmail_auth",
-      "description": "Check whether Gmail authorization is available. Platform: checks for injected OAuth token. Local: checks for token file existence (does not validate expiry).",
+      "description": "Check whether a Gmail mailbox is authorized. Platform: checks Anna connected-account metadata; local: checks token-file availability.",
       "parameters": [
         {
           "name": "mailbox",
@@ -531,7 +517,7 @@
     },
     {
       "name": "list_mailboxes",
-      "description": "Discover and list registered mailboxes, including selected and authorization state.",
+      "description": "Discover Anna connected Google accounts and list registered mailboxes, including selected and authorization state.",
       "parameters": [],
       "timeout": 120
     },
@@ -1112,6 +1098,49 @@
       "timeout": 120
     },
     {
+      "name": "start_compose_mail_prompt",
+      "description": "Start a read-only Compose-context AI prompt from the Anna sidebar. It may return a reviewable Compose draft artifact but never saves or sends email.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "draft",
+          "type": "object",
+          "description": "Current Compose snapshot: recipients, subject, and body.",
+          "required": true
+        },
+        {
+          "name": "visible_prompt",
+          "type": "string",
+          "description": "Prompt visible in the Anna sidebar.",
+          "required": true
+        },
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "Client-generated ID used to safely retry the same AI task.",
+          "required": false
+        },
+        {
+          "name": "expected_artifact",
+          "type": "string",
+          "description": "Expected artifact type: compose_draft. Feedback requests for non-empty drafts remain analysis-only.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider.",
+          "required": false
+        }
+      ],
+      "timeout": 180
+    },
+    {
       "name": "get_inbox_thread_draft",
       "description": "Read a persisted Inbox thread draft from mailbox-scoped storage.",
       "parameters": [
@@ -1680,7 +1709,7 @@
     },
     {
       "name": "get_authorized_email",
-      "description": "Discover the authorized Gmail account from the platform-injected token. Returns empty string in local dev mode.",
+      "description": "Discover the primary authorized Gmail mailbox from Anna connected accounts, with legacy local fallback.",
       "parameters": [],
       "timeout": 120
     },
@@ -1911,31 +1940,108 @@
     {
       "name": "search_compose_contacts",
       "description": "Search Google contacts for the Compose recipient picker. Results are not persisted.",
-      "parameters": [{"name":"mailbox","type":"string","description":"Mailbox email address.","required":true},{"name":"query","type":"string","description":"Name or email query.","required":true},{"name":"limit","type":"integer","description":"Maximum results.","required":false}],
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "query",
+          "type": "string",
+          "description": "Name or email query.",
+          "required": true
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Maximum results.",
+          "required": false
+        }
+      ],
       "timeout": 120
     },
     {
       "name": "list_compose_drafts",
       "description": "List Anna application-managed Compose drafts; these do not sync to Gmail Drafts.",
-      "parameters": [{"name":"mailbox","type":"string","description":"Mailbox email address.","required":true},{"name":"limit","type":"integer","description":"Maximum drafts.","required":false}],
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Maximum drafts.",
+          "required": false
+        }
+      ],
       "timeout": 120
     },
     {
       "name": "create_or_update_compose_draft",
       "description": "Create or update an Anna application-managed Compose draft.",
-      "parameters": [{"name":"mailbox","type":"string","description":"Mailbox email address.","required":true},{"name":"draft","type":"object","description":"Compose draft content.","required":true},{"name":"if_match","type":"string","description":"Optional optimistic-concurrency etag.","required":false}],
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "draft",
+          "type": "object",
+          "description": "Compose draft content.",
+          "required": true
+        },
+        {
+          "name": "if_match",
+          "type": "string",
+          "description": "Optional optimistic-concurrency etag.",
+          "required": false
+        }
+      ],
       "timeout": 120
     },
     {
       "name": "delete_compose_draft",
       "description": "Delete an Anna application-managed Compose draft.",
-      "parameters": [{"name":"mailbox","type":"string","description":"Mailbox email address.","required":true},{"name":"draft_id","type":"string","description":"Compose draft ID.","required":true}],
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "draft_id",
+          "type": "string",
+          "description": "Compose draft ID.",
+          "required": true
+        }
+      ],
       "timeout": 120
     },
     {
       "name": "send_compose_emails",
       "description": "Send one or more reviewed Compose emails. This performs real Gmail sends and must only be called after explicit user confirmation.",
-      "parameters": [{"name":"mailbox","type":"string","description":"Mailbox email address.","required":true},{"name":"messages","type":"array","description":"Reviewed Compose messages.","required":true}],
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "messages",
+          "type": "array",
+          "description": "Reviewed Compose messages.",
+          "required": true
+        }
+      ],
       "timeout": 120
     }
   ],
