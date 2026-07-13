@@ -129,6 +129,8 @@ class TestMultiTokenIntegration:
 
     def run(self):
         self.test_platform_credentials_multi_account_flow()
+        self.test_platform_credentials_grant_error_is_reported()
+        self.test_mailbox_list_includes_credentials_status()
         self.test_single_token_backward_compat()
         self.test_multi_token_only()
         self.test_mixed_platform_and_multi()
@@ -179,6 +181,48 @@ class TestMultiTokenIntegration:
         check("metadata only display name", discovered[0]["display_name"], "Personal")
 
         clear_adapter_state()
+
+    def test_platform_credentials_grant_error_is_reported(self):
+        section("0a. Platform credentials grant errors are surfaced safely")
+        clear_env()
+        clear_adapter_state()
+
+        from anna_inbox_executa import common
+        from executa_sdk.credentials import CredentialsError
+
+        async def rejected_list_accounts(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise CredentialsError(-32061, "not granted", {"credentials_token": "must-not-leak"})
+
+        with (
+            patch.object(common, "_platform_credentials_ready", True),
+            patch.object(common.platform_credentials, "list_accounts", side_effect=rejected_list_accounts),
+        ):
+            check("grant error discovers no accounts", common.refresh_platform_google_accounts(), [])
+            status = common.get_platform_credentials_status()
+
+        check("grant error code", status["code"], "not_granted")
+        check("grant error action", status["action"], "enable_connected_accounts")
+        check("grant error is unavailable", status["available"], False)
+        status_text = json.dumps(status, ensure_ascii=False)
+        check("grant error omits credential token", "credentials_token" in status_text, False)
+        clear_adapter_state()
+
+    def test_mailbox_list_includes_credentials_status(self):
+        section("0b. Mailbox list includes safe credentials status")
+        from anna_inbox_executa.mailbox_tools import _sync_list_mailboxes
+
+        with patch("anna_inbox_executa.mailbox_tools._discover_mailboxes", return_value=[]), \
+             patch("anna_inbox_executa.mailbox_tools.get_platform_credentials_status", return_value={
+                 "available": False,
+                 "code": "not_granted",
+                 "message": "Enable Google Connected accounts for Anna Inbox, then retry.",
+                 "action": "enable_connected_accounts",
+             }):
+            payload = _sync_list_mailboxes()
+
+        status = payload["credentials_status"]
+        check("mailbox list grant action", status["action"], "enable_connected_accounts")
+        check("mailbox list has no credentials", "token" in json.dumps(status).lower(), False)
 
     # ── 1. Single token backward compat ────────────────────────
 

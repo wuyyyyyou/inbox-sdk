@@ -16,6 +16,7 @@ import type {
   InboxMessageDisplayBodyPayload,
   InboxThreadDraftPayload,
   InboxThreadPagePayload,
+  MailboxListPayload,
   MailboxInfo,
   RunHistoryEntry,
   RunStatus,
@@ -134,7 +135,7 @@ export class MailAgentClient {
   }
 
   listMailboxes(storageProvider: string) {
-    return this.invoke<{ mailboxes: MailboxInfo[]; selected: string[]; discovered?: MailboxInfo[] }>("list_mailboxes", { storage_provider: storageProvider });
+    return this.invoke<MailboxListPayload>("list_mailboxes", { storage_provider: storageProvider });
   }
 
   getMailboxRegistry(storageProvider: string) {

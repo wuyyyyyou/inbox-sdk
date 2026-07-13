@@ -59,6 +59,20 @@ export interface MailboxInfo {
   card_count?: number;
 }
 
+export interface MailboxCredentialsStatus {
+  available: boolean;
+  code: "ok" | "not_checked" | "not_granted" | "protocol_unsupported" | "unavailable";
+  message: string;
+  action: "none" | "retry" | "enable_connected_accounts" | "upgrade_runtime";
+}
+
+export interface MailboxListPayload {
+  mailboxes: MailboxInfo[];
+  selected: string[];
+  discovered?: MailboxInfo[];
+  credentials_status?: MailboxCredentialsStatus;
+}
+
 export interface RuntimeState {
   connected: boolean;
   mode: RuntimeMode;

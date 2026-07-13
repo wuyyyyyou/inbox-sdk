@@ -938,6 +938,35 @@ sampling = SamplingClient(write_frame=write_frame)
 host_upload = HostUploadClient(write_frame=write_frame)
 platform_credentials = CredentialsClient(write_frame=write_frame)
 _platform_credentials_ready = False
+_platform_credentials_status_lock = threading.RLock()
+_platform_credentials_status: dict[str, Any] = {
+    "available": False,
+    "code": "not_checked",
+    "message": "Google Connected accounts have not been checked.",
+    "action": "retry",
+}
+
+
+def _set_platform_credentials_status(*, available: bool, code: str, message: str, action: str) -> None:
+    """更新当前进程最近一次 Google 多账号查询的安全状态。
+
+    中文说明：该状态会随 ``list_mailboxes`` 返回前端，因此只允许保存固定
+    错误分类、通用提示和下一步动作。Reverse RPC 的 error data 可能含有平台
+    内部凭据上下文，绝不能在这里保留、写日志或透传。
+    """
+    with _platform_credentials_status_lock:
+        _platform_credentials_status.update({
+            "available": available,
+            "code": code,
+            "message": message,
+            "action": action,
+        })
+
+
+def get_platform_credentials_status() -> dict[str, Any]:
+    """返回可安全展示的 Google Connected accounts 查询状态副本。"""
+    with _platform_credentials_status_lock:
+        return dict(_platform_credentials_status)
 
 
 def _normalize_storage_provider(value: Any = "") -> str:
@@ -1004,6 +1033,14 @@ def refresh_platform_google_accounts() -> list[dict[str, Any]]:
     are intentionally neither stored nor returned from this function.
     """
     if not _platform_credentials_ready:
+        # 中文说明：本地旧 runtime 没有 Reverse RPC；仍允许其使用既有单 token
+        # 兼容路径，但前端可以根据该状态提示升级 runtime 才能发现多个账户。
+        _set_platform_credentials_status(
+            available=False,
+            code="protocol_unsupported",
+            message="This Anna runtime does not support Google multi-account discovery.",
+            action="upgrade_runtime",
+        )
         return []
     try:
         future = asyncio.run_coroutine_threadsafe(
@@ -1011,9 +1048,35 @@ def refresh_platform_google_accounts() -> list[dict[str, Any]]:
         )
         payload = future.result(timeout=12.0)
     except CredentialsError as exc:
+        from mail_agent.mail_providers.gmail.adapter import set_platform_accounts
+        # 中文说明：用户未向本 App 授予 Connected accounts 时，不能继续使用
+        # 默认注入 token 冒充完整账户列表；清空旧 metadata 防止断开授权后残留。
+        set_platform_accounts([])
+        if exc.code == -32061:
+            _set_platform_credentials_status(
+                available=False,
+                code="not_granted",
+                message="Enable Google Connected accounts for Anna Inbox, then retry.",
+                action="enable_connected_accounts",
+            )
+        else:
+            _set_platform_credentials_status(
+                available=False,
+                code="unavailable",
+                message="Google connected-account discovery is temporarily unavailable.",
+                action="retry",
+            )
         log(f"platform Google account listing unavailable: {exc.code}")
         return []
     except Exception as exc:
+        from mail_agent.mail_providers.gmail.adapter import set_platform_accounts
+        set_platform_accounts([])
+        _set_platform_credentials_status(
+            available=False,
+            code="unavailable",
+            message="Google connected-account discovery is temporarily unavailable.",
+            action="retry",
+        )
         log(f"platform Google account listing unavailable: {type(exc).__name__}")
         return []
 
@@ -1021,6 +1084,12 @@ def refresh_platform_google_accounts() -> list[dict[str, Any]]:
     normalized = [item for item in accounts if isinstance(item, dict)] if isinstance(accounts, list) else []
     from mail_agent.mail_providers.gmail.adapter import set_platform_accounts
     set_platform_accounts(normalized)
+    _set_platform_credentials_status(
+        available=True,
+        code="ok",
+        message="Google Connected accounts are available.",
+        action="none",
+    )
     return normalized
 
 

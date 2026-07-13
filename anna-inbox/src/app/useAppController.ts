@@ -54,6 +54,7 @@ import {
 } from "./constants";
 import { createInitialState, removeAskHistoryEntry } from "./state";
 import { buildRevisionPrompt, buildScanFollowupRequest, decideAiRoute, resolveMailContext } from "./aiRoute";
+import { connectedAccountsStatusMessage } from "./connectedAccounts";
 
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -1270,6 +1271,8 @@ export function useAppController() {
     try {
       const payload = await client.listMailboxes(provider);
       const mailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : [];
+      const credentialsMessage = connectedAccountsStatusMessage(payload.credentials_status);
+      if (credentialsMessage) showToast(credentialsMessage);
       const selectedCandidates = (Array.isArray(payload.selected) && payload.selected.length
         ? payload.selected
         : mailboxes.filter((item) => item.selected !== false).map((item) => item.email)
@@ -1308,7 +1311,7 @@ export function useAppController() {
       // 注册表不可用时回退到原来的单邮箱行为。
       return { mailboxes: [], selected: state.mailbox ? [state.mailbox] : [], primary: state.mailbox };
     }
-  }, [client, state.mailbox, state.storageProvider]);
+  }, [client, showToast, state.mailbox, state.storageProvider]);
 
   const loadMailboxRegistry = useCallback(async (storageOverride?: string): Promise<{ mailboxes: MailboxInfo[]; selected: string[]; primary: string }> => {
     const provider = storageOverride ?? state.storageProvider;
