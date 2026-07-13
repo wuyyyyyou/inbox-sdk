@@ -344,6 +344,23 @@ export interface CustomRunResultItem {
   mail_links?: AskMailLink[];
 }
 
+/** 当前邮箱的 Inbox 展示偏好；由 Executa 按邮箱地址独立持久化。 */
+export interface InboxSettings {
+  mailbox: string;
+  display_range_days: 7 | 30 | 60;
+  time_section_mode: "detailed" | "recent_then_months" | "months_only";
+  stars_enabled: boolean;
+  stars_limit: number;
+  todos_enabled: boolean;
+  todos_limit: number;
+  updated_at?: string;
+}
+
+export interface InboxSettingsPayload {
+  settings: InboxSettings;
+  etag?: string;
+}
+
 export interface AskMailLink {
   label: string;
   mailbox: string;
@@ -697,6 +714,11 @@ export interface AppState {
   aiChatConversationId: string;
   aiChatLoading: boolean;
   customTraceOpen: boolean;
+  settingsOpen: boolean;
+  inboxSettings: InboxSettings;
+  inboxSettingsEtag: string;
+  inboxSettingsLoading: boolean;
+  inboxSettingsError: string;
   sourcesOpen: boolean;
   historyOpen: boolean;
   memoryOpen: boolean;

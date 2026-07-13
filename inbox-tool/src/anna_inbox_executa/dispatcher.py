@@ -187,7 +187,7 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         "start_summarize_thread", "start_inbox_thread_assist", "start_generate_draft", "start_inbox_mail_prompt", "start_compose_mail_prompt",
         "delete_custom_plan",
         "clear_cards", "clear_history", "reset_all_data", "reset_mailbox_scan_history", "delete_mailbox_data",
-        "get_scan_plan", "set_scan_plan",
+        "get_scan_plan", "set_scan_plan", "get_inbox_settings", "save_inbox_settings",
         "reply_now", "reply_from_ask", "mark_read_from_ask", "trash_from_ask", "get_inbox_thread_draft",
         "list_inbox_thread_drafts",
         "save_inbox_thread_draft", "delete_inbox_thread_draft", "modify_message_labels", "set_message_starred",

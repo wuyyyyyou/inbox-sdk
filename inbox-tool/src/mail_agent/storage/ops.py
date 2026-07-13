@@ -24,6 +24,7 @@ from .types import (
     ProcessedMessage,
     RunHistoryEntry,
     RunRecord,
+    InboxSettings,
     ScanPlan,
     ScanState,
     SnoozePrefs,
@@ -273,6 +274,56 @@ async def set_scan_plan(mailbox: str, plan: ScanPlan) -> dict:
     key = f"{_mailbox_prefix(mailbox)}/scan_plan"
     plan.updated_at = _now()
     return await get_storage().set(key, _dataclass_to_dict(plan), scope=default_scope())
+
+
+def _inbox_settings_key(mailbox: str) -> str:
+    """构造按邮箱隔离的 Inbox 设置 key，避免不同账号共享偏好。"""
+    return f"{_mailbox_prefix(mailbox)}/inbox_settings"
+
+
+async def get_inbox_settings(mailbox: str) -> dict[str, Any]:
+    """读取邮箱设置；不存在时返回约定默认值和空 etag。"""
+    result = await get_storage().get(_inbox_settings_key(mailbox), scope=default_scope())
+    raw = result.get("value") if result.get("exists") and isinstance(result.get("value"), dict) else {}
+    allowed = {key: raw[key] for key in InboxSettings.__dataclass_fields__ if key in raw}
+    allowed["mailbox"] = mailbox
+    return {
+        "settings": InboxSettings(**allowed),
+        "etag": str(result.get("etag") or ""),
+    }
+
+
+async def set_inbox_settings(
+    mailbox: str,
+    patch: dict[str, Any],
+    *,
+    if_match: str | None = None,
+) -> dict[str, Any]:
+    """合并并保存当前邮箱设置，使用 etag 防止并发覆盖。"""
+    current = await get_inbox_settings(mailbox)
+    settings = current["settings"]
+    values = dict(patch) if isinstance(patch, dict) else {}
+    if values.get("display_range_days") in (7, 30, 60):
+        settings.display_range_days = int(values["display_range_days"])
+    if values.get("time_section_mode") in ("detailed", "recent_then_months", "months_only"):
+        settings.time_section_mode = str(values["time_section_mode"])
+    for field_name in ("stars_enabled", "todos_enabled"):
+        if isinstance(values.get(field_name), bool):
+            setattr(settings, field_name, values[field_name])
+    for field_name in ("stars_limit", "todos_limit"):
+        if values.get(field_name) is not None:
+            try:
+                setattr(settings, field_name, max(1, min(50, int(values[field_name]))))
+            except (TypeError, ValueError):
+                pass
+    settings.updated_at = _now()
+    result = await get_storage().set(
+        _inbox_settings_key(mailbox),
+        _dataclass_to_dict(settings),
+        scope=default_scope(),
+        if_match=if_match,
+    )
+    return {"settings": settings, "etag": str(result.get("etag") or "")}
 
 
 # ── Inbox thread assist / draft ─────────────────────────────────────

@@ -16,6 +16,8 @@ import type {
   InboxMessageDisplayBodyPayload,
   InboxThreadDraftPayload,
   InboxThreadPagePayload,
+  InboxSettingsPayload,
+  InboxSettings,
   MailboxListPayload,
   MailboxInfo,
   RunHistoryEntry,
@@ -185,6 +187,14 @@ export class MailAgentClient {
 
   getCardDetail(mailbox: string, cardId: string, storageProvider: string, includeBody = false) {
     return this.invoke<CardDetailPayload>("get_card_detail", { mailbox, card_id: cardId, storage_provider: storageProvider, include_body: includeBody });
+  }
+
+  loadInboxSettings(mailbox: string, storageProvider: string) {
+    return this.invoke<InboxSettingsPayload>("get_inbox_settings", { mailbox, storage_provider: storageProvider });
+  }
+
+  saveInboxSettings(mailbox: string, patch: Partial<InboxSettings>, ifMatch: string, storageProvider: string) {
+    return this.invoke<InboxSettingsPayload & { ok?: boolean }>("save_inbox_settings", { mailbox, if_match: ifMatch, storage_provider: storageProvider, ...patch });
   }
 
   listInboxEmails(mailbox: string, days = 30, limit = 100, category = "inbox", clearCache = false) {

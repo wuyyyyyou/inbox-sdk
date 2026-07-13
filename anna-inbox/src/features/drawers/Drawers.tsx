@@ -3,6 +3,7 @@ import { modeLabel } from "../../app/constants";
 import { useApp } from "../../app/AppContext";
 import { formatBeijingTimestamp } from "../../shared/format";
 import type { ContactMemorySummary, ContactThreadMemory, RunHistoryEntry } from "../../types/mail";
+import { SettingsView } from "../settings/SettingsView";
 
 function RestoreIcon() {
   return (
@@ -15,10 +16,11 @@ function RestoreIcon() {
 
 export function Drawers() {
   const { state, actions } = useApp();
-  const overlayOpen = state.sourcesOpen || state.historyOpen || state.memoryOpen || state.scanPlanOpen;
+  const overlayOpen = state.settingsOpen || state.sourcesOpen || state.historyOpen || state.memoryOpen || state.scanPlanOpen;
   return (
     <>
-      <div className={`drawer-overlay ${overlayOpen ? "is-open" : ""}`} onClick={actions.closeDrawers} />
+      <div className={`drawer-overlay ${overlayOpen ? "is-open" : ""}`} onClick={() => { actions.closeDrawers(); actions.closeSettings(); }} />
+      <aside className={`drawer ${state.settingsOpen ? "is-open" : ""}`} aria-label="Settings drawer"><SettingsView settings={state.inboxSettings} loading={state.inboxSettingsLoading} error={state.inboxSettingsError} onChange={(patch) => void actions.saveInboxSettings(patch)} onBack={actions.closeSettings} /></aside>
       <SourcesDrawer />
       <MemoryDrawer />
       <HistoryDrawer />

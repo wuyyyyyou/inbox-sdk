@@ -80,6 +80,27 @@ class ScanPlan:
         return cls(mailbox=mailbox)
 
 
+# ── Inbox display preferences (mailbox-scoped) ─────────────────────
+
+
+@dataclass
+class InboxSettings:
+    """主页 Inbox 的显示设置，必须随 mailbox 隔离保存。"""
+
+    mailbox: str
+    display_range_days: int = 30
+    time_section_mode: str = "detailed"
+    stars_enabled: bool = True
+    stars_limit: int = 10
+    todos_enabled: bool = True
+    todos_limit: int = 10
+    updated_at: str = field(default_factory=_now)
+
+    @classmethod
+    def empty(cls, mailbox: str) -> "InboxSettings":
+        return cls(mailbox=mailbox)
+
+
 # ── Processed message index ─────────────────────────────────────────
 
 

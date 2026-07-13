@@ -285,6 +285,27 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "get_inbox_settings",
+            "description": "Get mailbox-scoped Inbox display settings.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+            ],
+        },
+        {
+            "name": "save_inbox_settings",
+            "description": "Save mailbox-scoped Inbox display settings using optimistic concurrency.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "if_match", "type": "string", "description": "Current settings etag.", "required": False},
+                {"name": "display_range_days", "type": "integer", "description": "7, 30, or 60.", "required": False},
+                {"name": "time_section_mode", "type": "string", "description": "detailed, recent_then_months, or months_only.", "required": False},
+                {"name": "stars_enabled", "type": "boolean", "description": "Show Stars section.", "required": False},
+                {"name": "stars_limit", "type": "integer", "description": "Starred thread limit.", "required": False},
+                {"name": "todos_enabled", "type": "boolean", "description": "Show Todos section.", "required": False},
+                {"name": "todos_limit", "type": "integer", "description": "Todo thread limit.", "required": False},
+            ],
+        },
+        {
             "name": "get_card_detail",
             "description": "Get a single card's detail including thread context. Set include_body=true only when the user explicitly asks to view the original email body.",
             "parameters": [

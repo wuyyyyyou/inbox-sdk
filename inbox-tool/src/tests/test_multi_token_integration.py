@@ -128,6 +128,7 @@ class TestMultiTokenIntegration:
         self._store = _store
 
     def run(self):
+        self.test_platform_account_id_alias_is_supported()
         self.test_platform_credentials_multi_account_flow()
         self.test_platform_credentials_grant_error_is_reported()
         self.test_mailbox_list_includes_credentials_status()
@@ -148,6 +149,27 @@ class TestMultiTokenIntegration:
         self.test_get_authorized_email_tool()
 
     # ── 0. Anna Credentials multi-account bridge ────────────────
+
+    def test_platform_account_id_alias_is_supported(self):
+        section("0. Platform account id alias")
+        clear_env()
+        clear_adapter_state()
+
+        from mail_agent.mail_providers.gmail import adapter
+
+        adapter.set_platform_accounts([
+            {"id": "account-kateq", "email": "kateq@anna.partners", "is_default": True, "status": "active"},
+            {"id": "account-kateqh", "email": "kateqh@anna.partners", "is_default": False, "status": "active"},
+        ])
+
+        accounts = adapter.get_platform_accounts()
+        check("id alias keeps both platform accounts", [item["email"] for item in accounts], ["kateq@anna.partners", "kateqh@anna.partners"])
+        check(
+            "id alias becomes token account id",
+            adapter.get_platform_account("kateqh@anna.partners").get("account_id"),
+            "account-kateqh",
+        )
+        clear_adapter_state()
 
     def test_platform_credentials_multi_account_flow(self):
         section("0. Platform credentials multi-account flow")

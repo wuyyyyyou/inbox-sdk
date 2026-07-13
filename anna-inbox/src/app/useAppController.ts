@@ -35,6 +35,7 @@ import type {
   InboxThreadDraftPayload,
   InboxThreadPagePayload,
   InboxThreadStateOperation,
+  InboxSettings,
   MailPromptRunResult,
   MailboxInfo,
   RunStatus,
@@ -55,6 +56,7 @@ import {
 import { createInitialState, removeAskHistoryEntry } from "./state";
 import { buildRevisionPrompt, buildScanFollowupRequest, decideAiRoute, resolveMailContext } from "./aiRoute";
 import { connectedAccountsStatusMessage } from "./connectedAccounts";
+import { resolveMailboxSelection } from "./mailboxSelection";
 
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -446,6 +448,10 @@ export interface AppActions {
   setProvider(kind: "llm" | "storage", value: string): void;
   setDrawer(drawer: "sources" | "history" | "memory" | "scanPlan", open: boolean): void;
   minimize(value: boolean): void;
+  openSettings(): void;
+  closeSettings(): void;
+  loadInboxSettings(mailbox?: string): Promise<void>;
+  saveInboxSettings(patch: Partial<InboxSettings>): Promise<void>;
   checkGmailAuth(mailboxOverride?: string): Promise<{ authorized: boolean; source: string }>;
   checkAnyGmailAuth(): Promise<{ authorized: boolean; source: string }>;
   closeGmailErrorPopup(): void;
@@ -1051,6 +1057,31 @@ export function useAppController() {
     }
   }, [client, state.mailbox, state.storageProvider]);
 
+  const loadInboxSettings = useCallback(async (mailboxOverride?: string) => {
+    const mailbox = normalizedMailbox(mailboxOverride || state.mailbox);
+    if (!mailbox) return;
+    setState((s) => ({ ...s, inboxSettingsLoading: true, inboxSettingsError: "" }));
+    try {
+      const payload = await client.loadInboxSettings(mailbox, state.storageProvider);
+      setState((s) => normalizedMailbox(s.mailbox) === mailbox ? { ...s, inboxSettings: payload.settings, inboxSettingsEtag: payload.etag || "", inboxSettingsLoading: false } : s);
+    } catch (error) {
+      setState((s) => ({ ...s, inboxSettingsLoading: false, inboxSettingsError: error instanceof Error ? error.message : String(error) }));
+    }
+  }, [client, state.mailbox, state.storageProvider]);
+
+  const saveInboxSettings = useCallback(async (patch: Partial<InboxSettings>) => {
+    const previous = state.inboxSettings;
+    const previousEtag = state.inboxSettingsEtag;
+    setState((s) => ({ ...s, inboxSettings: { ...s.inboxSettings, ...patch } }));
+    try {
+      const payload = await client.saveInboxSettings(state.mailbox, patch, previousEtag, state.storageProvider);
+      setState((s) => ({ ...s, inboxSettings: payload.settings, inboxSettingsEtag: payload.etag || "" }));
+    } catch (error) {
+      setState((s) => ({ ...s, inboxSettings: previous, inboxSettingsEtag: previousEtag }));
+      showToast(error instanceof Error ? error.message : String(error));
+    }
+  }, [client, showToast, state.inboxSettings, state.inboxSettingsEtag, state.mailbox, state.storageProvider]);
+
   const loadScanPlanForRun = useCallback(async (mailbox: string): Promise<Required<Pick<ScanPlan, "scan_window_days" | "max_messages">>> => {
     const normalized = normalizedMailbox(mailbox);
     const visiblePlanMailbox = normalizedMailbox(state.configMailbox || state.mailbox);
@@ -1273,27 +1304,16 @@ export function useAppController() {
       const mailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : [];
       const credentialsMessage = connectedAccountsStatusMessage(payload.credentials_status);
       if (credentialsMessage) showToast(credentialsMessage);
-      const selectedCandidates = (Array.isArray(payload.selected) && payload.selected.length
-        ? payload.selected
-        : mailboxes.filter((item) => item.selected !== false).map((item) => item.email)
-      ).map(normalizedMailbox).filter(Boolean)
-        .filter((email) => mailboxes.find((m) => m.email === email)?.authorized !== false);
-      const primary = selectedOrPrimary(selectedCandidates, mailboxes.find((item) => item.authorized !== false)?.email || state.mailbox);
-      const selected = primary ? [primary] : [];
-      const normalizedMailboxes = mailboxes.map((item) => ({ ...item, selected: normalizedMailbox(item.email) === primary }));
+      const selection = resolveMailboxSelection({
+        mailboxes,
+        selected: (Array.isArray(payload.selected) && payload.selected.length
+          ? payload.selected
+          : mailboxes.filter((item) => item.selected !== false).map((item) => item.email)),
+        fallback: state.mailbox,
+      });
+      const { primary, selected, mailboxes: normalizedMailboxes } = selection;
       void cacheMailboxes(normalizedMailboxes);
       if (primary) void setSelectedMailbox(primary);
-      if (selectedCandidates.length !== selected.length || selectedCandidates[0] !== primary) {
-        for (const item of mailboxes) {
-          const shouldSelect = normalizedMailbox(item.email) === primary;
-          if (Boolean(item.selected) === shouldSelect) continue;
-          try {
-            await client.setMailboxSelected(item.email, shouldSelect, provider);
-          } catch {
-            // Keep the UI single-account even if registry cleanup is temporarily unavailable.
-          }
-        }
-      }
       setState((s) => ({
         ...s,
         mailboxes: normalizedMailboxes,
@@ -1318,14 +1338,14 @@ export function useAppController() {
     try {
       const payload = await client.getMailboxRegistry(provider);
       const mailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : [];
-      const selectedCandidates = (Array.isArray(payload.selected) && payload.selected.length
-        ? payload.selected
-        : mailboxes.filter((item) => item.selected !== false).map((item) => item.email)
-      ).map(normalizedMailbox).filter(Boolean)
-        .filter((email) => mailboxes.find((m) => m.email === email)?.authorized !== false);
-      const primary = selectedOrPrimary(selectedCandidates, mailboxes.find((item) => item.authorized !== false)?.email || state.mailbox);
-      const selected = primary ? [primary] : [];
-      const normalizedMailboxes = mailboxes.map((item) => ({ ...item, selected: normalizedMailbox(item.email) === primary }));
+      const selection = resolveMailboxSelection({
+        mailboxes,
+        selected: (Array.isArray(payload.selected) && payload.selected.length
+          ? payload.selected
+          : mailboxes.filter((item) => item.selected !== false).map((item) => item.email)),
+        fallback: state.mailbox,
+      });
+      const { primary, selected, mailboxes: normalizedMailboxes } = selection;
       void cacheMailboxes(normalizedMailboxes);
       if (primary) void setSelectedMailbox(primary);
       setState((s) => ({
@@ -1577,6 +1597,10 @@ export function useAppController() {
       if (drawer === "scanPlan" && open) void loadScanPlan();
       if (drawer === "memory" && open) void loadContactMemories();
     },
+    openSettings() { setState((s) => ({ ...s, settingsOpen: true })); void loadInboxSettings(); },
+    closeSettings() { setState((s) => ({ ...s, settingsOpen: false })); },
+    loadInboxSettings,
+    saveInboxSettings,
     minimize(value) {
       setState((s) => ({ ...s, minimized: value }));
     },
@@ -1648,6 +1672,7 @@ export function useAppController() {
         }));
         await preloadMailboxSnapshot(primary, 30, true);
         await loadScanPlan(primary);
+        await loadInboxSettings(primary);
       } catch (error) {
         closeAccountSwitchNotice();
         const message = error instanceof Error ? error.message : String(error);

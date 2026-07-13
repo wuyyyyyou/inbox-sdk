@@ -1651,6 +1651,8 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         get_active_cards as storage_get_cards,
         get_scan_plan,
         set_scan_plan,
+        get_inbox_settings,
+        set_inbox_settings,
         update_card_status,
         add_snooze_sender,
         add_snooze_thread,
@@ -1710,6 +1712,19 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 plan.scan_categories = [str(c) for c in val if str(c) in ("promotions", "social", "updates", "forums")]
             await set_scan_plan(mb, plan)
         return {"ok": True, "mailbox": mailbox or "all", "targets": targets}
+
+    if tool == "get_inbox_settings":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        payload = await get_inbox_settings(mailbox)
+        return {"mailbox": mailbox, "settings": payload["settings"].__dict__, "etag": payload["etag"]}
+
+    if tool == "save_inbox_settings":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        fields = ("display_range_days", "time_section_mode", "stars_enabled", "stars_limit", "todos_enabled", "todos_limit")
+        payload = await set_inbox_settings(mailbox, {name: arguments[name] for name in fields if name in arguments}, if_match=str(arguments.get("if_match") or "") or None)
+        return {"ok": True, "mailbox": mailbox, "settings": payload["settings"].__dict__, "etag": payload["etag"]}
 
     if tool == "get_inbox_thread_page":
         if not mailbox:

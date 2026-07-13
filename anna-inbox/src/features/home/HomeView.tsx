@@ -27,6 +27,7 @@ import type {
 import { SnoozePicker } from "./SnoozePicker";
 import { ComposeView } from "./ComposeView";
 import { MailDetailDrawer } from "../mail-detail/MailDetailDrawer";
+import { splitImportantMessages } from "../settings/inboxSettings";
 import { sortInboxMessagesDesc } from "./inboxMessageOrder";
 import {
   parseAiMessageInline,
@@ -540,18 +541,19 @@ function snoozeUntilLabel(value: string | undefined) {
   return `${dayLabel} ${timeLabel}`;
 }
 
-function groupLabel(message: InboxMessage) {
+function groupLabel(message: InboxMessage, mode: "detailed" | "recent_then_months" | "months_only" = "detailed") {
   const date = messageDate(message);
   if (!date) return "LAST 30 DAYS";
   const now = new Date();
-  if (date.toDateString() === now.toDateString()) return "TODAY";
+  if (mode === "detailed" && date.toDateString() === now.toDateString()) return "TODAY";
   const yesterday = new Date(now);
   yesterday.setDate(now.getDate() - 1);
-  if (date.toDateString() === yesterday.toDateString()) return "YESTERDAY";
+  if (mode === "detailed" && date.toDateString() === yesterday.toDateString()) return "YESTERDAY";
   const daysAgo = Math.floor(
     (now.getTime() - date.getTime()) / (24 * 60 * 60 * 1000),
   );
-  if (daysAgo < INBOX_LAST_MONTH_DAYS) return "LAST 30 DAYS";
+  if (daysAgo < 7 && mode !== "months_only") return mode === "detailed" ? "LAST 7 DAYS" : "LAST 7 DAYS";
+  if (mode !== "months_only" && daysAgo < INBOX_LAST_MONTH_DAYS) return "EARLIER THIS MONTH";
   const currentMonthLabel = date
     .toLocaleDateString("en-US", { month: "long" })
     .toUpperCase();
@@ -1979,6 +1981,7 @@ function AccountRail() {
           <i className={scanFailed ? "is-inactive" : ""} />
         ) : null}
       </button>
+      <button className="account-settings-btn" type="button" aria-label="Open settings" title="Settings" onClick={actions.openSettings}>⚙</button>
       {menuOpen ? (
         <button
           className="account-menu-backdrop"
@@ -2540,6 +2543,23 @@ export function HomeView() {
     () => (localCategory ? visible.slice(0, feedWindow.localLimit) : visible),
     [feedWindow.localLimit, localCategory, visible],
   );
+  const pinnedImportantMessages = useMemo(() => {
+    const byId = new Map<string, InboxMessage>();
+    for (const message of [...Object.values(flags.saved), ...state.inboxSnapshotMessages, ...state.inboxMessages]) {
+      if (message.id && !isTrashMessage(message)) byId.set(message.id, message);
+    }
+    return [...byId.values()].filter((message) => isStarredMessage(message) || flags.todos.includes(message.id));
+  }, [flags.saved, flags.todos, state.inboxMessages, state.inboxSnapshotMessages]);
+  useEffect(() => {
+    const additions = pinnedImportantMessages.filter((message) => !flags.saved[message.id]);
+    if (!additions.length) return;
+    setFlags((current) => {
+      const next = { ...current, saved: { ...current.saved } };
+      for (const message of additions) next.saved[message.id] = message;
+      void setMailFlags(mailbox, next);
+      return next;
+    });
+  }, [flags.saved, mailbox, pinnedImportantMessages]);
   useEffect(() => {
     if (!mailbox || !displayedVisible.length) return;
     const session = ++bodyPreheatSession.current;
@@ -3062,6 +3082,12 @@ export function HomeView() {
   const isInboxSyncing =
     state.inboxSnapshotLoading || feedAction === "refresh";
   const days = feedWindow.days;
+  useEffect(() => {
+    const configuredDays = state.inboxSettings.display_range_days;
+    if (configuredDays === feedWindow.days || !mailbox) return;
+    setFeedWindow((current) => ({ ...DEFAULT_INBOX_FEED_WINDOW, days: configuredDays }));
+    void syncInbox(configuredDays, true);
+  }, [feedWindow.days, mailbox, state.inboxSettings.display_range_days, syncInbox]);
   const lastSyncedLabel = inboxLastSyncedLabel(state.inboxUpdatedAt);
   const canLoadMoreInbox =
     mailboxView === "inbox" && days === INBOX_LAST_MONTH_DAYS;
@@ -3072,16 +3098,18 @@ export function HomeView() {
     if (mailboxView !== "inbox") {
       return [{ label: "", messages: displayedVisible }];
     }
+    const normalImportant = displayedVisible.filter((message) => !isStarredMessage(message) && !flags.todos.includes(message.id));
+    const source = filter === "important" ? splitImportantMessages([...pinnedImportantMessages, ...normalImportant], state.inboxSettings, new Set(flags.todos)).flatMap((group) => group.kind === "important" ? group.messages : group.messages.map((message) => ({ ...message, __groupLabel: group.kind.toUpperCase() } as InboxMessage & { __groupLabel?: string }))) : displayedVisible;
     const groups: Array<{ label: string; messages: InboxMessage[] }> = [];
-    for (const message of displayedVisible) {
-      const label = groupLabel(message);
+    for (const message of source) {
+      const label = (message as InboxMessage & { __groupLabel?: string }).__groupLabel || groupLabel(message, state.inboxSettings.time_section_mode);
       const current = groups[groups.length - 1];
       if (!current || current.label !== label)
         groups.push({ label, messages: [message] });
       else current.messages.push(message);
     }
     return groups;
-  }, [displayedVisible, mailboxView]);
+  }, [displayedVisible, filter, flags.todos, mailboxView, pinnedImportantMessages, state.inboxSettings]);
 
   const selectedMessage = useMemo(() => {
     if (!selectedId) return null;
@@ -4013,7 +4041,7 @@ export function HomeView() {
                 Try again
               </button>
             </div>
-          ) : !visible.length ? (
+          ) : !grouped.some((group) => group.messages.length) ? (
             mailboxView !== "inbox" && mailboxView !== "all" ? (
               <div className="mail-empty is-category-empty">
                 <SearchIcon />
@@ -4037,12 +4065,12 @@ export function HomeView() {
                   <div className="mail-group-label">
                     <span>{group.label}</span>
                     <i />
-                    <button
+                    {group.label !== "STARS" && group.label !== "TODOS" ? <button
                       title="Mark this timeline as done"
                       onClick={() => markTimelineDone(group.messages)}
                     >
                       <AllDoneIcon />
-                    </button>
+                    </button> : null}
                   </div>
                 ) : null}
                 {group.messages.map((message) => {
