@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_INBOX_SETTINGS,
   clampInboxSettings,
+  groupSplitMessages,
+  splitInboxMessages,
   splitImportantMessages,
 } from "./inboxSettings";
 
@@ -22,6 +24,18 @@ describe("inbox settings", () => {
     });
   });
 
+  it("fills defaults for Split fields saved by earlier versions", () => {
+    expect(clampInboxSettings({
+      custom_categories: [
+        { id: "bills", name: "Bills", query: "subject:bill" },
+        { id: "invalid", name: "Invalid", query: "from:invalid@example.com", hide_when_empty: "yes", bundling_behavior: "group" },
+      ],
+    } as never).custom_categories).toEqual([
+      { id: "bills", name: "Bills", query: "subject:bill", hide_when_empty: false, bundling_behavior: "default" },
+      { id: "invalid", name: "Invalid", query: "from:invalid@example.com", hide_when_empty: false, bundling_behavior: "default" },
+    ]);
+  });
+
   it("places starred then todo messages before remaining important messages without duplicates", () => {
     const messages = [
       { id: "star", starred: true, important: true },
@@ -36,5 +50,40 @@ describe("inbox settings", () => {
 
     expect(groups.map((group) => group.kind)).toEqual(["stars", "todos", "important"]);
     expect(groups.flatMap((group) => group.messages.map((message) => message.id))).toEqual(["star", "todo", "rest"]);
+  });
+
+  it("allows custom Splits to overlap while Other excludes every Split match", () => {
+    const messages = [
+      { id: "important", important: true, from: "Important <important@example.com>" },
+      { id: "bill", from: "Billing <billing@example.com>", subject: "Invoice" },
+      { id: "report", from: "Billing <billing@example.com>", subject: "Monthly report" },
+      { id: "other", from: "Other <other@example.com>", subject: "Hello" },
+    ];
+    const result = splitInboxMessages(messages, {
+      ...DEFAULT_INBOX_SETTINGS,
+      custom_categories: [
+        { id: "billing", name: "Billing", query: "from:billing", hide_when_empty: false, bundling_behavior: "default" },
+        { id: "reports", name: "Reports", query: "subject:report", hide_when_empty: false, bundling_behavior: "none" },
+      ],
+    });
+
+    expect(result.important.map((message) => message.id)).toEqual(["important"]);
+    expect(result.custom.billing.map((message) => message.id)).toEqual(["bill", "report"]);
+    expect(result.custom.reports.map((message) => message.id)).toEqual(["report"]);
+    expect(result.other.map((message) => message.id)).toEqual(["other"]);
+  });
+
+  it("groups a Split by sender or leaves it ungrouped", () => {
+    const messages = [
+      { id: "first", from: "Alice <alice@example.com>" },
+      { id: "second", from: "Bob <bob@example.com>" },
+      { id: "third", from: "Alice <alice@example.com>" },
+    ];
+
+    expect(groupSplitMessages(messages, "by_sender", "detailed").map((group) => ({ label: group.label, ids: group.messages.map((message) => message.id) }))).toEqual([
+      { label: "Alice", ids: ["first", "third"] },
+      { label: "Bob", ids: ["second"] },
+    ]);
+    expect(groupSplitMessages(messages, "none", "detailed")).toEqual([{ label: "", messages }]);
   });
 });

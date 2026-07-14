@@ -451,7 +451,7 @@ export interface AppActions {
   openSettings(): void;
   closeSettings(): void;
   loadInboxSettings(mailbox?: string): Promise<void>;
-  saveInboxSettings(patch: Partial<InboxSettings>): Promise<void>;
+  saveInboxSettings(patch: Partial<InboxSettings>): Promise<boolean>;
   checkGmailAuth(mailboxOverride?: string): Promise<{ authorized: boolean; source: string }>;
   checkAnyGmailAuth(): Promise<{ authorized: boolean; source: string }>;
   closeGmailErrorPopup(): void;
@@ -1072,13 +1072,16 @@ export function useAppController() {
   const saveInboxSettings = useCallback(async (patch: Partial<InboxSettings>) => {
     const previous = state.inboxSettings;
     const previousEtag = state.inboxSettingsEtag;
-    setState((s) => ({ ...s, inboxSettings: { ...s.inboxSettings, ...patch } }));
+    setState((s) => ({ ...s, inboxSettings: { ...s.inboxSettings, ...patch }, inboxSettingsLoading: true, inboxSettingsError: "" }));
     try {
       const payload = await client.saveInboxSettings(state.mailbox, patch, previousEtag, state.storageProvider);
-      setState((s) => ({ ...s, inboxSettings: payload.settings, inboxSettingsEtag: payload.etag || "" }));
+      setState((s) => ({ ...s, inboxSettings: payload.settings, inboxSettingsEtag: payload.etag || "", inboxSettingsLoading: false }));
+      return true;
     } catch (error) {
-      setState((s) => ({ ...s, inboxSettings: previous, inboxSettingsEtag: previousEtag }));
-      showToast(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      setState((s) => ({ ...s, inboxSettings: previous, inboxSettingsEtag: previousEtag, inboxSettingsLoading: false, inboxSettingsError: message }));
+      showToast(message);
+      return false;
     }
   }, [client, showToast, state.inboxSettings, state.inboxSettingsEtag, state.mailbox, state.storageProvider]);
 
@@ -1473,6 +1476,7 @@ export function useAppController() {
           loadRunHistory(),
           loadCustomPlans(),
           loadScanPlan(currentMailbox),
+          loadInboxSettings(currentMailbox),
           loadActiveCards(undefined, "all"),
         ]);
         console.info(`[inbox-startup] initialize elapsed_ms=${Math.round(performance.now() - startedAt)} mailbox=${currentMailbox || ""}`);
@@ -1482,7 +1486,7 @@ export function useAppController() {
       showToast(`Init failed: ${msg}`);
       setState((s) => ({ ...s, loading: false, inboxLoading: false, inboxError: msg }));
     }
-  }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshSamplingStatus, showToast, state.mailbox]);
+  }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadInboxSettings, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshSamplingStatus, showToast, state.mailbox]);
 
   const actions: AppActions = {
     showToast,

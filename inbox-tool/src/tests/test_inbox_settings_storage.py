@@ -41,6 +41,22 @@ async def test_inbox_settings_defaults_are_mailbox_scoped() -> None:
     assert saved["settings"].display_range_days == 60
     assert (await get_inbox_settings("two@example.com"))["settings"].display_range_days == 30
 
+    categories = [
+        {"id": "invoices", "name": "Invoices", "query": "subject:invoice", "hide_when_empty": True, "bundling_behavior": "by_sender"},
+        {"id": "invoices", "name": "Duplicate", "query": "from:duplicate@example.com"},
+        {"id": "legacy", "name": "Legacy", "query": "from:legacy@example.com"},
+        {"id": "empty-name", "name": " ", "query": "from:ignored@example.com"},
+        {"id": "empty-query", "name": "Ignored", "query": " "},
+    ]
+    categorized = await set_inbox_settings("one@example.com", {"custom_categories": categories})
+    assert [item.id for item in categorized["settings"].custom_categories] == ["invoices", "legacy"]
+    assert categorized["settings"].custom_categories[0].name == "Invoices"
+    assert categorized["settings"].custom_categories[0].hide_when_empty is True
+    assert categorized["settings"].custom_categories[0].bundling_behavior == "by_sender"
+    assert categorized["settings"].custom_categories[1].hide_when_empty is False
+    assert categorized["settings"].custom_categories[1].bundling_behavior == "default"
+    assert (await get_inbox_settings("two@example.com"))["settings"].custom_categories == []
+
 
 if __name__ == "__main__":
     asyncio.run(test_inbox_settings_defaults_are_mailbox_scoped())

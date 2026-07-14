@@ -84,6 +84,17 @@ class ScanPlan:
 
 
 @dataclass
+class InboxCustomCategory:
+    """用户保存的本地 Inbox Split；查询语法由前端统一校验。"""
+
+    id: str
+    name: str
+    query: str
+    hide_when_empty: bool = False
+    bundling_behavior: Literal["default", "by_sender", "none"] = "default"
+
+
+@dataclass
 class InboxSettings:
     """主页 Inbox 的显示设置，必须随 mailbox 隔离保存。"""
 
@@ -94,6 +105,7 @@ class InboxSettings:
     stars_limit: int = 10
     todos_enabled: bool = True
     todos_limit: int = 10
+    custom_categories: list[InboxCustomCategory] = field(default_factory=list)
     updated_at: str = field(default_factory=_now)
 
     @classmethod

@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.0.15",
+  "version": "2.0.16",
   "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Brief workflows, Ask, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
@@ -695,7 +695,8 @@
         {"name": "stars_enabled", "type": "boolean", "description": "Show Stars section.", "required": false},
         {"name": "stars_limit", "type": "integer", "description": "Stars limit.", "required": false},
         {"name": "todos_enabled", "type": "boolean", "description": "Show Todos section.", "required": false},
-        {"name": "todos_limit", "type": "integer", "description": "Todos limit.", "required": false}
+        {"name": "todos_limit", "type": "integer", "description": "Todos limit.", "required": false},
+        {"name": "custom_categories", "type": "array", "description": "Saved local Inbox Splits with id, name, query, hide_when_empty, and bundling_behavior.", "required": false}
       ],
       "timeout": 120
     },

@@ -353,7 +353,16 @@ export interface InboxSettings {
   stars_limit: number;
   todos_enabled: boolean;
   todos_limit: number;
+  custom_categories: InboxCustomCategory[];
   updated_at?: string;
+}
+
+export interface InboxCustomCategory {
+  id: string;
+  name: string;
+  query: string;
+  hide_when_empty: boolean;
+  bundling_behavior: "default" | "by_sender" | "none";
 }
 
 export interface InboxSettingsPayload {

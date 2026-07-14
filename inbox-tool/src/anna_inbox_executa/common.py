@@ -303,6 +303,7 @@ DEFAULT_MANIFEST = {
                 {"name": "stars_limit", "type": "integer", "description": "Starred thread limit.", "required": False},
                 {"name": "todos_enabled", "type": "boolean", "description": "Show Todos section.", "required": False},
                 {"name": "todos_limit", "type": "integer", "description": "Todo thread limit.", "required": False},
+                {"name": "custom_categories", "type": "array", "description": "Saved local Inbox Splits with id, name, query, hide_when_empty, and bundling_behavior.", "required": False},
             ],
         },
         {

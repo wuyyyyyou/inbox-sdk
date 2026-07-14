@@ -58,7 +58,7 @@ export function createInitialState(): AppState {
     aiChatLoading: false,
     customTraceOpen: false,
     settingsOpen: false,
-    inboxSettings: { mailbox: "", display_range_days: 30, time_section_mode: "detailed", stars_enabled: true, stars_limit: 10, todos_enabled: true, todos_limit: 10 },
+    inboxSettings: { mailbox: "", display_range_days: 30, time_section_mode: "detailed", stars_enabled: true, stars_limit: 10, todos_enabled: true, todos_limit: 10, custom_categories: [] },
     inboxSettingsEtag: "",
     inboxSettingsLoading: false,
     inboxSettingsError: "",

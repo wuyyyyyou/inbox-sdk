@@ -20,7 +20,7 @@ export function Drawers() {
   return (
     <>
       <div className={`drawer-overlay ${overlayOpen ? "is-open" : ""}`} onClick={() => { actions.closeDrawers(); actions.closeSettings(); }} />
-      <aside className={`drawer ${state.settingsOpen ? "is-open" : ""}`} aria-label="Settings drawer"><SettingsView settings={state.inboxSettings} loading={state.inboxSettingsLoading} error={state.inboxSettingsError} onChange={(patch) => void actions.saveInboxSettings(patch)} onBack={actions.closeSettings} /></aside>
+      <aside className={`drawer ${state.settingsOpen ? "is-open" : ""}`} aria-label="Settings drawer"><SettingsView settings={state.inboxSettings} loading={state.inboxSettingsLoading} error={state.inboxSettingsError} onChange={actions.saveInboxSettings} onBack={actions.closeSettings} /></aside>
       <SourcesDrawer />
       <MemoryDrawer />
       <HistoryDrawer />

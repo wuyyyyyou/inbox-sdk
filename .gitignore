@@ -40,3 +40,4 @@ docs/adr/
 **/.local_storage
 /.claude/.claude/settings.local.json
 .history/
+anna-inbox/docs/superpowers/

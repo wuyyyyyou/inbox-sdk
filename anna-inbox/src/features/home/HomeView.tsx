@@ -27,7 +27,20 @@ import type {
 import { SnoozePicker } from "./SnoozePicker";
 import { ComposeView } from "./ComposeView";
 import { MailDetailDrawer } from "../mail-detail/MailDetailDrawer";
-import { splitImportantMessages } from "../settings/inboxSettings";
+import {
+  groupSplitMessages,
+  splitInboxMessages,
+  splitImportantMessages,
+} from "../settings/inboxSettings";
+import { SplitsManager } from "../settings/SplitsManager";
+import {
+  applyInboxQuerySuggestion,
+  getInboxQuerySuggestionPlaceholder,
+  getInboxQuerySuggestions,
+  matchInboxQuery,
+  parseInboxQuery,
+  splitInboxQueryTokens,
+} from "../search/inboxQuery";
 import { sortInboxMessagesDesc } from "./inboxMessageOrder";
 import {
   parseAiMessageInline,
@@ -48,7 +61,7 @@ import {
   splitAddresses as splitMailAddresses,
 } from "../../shared/mailIdentity";
 
-type FeedFilter = "important" | "other";
+type FeedFilter = "important" | "other" | "search" | `category:${string}`;
 type MailboxView =
   | "inbox"
   | "todos"
@@ -142,7 +155,12 @@ const MAILBOX_VIEWS: Array<{ id: MailboxView; label: string }> = [
 function isLocalMailboxView(
   view: MailboxView,
 ): view is "todos" | "snoozed" | "done" | "drafts" {
-  return view === "todos" || view === "snoozed" || view === "done" || view === "drafts";
+  return (
+    view === "todos" ||
+    view === "snoozed" ||
+    view === "done" ||
+    view === "drafts"
+  );
 }
 
 function scheduleDeferredWork(task: () => void, delayMs = 180) {
@@ -177,7 +195,8 @@ function scheduleDeferredWork(task: () => void, delayMs = 180) {
 function sidebarWidthBounds() {
   if (typeof window === "undefined")
     return { min: AI_SIDEBAR_MIN_WIDTH, max: AI_SIDEBAR_MAX_WIDTH };
-  const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
+  const viewportWidth =
+    document.documentElement.clientWidth || window.innerWidth;
   const compact = viewportWidth < 900;
   const compactMin = viewportWidth < 520 ? 180 : AI_SIDEBAR_MIN_WIDTH;
   const workspaceMin = compact
@@ -297,6 +316,11 @@ const RefreshIcon = () => (
   <Icon>
     <path d="M20 6v5h-5" />
     <path d="M19 11a7.5 7.5 0 1 0 .2 5" />
+  </Icon>
+);
+export const PlusIcon = () => (
+  <Icon>
+    <path d="M12 5v14M5 12h14" />
   </Icon>
 );
 const ComposeIcon = () => (
@@ -445,11 +469,12 @@ export function messageParticipant(
     Boolean(
       normalizedMailbox && sender.email.toLowerCase() === normalizedMailbox,
     );
-  const recipientSource = draft
-    && normalizedMailbox
-    && sender.email.toLowerCase() !== normalizedMailbox
-    ? message.from
-    : message.to;
+  const recipientSource =
+    draft &&
+    normalizedMailbox &&
+    sender.email.toLowerCase() !== normalizedMailbox
+      ? message.from
+      : message.to;
   const recipients = splitAddresses(recipientSource).map(senderParts);
   const outgoingParticipant = () => {
     const names = [
@@ -467,7 +492,9 @@ export function messageParticipant(
     const name = names.join(", ") || "me";
     return {
       name,
-      title: String(recipientSource || message.from || "Draft without recipients"),
+      title: String(
+        recipientSource || message.from || "Draft without recipients",
+      ),
       initial: recipients[0]?.name || "me",
       email: recipients[0]?.email || normalizedMailbox,
       outgoing,
@@ -531,29 +558,44 @@ function snoozeUntilLabel(value: string | undefined) {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const target = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  const days = Math.round((target.getTime() - today.getTime()) / (24 * 60 * 60 * 1000));
-  const dayLabel = days === 0
-    ? "Today"
-    : days === 1
-      ? "Tomorrow"
-      : date.toLocaleDateString("en-US", days > 1 && days < 7 ? { weekday: "short" } : { month: "short", day: "numeric" });
+  const days = Math.round(
+    (target.getTime() - today.getTime()) / (24 * 60 * 60 * 1000),
+  );
+  const dayLabel =
+    days === 0
+      ? "Today"
+      : days === 1
+        ? "Tomorrow"
+        : date.toLocaleDateString(
+            "en-US",
+            days > 1 && days < 7
+              ? { weekday: "short" }
+              : { month: "short", day: "numeric" },
+          );
   const timeLabel = `${date.getHours()}:${String(date.getMinutes()).padStart(2, "0")}`;
   return `${dayLabel} ${timeLabel}`;
 }
 
-function groupLabel(message: InboxMessage, mode: "detailed" | "recent_then_months" | "months_only" = "detailed") {
+function groupLabel(
+  message: InboxMessage,
+  mode: "detailed" | "recent_then_months" | "months_only" = "detailed",
+) {
   const date = messageDate(message);
   if (!date) return "LAST 30 DAYS";
   const now = new Date();
-  if (mode === "detailed" && date.toDateString() === now.toDateString()) return "TODAY";
+  if (mode === "detailed" && date.toDateString() === now.toDateString())
+    return "TODAY";
   const yesterday = new Date(now);
   yesterday.setDate(now.getDate() - 1);
-  if (mode === "detailed" && date.toDateString() === yesterday.toDateString()) return "YESTERDAY";
+  if (mode === "detailed" && date.toDateString() === yesterday.toDateString())
+    return "YESTERDAY";
   const daysAgo = Math.floor(
     (now.getTime() - date.getTime()) / (24 * 60 * 60 * 1000),
   );
-  if (daysAgo < 7 && mode !== "months_only") return mode === "detailed" ? "LAST 7 DAYS" : "LAST 7 DAYS";
-  if (mode !== "months_only" && daysAgo < INBOX_LAST_MONTH_DAYS) return "EARLIER THIS MONTH";
+  if (daysAgo < 7 && mode !== "months_only")
+    return mode === "detailed" ? "LAST 7 DAYS" : "LAST 7 DAYS";
+  if (mode !== "months_only" && daysAgo < INBOX_LAST_MONTH_DAYS)
+    return "EARLIER THIS MONTH";
   const currentMonthLabel = date
     .toLocaleDateString("en-US", { month: "long" })
     .toUpperCase();
@@ -578,9 +620,10 @@ function inboxLastSyncedLabel(value?: string) {
     hour: "2-digit",
     minute: "2-digit",
   });
-  const datePrefix = date.toDateString() === now.toDateString()
-    ? ""
-    : `${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}, `;
+  const datePrefix =
+    date.toDateString() === now.toDateString()
+      ? ""
+      : `${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}, `;
   return `Last synced: ${datePrefix}${time}`;
 }
 
@@ -647,7 +690,9 @@ export function isSentMessage(message: InboxMessage) {
 }
 
 function inboxThreadProjectionKey(message: InboxMessage) {
-  const mailboxKey = String(message.mailbox || "").trim().toLowerCase();
+  const mailboxKey = String(message.mailbox || "")
+    .trim()
+    .toLowerCase();
   const threadKey = String(message.thread_id || "").trim();
   if (threadKey) return `${mailboxKey}:thread:${threadKey}`;
   return `${mailboxKey}:message:${message.id}`;
@@ -684,7 +729,8 @@ export function mergeDraftOverlayMessages(
       // continue to reflect the selected thread message.
       draft_body: draft.draft_body,
       draft_local: true,
-      body_preview: draft.draft_body || draft.body_preview || message.body_preview,
+      body_preview:
+        draft.draft_body || draft.body_preview || message.body_preview,
       snippet: draft.draft_body || draft.snippet || message.snippet,
       label_ids: [...new Set([...(message.label_ids || []), "DRAFT"])],
     };
@@ -721,7 +767,10 @@ export function resolveSourceMessages(
     return uniqueLatestInboxThreads(
       flags[mailboxView]
         .map((id) => currentMessages.get(id))
-        .filter((message): message is InboxMessage => message !== undefined && !isTrashMessage(message)),
+        .filter(
+          (message): message is InboxMessage =>
+            message !== undefined && !isTrashMessage(message),
+        ),
     );
   }
   if (mailboxView === "done") {
@@ -732,25 +781,39 @@ export function resolveSourceMessages(
     return uniqueLatestInboxThreads(
       [...doneIds]
         .map((id) => currentMessages.get(id))
-        .filter((message): message is InboxMessage => message !== undefined && !isTrashMessage(message)),
+        .filter(
+          (message): message is InboxMessage =>
+            message !== undefined && !isTrashMessage(message),
+        ),
     );
   }
   if (mailboxView === "inbox") {
     return uniqueLatestInboxThreads(
-      inboxMessages.filter((message) => hasMessageLabel(message, "INBOX") && !isTrashMessage(message)),
+      inboxMessages.filter(
+        (message) =>
+          hasMessageLabel(message, "INBOX") && !isTrashMessage(message),
+      ),
     );
   }
   if (mailboxView === "starred")
     return uniqueLatestInboxThreads(
-      source.filter((message) => hasMessageLabel(message, "STARRED") && !isTrashMessage(message)),
+      source.filter(
+        (message) =>
+          hasMessageLabel(message, "STARRED") && !isTrashMessage(message),
+      ),
     );
   if (mailboxView === "drafts")
     return uniqueLatestInboxThreads(
-      source.filter((message) => isDraftMessage(message) && !isTrashMessage(message)),
+      source.filter(
+        (message) => isDraftMessage(message) && !isTrashMessage(message),
+      ),
     );
   if (mailboxView === "sent")
     return uniqueLatestInboxThreads(
-      source.filter((message) => hasMessageLabel(message, "SENT") && !isTrashMessage(message)),
+      source.filter(
+        (message) =>
+          hasMessageLabel(message, "SENT") && !isTrashMessage(message),
+      ),
     );
   if (mailboxView === "trash")
     return uniqueLatestInboxThreads(
@@ -763,7 +826,10 @@ export function resolveSourceMessages(
     );
   if (mailboxView === "spam")
     return uniqueLatestInboxThreads(
-      source.filter((message) => hasMessageLabel(message, "SPAM") && !isTrashMessage(message)),
+      source.filter(
+        (message) =>
+          hasMessageLabel(message, "SPAM") && !isTrashMessage(message),
+      ),
     );
   if (mailboxView === "all")
     return uniqueLatestInboxThreads(
@@ -778,11 +844,12 @@ export function resolveSourceMessages(
 }
 
 function hasInboxMessageAttachment(message: InboxMessage) {
-  const attachments = (message as InboxMessage & { attachments?: unknown[] }).attachments;
+  const attachments = (message as InboxMessage & { attachments?: unknown[] })
+    .attachments;
   return Boolean(
-    message.has_attachment
-    || Number(message.attachment_count || 0) > 0
-    || (Array.isArray(attachments) && attachments.length > 0)
+    message.has_attachment ||
+    Number(message.attachment_count || 0) > 0 ||
+    (Array.isArray(attachments) && attachments.length > 0),
   );
 }
 
@@ -810,7 +877,10 @@ function InboxRow({
   mailbox: string;
   onSelect: () => void;
   onFlag: (kind: CategoryFlag, message: InboxMessage) => void;
-  onThreadAction: (operation: InboxThreadStateOperation, message: InboxMessage) => void;
+  onThreadAction: (
+    operation: InboxThreadStateOperation,
+    message: InboxMessage,
+  ) => void;
   onSnooze: (message: InboxMessage) => void;
   onPrefetch: () => void;
   avatarUrl?: string;
@@ -822,25 +892,44 @@ function InboxRow({
   const { actions } = useApp();
   const [avatarFailed, setAvatarFailed] = useState(false);
   const participant = messageParticipant(message, mailboxView, mailbox);
-  const fallbackAvatar = mailAvatarFallback(participant.name || participant.email || participant.initial, participant.name || participant.initial);
+  const fallbackAvatar = mailAvatarFallback(
+    participant.name || participant.email || participant.initial,
+    participant.name || participant.initial,
+  );
   const sentView = participant.outgoing;
   const sentMessage = isSentMessage(message);
   const isDone = isDoneMessage(message, flags);
   const isTodo = flags.todos.includes(message.id);
   const isSnoozed = flags.snoozed.includes(message.id);
   const trashed = isTrashMessage(message);
-  const snoozeLabel = !trashed && mailboxView === "snoozed" ? snoozeUntilLabel(flags.snoozedUntil?.[message.id]) : "";
+  const snoozeLabel =
+    !trashed && mailboxView === "snoozed"
+      ? snoozeUntilLabel(flags.snoozedUntil?.[message.id])
+      : "";
   const important = isImportantMessage(message);
   const starred = isStarredMessage(message);
   const draft = isDraftMessage(message);
   const isComposeDraft = draft && message.id.startsWith("compose:");
   const preview =
-    (draft ? message.draft_body : "") || message.snippet || message.body_preview || "No preview available";
+    (draft ? message.draft_body : "") ||
+    message.snippet ||
+    message.body_preview ||
+    "No preview available";
   return (
     <article
       className={`mail-row ${mailboxView === "all" ? "is-all-mail" : ""} ${message.unread ? "is-unread" : ""} ${selected ? "is-selected" : ""}`}
     >
-      {selectable ? <button type="button" className="draft-select" aria-label={`Select ${message.subject || "draft"}`} aria-pressed={selectedForBatch} onClick={onBatchToggle}>{selectedForBatch ? "✓" : ""}</button> : null}
+      {selectable ? (
+        <button
+          type="button"
+          className="draft-select"
+          aria-label={`Select ${message.subject || "draft"}`}
+          aria-pressed={selectedForBatch}
+          onClick={onBatchToggle}
+        >
+          {selectedForBatch ? "✓" : ""}
+        </button>
+      ) : null}
       <button
         className={`mail-row-main ${snoozeLabel ? "has-snooze-time" : ""}`}
         data-mail-row-id={message.id}
@@ -858,9 +947,7 @@ function InboxRow({
             onError={() => setAvatarFailed(true)}
           />
         ) : (
-          <span
-            className={`sender-avatar tone-${fallbackAvatar.tone}`}
-          >
+          <span className={`sender-avatar tone-${fallbackAvatar.tone}`}>
             {fallbackAvatar.initial}
           </span>
         )}
@@ -922,7 +1009,10 @@ function InboxRow({
           ) : null}
         </span>
         {snoozeLabel ? (
-          <span className="mail-snooze-until" title={`Snoozed until ${snoozeLabel}`}>
+          <span
+            className="mail-snooze-until"
+            title={`Snoozed until ${snoozeLabel}`}
+          >
             <ClockIcon />
             <span>{snoozeLabel}</span>
           </span>
@@ -932,7 +1022,11 @@ function InboxRow({
       </button>
       <span className="mail-row-actions">
         {isComposeDraft ? (
-          <button aria-label="Delete draft" data-tooltip="Delete draft" onClick={onComposeDraftDelete}>
+          <button
+            aria-label="Delete draft"
+            data-tooltip="Delete draft"
+            onClick={onComposeDraftDelete}
+          >
             <TrashIcon />
           </button>
         ) : trashed ? (
@@ -958,7 +1052,12 @@ function InboxRow({
               className={important ? "is-active is-important" : ""}
               aria-label={important ? "Mark not important" : "Mark important"}
               data-tooltip={important ? "Mark not important" : "Mark important"}
-              onClick={() => onThreadAction(important ? "mark_not_important" : "mark_important", message)}
+              onClick={() =>
+                onThreadAction(
+                  important ? "mark_not_important" : "mark_important",
+                  message,
+                )
+              }
             >
               <ImportantIcon />
             </button>
@@ -998,10 +1097,18 @@ function InboxRow({
             <button
               className={isDone ? "is-active is-done" : ""}
               aria-label={
-                sentMessage ? "Sent and done" : isDone ? "Move to inbox" : "Done"
+                sentMessage
+                  ? "Sent and done"
+                  : isDone
+                    ? "Move to inbox"
+                    : "Done"
               }
               data-tooltip={
-                sentMessage ? "Sent and done" : isDone ? "Move to inbox" : "Done"
+                sentMessage
+                  ? "Sent and done"
+                  : isDone
+                    ? "Move to inbox"
+                    : "Done"
               }
               disabled={sentMessage}
               onClick={() => onFlag("done", message)}
@@ -1024,11 +1131,18 @@ function aiResultCount(result: CustomRunResult) {
 
 export function aiSearchStatus(result: CustomRunResult) {
   const itemCount = aiResultCount(result);
-  const chinese = /[\u3400-\u9fff]/.test([
-    result.title,
-    result.summary,
-    ...(result.sections || []).flatMap((section) => [section.heading, section.body]),
-  ].filter(Boolean).join(" "));
+  const chinese = /[\u3400-\u9fff]/.test(
+    [
+      result.title,
+      result.summary,
+      ...(result.sections || []).flatMap((section) => [
+        section.heading,
+        section.body,
+      ]),
+    ]
+      .filter(Boolean)
+      .join(" "),
+  );
   if (itemCount > 0)
     return chinese
       ? `找到 ${itemCount} 个相关邮件线程。`
@@ -1096,7 +1210,10 @@ function AiMessageInlineContent({
     if (node.type === "link") {
       return (
         <a key={key} href={node.href} target="_blank" rel="noreferrer noopener">
-          <AiMessageInlineContent content={parseAiMessageInline(node.label)} onOpenThread={onOpenThread} />
+          <AiMessageInlineContent
+            content={parseAiMessageInline(node.label)}
+            onOpenThread={onOpenThread}
+          />
         </a>
       );
     }
@@ -1128,16 +1245,52 @@ function RichAssistantText({
       {parseAiMessageMarkdown(text).map((block, index) => {
         const key = `${block.type}-${index}`;
         if (block.type === "heading") {
-          const Heading = (`h${block.level + 2}` as "h3" | "h4" | "h5");
-          return <Heading key={key}><AiMessageInlineContent content={block.content} onOpenThread={onOpenThread} /></Heading>;
+          const Heading = `h${block.level + 2}` as "h3" | "h4" | "h5";
+          return (
+            <Heading key={key}>
+              <AiMessageInlineContent
+                content={block.content}
+                onOpenThread={onOpenThread}
+              />
+            </Heading>
+          );
         }
         if (block.type === "unordered_list") {
-          return <ul key={key}>{block.items.map((item, itemIndex) => <li key={itemIndex}><AiMessageInlineContent content={item} onOpenThread={onOpenThread} /></li>)}</ul>;
+          return (
+            <ul key={key}>
+              {block.items.map((item, itemIndex) => (
+                <li key={itemIndex}>
+                  <AiMessageInlineContent
+                    content={item}
+                    onOpenThread={onOpenThread}
+                  />
+                </li>
+              ))}
+            </ul>
+          );
         }
         if (block.type === "ordered_list") {
-          return <ol key={key}>{block.items.map((item, itemIndex) => <li key={itemIndex}><AiMessageInlineContent content={item} onOpenThread={onOpenThread} /></li>)}</ol>;
+          return (
+            <ol key={key}>
+              {block.items.map((item, itemIndex) => (
+                <li key={itemIndex}>
+                  <AiMessageInlineContent
+                    content={item}
+                    onOpenThread={onOpenThread}
+                  />
+                </li>
+              ))}
+            </ol>
+          );
         }
-        return <p key={key}><AiMessageInlineContent content={block.content} onOpenThread={onOpenThread} /></p>;
+        return (
+          <p key={key}>
+            <AiMessageInlineContent
+              content={block.content}
+              onOpenThread={onOpenThread}
+            />
+          </p>
+        );
       })}
     </div>
   );
@@ -1200,8 +1353,14 @@ function AiAssistantMessage({
 }: {
   message: AiChatMessage;
   currentMailContext: AiMailContextRef | null;
-  onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
-  onUseComposeArtifact: (artifact: ComposeDraftArtifact, context: AiComposeContextRef | null) => void;
+  onUseArtifact: (
+    artifact: DraftReplyArtifact,
+    mode: "append" | "replace",
+  ) => void;
+  onUseComposeArtifact: (
+    artifact: ComposeDraftArtifact,
+    context: AiComposeContextRef | null,
+  ) => void;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
 }) {
@@ -1244,21 +1403,28 @@ function AiAssistantMessage({
     const text = displayAssistantText(message);
     const animate = shouldAnimateAssistantText(message.timestamp);
     const draftArtifact =
-      message.artifact?.type === "draft_reply" && (!animate || assistantTextComplete)
+      message.artifact?.type === "draft_reply" &&
+      (!animate || assistantTextComplete)
         ? message.artifact
         : null;
     const composeArtifact =
-      message.artifact?.type === "compose_draft" && (!animate || assistantTextComplete)
+      message.artifact?.type === "compose_draft" &&
+      (!animate || assistantTextComplete)
         ? message.artifact
         : null;
-    const sendPlan = message.artifact?.type === "send_plan" && (!animate || assistantTextComplete) ? message.artifact : null;
+    const sendPlan =
+      message.artifact?.type === "send_plan" &&
+      (!animate || assistantTextComplete)
+        ? message.artifact
+        : null;
     const summaryLink = message.mailSummaryLink;
     const clarification = message.clarification;
     const targetThreadOpen = Boolean(
       draftArtifact &&
       currentMailContext &&
       currentMailContext.kind === "gmail_thread" &&
-      currentMailContext.mailbox.trim().toLowerCase() === draftArtifact.mailbox.trim().toLowerCase() &&
+      currentMailContext.mailbox.trim().toLowerCase() ===
+        draftArtifact.mailbox.trim().toLowerCase() &&
       currentMailContext.thread_id === draftArtifact.thread_id,
     );
     const submitReplyGap = async () => {
@@ -1281,7 +1447,10 @@ function AiAssistantMessage({
       try {
         if (message.mailContext.kind === "compose") {
           const details = message.replyGaps.questions
-            .map((question) => `- ${question.question}: ${String(answers[question.id] || "").trim()}`)
+            .map(
+              (question) =>
+                `- ${question.question}: ${String(answers[question.id] || "").trim()}`,
+            )
             .join("\n");
           await actions.submitMailContextPrompt({
             visiblePrompt: `Create a complete revised draft using these details:\n${details}`,
@@ -1330,30 +1499,43 @@ function AiAssistantMessage({
                   <input
                     value={clarificationInput}
                     placeholder="Add details (optional)"
-                    onChange={(event) => setClarificationInput(event.target.value)}
+                    onChange={(event) =>
+                      setClarificationInput(event.target.value)
+                    }
                   />
                 ) : null}
                 <div className="ai-clarification-actions">
                   {clarification.actions.map((action) => (
                     <button
                       key={action.id}
-                      onClick={() => void actions.sendAiChatMessage({
-                        currentMailContext,
-                        forcedKind: action.id,
-                        prompt: clarificationInput.trim() || clarification.original_input,
-                        clarificationMessageId: message.id,
-                      })}
+                      onClick={() =>
+                        void actions.sendAiChatMessage({
+                          currentMailContext,
+                          forcedKind: action.id,
+                          prompt:
+                            clarificationInput.trim() ||
+                            clarification.original_input,
+                          clarificationMessageId: message.id,
+                        })
+                      }
                     >
                       {action.label}
                     </button>
                   ))}
-                  <button className="is-dismiss" onClick={() => actions.dismissAiClarification(message.id)}>
+                  <button
+                    className="is-dismiss"
+                    onClick={() => actions.dismissAiClarification(message.id)}
+                  >
                     Cancel
                   </button>
                 </div>
               </>
             ) : (
-              <span>{clarification.status === "dismissed" ? "Dismissed" : "Resolved"}</span>
+              <span>
+                {clarification.status === "dismissed"
+                  ? "Dismissed"
+                  : "Resolved"}
+              </span>
             )}
           </div>
         ) : null}
@@ -1363,24 +1545,34 @@ function AiAssistantMessage({
             <div className="ai-draft-artifact-actions">
               {targetThreadOpen ? (
                 <>
-                  <button className="is-primary" onClick={() => onUseArtifact(draftArtifact, "append")}>
+                  <button
+                    className="is-primary"
+                    onClick={() => onUseArtifact(draftArtifact, "append")}
+                  >
                     Append to draft reply
                   </button>
-                  <button className="is-secondary" onClick={() => onUseArtifact(draftArtifact, "replace")}>
+                  <button
+                    className="is-secondary"
+                    onClick={() => onUseArtifact(draftArtifact, "replace")}
+                  >
                     Replace draft reply
                   </button>
                 </>
               ) : (
                 <button
                   className="is-primary"
-                  onClick={() => onOpenMail({
-                    label: "Draft thread",
-                    mailbox: draftArtifact.mailbox,
-                    thread_id: draftArtifact.thread_id,
-                    message_id: message.mailContext?.kind === "gmail_thread"
-                      ? (message.mailContext.latest_message_id || message.mailContext.anchor_message_id)
-                      : "",
-                  })}
+                  onClick={() =>
+                    onOpenMail({
+                      label: "Draft thread",
+                      mailbox: draftArtifact.mailbox,
+                      thread_id: draftArtifact.thread_id,
+                      message_id:
+                        message.mailContext?.kind === "gmail_thread"
+                          ? message.mailContext.latest_message_id ||
+                            message.mailContext.anchor_message_id
+                          : "",
+                    })
+                  }
                 >
                   Go to thread
                 </button>
@@ -1398,11 +1590,20 @@ function AiAssistantMessage({
           <div className="ai-draft-artifact">
             <pre>{composeArtifact.body}</pre>
             <div className="ai-draft-artifact-actions">
-              <button className="is-primary" onClick={() => onUseComposeArtifact(
-                composeArtifact,
-                message.mailContext?.kind === "compose" ? message.mailContext : null,
-              )}>
-                {composeArtifact.mode === "replace" ? "Apply revised draft" : "Insert draft"}
+              <button
+                className="is-primary"
+                onClick={() =>
+                  onUseComposeArtifact(
+                    composeArtifact,
+                    message.mailContext?.kind === "compose"
+                      ? message.mailContext
+                      : null,
+                  )
+                }
+              >
+                {composeArtifact.mode === "replace"
+                  ? "Apply revised draft"
+                  : "Insert draft"}
               </button>
               <button
                 className="is-secondary"
@@ -1413,9 +1614,36 @@ function AiAssistantMessage({
             </div>
           </div>
         ) : null}
-        {sendPlan ? <div className="ai-draft-artifact ai-send-plan"><strong>Review before sending</strong>{sendPlan.messages.map((item, index) => <div key={index}><p><b>To:</b> {item.recipients.join(", ") || "Missing recipient"}</p><p><b>Subject:</b> {item.subject || "Missing subject"}</p><pre>{item.body}</pre></div>)}<div className="ai-draft-artifact-actions"><button className="is-primary" onClick={() => onConfirmSendPlan(sendPlan)}>Confirm and send</button></div></div> : null}
+        {sendPlan ? (
+          <div className="ai-draft-artifact ai-send-plan">
+            <strong>Review before sending</strong>
+            {sendPlan.messages.map((item, index) => (
+              <div key={index}>
+                <p>
+                  <b>To:</b> {item.recipients.join(", ") || "Missing recipient"}
+                </p>
+                <p>
+                  <b>Subject:</b> {item.subject || "Missing subject"}
+                </p>
+                <pre>{item.body}</pre>
+              </div>
+            ))}
+            <div className="ai-draft-artifact-actions">
+              <button
+                className="is-primary"
+                onClick={() => onConfirmSendPlan(sendPlan)}
+              >
+                Confirm and send
+              </button>
+            </div>
+          </div>
+        ) : null}
         {draftArtifact && message.assistantFollowupText ? (
-          <AnimatedAssistantText text={message.assistantFollowupText} animate={animate} onOpenThread={openThreadReference} />
+          <AnimatedAssistantText
+            text={message.assistantFollowupText}
+            animate={animate}
+            onOpenThread={openThreadReference}
+          />
         ) : null}
         {assistantTextComplete && message.replyGaps?.needs_user_input ? (
           <div className="ai-reply-gaps">
@@ -1477,7 +1705,11 @@ function AiAssistantMessage({
           <code>{result.plan_gmail_queries[0].query}</code>
         ) : null}
       </div>
-      <AnimatedAssistantText text={summaryText} animate={animate} onOpenThread={openThreadReference} />
+      <AnimatedAssistantText
+        text={summaryText}
+        animate={animate}
+        onOpenThread={openThreadReference}
+      />
       {result.title || result.plan_title ? (
         <h2>{result.title || result.plan_title}</h2>
       ) : null}
@@ -1496,28 +1728,42 @@ function AiAssistantMessage({
                           {item.mail_links.slice(0, 5).map((link) => (
                             <button
                               key={`${link.mailbox}:${link.message_id}`}
-                              title={[link.label, link.from, link.date, link.snippet].filter(Boolean).join(" · ")}
+                              title={[
+                                link.label,
+                                link.from,
+                                link.date,
+                                link.snippet,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ")}
                               onClick={() => onOpenMail(link)}
                             >
                               {link.label}
                             </button>
                           ))}
                         </span>
-                      ) : item.subject && item.mailbox && item.thread_id && item.message_id ? (
+                      ) : item.subject &&
+                        item.mailbox &&
+                        item.thread_id &&
+                        item.message_id ? (
                         <button
                           className="ai-single-mail-link"
                           title={item.subject}
-                          onClick={() => onOpenMail({
-                            label: item.subject || "Email",
-                            mailbox: item.mailbox || "",
-                            thread_id: item.thread_id || "",
-                            message_id: item.message_id || "",
-                            from: item.from,
-                          })}
+                          onClick={() =>
+                            onOpenMail({
+                              label: item.subject || "Email",
+                              mailbox: item.mailbox || "",
+                              thread_id: item.thread_id || "",
+                              message_id: item.message_id || "",
+                              from: item.from,
+                            })
+                          }
                         >
                           {item.subject}
                         </button>
-                      ) : item.subject ? <b>{item.subject}</b> : null}
+                      ) : item.subject ? (
+                        <b>{item.subject}</b>
+                      ) : null}
                       {item.context || item.suggestion
                         ? ` ${item.context || item.suggestion}`
                         : null}
@@ -1544,8 +1790,14 @@ function AiMessageBubble({
 }: {
   message: AiChatMessage;
   currentMailContext: AiMailContextRef | null;
-  onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
-  onUseComposeArtifact: (artifact: ComposeDraftArtifact, context: AiComposeContextRef | null) => void;
+  onUseArtifact: (
+    artifact: DraftReplyArtifact,
+    mode: "append" | "replace",
+  ) => void;
+  onUseComposeArtifact: (
+    artifact: ComposeDraftArtifact,
+    context: AiComposeContextRef | null,
+  ) => void;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
 }) {
@@ -1577,8 +1829,14 @@ function AiSidebar({
   collapsed: boolean;
   onToggle: () => void;
   currentMailContext: AiMailContextRef | null;
-  onUseArtifact: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
-  onUseComposeArtifact: (artifact: ComposeDraftArtifact, context: AiComposeContextRef | null) => void;
+  onUseArtifact: (
+    artifact: DraftReplyArtifact,
+    mode: "append" | "replace",
+  ) => void;
+  onUseComposeArtifact: (
+    artifact: ComposeDraftArtifact,
+    context: AiComposeContextRef | null,
+  ) => void;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
   composerFocusKey: number;
@@ -1638,7 +1896,9 @@ function AiSidebar({
 
   useEffect(() => {
     if (!composerFocusKey) return;
-    const frame = window.requestAnimationFrame(() => composerInputRef.current?.focus());
+    const frame = window.requestAnimationFrame(() =>
+      composerInputRef.current?.focus(),
+    );
     return () => window.cancelAnimationFrame(frame);
   }, [composerFocusKey]);
 
@@ -1809,7 +2069,11 @@ function AiSidebar({
         ) : null}
         <div
           className={`ai-composer ${running ? "is-running" : ""} ${llmOffline ? "is-offline" : ""}`}
-          data-tooltip={llmOffline ? "LLM is offline. Please try again when it reconnects." : undefined}
+          data-tooltip={
+            llmOffline
+              ? "LLM is offline. Please try again when it reconnects."
+              : undefined
+          }
         >
           <textarea
             ref={composerInputRef}
@@ -1841,7 +2105,9 @@ function AiSidebar({
                 </button>
               ) : null}
               <button
-                disabled={llmOffline || running || !state.customScanInput.trim()}
+                disabled={
+                  llmOffline || running || !state.customScanInput.trim()
+                }
                 onClick={submit}
                 aria-label="Ask Anna"
               >
@@ -1981,7 +2247,31 @@ function AccountRail() {
           <i className={scanFailed ? "is-inactive" : ""} />
         ) : null}
       </button>
-      <button className="account-settings-btn" type="button" aria-label="Open settings" title="Settings" onClick={actions.openSettings}>⚙</button>
+      <button
+        className="icon-btn account-settings-btn"
+        type="button"
+        aria-label="Open settings"
+        title="Settings"
+        data-tooltip="Settings"
+        onClick={actions.openSettings}
+      >
+        <svg
+          width="20"
+          height="20"
+          viewBox="0 0 24 24"
+          fill="none"
+          xmlns="http://www.w3.org/2000/svg"
+        >
+          <path
+            d="M8.9104 21.6961C9.00388 22.1635 9.4143 22.5 9.89098 22.5H14.1132C14.5899 22.5 15.0003 22.1635 15.0938 21.6961L15.5256 19.5368L16.7521 18.9236L18.416 19.7555C18.91 20.0025 19.5106 19.8023 19.7576 19.3083L21.8687 15.0861C22.0849 14.6538 21.9609 14.1289 21.5743 13.8389L19.8632 12.5556V11.4444L21.5743 10.1611C21.9609 9.87114 22.0849 9.34616 21.8687 8.9139L19.7576 4.69168C19.525 4.22649 18.9747 4.01726 18.4918 4.21041L16.3413 5.07061L15.5403 4.5366L15.0938 2.30388C15.0003 1.83646 14.5899 1.5 14.1132 1.5H9.89098C9.4143 1.5 9.00388 1.83646 8.9104 2.30388L8.46385 4.5366L7.66285 5.0706L5.51237 4.21041C5.02948 4.01726 4.47914 4.22649 4.24655 4.69168L2.13544 8.9139C1.91931 9.34616 2.04324 9.87114 2.42986 10.1611L4.14098 11.4444V12.5556L2.42986 13.8389C2.04324 14.1289 1.91931 14.6538 2.13544 15.0861L4.24655 19.3083C4.49354 19.8023 5.09421 20.0025 5.58819 19.7555L7.25209 18.9236L8.47853 19.5368L8.9104 21.6961ZM10.7108 20.5L10.3438 18.665C10.2833 18.3624 10.0864 18.1047 9.81041 17.9667L7.6993 16.9111C7.41777 16.7704 7.0864 16.7704 6.80487 16.9111L5.58819 17.5195L4.29753 14.9381L5.74098 13.8556C5.99278 13.6667 6.14098 13.3703 6.14098 13.0556L6.14098 10.9444C6.14098 10.6297 5.99278 10.3333 5.74098 10.1444L4.29753 9.06186L5.62391 6.40909L7.40847 7.12292C7.71422 7.24522 8.06057 7.20916 8.33457 7.02649L9.9179 5.97094C10.1386 5.82382 10.2918 5.59507 10.3438 5.335L10.7108 3.5H13.2934L13.6604 5.335C13.7124 5.59507 13.8656 5.82382 14.0863 5.97094L15.6696 7.02649C15.9436 7.20916 16.29 7.24522 16.5957 7.12292L18.3803 6.40909L19.7066 9.06186L18.2632 10.1444C18.0114 10.3333 17.8632 10.6297 17.8632 10.9444V13.0556C17.8632 13.3703 18.0114 13.6667 18.2632 13.8556L19.7066 14.9381L18.416 17.5195L17.1993 16.9111C16.9178 16.7704 16.5864 16.7704 16.3049 16.9111L14.1938 17.9667C13.9178 18.1047 13.7209 18.3624 13.6604 18.665L13.2934 20.5H10.7108Z"
+            fill="black"
+          ></path>
+          <path
+            d="M12 9.5C10.6193 9.5 9.5 10.6193 9.5 12C9.5 13.3807 10.6193 14.5 12 14.5C13.3807 14.5 14.5 13.3807 14.5 12C14.5 10.6193 13.3807 9.5 12 9.5ZM7.5 12C7.5 9.51472 9.51472 7.5 12 7.5C14.4853 7.5 16.5 9.51472 16.5 12C16.5 14.4853 14.4853 16.5 12 16.5C9.51472 16.5 7.5 14.4853 7.5 12Z"
+            fill="black"
+          ></path>
+        </svg>
+      </button>
       {menuOpen ? (
         <button
           className="account-menu-backdrop"
@@ -1998,7 +2288,9 @@ function AccountRail() {
           <small>Switch inbox</small>
         </header>
         <div>
-          {!mailboxes.length ? <p className="account-menu-empty">empty</p> : null}
+          {!mailboxes.length ? (
+            <p className="account-menu-empty">empty</p>
+          ) : null}
           {mailboxes.map((item) => {
             const active = item.email.toLowerCase() === mailbox.toLowerCase();
             return (
@@ -2038,6 +2330,89 @@ export function HomeView() {
   const { state, actions } = useApp();
   const [filter, setFilter] = useState<FeedFilter>("important");
   const [search, setSearch] = useState("");
+  const [searchFocused, setSearchFocused] = useState(false);
+  const [searchSuggestionIndex, setSearchSuggestionIndex] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const [activeSearch, setActiveSearch] = useState("");
+  const [filterBeforeSearch, setFilterBeforeSearch] =
+    useState<FeedFilter>("important");
+  const parsedSearch = useMemo(() => parseInboxQuery(search), [search]);
+  const searchSuggestions = useMemo(
+    () => getInboxQuerySuggestions(search),
+    [search],
+  );
+  const parsedActiveSearch = useMemo(
+    () => parseInboxQuery(activeSearch),
+    [activeSearch],
+  );
+  const applySearch = useCallback(
+    (value: string) => {
+      const parsed = parseInboxQuery(value);
+      const directStatus =
+        parsed.expression?.kind === "term" && parsed.expression.field === "is"
+          ? parsed.expression.value
+          : "";
+      setSearch(value);
+      setSearchFocused(false);
+      if (directStatus) {
+        setActiveSearch("");
+        if (directStatus === "important") {
+          setMailboxView("inbox");
+          setFilter("important");
+          return;
+        }
+        if (directStatus === "all") {
+          setMailboxView("all");
+          return;
+        }
+        if (directStatus === "unread") {
+          setMailboxView("inbox");
+          setFilterBeforeSearch("important");
+          setActiveSearch(value);
+          setFilter("search");
+          return;
+        }
+        const view = directStatus === "is" ? "inbox" : directStatus;
+        if (
+          [
+            "inbox",
+            "todos",
+            "snoozed",
+            "done",
+            "starred",
+            "drafts",
+            "sent",
+            "trash",
+            "spam",
+          ].includes(view)
+        ) {
+          setMailboxView(view as MailboxView);
+          if (view === "inbox") setFilter("other");
+          return;
+        }
+      }
+      if (value.trim() && !parsed.error) {
+        setFilterBeforeSearch(
+          filter === "search" ? filterBeforeSearch : filter,
+        );
+        setActiveSearch(value);
+        setFilter("search");
+      }
+    },
+    [filter, filterBeforeSearch],
+  );
+  const applySuggestion = useCallback(
+    (suggestion: string) => {
+      const next = applyInboxQuerySuggestion(search, suggestion);
+      setSearch(next);
+      setSearchFocused(true);
+      // 选择补全后 React 会保留旧光标偏移；显式移到新增 token 的末尾。
+      window.requestAnimationFrame(() =>
+        searchInputRef.current?.setSelectionRange(next.length, next.length),
+      );
+    },
+    [search],
+  );
   const [selectedId, setSelectedId] = useState("");
   const [snoozeTarget, setSnoozeTarget] = useState<InboxMessage | null>(null);
   const [insertRequest, setInsertRequest] = useState<{
@@ -2045,7 +2420,8 @@ export function HomeView() {
     artifact: DraftReplyArtifact;
     mode: "append" | "replace";
   } | null>(null);
-  const [externalDetailMessage, setExternalDetailMessage] = useState<InboxMessage | null>(null);
+  const [externalDetailMessage, setExternalDetailMessage] =
+    useState<InboxMessage | null>(null);
   const [drawerMessage, setDrawerMessage] = useState<InboxMessage | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -2056,16 +2432,22 @@ export function HomeView() {
   const [refreshChoiceOpen, setRefreshChoiceOpen] = useState(false);
   const [composeOpen, setComposeOpen] = useState(false);
   const [composeClosing, setComposeClosing] = useState(false);
-  const [composeResumeDraft, setComposeResumeDraft] = useState<ComposeDraft | null>(null);
-  const [composeAiContext, setComposeAiContext] = useState<AiComposeContextRef | null>(null);
+  const [composeResumeDraft, setComposeResumeDraft] =
+    useState<ComposeDraft | null>(null);
+  const [composeAiContext, setComposeAiContext] =
+    useState<AiComposeContextRef | null>(null);
   const [composeInsertRequest, setComposeInsertRequest] = useState<{
     nonce: string;
     artifact: ComposeDraftArtifact;
   } | null>(null);
   const [aiComposerFocusKey, setAiComposerFocusKey] = useState(0);
   const [composeDrafts, setComposeDrafts] = useState<ComposeDraft[]>([]);
-  const [selectedComposeDraftIds, setSelectedComposeDraftIds] = useState<Set<string>>(new Set());
-  const [batchConfirmDrafts, setBatchConfirmDrafts] = useState<ComposeDraft[] | null>(null);
+  const [selectedComposeDraftIds, setSelectedComposeDraftIds] = useState<
+    Set<string>
+  >(new Set());
+  const [batchConfirmDrafts, setBatchConfirmDrafts] = useState<
+    ComposeDraft[] | null
+  >(null);
   const pendingComposeTimer = useRef<number | null>(null);
   const pendingComposeCountdown = useRef<number | null>(null);
   const composeCloseTimer = useRef<number | null>(null);
@@ -2218,8 +2600,7 @@ export function HomeView() {
         Number(cached.avatarsUpdatedAt || 0) >
         Date.now() - 7 * 24 * 60 * 60 * 1000;
       const missesFresh =
-        Number(cached.missingUpdatedAt || 0) >
-        Date.now() - 24 * 60 * 60 * 1000;
+        Number(cached.missingUpdatedAt || 0) > Date.now() - 24 * 60 * 60 * 1000;
       setContactAvatars(
         avatarsFresh && cached.avatars && typeof cached.avatars === "object"
           ? cached.avatars
@@ -2291,39 +2672,62 @@ export function HomeView() {
   const localCategory = isLocalMailboxView(mailboxView);
 
   const inboxMessagesWithDrafts = useMemo(
-    () => mergeDraftOverlayMessages(state.inboxMessages, state.inboxDraftMessages),
+    () =>
+      mergeDraftOverlayMessages(state.inboxMessages, state.inboxDraftMessages),
     [state.inboxDraftMessages, state.inboxMessages],
   );
   const inboxSnapshotMessagesWithDrafts = useMemo(
-    () => mergeDraftOverlayMessages(state.inboxSnapshotMessages, state.inboxDraftMessages),
+    () =>
+      mergeDraftOverlayMessages(
+        state.inboxSnapshotMessages,
+        state.inboxDraftMessages,
+      ),
     [state.inboxDraftMessages, state.inboxSnapshotMessages],
   );
-  const sourceMessages = useMemo(
-    () => {
-      const resolved = resolveSourceMessages(
-        mailboxView,
-        inboxMessagesWithDrafts,
-        inboxSnapshotMessagesWithDrafts,
-        flags,
-      );
-      if (mailboxView !== "drafts") return resolved;
-      const composeMessages: InboxMessage[] = composeDrafts.map((draft) => ({
-        id: `compose:${draft.id}`,
-        mailbox,
-        date: draft.updated_at || draft.created_at || "",
-        from: mailbox,
-        to: draft.recipients.join(", "),
-        subject: draft.subject || "(no subject)",
-        snippet: draft.body.slice(0, 120),
-        body_preview: draft.body.slice(0, 120),
-        draft_body: draft.body,
-        draft_local: true,
-        label_ids: ["DRAFT"],
-      }));
-      return [...composeMessages, ...resolved];
-    },
-    [composeDrafts, flags, inboxMessagesWithDrafts, inboxSnapshotMessagesWithDrafts, mailbox, mailboxView],
+  const sourceMessages = useMemo(() => {
+    const resolved = resolveSourceMessages(
+      mailboxView,
+      inboxMessagesWithDrafts,
+      inboxSnapshotMessagesWithDrafts,
+      flags,
+    );
+    if (mailboxView !== "drafts") return resolved;
+    const composeMessages: InboxMessage[] = composeDrafts.map((draft) => ({
+      id: `compose:${draft.id}`,
+      mailbox,
+      date: draft.updated_at || draft.created_at || "",
+      from: mailbox,
+      to: draft.recipients.join(", "),
+      subject: draft.subject || "(no subject)",
+      snippet: draft.body.slice(0, 120),
+      body_preview: draft.body.slice(0, 120),
+      draft_body: draft.body,
+      draft_local: true,
+      label_ids: ["DRAFT"],
+    }));
+    return [...composeMessages, ...resolved];
+  }, [
+    composeDrafts,
+    flags,
+    inboxMessagesWithDrafts,
+    inboxSnapshotMessagesWithDrafts,
+    mailbox,
+    mailboxView,
+  ]);
+  const inboxSplitMessages = useMemo(
+    () =>
+      splitInboxMessages(
+        sourceMessages.filter(
+          (message) =>
+            !flags.todos.includes(message.id) &&
+            !isDoneMessage(message, flags) &&
+            !flags.snoozed.includes(message.id),
+        ),
+        state.inboxSettings,
+      ),
+    [flags, sourceMessages, state.inboxSettings],
   );
+  const [splitsOpen, setSplitsOpen] = useState(false);
 
   const messagesInThread = useCallback(
     (message: InboxMessage, currentFlags: MailUiFlags = flags) => {
@@ -2352,7 +2756,11 @@ export function HomeView() {
     ) => {
       const ids = new Set(messages.map((item) => item.id));
       setFlags((current) => {
-        const next = { ...current, saved: { ...current.saved }, snoozedUntil: { ...(current.snoozedUntil || {}) } };
+        const next = {
+          ...current,
+          saved: { ...current.saved },
+          snoozedUntil: { ...(current.snoozedUntil || {}) },
+        };
         for (const workflowKind of ["todos", "snoozed", "done"] as const) {
           const retained = current[workflowKind].filter((id) => !ids.has(id));
           next[workflowKind] =
@@ -2381,7 +2789,11 @@ export function HomeView() {
     (messages: InboxMessage[], previous: MailUiFlags) => {
       const ids = new Set(messages.map((item) => item.id));
       setFlags((current) => {
-        const next = { ...current, saved: { ...current.saved }, snoozedUntil: { ...(current.snoozedUntil || {}) } };
+        const next = {
+          ...current,
+          saved: { ...current.saved },
+          snoozedUntil: { ...(current.snoozedUntil || {}) },
+        };
         for (const workflowKind of ["todos", "snoozed", "done"] as const) {
           next[workflowKind] = [
             ...current[workflowKind].filter((id) => !ids.has(id)),
@@ -2389,7 +2801,8 @@ export function HomeView() {
           ];
         }
         for (const id of ids) {
-          if (previous.snoozedUntil?.[id]) next.snoozedUntil[id] = previous.snoozedUntil[id];
+          if (previous.snoozedUntil?.[id])
+            next.snoozedUntil[id] = previous.snoozedUntil[id];
           else delete next.snoozedUntil[id];
         }
         next.doneRemoved = [
@@ -2415,7 +2828,11 @@ export function HomeView() {
       [key]: { status: "loading", body: current[key]?.body || "" },
     }));
     try {
-      const cached = await getCachedMessageBody(bodyMailbox, message.id, message.internal_date);
+      const cached = await getCachedMessageBody(
+        bodyMailbox,
+        message.id,
+        message.internal_date,
+      );
       if (cached) {
         setMessageBodies((current) => ({
           ...current,
@@ -2423,10 +2840,7 @@ export function HomeView() {
         }));
         return;
       }
-      const body = await loadInboxEmailBodyRef.current(
-        message.id,
-        bodyMailbox,
-      );
+      const body = await loadInboxEmailBodyRef.current(message.id, bodyMailbox);
       void setCachedMessageBody(bodyMailbox, message, { body_text: body });
       setMessageBodies((current) => ({
         ...current,
@@ -2468,9 +2882,10 @@ export function HomeView() {
       void actions
         .loadContactAvatars(emails, mailbox)
         .then(({ avatars, permissionRequired, serviceDisabled }) => {
-          const missing = permissionRequired || serviceDisabled
-            ? []
-            : emails.filter((email) => !avatars[email]);
+          const missing =
+            permissionRequired || serviceDisabled
+              ? []
+              : emails.filter((email) => !avatars[email]);
           for (const email of missing) avatarMisses.current.add(email);
           if (Object.keys(avatars).length || missing.length) {
             setContactAvatars((current) => {
@@ -2508,7 +2923,20 @@ export function HomeView() {
   }, [mailbox, state.inboxMessages, state.inboxSnapshotMessages]);
 
   const visible = useMemo(() => {
-    const query = search.trim().toLowerCase();
+    const categoryId = filter.startsWith("category:")
+      ? filter.slice("category:".length)
+      : "";
+    const splitMessages =
+      filter === "important"
+        ? inboxSplitMessages.important
+        : filter === "other"
+          ? inboxSplitMessages.other
+          : categoryId
+            ? inboxSplitMessages.custom[categoryId] || []
+            : null;
+    const splitMessageIds = splitMessages
+      ? new Set(splitMessages.map((message) => message.id))
+      : null;
     return sourceMessages.filter((message) => {
       const matchesView =
         mailboxView === "inbox"
@@ -2528,16 +2956,31 @@ export function HomeView() {
         mailboxView !== "inbox"
           ? true
           : filter === "important"
-            ? isImportantMessage(message)
-            : !isImportantMessage(message) && !flags.todos.includes(message.id);
+            ? Boolean(splitMessageIds?.has(message.id))
+            : filter === "search"
+              ? true
+              : Boolean(splitMessageIds?.has(message.id));
       if (!matchesView) return false;
       if (!matchesFilter) return false;
-      if (!query) return true;
-      return `${message.from || ""} ${message.subject || ""} ${message.snippet || ""}`
-        .toLowerCase()
-        .includes(query);
+      if (!activeSearch.trim() || parsedActiveSearch.error) return true;
+      return matchInboxQuery(message, parsedActiveSearch);
     });
-  }, [filter, flags, mailboxView, search, sourceMessages]);
+  }, [
+    activeSearch,
+    filter,
+    flags,
+    inboxSplitMessages,
+    mailboxView,
+    parsedActiveSearch,
+    sourceMessages,
+  ]);
+
+  useEffect(() => {
+    if (!filter.startsWith("category:")) return;
+    const id = filter.slice("category:".length);
+    if (!state.inboxSettings.custom_categories.some((split) => split.id === id))
+      setFilter("important");
+  }, [filter, state.inboxSettings.custom_categories]);
 
   const displayedVisible = useMemo(
     () => (localCategory ? visible.slice(0, feedWindow.localLimit) : visible),
@@ -2545,13 +2988,27 @@ export function HomeView() {
   );
   const pinnedImportantMessages = useMemo(() => {
     const byId = new Map<string, InboxMessage>();
-    for (const message of [...Object.values(flags.saved), ...state.inboxSnapshotMessages, ...state.inboxMessages]) {
+    for (const message of [
+      ...Object.values(flags.saved),
+      ...state.inboxSnapshotMessages,
+      ...state.inboxMessages,
+    ]) {
       if (message.id && !isTrashMessage(message)) byId.set(message.id, message);
     }
-    return [...byId.values()].filter((message) => isStarredMessage(message) || flags.todos.includes(message.id));
-  }, [flags.saved, flags.todos, state.inboxMessages, state.inboxSnapshotMessages]);
+    return [...byId.values()].filter(
+      (message) =>
+        isStarredMessage(message) || flags.todos.includes(message.id),
+    );
+  }, [
+    flags.saved,
+    flags.todos,
+    state.inboxMessages,
+    state.inboxSnapshotMessages,
+  ]);
   useEffect(() => {
-    const additions = pinnedImportantMessages.filter((message) => !flags.saved[message.id]);
+    const additions = pinnedImportantMessages.filter(
+      (message) => !flags.saved[message.id],
+    );
     if (!additions.length) return;
     setFlags((current) => {
       const next = { ...current, saved: { ...current.saved } };
@@ -2564,7 +3021,9 @@ export function HomeView() {
     if (!mailbox || !displayedVisible.length) return;
     const session = ++bodyPreheatSession.current;
     const start = Math.max(0, displayedVisible.length - INBOX_FEED_PAGE_SIZE);
-    const pageMessages = displayedVisible.slice(start).filter((message) => message.id);
+    const pageMessages = displayedVisible
+      .slice(start)
+      .filter((message) => message.id);
     if (!pageMessages.length) return;
     const cleanup = scheduleDeferredWork(() => {
       let cursor = 0;
@@ -2575,17 +3034,27 @@ export function HomeView() {
           const message = pageMessages[cursor++];
           const bodyMailbox = message.mailbox || mailbox;
           const key = `${bodyMailbox}:${message.id}:${message.internal_date || ""}`;
-          if (bodyPreheatSeen.current.has(key) || bodyRequests.current.has(key)) continue;
+          if (bodyPreheatSeen.current.has(key) || bodyRequests.current.has(key))
+            continue;
           bodyPreheatSeen.current.add(key);
           bodyRequests.current.add(key);
           active += 1;
           void (async () => {
             try {
-              const cached = await getCachedMessageBody(bodyMailbox, message.id, message.internal_date);
+              const cached = await getCachedMessageBody(
+                bodyMailbox,
+                message.id,
+                message.internal_date,
+              );
               if (cached || session !== bodyPreheatSession.current) return;
-              const body = await loadInboxEmailBodyRef.current(message.id, bodyMailbox);
+              const body = await loadInboxEmailBodyRef.current(
+                message.id,
+                bodyMailbox,
+              );
               if (session !== bodyPreheatSession.current) return;
-              await setCachedMessageBody(bodyMailbox, message, { body_text: body });
+              await setCachedMessageBody(bodyMailbox, message, {
+                body_text: body,
+              });
             } catch {
               bodyPreheatSeen.current.delete(key);
             } finally {
@@ -2734,7 +3203,8 @@ export function HomeView() {
           if (message.id) excludeIds.add(message.id);
         }
         if (currentSource === "cache") {
-          currentNextOffset = "nextOffset" in result ? result.nextOffset : currentNextOffset;
+          currentNextOffset =
+            "nextOffset" in result ? result.nextOffset : currentNextOffset;
           if (result.hasMore) {
             continue;
           }
@@ -2768,10 +3238,17 @@ export function HomeView() {
         if (localCategory) {
           if (mailboxView === "drafts") {
             await actions.listInboxThreadDrafts(mailbox, 100);
-            setFeedWindow((current) => ({ ...current, localLimit: INBOX_FEED_PAGE_SIZE }));
+            setFeedWindow((current) => ({
+              ...current,
+              localLimit: INBOX_FEED_PAGE_SIZE,
+            }));
             return true;
           }
-          const result = await actions.refreshInboxEmails("inbox", 7, clearCache);
+          const result = await actions.refreshInboxEmails(
+            "inbox",
+            7,
+            clearCache,
+          );
           if (result.ok) {
             setFeedWindow((current) => ({
               ...current,
@@ -2837,7 +3314,15 @@ export function HomeView() {
         setFeedAction((current) => (current === "refresh" ? null : current));
       }
     },
-    [actions, feedWindow.days, loadRemainingAllTimeInbox, loadRemoteCategory, localCategory, mailbox, mailboxView],
+    [
+      actions,
+      feedWindow.days,
+      loadRemainingAllTimeInbox,
+      loadRemoteCategory,
+      localCategory,
+      mailbox,
+      mailboxView,
+    ],
   );
 
   const reloadInboxFromEmpty = useCallback(async () => {
@@ -2870,7 +3355,9 @@ export function HomeView() {
       }
       const category = mailboxView;
       const targetDays = feedWindow.days;
-      const excludeIds = sourceMessages.map((message) => message.id).filter(Boolean);
+      const excludeIds = sourceMessages
+        .map((message) => message.id)
+        .filter(Boolean);
       const result = await loadGmailPage(
         category,
         targetDays,
@@ -2890,11 +3377,23 @@ export function HomeView() {
         gmailPageToken: result.pageToken,
         gmailPageOffset: result.pageOffset,
       }));
-      actions.showToast(result.count ? `${result.count} new email${result.count === 1 ? "" : "s"} loaded.` : "No new emails found.");
+      actions.showToast(
+        result.count
+          ? `${result.count} new email${result.count === 1 ? "" : "s"} loaded.`
+          : "No new emails found.",
+      );
     } finally {
       setFeedAction((current) => (current === "refresh" ? null : current));
     }
-  }, [actions, feedWindow.days, loadGmailPage, localCategory, mailboxView, sourceMessages, syncInbox]);
+  }, [
+    actions,
+    feedWindow.days,
+    loadGmailPage,
+    localCategory,
+    mailboxView,
+    sourceMessages,
+    syncInbox,
+  ]);
 
   const gmailAuthorizationRequired = isGmailAuthorizationRequired(
     state.gmailAuthStatus,
@@ -3079,37 +3578,90 @@ export function HomeView() {
     state.inboxSnapshotLoading,
   ]);
 
-  const isInboxSyncing =
-    state.inboxSnapshotLoading || feedAction === "refresh";
+  const isInboxSyncing = state.inboxSnapshotLoading || feedAction === "refresh";
   const days = feedWindow.days;
   useEffect(() => {
     const configuredDays = state.inboxSettings.display_range_days;
     if (configuredDays === feedWindow.days || !mailbox) return;
-    setFeedWindow((current) => ({ ...DEFAULT_INBOX_FEED_WINDOW, days: configuredDays }));
+    setFeedWindow((current) => ({
+      ...DEFAULT_INBOX_FEED_WINDOW,
+      days: configuredDays,
+    }));
     void syncInbox(configuredDays, true);
-  }, [feedWindow.days, mailbox, state.inboxSettings.display_range_days, syncInbox]);
+  }, [
+    feedWindow.days,
+    mailbox,
+    state.inboxSettings.display_range_days,
+    syncInbox,
+  ]);
   const lastSyncedLabel = inboxLastSyncedLabel(state.inboxUpdatedAt);
   const canLoadMoreInbox =
-    mailboxView === "inbox" && days === INBOX_LAST_MONTH_DAYS;
+    mailboxView === "inbox" &&
+    filter !== "search" &&
+    days === INBOX_LAST_MONTH_DAYS;
   const canShowOlderInboxActions =
-    !state.inboxError && !state.inboxLoading && !isInboxSyncing && feedAction === null;
+    !state.inboxError &&
+    !state.inboxLoading &&
+    !isInboxSyncing &&
+    feedAction === null;
 
   const grouped = useMemo(() => {
-    if (mailboxView !== "inbox") {
+    if (mailboxView !== "inbox" || filter === "search") {
       return [{ label: "", messages: displayedVisible }];
     }
-    const normalImportant = displayedVisible.filter((message) => !isStarredMessage(message) && !flags.todos.includes(message.id));
-    const source = filter === "important" ? splitImportantMessages([...pinnedImportantMessages, ...normalImportant], state.inboxSettings, new Set(flags.todos)).flatMap((group) => group.kind === "important" ? group.messages : group.messages.map((message) => ({ ...message, __groupLabel: group.kind.toUpperCase() } as InboxMessage & { __groupLabel?: string }))) : displayedVisible;
+    const selectedCustomSplit = filter.startsWith("category:")
+      ? state.inboxSettings.custom_categories.find(
+          (split) => split.id === filter.slice("category:".length),
+        )
+      : undefined;
+    if (selectedCustomSplit) {
+      return groupSplitMessages(
+        displayedVisible,
+        selectedCustomSplit.bundling_behavior,
+        state.inboxSettings.time_section_mode,
+      );
+    }
+    const normalImportant = displayedVisible.filter(
+      (message) =>
+        !isStarredMessage(message) && !flags.todos.includes(message.id),
+    );
+    const source =
+      filter === "important"
+        ? splitImportantMessages(
+            [...pinnedImportantMessages, ...normalImportant],
+            state.inboxSettings,
+            new Set(flags.todos),
+          ).flatMap((group) =>
+            group.kind === "important"
+              ? group.messages
+              : group.messages.map(
+                  (message) =>
+                    ({
+                      ...message,
+                      __groupLabel: group.kind.toUpperCase(),
+                    }) as InboxMessage & { __groupLabel?: string },
+                ),
+          )
+        : displayedVisible;
     const groups: Array<{ label: string; messages: InboxMessage[] }> = [];
     for (const message of source) {
-      const label = (message as InboxMessage & { __groupLabel?: string }).__groupLabel || groupLabel(message, state.inboxSettings.time_section_mode);
+      const label =
+        (message as InboxMessage & { __groupLabel?: string }).__groupLabel ||
+        groupLabel(message, state.inboxSettings.time_section_mode);
       const current = groups[groups.length - 1];
       if (!current || current.label !== label)
         groups.push({ label, messages: [message] });
       else current.messages.push(message);
     }
     return groups;
-  }, [displayedVisible, filter, flags.todos, mailboxView, pinnedImportantMessages, state.inboxSettings]);
+  }, [
+    displayedVisible,
+    filter,
+    flags.todos,
+    mailboxView,
+    pinnedImportantMessages,
+    state.inboxSettings,
+  ]);
 
   const selectedMessage = useMemo(() => {
     if (!selectedId) return null;
@@ -3119,7 +3671,9 @@ export function HomeView() {
       state.inboxSnapshotMessages.find((item) => item.id === selectedId) ||
       state.inboxMessages.find((item) => item.id === selectedId) ||
       flags.saved[selectedId] ||
-      (externalDetailMessage?.id === selectedId ? externalDetailMessage : null) ||
+      (externalDetailMessage?.id === selectedId
+        ? externalDetailMessage
+        : null) ||
       null
     );
   }, [
@@ -3159,9 +3713,13 @@ export function HomeView() {
     }, DETAIL_DRAWER_TRANSITION_MS);
   }, [drawerMessage, drawerOpen, selectedMessage]);
 
-  useEffect(() => () => {
-    if (drawerCloseTimer.current) window.clearTimeout(drawerCloseTimer.current);
-  }, []);
+  useEffect(
+    () => () => {
+      if (drawerCloseTimer.current)
+        window.clearTimeout(drawerCloseTimer.current);
+    },
+    [],
+  );
 
   const detailFlags = useMemo(
     () => ({
@@ -3225,26 +3783,29 @@ export function HomeView() {
 
   const sidebarMailContext = composeAiContext || currentMailContext;
 
-  const openComposeAiDraft = useCallback((draft: Pick<ComposeDraft, "recipients" | "subject" | "body">) => {
-    const context: AiComposeContextRef = {
-      kind: "compose",
-      session_id: crypto.randomUUID(),
-      mailbox,
-      recipients: [...draft.recipients],
-      subject: draft.subject,
-      body: draft.body,
-    };
-    setComposeAiContext(context);
-    actions.startNewAiConversation();
-    setSidebarCollapsed(false);
-    actions.setInput(
-      "customScanInput",
-      draft.body.trim()
-        ? "Suggest changes to improve my draft"
-        : `Write a first draft about ${draft.subject}`,
-    );
-    setAiComposerFocusKey((key) => key + 1);
-  }, [actions, mailbox]);
+  const openComposeAiDraft = useCallback(
+    (draft: Pick<ComposeDraft, "recipients" | "subject" | "body">) => {
+      const context: AiComposeContextRef = {
+        kind: "compose",
+        session_id: crypto.randomUUID(),
+        mailbox,
+        recipients: [...draft.recipients],
+        subject: draft.subject,
+        body: draft.body,
+      };
+      setComposeAiContext(context);
+      actions.startNewAiConversation();
+      setSidebarCollapsed(false);
+      actions.setInput(
+        "customScanInput",
+        draft.body.trim()
+          ? "Suggest changes to improve my draft"
+          : `Write a first draft about ${draft.subject}`,
+      );
+      setAiComposerFocusKey((key) => key + 1);
+    },
+    [actions, mailbox],
+  );
 
   const closeDetailDrawer = useCallback(() => {
     const currentId = selectedId;
@@ -3265,9 +3826,12 @@ export function HomeView() {
   const openMessageDetail = useCallback(
     (message: InboxMessage) => {
       if (message.id.startsWith("compose:")) {
-        const draft = composeDrafts.find((item) => item.id === message.id.slice("compose:".length));
+        const draft = composeDrafts.find(
+          (item) => item.id === message.id.slice("compose:".length),
+        );
         if (draft) {
-          if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current);
+          if (composeCloseTimer.current)
+            window.clearTimeout(composeCloseTimer.current);
           setComposeClosing(false);
           setComposeResumeDraft(draft);
           setComposeOpen(true);
@@ -3282,7 +3846,11 @@ export function HomeView() {
       )
         return;
       void actions
-        .updateInboxThreadState(message.mailbox || mailbox, message.thread_id, "mark_read")
+        .updateInboxThreadState(
+          message.mailbox || mailbox,
+          message.thread_id,
+          "mark_read",
+        )
         .catch((reason) => {
           actions.showToast(
             reason instanceof Error ? reason.message : String(reason),
@@ -3292,57 +3860,79 @@ export function HomeView() {
     [actions, composeDrafts, mailbox],
   );
 
-  const openMailDetailFromAi = useCallback(async (target: AskMailLink) => {
-    const targetMailbox = target.mailbox.trim().toLowerCase();
-    if (!targetMailbox || !target.thread_id) {
-      actions.showToast("This email reference is incomplete.");
-      return;
-    }
-    try {
-      if (targetMailbox !== mailbox.trim().toLowerCase()) {
-        await actions.switchMailbox(targetMailbox);
-      }
-      const known = [
-        ...state.inboxMessages,
-        ...state.inboxSnapshotMessages,
-        ...state.inboxDraftMessages,
-        ...Object.values(flags.saved),
-      ].find((item) =>
-        (item.mailbox || targetMailbox).trim().toLowerCase() === targetMailbox &&
-        (target.message_id ? item.id === target.message_id : (item.thread_id || item.id) === target.thread_id),
-      );
-      if (known) {
-        setExternalDetailMessage(null);
-        setSelectedId(known.id);
+  const openMailDetailFromAi = useCallback(
+    async (target: AskMailLink) => {
+      const targetMailbox = target.mailbox.trim().toLowerCase();
+      if (!targetMailbox || !target.thread_id) {
+        actions.showToast("This email reference is incomplete.");
         return;
       }
-      const page = await actions.loadInboxThreadPage(targetMailbox, target.thread_id, {
-        anchorMessageId: target.message_id || undefined,
-        limit: 5,
-        includeDisplayBody: true,
-      });
-      const anchor = page.messages.find((item) => item.id === target.message_id)
-        || page.messages.find((item) => item.id === page.latest_message_id)
-        || page.messages.at(-1);
-      if (!anchor) throw new Error("The referenced thread could not be loaded.");
-      const placeholder: InboxMessage = {
-        id: anchor.id,
-        thread_id: page.thread_id || target.thread_id,
-        mailbox: targetMailbox,
-        internal_date: anchor.internal_date,
-        from: anchor.from,
-        to: anchor.to,
-        subject: anchor.subject || page.subject,
-        label_ids: anchor.label_ids || [],
-        snippet: anchor.body_text || "",
-      };
-      setExternalDetailMessage(placeholder);
-      setSelectedId(placeholder.id);
-      setMailboxView("inbox");
-    } catch (reason) {
-      actions.showToast(reason instanceof Error ? reason.message : String(reason));
-    }
-  }, [actions, flags.saved, mailbox, state.inboxDraftMessages, state.inboxMessages, state.inboxSnapshotMessages]);
+      try {
+        if (targetMailbox !== mailbox.trim().toLowerCase()) {
+          await actions.switchMailbox(targetMailbox);
+        }
+        const known = [
+          ...state.inboxMessages,
+          ...state.inboxSnapshotMessages,
+          ...state.inboxDraftMessages,
+          ...Object.values(flags.saved),
+        ].find(
+          (item) =>
+            (item.mailbox || targetMailbox).trim().toLowerCase() ===
+              targetMailbox &&
+            (target.message_id
+              ? item.id === target.message_id
+              : (item.thread_id || item.id) === target.thread_id),
+        );
+        if (known) {
+          setExternalDetailMessage(null);
+          setSelectedId(known.id);
+          return;
+        }
+        const page = await actions.loadInboxThreadPage(
+          targetMailbox,
+          target.thread_id,
+          {
+            anchorMessageId: target.message_id || undefined,
+            limit: 5,
+            includeDisplayBody: true,
+          },
+        );
+        const anchor =
+          page.messages.find((item) => item.id === target.message_id) ||
+          page.messages.find((item) => item.id === page.latest_message_id) ||
+          page.messages.at(-1);
+        if (!anchor)
+          throw new Error("The referenced thread could not be loaded.");
+        const placeholder: InboxMessage = {
+          id: anchor.id,
+          thread_id: page.thread_id || target.thread_id,
+          mailbox: targetMailbox,
+          internal_date: anchor.internal_date,
+          from: anchor.from,
+          to: anchor.to,
+          subject: anchor.subject || page.subject,
+          label_ids: anchor.label_ids || [],
+          snippet: anchor.body_text || "",
+        };
+        setExternalDetailMessage(placeholder);
+        setSelectedId(placeholder.id);
+        setMailboxView("inbox");
+      } catch (reason) {
+        actions.showToast(
+          reason instanceof Error ? reason.message : String(reason),
+        );
+      }
+    },
+    [
+      actions,
+      flags.saved,
+      mailbox,
+      state.inboxDraftMessages,
+      state.inboxMessages,
+      state.inboxSnapshotMessages,
+    ],
+  );
 
   const handleGmailThreadAction = useCallback(
     async (operation: InboxThreadStateOperation, message: InboxMessage) => {
@@ -3609,7 +4199,7 @@ export function HomeView() {
   );
 
   const selectMailboxView = (next: MailboxView) => {
-    if (next === mailboxView) {
+    if (next === mailboxView && filter !== "search") {
       setFolderOpen(false);
       return;
     }
@@ -3628,10 +4218,11 @@ export function HomeView() {
       return;
     }
     if (next === "drafts") {
+      void actions.listInboxThreadDrafts(mailbox, 100).catch(() => undefined);
       void actions
-        .listInboxThreadDrafts(mailbox, 100)
-        .catch(() => undefined);
-      void actions.listComposeDrafts(mailbox).then((payload) => setComposeDrafts(payload.drafts || [])).catch(() => setComposeDrafts([]));
+        .listComposeDrafts(mailbox)
+        .then((payload) => setComposeDrafts(payload.drafts || []))
+        .catch(() => setComposeDrafts([]));
       return;
     }
     if (isLocalMailboxView(next)) {
@@ -3662,53 +4253,80 @@ export function HomeView() {
     });
   };
 
-  const scheduleComposeSend = useCallback((draft: ComposeDraft) => {
-    if (pendingComposeTimer.current) window.clearTimeout(pendingComposeTimer.current);
-    if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current);
-    setComposeResumeDraft(null);
-    setComposeOpen(false);
-    setComposeClosing(true);
-    const undo = () => {
-      if (pendingComposeTimer.current) window.clearTimeout(pendingComposeTimer.current);
-      if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current);
-      pendingComposeTimer.current = null;
-      pendingComposeCountdown.current = null;
-      void actions.deleteComposeDraft(mailbox, draft.id).catch(() => undefined);
-      if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current);
-      setComposeClosing(false);
-      setComposeResumeDraft(draft);
-      setComposeOpen(true);
-    };
-    const deadline = Date.now() + 10_000;
-    const updateCountdown = () => {
-      const seconds = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
-      actions.showToast(`Will send in ${seconds} second${seconds === 1 ? "" : "s"}.`, { actionLabel: "Undo", onAction: undo, durationMs: 1_100 });
-    };
-    updateCountdown();
-    pendingComposeCountdown.current = window.setInterval(updateCountdown, 1_000);
-    pendingComposeTimer.current = window.setTimeout(() => {
-      pendingComposeTimer.current = null;
-      if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current);
-      pendingComposeCountdown.current = null;
-      actions.showToast("Sending…", { durationMs: 30_000 });
-      void actions.sendComposeEmails(mailbox, [draft]).then(async (results) => {
-        const result = results[0];
-        if (result?.ok) {
-          await actions.deleteComposeDraft(mailbox, draft.id);
-          actions.showToast("Email sent.");
-        } else {
-          actions.showToast(result?.error || "Email could not be sent. The draft was kept.");
-        }
-      }).catch((reason) => actions.showToast(reason instanceof Error ? reason.message : String(reason)));
-    }, 10_000);
-  }, [actions, mailbox]);
+  const scheduleComposeSend = useCallback(
+    (draft: ComposeDraft) => {
+      if (pendingComposeTimer.current)
+        window.clearTimeout(pendingComposeTimer.current);
+      if (pendingComposeCountdown.current)
+        window.clearInterval(pendingComposeCountdown.current);
+      setComposeResumeDraft(null);
+      setComposeOpen(false);
+      setComposeClosing(true);
+      const undo = () => {
+        if (pendingComposeTimer.current)
+          window.clearTimeout(pendingComposeTimer.current);
+        if (pendingComposeCountdown.current)
+          window.clearInterval(pendingComposeCountdown.current);
+        pendingComposeTimer.current = null;
+        pendingComposeCountdown.current = null;
+        void actions
+          .deleteComposeDraft(mailbox, draft.id)
+          .catch(() => undefined);
+        if (composeCloseTimer.current)
+          window.clearTimeout(composeCloseTimer.current);
+        setComposeClosing(false);
+        setComposeResumeDraft(draft);
+        setComposeOpen(true);
+      };
+      const deadline = Date.now() + 10_000;
+      const updateCountdown = () => {
+        const seconds = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
+        actions.showToast(
+          `Will send in ${seconds} second${seconds === 1 ? "" : "s"}.`,
+          { actionLabel: "Undo", onAction: undo, durationMs: 1_100 },
+        );
+      };
+      updateCountdown();
+      pendingComposeCountdown.current = window.setInterval(
+        updateCountdown,
+        1_000,
+      );
+      pendingComposeTimer.current = window.setTimeout(() => {
+        pendingComposeTimer.current = null;
+        if (pendingComposeCountdown.current)
+          window.clearInterval(pendingComposeCountdown.current);
+        pendingComposeCountdown.current = null;
+        actions.showToast("Sending…", { durationMs: 30_000 });
+        void actions
+          .sendComposeEmails(mailbox, [draft])
+          .then(async (results) => {
+            const result = results[0];
+            if (result?.ok) {
+              await actions.deleteComposeDraft(mailbox, draft.id);
+              actions.showToast("Email sent.");
+            } else {
+              actions.showToast(
+                result?.error || "Email could not be sent. The draft was kept.",
+              );
+            }
+          })
+          .catch((reason) =>
+            actions.showToast(
+              reason instanceof Error ? reason.message : String(reason),
+            ),
+          );
+      }, 10_000);
+    },
+    [actions, mailbox],
+  );
 
   const closeComposeDrawer = useCallback(() => {
     setComposeOpen(false);
     setComposeAiContext(null);
     setComposeInsertRequest(null);
     setComposeClosing(true);
-    if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current);
+    if (composeCloseTimer.current)
+      window.clearTimeout(composeCloseTimer.current);
     composeCloseTimer.current = window.setTimeout(() => {
       setComposeClosing(false);
       setComposeResumeDraft(null);
@@ -3716,58 +4334,124 @@ export function HomeView() {
     }, 360);
   }, []);
 
-  const scheduleComposeBatch = useCallback((confirmed = false) => {
-    const selected = composeDrafts.filter((draft) => selectedComposeDraftIds.has(`compose:${draft.id}`));
-    if (!selected.length) {
-      actions.showToast("Select a Compose draft to send.");
-      return;
-    }
-    const incomplete = selected.filter((draft) => !draft.recipients.length || !draft.subject.trim() || !draft.body.trim());
-    if (incomplete.length) {
-      actions.showToast(`Complete ${incomplete.length} selected draft${incomplete.length === 1 ? "" : "s"} before sending.`);
-      return;
-    }
-    if (!confirmed) {
-      setBatchConfirmDrafts(selected);
-      return;
-    }
-    setBatchConfirmDrafts(null);
-    if (pendingComposeTimer.current) window.clearTimeout(pendingComposeTimer.current);
-    if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current);
-    const deadline = Date.now() + 10_000;
-    const undo = () => { if (pendingComposeTimer.current) window.clearTimeout(pendingComposeTimer.current); if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current); pendingComposeTimer.current = null; pendingComposeCountdown.current = null; };
-    const updateCountdown = () => { const seconds = Math.max(1, Math.ceil((deadline - Date.now()) / 1000)); actions.showToast(`${selected.length} drafts will send in ${seconds} second${seconds === 1 ? "" : "s"}.`, { actionLabel: "Undo", onAction: undo, durationMs: 1_100 }); };
-    updateCountdown();
-    pendingComposeCountdown.current = window.setInterval(updateCountdown, 1_000);
-    pendingComposeTimer.current = window.setTimeout(() => {
-      pendingComposeTimer.current = null;
-      if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current);
-      pendingComposeCountdown.current = null;
-      actions.showToast("Sending drafts…", { durationMs: 30_000 });
-      void actions.sendComposeEmails(mailbox, selected).then(async (results) => {
-        const succeeded = results.filter((result) => result.ok).map((result) => result.id);
-        await Promise.all(succeeded.map((id) => actions.deleteComposeDraft(mailbox, id)));
-        setComposeDrafts((drafts) => drafts.filter((draft) => !succeeded.includes(draft.id)));
-        setSelectedComposeDraftIds(new Set());
-        const failures = results.filter((result) => !result.ok);
-        actions.showToast(failures.length ? `${succeeded.length} sent; ${failures.length} draft${failures.length === 1 ? "" : "s"} failed and were kept.` : `${succeeded.length} drafts sent.`);
-      }).catch((reason) => actions.showToast(reason instanceof Error ? reason.message : String(reason)));
-    }, 10_000);
-  }, [actions, composeDrafts, mailbox, selectedComposeDraftIds]);
+  const scheduleComposeBatch = useCallback(
+    (confirmed = false) => {
+      const selected = composeDrafts.filter((draft) =>
+        selectedComposeDraftIds.has(`compose:${draft.id}`),
+      );
+      if (!selected.length) {
+        actions.showToast("Select a Compose draft to send.");
+        return;
+      }
+      const incomplete = selected.filter(
+        (draft) =>
+          !draft.recipients.length ||
+          !draft.subject.trim() ||
+          !draft.body.trim(),
+      );
+      if (incomplete.length) {
+        actions.showToast(
+          `Complete ${incomplete.length} selected draft${incomplete.length === 1 ? "" : "s"} before sending.`,
+        );
+        return;
+      }
+      if (!confirmed) {
+        setBatchConfirmDrafts(selected);
+        return;
+      }
+      setBatchConfirmDrafts(null);
+      if (pendingComposeTimer.current)
+        window.clearTimeout(pendingComposeTimer.current);
+      if (pendingComposeCountdown.current)
+        window.clearInterval(pendingComposeCountdown.current);
+      const deadline = Date.now() + 10_000;
+      const undo = () => {
+        if (pendingComposeTimer.current)
+          window.clearTimeout(pendingComposeTimer.current);
+        if (pendingComposeCountdown.current)
+          window.clearInterval(pendingComposeCountdown.current);
+        pendingComposeTimer.current = null;
+        pendingComposeCountdown.current = null;
+      };
+      const updateCountdown = () => {
+        const seconds = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
+        actions.showToast(
+          `${selected.length} drafts will send in ${seconds} second${seconds === 1 ? "" : "s"}.`,
+          { actionLabel: "Undo", onAction: undo, durationMs: 1_100 },
+        );
+      };
+      updateCountdown();
+      pendingComposeCountdown.current = window.setInterval(
+        updateCountdown,
+        1_000,
+      );
+      pendingComposeTimer.current = window.setTimeout(() => {
+        pendingComposeTimer.current = null;
+        if (pendingComposeCountdown.current)
+          window.clearInterval(pendingComposeCountdown.current);
+        pendingComposeCountdown.current = null;
+        actions.showToast("Sending drafts…", { durationMs: 30_000 });
+        void actions
+          .sendComposeEmails(mailbox, selected)
+          .then(async (results) => {
+            const succeeded = results
+              .filter((result) => result.ok)
+              .map((result) => result.id);
+            await Promise.all(
+              succeeded.map((id) => actions.deleteComposeDraft(mailbox, id)),
+            );
+            setComposeDrafts((drafts) =>
+              drafts.filter((draft) => !succeeded.includes(draft.id)),
+            );
+            setSelectedComposeDraftIds(new Set());
+            const failures = results.filter((result) => !result.ok);
+            actions.showToast(
+              failures.length
+                ? `${succeeded.length} sent; ${failures.length} draft${failures.length === 1 ? "" : "s"} failed and were kept.`
+                : `${succeeded.length} drafts sent.`,
+            );
+          })
+          .catch((reason) =>
+            actions.showToast(
+              reason instanceof Error ? reason.message : String(reason),
+            ),
+          );
+      }, 10_000);
+    },
+    [actions, composeDrafts, mailbox, selectedComposeDraftIds],
+  );
 
-  const confirmAiSendPlan = useCallback((plan: SendPlanArtifact) => {
-    const item = plan.messages[0];
-    if (!item) return;
-    void actions.saveComposeDraft(mailbox, { recipients: item.recipients, subject: item.subject, body: item.body })
-      .then((draft) => scheduleComposeSend(draft))
-      .catch((reason) => actions.showToast(reason instanceof Error ? reason.message : String(reason)));
-  }, [actions, mailbox, scheduleComposeSend]);
+  const confirmAiSendPlan = useCallback(
+    (plan: SendPlanArtifact) => {
+      const item = plan.messages[0];
+      if (!item) return;
+      void actions
+        .saveComposeDraft(mailbox, {
+          recipients: item.recipients,
+          subject: item.subject,
+          body: item.body,
+        })
+        .then((draft) => scheduleComposeSend(draft))
+        .catch((reason) =>
+          actions.showToast(
+            reason instanceof Error ? reason.message : String(reason),
+          ),
+        );
+    },
+    [actions, mailbox, scheduleComposeSend],
+  );
 
-  useEffect(() => () => {
-    if (pendingComposeTimer.current) window.clearTimeout(pendingComposeTimer.current);
-    if (pendingComposeCountdown.current) window.clearInterval(pendingComposeCountdown.current);
-    if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current);
-  }, []);
+  useEffect(
+    () => () => {
+      if (pendingComposeTimer.current)
+        window.clearTimeout(pendingComposeTimer.current);
+      if (pendingComposeCountdown.current)
+        window.clearInterval(pendingComposeCountdown.current);
+      if (composeCloseTimer.current)
+        window.clearTimeout(composeCloseTimer.current);
+    },
+    [],
+  );
 
   return (
     <div
@@ -3783,12 +4467,15 @@ export function HomeView() {
         }
         onUseComposeArtifact={(artifact, sourceContext) => {
           if (
-            !composeOpen
-            || !composeAiContext
-            || sourceContext?.session_id !== composeAiContext?.session_id
-            || composeAiContext.mailbox.trim().toLowerCase() !== artifact.mailbox.trim().toLowerCase()
+            !composeOpen ||
+            !composeAiContext ||
+            sourceContext?.session_id !== composeAiContext?.session_id ||
+            composeAiContext.mailbox.trim().toLowerCase() !==
+              artifact.mailbox.trim().toLowerCase()
           ) {
-            actions.showToast("Open the matching Compose draft before applying this suggestion.");
+            actions.showToast(
+              "Open the matching Compose draft before applying this suggestion.",
+            );
             return;
           }
           setComposeInsertRequest({ nonce: crypto.randomUUID(), artifact });
@@ -3813,7 +4500,7 @@ export function HomeView() {
         onKeyDown={adjustSidebarWithKeyboard}
       />
       <main
-        className={`mail-workspace ${mailboxView === "inbox" ? "" : "is-folder-view"}`}
+        className={`mail-workspace ${mailboxView === "inbox" && filter !== "search" ? "" : "is-folder-view"}`}
       >
         <header className="mail-topbar">
           <div className="mailbox-picker">
@@ -3822,12 +4509,21 @@ export function HomeView() {
               aria-expanded={folderOpen}
               onClick={() => setFolderOpen((open) => !open)}
             >
-              <span className={`mailbox-current-icon is-${mailboxView}`}>
-                <FolderIcon view={mailboxView} />
+              <span
+                className={`mailbox-current-icon is-${filter === "search" ? "search" : mailboxView}`}
+              >
+                {filter === "search" ? (
+                  <SearchIcon />
+                ) : (
+                  <FolderIcon view={mailboxView} />
+                )}
               </span>
               <div>
                 <strong>
-                  {MAILBOX_VIEWS.find((item) => item.id === mailboxView)?.label}
+                  {filter === "search"
+                    ? "Search"
+                    : MAILBOX_VIEWS.find((item) => item.id === mailboxView)
+                        ?.label}
                 </strong>
                 <span>{mailbox || "Gmail"}</span>
               </div>
@@ -3860,14 +4556,120 @@ export function HomeView() {
               ))}
             </div>
           </div>
-          <label className="mail-search">
-            <SearchIcon />
-            <input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search in this catagory"
-            />
-          </label>
+          <div className="mail-search-wrap">
+            <label className="mail-search">
+              <SearchIcon />
+              <span className="mail-search-highlight" aria-hidden="true">
+                {splitInboxQueryTokens(search).map((token, index, tokens) => (
+                  <span
+                    className={`is-${token.kind}${parsedSearch.error && index === tokens.length - 1 && !/\s$/u.test(search) ? " is-editing" : ""}`}
+                    key={`${token.text}-${index}`}
+                  >
+                    {token.text}
+                  </span>
+                ))}
+              </span>
+              <input
+                ref={searchInputRef}
+                value={search}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                  setActiveSearch("");
+                  setSearchFocused(true);
+                  setSearchSuggestionIndex(0);
+                }}
+                onFocus={() => setSearchFocused(true)}
+                onBlur={() =>
+                  window.setTimeout(() => setSearchFocused(false), 120)
+                }
+                onKeyDown={(event) => {
+                  if (event.key === "ArrowDown" && searchSuggestions.length) {
+                    event.preventDefault();
+                    setSearchSuggestionIndex(
+                      (index) => (index + 1) % searchSuggestions.length,
+                    );
+                  } else if (
+                    event.key === "ArrowUp" &&
+                    searchSuggestions.length
+                  ) {
+                    event.preventDefault();
+                    setSearchSuggestionIndex(
+                      (index) =>
+                        (index - 1 + searchSuggestions.length) %
+                        searchSuggestions.length,
+                    );
+                  } else if (event.key === "Enter") {
+                    event.preventDefault();
+                    if (searchSuggestions.length)
+                      applySuggestion(searchSuggestions[searchSuggestionIndex]);
+                    else if (
+                      parsedSearch.expression &&
+                      !parsedSearch.error &&
+                      !/\s$/u.test(search)
+                    ) {
+                      const next = `${search} `;
+                      setSearch(next);
+                      window.requestAnimationFrame(() =>
+                        searchInputRef.current?.setSelectionRange(
+                          next.length,
+                          next.length,
+                        ),
+                      );
+                    } else applySearch(search);
+                  }
+                }}
+                placeholder="search emails..."
+              />
+              {activeSearch || search ? (
+                <button
+                  type="button"
+                  className="mail-search-clear"
+                  aria-label="Clear search"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => {
+                    setSearch("");
+                    setActiveSearch("");
+                    setMailboxView("inbox");
+                    setFilter("important");
+                  }}
+                >
+                  ×
+                </button>
+              ) : null}
+            </label>
+            {searchFocused ? (
+              <div className="mail-search-suggestions" role="listbox">
+                {searchSuggestions.length ? (
+                  searchSuggestions.map((suggestion, index) => (
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={index === searchSuggestionIndex}
+                      className={
+                        index === searchSuggestionIndex ? "is-selected" : ""
+                      }
+                      key={suggestion}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onMouseMove={() => setSearchSuggestionIndex(index)}
+                      onClick={() => applySuggestion(suggestion)}
+                    >
+                      <strong>{suggestion}</strong>
+                      {getInboxQuerySuggestionPlaceholder(suggestion) ? (
+                        <span>
+                          {getInboxQuerySuggestionPlaceholder(suggestion)}
+                        </span>
+                      ) : null}
+                      {index === searchSuggestionIndex ? (
+                        <kbd>Enter</kbd>
+                      ) : null}
+                    </button>
+                  ))
+                ) : parsedSearch.error ? (
+                  <p role="alert">{parsedSearch.error}</p>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
           <button
             className={`refresh-mail-btn ${isInboxSyncing ? "is-syncing" : ""}`}
             disabled={isInboxSyncing}
@@ -3876,14 +4678,27 @@ export function HomeView() {
             <RefreshIcon />
             <span>{isInboxSyncing ? "Syncing" : "Refresh"}</span>
           </button>
-          <button className="refresh-mail-btn compose-open-btn" type="button" onClick={() => { if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current); setComposeClosing(false); setComposeResumeDraft(null); setComposeOpen(true); }}>
+          <button
+            className="refresh-mail-btn compose-open-btn"
+            type="button"
+            onClick={() => {
+              if (composeCloseTimer.current)
+                window.clearTimeout(composeCloseTimer.current);
+              setComposeClosing(false);
+              setComposeResumeDraft(null);
+              setComposeOpen(true);
+            }}
+          >
             <ComposeIcon />
             <span>Compose</span>
           </button>
         </header>
 
         {refreshChoiceOpen ? (
-          <div className="confirm-overlay refresh-choice-overlay" role="presentation">
+          <div
+            className="confirm-overlay refresh-choice-overlay"
+            role="presentation"
+          >
             <section
               className="confirm-dialog refresh-choice-dialog"
               role="dialog"
@@ -3891,7 +4706,10 @@ export function HomeView() {
               aria-labelledby="refresh-choice-title"
             >
               <h3 id="refresh-choice-title">Refresh inbox</h3>
-              <p>Choose how Anna should refresh the current mailbox cache and view.</p>
+              <p>
+                Choose how Anna should refresh the current mailbox cache and
+                view.
+              </p>
               <div className="refresh-choice-actions">
                 <button
                   className="danger-btn"
@@ -3908,7 +4726,10 @@ export function HomeView() {
                 >
                   Continue loading new mail
                 </button>
-                <button type="button" onClick={() => setRefreshChoiceOpen(false)}>
+                <button
+                  type="button"
+                  onClick={() => setRefreshChoiceOpen(false)}
+                >
                   Cancel
                 </button>
               </div>
@@ -3918,38 +4739,96 @@ export function HomeView() {
 
         {batchConfirmDrafts ? (
           <div className="confirm-overlay" role="presentation">
-            <section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="batch-send-title">
-              <h3 id="batch-send-title">Send {batchConfirmDrafts.length} draft{batchConfirmDrafts.length === 1 ? "" : "s"}?</h3>
-              <p>Each email will be sent separately after the 10-second Undo window.</p>
-              <ul className="batch-send-summary">{batchConfirmDrafts.map((draft) => <li key={draft.id}><strong>{draft.subject || "(no subject)"}</strong>&nbsp;<span>{draft.recipients.join(", ")}</span></li>)}</ul>
-              <div className="refresh-choice-actions"><button type="button" onClick={() => setBatchConfirmDrafts(null)}>Cancel</button><button type="button" className="is-primary" onClick={() => scheduleComposeBatch(true)}>Confirm send</button></div>
+            <section
+              className="confirm-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="batch-send-title"
+            >
+              <h3 id="batch-send-title">
+                Send {batchConfirmDrafts.length} draft
+                {batchConfirmDrafts.length === 1 ? "" : "s"}?
+              </h3>
+              <p>
+                Each email will be sent separately after the 10-second Undo
+                window.
+              </p>
+              <ul className="batch-send-summary">
+                {batchConfirmDrafts.map((draft) => (
+                  <li key={draft.id}>
+                    <strong>{draft.subject || "(no subject)"}</strong>&nbsp;
+                    <span>{draft.recipients.join(", ")}</span>
+                  </li>
+                ))}
+              </ul>
+              <div className="refresh-choice-actions">
+                <button
+                  type="button"
+                  onClick={() => setBatchConfirmDrafts(null)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="is-primary"
+                  onClick={() => scheduleComposeBatch(true)}
+                >
+                  Confirm send
+                </button>
+              </div>
             </section>
           </div>
         ) : null}
 
-        {mailboxView === "inbox" ? (
+        {mailboxView === "inbox" && filter !== "search" ? (
           <nav className="mail-tabs" aria-label="Inbox filters">
             {(
               [
-                ["important", "Important"],
-                ["other", "Other"],
-              ] as Array<[FeedFilter, string]>
-            ).map(([key, label]) => (
+                ["important", "Important", inboxSplitMessages.important.length],
+                ["other", "Other", inboxSplitMessages.other.length],
+                ...state.inboxSettings.custom_categories
+                  .filter(
+                    (split) =>
+                      !split.hide_when_empty ||
+                      (inboxSplitMessages.custom[split.id] || []).length > 0,
+                  )
+                  .map((split) => [
+                    `category:${split.id}` as FeedFilter,
+                    split.name,
+                    (inboxSplitMessages.custom[split.id] || []).length,
+                  ]),
+              ] as Array<[FeedFilter, string, number]>
+            ).map(([key, label, count]) => (
               <button
                 key={key}
                 className={filter === key ? "is-active" : ""}
                 onClick={() => setFilter(key)}
               >
                 {label}
-                <span>{counts[key]}</span>
+                <span>{count}</span>
               </button>
             ))}
+            <button
+              className="icon-btn mail-tabs-manage"
+              type="button"
+              aria-label="Manage Splits"
+              data-tooltip="Manage Splits"
+              onClick={() => setSplitsOpen(true)}
+            >
+              <PlusIcon />
+            </button>
             <div className="mail-tabs-meta">
               {lastSyncedLabel ? <span>{lastSyncedLabel}</span> : null}
               <p>{inboxRangeLabel(days)}</p>
             </div>
           </nav>
         ) : null}
+        <SplitsManager
+          open={splitsOpen}
+          settings={state.inboxSettings}
+          onChange={actions.saveInboxSettings}
+          onClose={() => setSplitsOpen(false)}
+        />
 
         <section
           className={`mail-feed ${mailboxView === "trash" ? "is-trash-view" : ""}`}
@@ -3957,7 +4836,44 @@ export function HomeView() {
           ref={mailFeedRef}
           onScroll={handleFeedScroll}
         >
-          {mailboxView === "drafts" && sourceMessages.length ? <div className="draft-batch-bar"><button type="button" className="draft-select draft-select-all" aria-label="Select all drafts" aria-pressed={sourceMessages.length > 0 && sourceMessages.every((message) => selectedComposeDraftIds.has(message.id))} onClick={() => setSelectedComposeDraftIds((current) => current.size === sourceMessages.length ? new Set() : new Set(sourceMessages.map((message) => message.id)))}>{sourceMessages.length > 0 && sourceMessages.every((message) => selectedComposeDraftIds.has(message.id)) ? "✓" : ""}</button><span>{selectedComposeDraftIds.size} selected</span><button type="button" className="refresh-mail-btn draft-batch-send" disabled={!selectedComposeDraftIds.size} onClick={() => scheduleComposeBatch()}>Send selected</button></div> : null}
+          {mailboxView === "drafts" && sourceMessages.length ? (
+            <div className="draft-batch-bar">
+              <button
+                type="button"
+                className="draft-select draft-select-all"
+                aria-label="Select all drafts"
+                aria-pressed={
+                  sourceMessages.length > 0 &&
+                  sourceMessages.every((message) =>
+                    selectedComposeDraftIds.has(message.id),
+                  )
+                }
+                onClick={() =>
+                  setSelectedComposeDraftIds((current) =>
+                    current.size === sourceMessages.length
+                      ? new Set()
+                      : new Set(sourceMessages.map((message) => message.id)),
+                  )
+                }
+              >
+                {sourceMessages.length > 0 &&
+                sourceMessages.every((message) =>
+                  selectedComposeDraftIds.has(message.id),
+                )
+                  ? "✓"
+                  : ""}
+              </button>
+              <span>{selectedComposeDraftIds.size} selected</span>
+              <button
+                type="button"
+                className="refresh-mail-btn draft-batch-send"
+                disabled={!selectedComposeDraftIds.size}
+                onClick={() => scheduleComposeBatch()}
+              >
+                Send selected
+              </button>
+            </div>
+          ) : null}
           {state.inboxError &&
           sourceMessages.length > 0 &&
           !cachedInboxBannerDismissed ? (
@@ -3971,11 +4887,11 @@ export function HomeView() {
                   Skip
                 </button>
                 <button
-                  onClick={() => void (
-                    cachedInboxRetryAction === "load-more"
+                  onClick={() =>
+                    void (cachedInboxRetryAction === "load-more"
                       ? loadMoreInbox()
-                      : syncInbox(days)
-                  )}
+                      : syncInbox(days))
+                  }
                   disabled={isInboxSyncing || feedAction !== null}
                 >
                   {cachedInboxRetryAction === "load-more"
@@ -3997,11 +4913,16 @@ export function HomeView() {
                 <div className="auth-guide-steps">
                   <div className="auth-step">
                     <span className="auth-step-num">1</span>
-                    <span>Open <strong>More → Authorizations</strong></span>
+                    <span>
+                      Open <strong>More → Authorizations</strong>
+                    </span>
                   </div>
                   <div className="auth-step">
                     <span className="auth-step-num">2</span>
-                    <span>Select <strong>Google</strong> → <strong>Connect with OAuth</strong></span>
+                    <span>
+                      Select <strong>Google</strong> →{" "}
+                      <strong>Connect with OAuth</strong>
+                    </span>
                   </div>
                   <div className="auth-step">
                     <span className="auth-step-num">3</span>
@@ -4009,7 +4930,9 @@ export function HomeView() {
                   </div>
                   <div className="auth-step">
                     <span className="auth-step-num">4</span>
-                    <span>Click <strong>Authorize</strong> and return here</span>
+                    <span>
+                      Click <strong>Authorize</strong> and return here
+                    </span>
                   </div>
                 </div>
               </div>
@@ -4061,16 +4984,18 @@ export function HomeView() {
           ) : (
             grouped.map((group) => (
               <div className="mail-group" key={group.label}>
-                {mailboxView === "inbox" ? (
+                {mailboxView === "inbox" && filter !== "search" ? (
                   <div className="mail-group-label">
                     <span>{group.label}</span>
                     <i />
-                    {group.label !== "STARS" && group.label !== "TODOS" ? <button
-                      title="Mark this timeline as done"
-                      onClick={() => markTimelineDone(group.messages)}
-                    >
-                      <AllDoneIcon />
-                    </button> : null}
+                    {group.label !== "STARS" && group.label !== "TODOS" ? (
+                      <button
+                        title="Mark this timeline as done"
+                        onClick={() => markTimelineDone(group.messages)}
+                      >
+                        <AllDoneIcon />
+                      </button>
+                    ) : null}
                   </div>
                 ) : null}
                 {group.messages.map((message) => {
@@ -4090,19 +5015,50 @@ export function HomeView() {
                       avatarUrl={contactAvatars[avatarEmail]}
                       onPrefetch={() => void prefetchMessageBody(message)}
                       onFlag={updateFlag}
-                      onThreadAction={(operation, message) => void handleGmailThreadAction(operation, message)}
+                      onThreadAction={(operation, message) =>
+                        void handleGmailThreadAction(operation, message)
+                      }
                       onSnooze={openSnoozePicker}
                       onSelect={() => openMessageDetail(message)}
-                      selectable={mailboxView === "drafts" && isDraftMessage(message)}
+                      selectable={
+                        mailboxView === "drafts" && isDraftMessage(message)
+                      }
                       selectedForBatch={selectedComposeDraftIds.has(message.id)}
-                      onBatchToggle={() => setSelectedComposeDraftIds((current) => { const next = new Set(current); const id = message.id; if (next.has(id)) next.delete(id); else next.add(id); return next; })}
-                      onComposeDraftDelete={message.id.startsWith("compose:") ? () => {
-                        const id = message.id.slice("compose:".length);
-                        void actions.deleteComposeDraft(mailbox, id).then(() => {
-                          setComposeDrafts((drafts) => drafts.filter((draft) => draft.id !== id));
-                          setSelectedComposeDraftIds((current) => { const next = new Set(current); next.delete(message.id); return next; });
-                        }).catch((reason) => actions.showToast(reason instanceof Error ? reason.message : String(reason)));
-                      } : undefined}
+                      onBatchToggle={() =>
+                        setSelectedComposeDraftIds((current) => {
+                          const next = new Set(current);
+                          const id = message.id;
+                          if (next.has(id)) next.delete(id);
+                          else next.add(id);
+                          return next;
+                        })
+                      }
+                      onComposeDraftDelete={
+                        message.id.startsWith("compose:")
+                          ? () => {
+                              const id = message.id.slice("compose:".length);
+                              void actions
+                                .deleteComposeDraft(mailbox, id)
+                                .then(() => {
+                                  setComposeDrafts((drafts) =>
+                                    drafts.filter((draft) => draft.id !== id),
+                                  );
+                                  setSelectedComposeDraftIds((current) => {
+                                    const next = new Set(current);
+                                    next.delete(message.id);
+                                    return next;
+                                  });
+                                })
+                                .catch((reason) =>
+                                  actions.showToast(
+                                    reason instanceof Error
+                                      ? reason.message
+                                      : String(reason),
+                                  ),
+                                );
+                            }
+                          : undefined
+                      }
                     />
                   );
                 })}
@@ -4124,13 +5080,19 @@ export function HomeView() {
             <footer className="trash-retention-notice">
               <p>Trash is deleted after 30 days.</p>
               <p>
-                To empty your trash now, {" "}
+                To empty your trash now,{" "}
                 <button
                   type="button"
                   onClick={() => {
                     void copyTextToClipboard(gmailTrashUrl(mailbox))
-                      .then(() => actions.showToast("Gmail link copied. Paste it into your browser."))
-                      .catch(() => actions.showToast("Could not copy the Gmail link."));
+                      .then(() =>
+                        actions.showToast(
+                          "Gmail link copied. Paste it into your browser.",
+                        ),
+                      )
+                      .catch(() =>
+                        actions.showToast("Could not copy the Gmail link."),
+                      );
                   }}
                 >
                   copy Gmail link
@@ -4175,19 +5137,30 @@ export function HomeView() {
           contactAvatars={contactAvatars}
           loadContactAvatars={actions.loadContactAvatars}
           latestThreadMessageId={latestSelectedThreadMessage?.id || ""}
-          latestThreadInternalDate={latestSelectedThreadMessage?.internal_date || ""}
+          latestThreadInternalDate={
+            latestSelectedThreadMessage?.internal_date || ""
+          }
         />
-        {composeOpen || composeClosing ? <ComposeView
-          mailbox={mailbox}
-          initialDraft={composeResumeDraft}
-          open={composeOpen}
-          onClose={closeComposeDrawer}
-          onViewDrafts={() => { closeComposeDrawer(); selectMailboxView("drafts"); }}
-          onScheduleSend={scheduleComposeSend}
-          insertRequest={composeInsertRequest}
-          onConsumeInsertRequest={(nonce) => setComposeInsertRequest((current) => current?.nonce === nonce ? null : current)}
-          onOpenAiDraft={openComposeAiDraft}
-        /> : null}
+        {composeOpen || composeClosing ? (
+          <ComposeView
+            mailbox={mailbox}
+            initialDraft={composeResumeDraft}
+            open={composeOpen}
+            onClose={closeComposeDrawer}
+            onViewDrafts={() => {
+              closeComposeDrawer();
+              selectMailboxView("drafts");
+            }}
+            onScheduleSend={scheduleComposeSend}
+            insertRequest={composeInsertRequest}
+            onConsumeInsertRequest={(nonce) =>
+              setComposeInsertRequest((current) =>
+                current?.nonce === nonce ? null : current,
+              )
+            }
+            onOpenAiDraft={openComposeAiDraft}
+          />
+        ) : null}
         <SnoozePicker
           open={Boolean(snoozeTarget)}
           onClose={() => setSnoozeTarget(null)}

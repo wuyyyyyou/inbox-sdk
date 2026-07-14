@@ -1,5 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { accountDisplayName, aiSearchStatus, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, mergeDraftOverlayMessages, messageParticipant, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+import { PlusIcon, accountDisplayName, aiSearchStatus, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, mergeDraftOverlayMessages, messageParticipant, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+
+describe("PlusIcon", () => {
+  it("renders an accessible-hidden SVG plus glyph", () => {
+    const icon = PlusIcon();
+    const svg = icon.type(icon.props);
+
+    expect(svg.type).toBe("svg");
+    expect(svg.props["aria-hidden"]).toBe("true");
+    expect(svg.props.children.type).toBe("path");
+    expect(svg.props.children.props.d).toBe("M12 5v14M5 12h14");
+  });
+});
 
 describe("gmailAuthorizationError", () => {
   it("includes the source returned by the authorization check", () => {

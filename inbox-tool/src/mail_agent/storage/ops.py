@@ -24,6 +24,7 @@ from .types import (
     ProcessedMessage,
     RunHistoryEntry,
     RunRecord,
+    InboxCustomCategory,
     InboxSettings,
     ScanPlan,
     ScanState,
@@ -281,11 +282,41 @@ def _inbox_settings_key(mailbox: str) -> str:
     return f"{_mailbox_prefix(mailbox)}/inbox_settings"
 
 
+def _normalize_inbox_custom_categories(value: Any) -> list[InboxCustomCategory]:
+    """规范化 Split 列表，防止非法条目、重复 ID 或超长输入进入邮箱设置。"""
+    if not isinstance(value, list):
+        return []
+    categories: list[InboxCustomCategory] = []
+    seen_ids: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict) or len(categories) >= 20:
+            continue
+        category_id = str(raw.get("id") or "").strip()
+        name = str(raw.get("name") or "").strip()
+        query = str(raw.get("query") or "").strip()
+        # ID、显示名称和查询缺一不可；ID 重复时保留先保存的 Split。
+        if not category_id or not name or not query or category_id in seen_ids:
+            continue
+        seen_ids.add(category_id)
+        bundling_behavior = str(raw.get("bundling_behavior") or "default")
+        if bundling_behavior not in ("default", "by_sender", "none"):
+            bundling_behavior = "default"
+        categories.append(InboxCustomCategory(
+            id=category_id[:120],
+            name=name[:60],
+            query=query[:500],
+            hide_when_empty=raw.get("hide_when_empty") is True,
+            bundling_behavior=bundling_behavior,
+        ))
+    return categories
+
+
 async def get_inbox_settings(mailbox: str) -> dict[str, Any]:
     """读取邮箱设置；不存在时返回约定默认值和空 etag。"""
     result = await get_storage().get(_inbox_settings_key(mailbox), scope=default_scope())
     raw = result.get("value") if result.get("exists") and isinstance(result.get("value"), dict) else {}
-    allowed = {key: raw[key] for key in InboxSettings.__dataclass_fields__ if key in raw}
+    allowed = {key: raw[key] for key in InboxSettings.__dataclass_fields__ if key in raw and key != "custom_categories"}
+    allowed["custom_categories"] = _normalize_inbox_custom_categories(raw.get("custom_categories"))
     allowed["mailbox"] = mailbox
     return {
         "settings": InboxSettings(**allowed),
@@ -316,6 +347,9 @@ async def set_inbox_settings(
                 setattr(settings, field_name, max(1, min(50, int(values[field_name]))))
             except (TypeError, ValueError):
                 pass
+    if "custom_categories" in values:
+        # 分类只随当前 mailbox 的 InboxSettings 保存，沿用同一 etag 并发保护。
+        settings.custom_categories = _normalize_inbox_custom_categories(values["custom_categories"])
     settings.updated_at = _now()
     result = await get_storage().set(
         _inbox_settings_key(mailbox),
