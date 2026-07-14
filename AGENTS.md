@@ -1,17 +1,19 @@
 # AGENTS.md
 
-## 项目约定
+## 开发约定
 
 - 代码编写前先保证对功能和内容的理解和我完全对齐，发现存在不明确的内容先与我沟通，最后再进行代码编写
 - 每次只改和当前任务直接相关的文件，完成前说明验证命令和结果
-- 对于比较复杂的业务需求，应询问 `是否开启 subagent 进行代码实现，最后由主 agent 进行审查验收`
-- 对于简单的业务需求，无需让我审批实施计划，但是必须和我的需要的功能和理解对齐，否则先与我沟通
 - 所有的后端代码编写都要有详细清晰的中文注释，如果读取到的后端代码没有中文注释，应该及时补充
-- 所有文档必须在 `anna-inbox/docs/` 中
+- 所有文档必须在 `anna-inbox/docs/` 中，且文档必须为中文文档
 - 对于`提交前的审核`/`准备提交`的需求，需要完成以下几件事
   - 更新当前版本号：如果不指定则按小版本加1，存在不明确的内容先与我沟通
-  - 更新项目所有基线文档：包括版本号信息、进度，存在不明确的内容先与我沟通
-  - 根据当前工作树内容生成git commit的中文消息，不要包含测试补充、文档更新、版本同步的消息，最后我审核后手动提交，message格式如下：
+  - 更新项目文档：`README.md` `CONTEXT.md` `AGENTS.md` 以及 `anna-inbox/docs` 下的文档，存在不明确的内容先与我沟通。更新内容包括：
+    - 版本号
+    - 当前版本内容
+    - 某个功能完成进度
+    - 项目基线
+- 根据当前工作树内容生成git commit的中文消息，不要包含测试补充、文档更新、版本同步的消息，最后我审核后手动提交，message格式如下：
     ```md
     version: x.x.x
     - 消息内容...
@@ -33,7 +35,7 @@ Anna Inbox 当前版本为 `2.0.16`。前端位于 `anna-inbox/`，后端 Execut
 - `inbox-tool/src/mail_agent/ask/`：Ask 规划、搜索和回答。
 - `inbox-tool/src/mail_agent/core/`、`cards/`、`judgment_engine/`：Brief 管线。
 
-`anna-inbox/bundle/` 是构建产物，不手写、不提交。设置入口在 2.0.1 前端暂时隐藏；除非任务明确要求，不删除设置相关后端工具和状态。
+`anna-inbox/bundle/` 是构建产物，不手写、不提交。
 
 ## 协议与安全
 
@@ -111,4 +113,3 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' | uv --directory inbo
 - 修改邮件 DTO 时同时核对 `anna-inbox/src/types/mail.ts`、API facade 和后端返回边界。
 - 修改协议、Gmail auth、LLM sampling、存储或卡片 schema 前，先阅读对应当前文档和实现，不凭旧设计记录猜测。
 - 保留无关工作树改动，不覆盖 token、本地缓存、release artifact 或用户密钥。
-- 修改公共工具行为时，同步更新 `anna-inbox/docs/` 中的文档。
