@@ -28,3 +28,21 @@ describe("Manage Splits tooltip", () => {
     expect(manageSplitsButton).not.toContain('title="Manage Splits"');
   });
 });
+
+describe("AI scan invocation", () => {
+  it("uses the current Scan Plan and a 60-second initial wait in every entry point", () => {
+    expect(controllerSource.match(/wait_timeout_seconds: 60/g)?.length || 0).toBeGreaterThanOrEqual(3);
+    expect(controllerSource.match(/scan_window_days: scanScope\.scan_window_days/g)?.length || 0).toBeGreaterThanOrEqual(3);
+    expect(controllerSource.match(/max_messages: scanScope\.max_messages/g)?.length || 0).toBeGreaterThanOrEqual(3);
+  });
+
+  it("uses the Inbox display range as the AI scan time range", () => {
+    expect(controllerSource).toMatch(/scan_window_days: clampInt\(settings\.display_range_days, plan\.scan_window_days, 1, 90\)/);
+  });
+
+  it("wires the unified startAiTurn path for the sidebar", () => {
+    expect(controllerSource).toMatch(/client\.startAiTurn\(/);
+    expect(controllerSource).toMatch(/isAiTurnEnabled\(/);
+    expect(controllerSource).toMatch(/buildAiTurnUiContext\(/);
+  });
+});

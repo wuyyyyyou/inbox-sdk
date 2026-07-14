@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any
 
 SRC = Path(__file__).resolve().parents[1]
 if str(SRC) not in sys.path:
@@ -290,23 +291,52 @@ def test_render_empty_candidates():
     print("[PASS] test_render_empty_candidates")
 
 
-# ── Filter prompt ──────────────────────────────────────────────────────
+def test_context_selection_limits_body_and_thread_reads():
+    """筛选后的全部候选仍保留统计，但最多有限条进入正文与线程读取。"""
+    from mail_agent.ask.answer import _select_candidates_for_context, _MAX_CONTEXT_CANDIDATES
+    from mail_agent.ask.planner import AskPlan
+    from mail_agent.domain.types import MessageLite
 
-def test_filter_prompt_format():
-    """Filter prompt template renders correctly."""
-    from mail_agent.ask.answer import _FILTER_SYSTEM_PROMPT, _FILTER_USER_TEMPLATE
+    candidates = [
+        MessageLite(
+            message_id=f"m{index}", thread_id=f"t{index}", from_addr="sender@example.com", to_addr="owner@example.com",
+            subject=f"Invoice {index}", snippet="billing update", unread=index == 99,
+            internal_date=str(index),
+        )
+        for index in range(100)
+    ]
+    plan = AskPlan(user_request="Find invoice emails", topics=[{"search_terms": ["invoice"]}])
+    selected = _select_candidates_for_context(candidates, plan)
 
-    user = _FILTER_USER_TEMPLATE.format(
-        user_request="find candidates",
-        relevance_hint="unknown senders about jobs",
-        count=5,
-        headers='[{"i":0,"f":"a@x.com","s":"test"}]',
-    )
-    assert "find candidates" in user
-    assert "unknown senders about jobs" in user
-    assert "5 total" in user
-    assert _FILTER_SYSTEM_PROMPT.startswith("You are Anna's relevance filter")
-    print("[PASS] test_filter_prompt_format")
+    assert len(selected) == _MAX_CONTEXT_CANDIDATES
+    assert selected[0].message_id == "m99"
+    print("[PASS] test_context_selection_limits_body_and_thread_reads")
+
+
+async def test_filter_candidates_does_not_make_a_second_sampling_call():
+    """Ask 已有本地排序时，筛选不能额外调用或重试 Sampling。"""
+    from mail_agent.ask.answer import _filter_candidates
+    from mail_agent.ask.planner import AskPlan
+    from mail_agent.domain.types import MessageLite
+
+    calls: list[dict[str, Any]] = []
+
+    async def sampling_stub(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {"content": {"type": "text", "text": "{}"}}
+
+    messages = [
+        MessageLite(
+            message_id=f"m{index}", thread_id=f"t{index}", from_addr="sender@example.com", to_addr="owner@example.com",
+            subject=f"Invoice {index}", snippet="billing update",
+        )
+        for index in range(11)
+    ]
+    filtered = await _filter_candidates(messages, AskPlan(user_request="Find invoices"), sampling_create_message=sampling_stub)
+
+    assert filtered == messages
+    assert calls == []
+    print("[PASS] test_filter_candidates_does_not_make_a_second_sampling_call")
 
 
 def test_answer_language_instruction():
@@ -319,6 +349,15 @@ def test_answer_language_instruction():
     assert "original language" in chinese
     assert "same language as the user's request" in english
     print("[PASS] test_answer_language_instruction")
+
+
+def test_answer_requires_synthesis_instead_of_copying_email_body():
+    """总结提示词必须要求综合邮件证据，不能直接逐字复述正文。"""
+    from mail_agent.ask.answer import _ASK_SYNTHESIS_INSTRUCTION
+
+    assert "own words" in _ASK_SYNTHESIS_INSTRUCTION
+    assert "Do not copy email body verbatim" in _ASK_SYNTHESIS_INSTRUCTION
+    print("[PASS] test_answer_requires_synthesis_instead_of_copying_email_body")
 
 
 def test_answer_fallback_uses_request_language():
@@ -335,44 +374,35 @@ def test_answer_fallback_uses_request_language():
     print("[PASS] test_answer_fallback_uses_request_language")
 
 
-def test_answer_sampling_token_limit_stays_below_host_cap():
-    """The Ask answer sampling request must fit the Anna Host limit."""
-    from mail_agent.ask.sampling_budget import ASK_ANSWER_MAX_TOKENS
+def test_empty_sampling_uses_error_fallback_not_local_mail_list():
+    """Anna 空响应时返回错误摘要，不再回退为本地邮件列表。"""
+    from mail_agent.ask.answer import _answer_fallback
+    from mail_agent.ask.planner import AskPlan
 
-    assert 0 < ASK_ANSWER_MAX_TOKENS < 8192
-    print("[PASS] test_answer_sampling_token_limit_stays_below_host_cap")
-
-
-def test_ask_sampling_budget_is_cumulative_across_calls():
-    """Planner, filter, answer, and repair share one host quota."""
-    from mail_agent.ask.sampling_budget import (
-        ASK_SAMPLING_TOTAL_TOKENS,
-        AskSamplingBudgetExceeded,
-        with_ask_sampling_budget,
+    result = _answer_fallback(
+        AskPlan(user_request="Find urgent emails", title="Urgent emails"),
+        "Anna sampling failed",
     )
 
-    calls: list[int] = []
+    assert result["title"] == "Urgent emails"
+    assert result["sections"] == []
+    assert "matching emails" not in result["summary"].lower()
+    assert "相关邮件" not in result["summary"]
+    print("[PASS] test_empty_sampling_uses_error_fallback_not_local_mail_list")
 
-    async def fake_sampling(**kwargs):
-        calls.append(kwargs["max_tokens"])
-        return {"content": {"type": "text", "text": "{}"}}
 
-    async def exercise_budget():
-        sampling = with_ask_sampling_budget(fake_sampling)
-        await sampling(max_tokens=8000, metadata={"tool": "ask_planner"})
-        await sampling(max_tokens=4096, metadata={"tool": "ask_filter"})
-        await sampling(max_tokens=8000, metadata={"tool": "ask_answer"})
-        await sampling(max_tokens=4096, metadata={"tool": "json_repair"})
-        try:
-            await sampling(max_tokens=1, metadata={"tool": "ask_answer"})
-        except AskSamplingBudgetExceeded:
-            return
-        raise AssertionError("sampling after the cumulative budget is exhausted must fail locally")
+def test_answer_sampling_token_limit_stays_below_host_cap():
+    """Ask 各阶段输出额度必须适配公共 6000/4096 预算守卫。"""
+    from mail_agent.ask.sampling_budget import (
+        ASK_ANSWER_MAX_TOKENS,
+        ASK_JSON_REPAIR_MAX_TOKENS,
+        ASK_PLANNER_MAX_TOKENS,
+    )
 
-    asyncio.run(exercise_budget())
-    assert calls == [1024, 512, 6144, 512]
-    assert sum(calls) == ASK_SAMPLING_TOTAL_TOKENS
-    print("[PASS] test_ask_sampling_budget_is_cumulative_across_calls")
+    assert ASK_PLANNER_MAX_TOKENS == 512
+    assert ASK_ANSWER_MAX_TOKENS == 1536
+    assert ASK_JSON_REPAIR_MAX_TOKENS == 512
+    print("[PASS] test_answer_sampling_token_limit_stays_below_host_cap")
 
 
 # ── Main ────────────────────────────────────────────────────────────────
@@ -399,12 +429,14 @@ def main():
     test_render_candidates_body_truncation()
     test_render_empty_candidates()
 
-    print("\n--- Filter prompt ---\n")
-    test_filter_prompt_format()
+    print("\n--- Candidate selection ---\n")
+    test_context_selection_limits_body_and_thread_reads()
+    asyncio.run(test_filter_candidates_does_not_make_a_second_sampling_call())
     test_answer_language_instruction()
+    test_answer_requires_synthesis_instead_of_copying_email_body()
     test_answer_fallback_uses_request_language()
+    test_empty_sampling_uses_error_fallback_not_local_mail_list()
     test_answer_sampling_token_limit_stays_below_host_cap()
-    test_ask_sampling_budget_is_cumulative_across_calls()
 
     print(f"\n[ALL TESTS PASSED]")
 

@@ -6,6 +6,7 @@ from anna_inbox_executa.storage_tools import *
 from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.brief_flow import *
 from anna_inbox_executa.ask_flow import *
+from anna_inbox_executa.ai_turn_flow import *
 from anna_inbox_executa.contact_memory_flow import *
 from anna_inbox_executa.mailbox_tools import *
 from anna_inbox_executa.card_tools import *
@@ -126,6 +127,8 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "tool": tool, "data": start_custom_scan(arguments, invoke_id)}
     if tool == "re_run_custom_scan":
         return {"success": True, "tool": tool, "data": re_run_custom_scan(arguments, invoke_id)}
+    if tool == "start_ai_turn":
+        return {"success": True, "tool": tool, "data": start_ai_turn(arguments, invoke_id)}
     if tool == "get_authorized_email":
         discovered = _discover_mailboxes()
         authorized = [d["email"] for d in discovered if d.get("authorized")]

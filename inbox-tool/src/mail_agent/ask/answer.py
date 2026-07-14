@@ -5,22 +5,33 @@ run_ask_pipeline() is the orchestrator: plan → search → filter → context �
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
-from ..core.pipeline import _EXECUTION_SYSTEM_PROMPT
 from ..domain.types import MessageLite
 from .planner import AskPlan
-from .sampling_budget import ASK_ANSWER_MAX_TOKENS, ASK_FILTER_MAX_TOKENS, with_ask_sampling_budget
+from .sampling_budget import ASK_ANSWER_MAX_TOKENS
 
 _logger = logging.getLogger(__name__)
 _BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
-# 匹配时过滤，≤此值跳过
-_SKIP_FILTER_THRESHOLD = 10
+# 中文注释：反向 JSON-RPC 不能使用文件传输；筛选请求需远低于 512 KiB 协议帧上限。
+# 中文注释：全部命中用于扫描统计，只有排序靠前的有限候选才能读取正文和线程。
+_MAX_CONTEXT_CANDIDATES = 8
+# 中文注释：正文/线程 Gmail 读限并发，避免 8 封串行放大墙钟时间。
+_CONTEXT_READ_CONCURRENCY = 4
+# 中文注释：即使有必要阅读片段，回答也必须综合事实，避免退化为邮件正文复制。
+_ASK_SYNTHESIS_INSTRUCTION = (
+    "Summarize and synthesize the evidence in your own words. "
+    "Do not copy email body verbatim, except for a short necessary quote or an exact subject."
+)
+_ASK_ANSWER_SYSTEM_PROMPT = """You are Anna, an executive email assistant. Return one valid JSON object only, with no markdown or analysis.
+Schema: {"title": string, "summary": string, "sections": [{"heading": string, "body": string?, "items": [{"subject": string?, "context": string?, "suggestion": string?, "draft": string?, "mailbox": string?, "message_id": string?, "thread_id": string?, "from": string?, "mail_links": array?, "reply_gaps": object?}]}]}.
+Use only the supplied email evidence. Keep the answer concise, factual, and in the user's language. A reply draft and reply_gaps.needs_user_input cannot both appear for one item."""
+
+
 def _answer_language_instruction(user_request: str) -> str:
     """Keep generated answer copy aligned with the user's language."""
     if re.search(r"[\u3400-\u9fff]", user_request):
@@ -39,40 +50,16 @@ def _uses_chinese(user_request: str) -> bool:
 
 
 def _answer_fallback(plan: AskPlan, detail: str = "") -> dict[str, Any]:
+    # 中文注释：用户侧只展示可行动摘要；解析器/stack 细节只写日志，避免把 excerpt 甩到侧栏。
+    if detail:
+        _logger.warning("ask answer fallback: detail=%s", str(detail)[:300])
     if _uses_chinese(plan.user_request):
-        summary = "Anna 暂时无法生成可用的回答。"
+        summary = "Anna 暂时无法生成可用的回答，请换个说法重试，或打开具体邮件后再问。"
         title = plan.title or "扫描未完成"
     else:
-        summary = "Anna could not produce a usable answer."
+        summary = "Anna could not produce a usable answer. Try rephrasing, or open a specific email first."
         title = plan.title or "Scan incomplete"
-    if detail:
-        summary = f"{summary} {detail[:240]}"
     return {"title": title, "summary": summary, "sections": []}
-
-
-# ── Filter ─────────────────────────────────────────────────────────────
-
-# 中文注释：候选数较少时跳过过滤 LLM，避免多消耗一次 sampling 调用。
-_FILTER_SYSTEM_PROMPT = """You are Anna's relevance filter. For each email header, answer one question:
-"Is this email relevant to the user's request?"
-
-A relevant email helps answer the user's question. If in doubt, mark it relevant — the next stage will do deeper analysis.
-
-## Output format
-Output a single JSON object. First character MUST be `{`.
-{"items": [{"i": <index>, "relevant": true|false, "reason": "brief reason"}]}
-
-Include EVERY email in the items array. Set "relevant": false for emails to exclude.
-Omitted items default to "relevant": true (pass through)."""
-
-_FILTER_USER_TEMPLATE = """## User request
-{user_request}
-
-## What to look for
-{relevance_hint}
-
-## Emails ({count} total)
-{headers}"""
 
 
 async def _filter_candidates(
@@ -81,67 +68,10 @@ async def _filter_candidates(
     *,
     sampling_create_message: Any = None,
 ) -> list[MessageLite]:
-    """Filter messages through a lightweight relevance LLM call.
-
-    Skips the LLM call entirely if there are ≤_SKIP_FILTER_THRESHOLD messages.
-    On LLM failure, all messages pass through unfiltered.
-    """
-    if len(messages) <= _SKIP_FILTER_THRESHOLD:
-        return list(messages)
-
-    from ..core.phase1 import _compact_header
-    from ..llm_runtime.service import call_llm_json_safe
-
-    # Merge relevance_hints from all topics
-    hints = [t.get("relevance_hint", "") for t in plan.topics if t.get("relevance_hint")]
-    relevance_hint = "; ".join(hints) if hints else "Find emails relevant to the user's request"
-
-    headers_json = json.dumps(
-        [_compact_header(m, i) for i, m in enumerate(messages)],
-        ensure_ascii=False,
-    )
-
-    user_message = _FILTER_USER_TEMPLATE.format(
-        user_request=plan.user_request,
-        relevance_hint=relevance_hint,
-        count=len(messages),
-        headers=headers_json,
-    )
-
-    try:
-        result = await call_llm_json_safe(
-            sampling_create_message,
-            system_prompt=_FILTER_SYSTEM_PROMPT,
-            user_message=user_message,
-            fallback={"items": []},
-            temperature=0.1,
-            max_tokens=ASK_FILTER_MAX_TOKENS,
-            timeout=120.0,
-            metadata={"tool": "ask_filter"},
-            allow_fallback=True,
-            allow_sampling_provider_fallback=True,
-            max_attempts=2 if sampling_create_message is not None else None,
-        )
-    except Exception:
-        _logger.warning("Ask filter LLM failed, passing all %d messages through", len(messages))
-        return list(messages)
-
-    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
-    items = payload.get("items") if isinstance(payload.get("items"), list) else []
-
-    # Build set of indices to exclude
-    exclude_indices: set[int] = set()
-    for item in items:
-        if isinstance(item, dict) and not item.get("relevant", True):
-            try:
-                exclude_indices.add(int(item.get("i", -1)))
-            except (ValueError, TypeError):
-                pass
-
-    filtered = [m for i, m in enumerate(messages) if i not in exclude_indices]
-    if len(filtered) < len(messages):
-        _logger.info("Ask filter: %d → %d relevant", len(messages), len(filtered))
-    return filtered
+    """保留全部搜索命中，相关度筛选统一由本地排序在正文读取前完成。"""
+    # 中文注释：不再为筛选额外调用或重试 Sampling，避免空响应消耗预算并拖长 Answer 阶段。
+    _ = plan, sampling_create_message
+    return list(messages)
 
 
 # ── Context reader ─────────────────────────────────────────────────────
@@ -154,6 +84,31 @@ def _fmt_ts(epoch_ms: str) -> str:
         return dt.strftime("%b %d, %Y, %H:%M")
     except (ValueError, TypeError, OSError):
         return str(epoch_ms)[:20]
+
+
+def _select_candidates_for_context(candidates: list[MessageLite], plan: AskPlan) -> list[MessageLite]:
+    """按请求相关度排序并选择有限候选，避免将所有正文交给模型。"""
+    # 中文注释：这里是确定性本地排序，不新增 Sampling 调用；关键词仅用于缩小正文读取集合。
+    terms = [str(term).casefold().strip() for topic in plan.topics for term in topic.get("search_terms", [])]
+    terms.extend(re.findall(r"[\w\u3400-\u9fff]{2,}", plan.user_request.casefold()))
+    terms = [term for term in terms if term]
+
+    def score(item: tuple[int, MessageLite]) -> tuple[int, int, int]:
+        index, message = item
+        subject = (message.subject or "").casefold()
+        snippet = (message.snippet or "").casefold()
+        relevance = sum(8 for term in terms if term in subject)
+        relevance += sum(3 for term in terms if term in snippet)
+        if getattr(message, "unread", False):
+            relevance += 4
+        try:
+            timestamp = int(message.internal_date or 0)
+        except (TypeError, ValueError):
+            timestamp = 0
+        return (relevance, timestamp, -index)
+
+    ranked = sorted(enumerate(candidates), key=score, reverse=True)
+    return [message for _index, message in ranked[:_MAX_CONTEXT_CANDIDATES]]
 
 
 async def _read_candidate_context(
@@ -171,6 +126,8 @@ async def _read_candidate_context(
     from ..mail_providers.gmail.adapter import normalize_mailbox, get_message_detail, get_thread_context
 
     normalized = normalize_mailbox(mailbox)
+    # 中文注释：即使未来有其他调用方绕过编排层，也不能读取无限量邮件正文。
+    candidates = candidates[:_MAX_CONTEXT_CANDIDATES]
 
     # Collect unique senders for contact memory retrieval
     sender_emails: list[str] = []
@@ -205,8 +162,13 @@ async def _read_candidate_context(
     except ImportError:
         pass
 
-    enriched: list[dict[str, Any]] = []
-    for idx, msg in enumerate(candidates, 1):
+    import asyncio as _asyncio
+
+    # 中文注释：Gmail adapter 为同步 I/O，放入线程池并行读取，用信号量限制并发。
+    semaphore = _asyncio.Semaphore(_CONTEXT_READ_CONCURRENCY)
+    total = len(candidates)
+
+    async def _read_one(idx: int, msg: MessageLite) -> dict[str, Any]:
         source_mailbox = (mailbox_by_message_id or {}).get(msg.message_id or "", mailbox)
         source_mailbox = normalize_mailbox(source_mailbox)
         entry: dict[str, Any] = {
@@ -224,37 +186,36 @@ async def _read_candidate_context(
             "thread": [],
             "contact_context": contact_contexts.get(msg.from_addr or "", ""),
         }
-
-        # Read body
-        try:
-            detail = get_message_detail(source_mailbox, msg.message_id)
-            if detail:
-                entry["body"] = (getattr(detail, "body_text", "") or "")[:4000]
-        except Exception:
-            pass
-
-        # Read thread context
-        try:
-            thread_ctx = get_thread_context(source_mailbox, msg.thread_id or msg.message_id)
-            if thread_ctx and thread_ctx.messages:
+        async with semaphore:
+            try:
+                detail = await _asyncio.to_thread(get_message_detail, source_mailbox, msg.message_id)
+                if detail:
+                    entry["body"] = (getattr(detail, "body_text", "") or "")[:1200]
+            except Exception:
+                pass
+            try:
+                thread_ctx = await _asyncio.to_thread(
+                    get_thread_context, source_mailbox, msg.thread_id or msg.message_id
+                )
+                if thread_ctx and thread_ctx.messages:
+                    entry["thread"] = []
+                    for tm in thread_ctx.messages[:3]:
+                        entry["thread"].append({
+                            "from": getattr(tm, "from_addr", "") or "",
+                            "to": getattr(tm, "to_addr", "") or "",
+                            "subject": getattr(tm, "subject", "") or "",
+                            "date": _fmt_ts(getattr(tm, "internal_date", "") or ""),
+                            "body": (getattr(tm, "body_text", "") or "")[:400],
+                        })
+            except Exception:
                 entry["thread"] = []
-                for tm in thread_ctx.messages[:10]:
-                    entry["thread"].append({
-                        "from": getattr(tm, "from_addr", "") or "",
-                        "to": getattr(tm, "to_addr", "") or "",
-                        "subject": getattr(tm, "subject", "") or "",
-                        "date": _fmt_ts(getattr(tm, "internal_date", "") or ""),
-                        "body": (getattr(tm, "body_text", "") or "")[:3000],
-                    })
-        except Exception:
-            entry["thread"] = []
+        if progress_callback and (idx % 2 == 0 or idx == total):
+            progress_callback("read_context", {"current": idx, "total": total})
+        return entry
 
-        if progress_callback and idx % 5 == 0:
-            progress_callback("read_context", {"current": idx, "total": len(candidates)})
-
-        enriched.append(entry)
-
-    return enriched
+    return list(await _asyncio.gather(*[
+        _read_one(idx, msg) for idx, msg in enumerate(candidates, 1)
+    ]))
 
 
 # ── Answer LLM ─────────────────────────────────────────────────────────
@@ -348,19 +309,12 @@ async def _generate_answer(
             f"{rendered}\n\n"
             f"## Important\n"
             f"- Base your answer ONLY on the emails provided below.\n"
+            f"- {_ASK_SYNTHESIS_INSTRUCTION}\n"
             f"- If the emails below do not contain what the user is looking for, say so honestly."
         )
 
-    variants = (
-        [
-            {"name": "full", "body_limit": 4000, "thread_body_limit": 2000, "max_thread_messages": 20},
-            {"name": "compact", "body_limit": 1600, "thread_body_limit": 900, "max_thread_messages": 8},
-            {"name": "short", "body_limit": 800, "thread_body_limit": 500, "max_thread_messages": 5},
-            {"name": "headers", "body_limit": 0, "thread_body_limit": 0, "max_thread_messages": 0},
-        ]
-        if sampling_create_message is not None
-        else [{"name": "full", "body_limit": 4000, "thread_body_limit": 2000, "max_thread_messages": 20}]
-    )
+    # 中文注释：Anna invoke 只尝试一次紧凑回答；失败直接返回安全 fallback，不能再消耗多轮 token。
+    variants = [{"name": "compact", "body_limit": 700, "thread_body_limit": 240, "max_thread_messages": 2}]
 
     result: dict[str, Any] | None = None
     last_error = ""
@@ -374,12 +328,12 @@ async def _generate_answer(
         try:
             result = await call_llm_json_safe(
                 sampling_create_message,
-                system_prompt=_EXECUTION_SYSTEM_PROMPT,
+                system_prompt=_ASK_ANSWER_SYSTEM_PROMPT,
                 user_message=_build_user_prompt(rendered),
                 fallback={"title": "Scan failed", "summary": "Unable to analyze emails.", "sections": []},
                 temperature=0.2,
                 max_tokens=ASK_ANSWER_MAX_TOKENS,
-                timeout=180.0,
+                timeout=60.0,
                 metadata={"tool": "ask_answer", "email_count": str(len(enriched)), "variant": variant["name"]},
                 allow_fallback=sampling_create_message is None,
                 allow_sampling_provider_fallback=True,
@@ -392,11 +346,12 @@ async def _generate_answer(
                 progress_callback("evaluate", {"variant": variant["name"], "reason": last_error[:200]})
 
     if result is None:
-        return _answer_fallback(plan, last_error)
+        # 中文注释：不再把本地邮件列表伪装成 AI 回答；失败时返回明确错误摘要。
+        return _answer_fallback(plan, last_error or "Anna sampling failed")
 
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
     if not payload:
-        payload = {"title": plan.title or "Scan complete", "summary": "No analysis produced.", "sections": []}
+        return _answer_fallback(plan, "Anna returned empty analysis")
     payload["llm_meta"] = {
         "provider": result.get("provider"),
         "model": result.get("model"),
@@ -555,6 +510,8 @@ async def run_ask_pipeline(
     mailboxes: list[str] | None = None,
     *,
     plan: AskPlan | None = None,
+    scan_window_days: int | None = None,
+    max_messages: int | None = None,
     sampling_create_message: Any = None,
     progress_callback: Any = None,
 ) -> dict[str, Any]:
@@ -566,14 +523,11 @@ async def run_ask_pipeline(
     If `plan` is provided, skips the Planner LLM and uses the given plan directly
     (for re-running saved plans without re-planning).
     """
-    from .planner import plan_ask_request
+    from .planner import plan_ask_request, resolve_effective_timeframe
     from .search import build_queries, execute_search
 
     if not mailboxes:
         return {"title": "Error", "summary": "No mailbox selected.", "sections": []}
-
-    if sampling_create_message is not None:
-        sampling_create_message = with_ask_sampling_budget(sampling_create_message)
 
     primary_mailbox = mailboxes[0]
 
@@ -585,10 +539,16 @@ async def run_ask_pipeline(
             progress_callback("plan", {"stage": "plan"})
         plan = await plan_ask_request(user_request, primary_mailbox, sampling_create_message=sampling_create_message)
 
+    # 中文注释：模型计划只能决定检索意图，默认扫描时间必须服从用户当前 Scan Plan。
+    plan.timeframe = resolve_effective_timeframe(plan.user_request or user_request, scan_window_days, plan.timeframe)
+
+    timeframe_match = re.fullmatch(r"(\d{1,3})d", plan.timeframe)
+    timeframe_days = int(timeframe_match.group(1)) if timeframe_match else 0
     if progress_callback:
         progress_callback("plan_done", {
             "title": plan.title, "goal": plan.goal,
             "direction": plan.direction, "timeframe": plan.timeframe,
+            "scan_window_days": timeframe_days,
         })
 
     # ── 2. Search + filter per mailbox (concurrent) ──────────────────
@@ -604,9 +564,20 @@ async def run_ask_pipeline(
         if not primary_queries and mbox == primary_mailbox:
             primary_queries = queries
         if progress_callback:
-            progress_callback("search", {"mailbox": mbox, "query_total": len(queries)})
+            progress_callback("search", {
+                "mailbox": mbox,
+                "query_total": len(queries),
+                "scan_window_days": timeframe_days,
+            })
 
-        messages = await execute_search(mbox, queries, progress_callback=progress_callback)
+        # 中文注释：多邮箱并发时最多 broaden 1 次，避免 0 结果时 Gmail 调用成倍放大。
+        messages = await execute_search(
+            mbox,
+            queries,
+            progress_callback=progress_callback,
+            max_broaden_attempts=1 if len(mailboxes) > 1 else 2,
+            max_messages=max_messages if max_messages is not None else 200,
+        )
         if not messages:
             return (mbox, [], [])
 
@@ -620,8 +591,10 @@ async def run_ask_pipeline(
             })
 
         if progress_callback:
+            thread_count = len({message.thread_id for message in messages if message.thread_id})
             progress_callback("search_done", {
-                "mailbox": mbox, "scanned": len(messages),
+                "mailbox": mbox, "scanned": len(messages), "threads": thread_count,
+                "scan_window_days": timeframe_days,
                 "partial": {"sources": all_sources[-8:]},
             })
 
@@ -663,12 +636,19 @@ async def run_ask_pipeline(
         progress_callback("filter_done", {"candidates": len(all_candidates), "scanned": total_scanned})
 
     # ── 4. Context ──────────────────────────────────────────────────
+    context_candidates = _select_candidates_for_context(all_candidates, plan)
+    if progress_callback:
+        # 中文注释：只展示安全数量，明确告知用户模型仅打开必要的有限上下文。
+        progress_callback("read_context", {"current": 0, "total": len(context_candidates)})
     enriched = await _read_candidate_context(
-        all_candidates, primary_mailbox,
+        context_candidates, primary_mailbox,
         mailbox_by_message_id=candidate_mailboxes,
-        sampling_create_message=sampling_create_message,
+        # 中文注释：联系人记忆会对每个联系人再发起 LLM 选择；Ask Session 每轮只允许规划与回答两次调用。
+        sampling_create_message=None,
         progress_callback=progress_callback,
     )
+    if progress_callback:
+        progress_callback("read_context_done", {"total": len(enriched)})
 
     # ── 5. Answer LLM ───────────────────────────────────────────────
     if progress_callback:
@@ -678,8 +658,8 @@ async def run_ask_pipeline(
                                      progress_callback=progress_callback)
 
     # ── 6. Guard ────────────────────────────────────────────────────
-    valid_ids = {c.message_id or "" for c in all_candidates if c.message_id}
-    valid_thread_ids = {c.thread_id or "" for c in all_candidates if c.thread_id}
+    valid_ids = {c.message_id or "" for c in context_candidates if c.message_id}
+    valid_thread_ids = {c.thread_id or "" for c in context_candidates if c.thread_id}
     valid_sources = {
         str(entry.get("message_id") or ""): {
             "mailbox": str(entry.get("mailbox") or ""),

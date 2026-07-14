@@ -53,6 +53,8 @@ function getRequiredExecutaToolId(): string {
 
 const TOOL_ID = getRequiredExecutaToolId();
 const INVOKE_TIMEOUT_MS = 180000;
+/** Ask 初等等待 60s + 网络余量；后端超时后返回可轮询状态，勿与 wait_timeout 倒置。 */
+const CUSTOM_SCAN_INVOKE_TIMEOUT_MS = 120_000;
 const SAFE_RETRY_DELAYS_MS = [500, 1000];
 
 export function isRetryableToolInvocationError(error: unknown) {
@@ -96,6 +98,7 @@ export class MailAgentClient {
       tool_id: TOOL_ID,
       method,
       args,
+      timeoutMs,
     };
     for (let attempt = 0; ; attempt += 1) {
       try {
@@ -418,11 +421,16 @@ export class MailAgentClient {
   }
 
   startCustomScan(args: Record<string, unknown>) {
-    return this.invoke<RunStatus>("start_custom_scan", args, { timeoutMs: 600_000, retry: "safe" });
+    return this.invoke<RunStatus>("start_custom_scan", args, { timeoutMs: CUSTOM_SCAN_INVOKE_TIMEOUT_MS, retry: "safe" });
   }
 
   reRunCustomScan(args: Record<string, unknown>) {
-    return this.invoke<RunStatus>("re_run_custom_scan", args, { timeoutMs: 600_000 });
+    return this.invoke<RunStatus>("re_run_custom_scan", args, { timeoutMs: CUSTOM_SCAN_INVOKE_TIMEOUT_MS });
+  }
+
+  /** 统一 AI 侧栏 turn：后端本地 Router + 白名单工具，可轮询 run。 */
+  startAiTurn(args: Record<string, unknown>) {
+    return this.invoke<RunStatus>("start_ai_turn", args, { timeoutMs: CUSTOM_SCAN_INVOKE_TIMEOUT_MS, retry: "safe" });
   }
 
   clearCards(mailbox: string, category: string) {

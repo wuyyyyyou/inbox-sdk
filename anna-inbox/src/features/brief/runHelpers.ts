@@ -144,6 +144,9 @@ export function customStageKey(stage: string | undefined, status: string | undef
   if (stage === "plan" || stage === "plan_done") return "planning";
   if (stage === "search" || stage === "search_done" || stage === "filter_done") return "searching";
   if (stage === "answer") return "answering";
+  // AI turn 统一入口：routing 映射到 planning 文案
+  if (stage === "routing" || stage === "routing_done") return "planning";
+  if (stage === "read") return "reading";
   if (stage === "done") return "done";
   return "planning";
 }
@@ -168,6 +171,35 @@ export function customStageCopy(stageKey: string, progress: Record<string, unkno
   }
   if (stageKey === "done") return "Answer ready.";
   return "The scan stopped before an answer was produced.";
+}
+
+export type CustomExecutionStep = {
+  label: string;
+  status: "complete" | "active" | "pending";
+};
+
+export function customExecutionSteps(stage: string | undefined, progress: Record<string, unknown> = {}): CustomExecutionStep[] {
+  const days = Number(progress.scan_window_days || 0);
+  const scanned = Number(progress.scanned || 0);
+  const threads = Number(progress.threads || 0);
+  const labels = [
+    "Understanding request",
+    days > 0 ? `Searching selected time range (${days} days)` : "Searching selected time range",
+    scanned > 0 ? `Found ${scanned} emails${threads > 0 ? ` in ${threads} threads` : ""}` : "Finding matching emails and threads",
+    "Filtering relevant mail",
+    "Reading necessary context",
+    "Preparing result",
+  ];
+  const activeIndex = stage === "search" ? 1
+    : stage === "search_done" ? 2
+      : stage === "filter_done" ? 3
+        : stage === "read_context" || stage === "read_context_done" ? 4
+          : stage === "answer" || stage === "done" ? 5
+            : 0;
+  return labels.map((label, index) => ({
+    label,
+    status: index < activeIndex ? "complete" : index === activeIndex ? "active" : "pending",
+  }));
 }
 
 export function makeCustomRunProgress(

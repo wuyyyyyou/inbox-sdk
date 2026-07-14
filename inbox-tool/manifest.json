@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.0.16",
+  "version": "2.0.17",
   "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Brief workflows, Ask, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
@@ -680,7 +680,12 @@
       "name": "get_inbox_settings",
       "description": "Get mailbox-scoped Inbox display settings.",
       "parameters": [
-        {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": true}
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        }
       ],
       "timeout": 120
     },
@@ -688,15 +693,60 @@
       "name": "save_inbox_settings",
       "description": "Save mailbox-scoped Inbox display settings.",
       "parameters": [
-        {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": true},
-        {"name": "if_match", "type": "string", "description": "Optional optimistic-concurrency etag.", "required": false},
-        {"name": "display_range_days", "type": "integer", "description": "7, 30, or 60.", "required": false},
-        {"name": "time_section_mode", "type": "string", "description": "Time grouping mode.", "required": false},
-        {"name": "stars_enabled", "type": "boolean", "description": "Show Stars section.", "required": false},
-        {"name": "stars_limit", "type": "integer", "description": "Stars limit.", "required": false},
-        {"name": "todos_enabled", "type": "boolean", "description": "Show Todos section.", "required": false},
-        {"name": "todos_limit", "type": "integer", "description": "Todos limit.", "required": false},
-        {"name": "custom_categories", "type": "array", "description": "Saved local Inbox Splits with id, name, query, hide_when_empty, and bundling_behavior.", "required": false}
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "if_match",
+          "type": "string",
+          "description": "Optional optimistic-concurrency etag.",
+          "required": false
+        },
+        {
+          "name": "display_range_days",
+          "type": "integer",
+          "description": "7, 30, or 60.",
+          "required": false
+        },
+        {
+          "name": "time_section_mode",
+          "type": "string",
+          "description": "Time grouping mode.",
+          "required": false
+        },
+        {
+          "name": "stars_enabled",
+          "type": "boolean",
+          "description": "Show Stars section.",
+          "required": false
+        },
+        {
+          "name": "stars_limit",
+          "type": "integer",
+          "description": "Stars limit.",
+          "required": false
+        },
+        {
+          "name": "todos_enabled",
+          "type": "boolean",
+          "description": "Show Todos section.",
+          "required": false
+        },
+        {
+          "name": "todos_limit",
+          "type": "integer",
+          "description": "Todos limit.",
+          "required": false
+        },
+        {
+          "name": "custom_categories",
+          "type": "array",
+          "description": "Saved local Inbox Splits with id, name, query, hide_when_empty, and bundling_behavior.",
+          "required": false
+        }
       ],
       "timeout": 120
     },
@@ -1672,6 +1722,12 @@
           "type": "integer",
           "description": "How long this invoke should wait before returning a pollable running state.",
           "required": false
+        },
+        {
+          "name": "scan_window_days",
+          "type": "integer",
+          "description": "Default Scan Plan day range when the request has no explicit time.",
+          "required": false
         }
       ],
       "timeout": 600
@@ -1708,6 +1764,79 @@
           "name": "primary_count",
           "type": "integer",
           "description": "How many recent Primary emails to fetch first.",
+          "required": false
+        },
+        {
+          "name": "ai_provider",
+          "type": "string",
+          "description": "LLM provider: dashscope or anna-llm.",
+          "required": false
+        },
+        {
+          "name": "storage_provider",
+          "type": "string",
+          "description": "Storage provider: local or aps.",
+          "required": false
+        },
+        {
+          "name": "wait_timeout_seconds",
+          "type": "integer",
+          "description": "How long this invoke should wait before returning a pollable running state.",
+          "required": false
+        },
+        {
+          "name": "scan_window_days",
+          "type": "integer",
+          "description": "Default Scan Plan day range when the request has no explicit time.",
+          "required": false
+        }
+      ],
+      "timeout": 600
+    },
+    {
+      "name": "start_ai_turn",
+      "description": "Unified AI sidebar turn: local router selects whitelist tools (chat, search, summarize) then returns a pollable run.",
+      "parameters": [
+        {
+          "name": "user_text",
+          "type": "string",
+          "description": "Natural language user message.",
+          "required": true
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Primary mailbox email address.",
+          "required": false
+        },
+        {
+          "name": "ui_context",
+          "type": "object",
+          "description": "Read-only screen context: current thread, selected mailboxes, display range.",
+          "required": false
+        },
+        {
+          "name": "conversation_id",
+          "type": "string",
+          "description": "Ephemeral sidebar conversation id.",
+          "required": false
+        },
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "Client-generated run ID for polling.",
+          "required": false
+        },
+        {
+          "name": "max_messages",
+          "type": "integer",
+          "description": "Max messages for inbox search tools.",
+          "required": false
+        },
+        {
+          "name": "scan_window_days",
+          "type": "integer",
+          "description": "Default day range for inbox search.",
           "required": false
         },
         {

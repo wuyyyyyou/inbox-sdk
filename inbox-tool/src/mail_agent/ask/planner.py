@@ -8,6 +8,7 @@ NOT raw Gmail query syntax. Code builds queries from these params.
 from __future__ import annotations
 
 import uuid
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -247,6 +248,101 @@ _PLANNER_USER_TEMPLATE = """Mailbox owner: {mailbox}
 User request: {user_request}"""
 
 
+def resolve_effective_timeframe(
+    user_request: str,
+    scan_window_days: int | None,
+    planned_timeframe: str = "30d",
+) -> str:
+    """根据用户明确时间或 Scan Plan 计算最终 Gmail 时间范围。
+
+    中文注释：Planner 的 timeframe 属于模型推断，不能在用户未指定时间时
+    覆盖当前 Scan Plan；只有请求文本含明确相对时间时才允许覆盖默认范围。
+    """
+    request = str(user_request or "").strip().casefold()
+    explicit_days: int | None = None
+
+    # 中文注释：优先匹配带数字的天/周/月表达，避免“最近”一词抢占更精确范围。
+    day_match = re.search(r"(?:last|past|recent)\s+(\d{1,3})\s+days?|最近\s*(\d{1,3})\s*天", request)
+    week_match = re.search(r"(?:last|past|recent)\s+(\d{1,2})\s+weeks?|最近\s*(\d{1,2})\s*周", request)
+    month_match = re.search(r"(?:last|past|recent)\s+(\d{1,2})\s+months?|最近\s*(\d{1,2})\s*个?月", request)
+    if day_match:
+        explicit_days = int(day_match.group(1) or day_match.group(2))
+    elif week_match:
+        explicit_days = int(week_match.group(1) or week_match.group(2)) * 7
+    elif month_match:
+        explicit_days = int(month_match.group(1) or month_match.group(2)) * 30
+    elif any(token in request for token in ("today", "今天", "今日", "yesterday", "昨天")):
+        explicit_days = 1
+    elif any(token in request for token in ("this week", "last week", "past week", "本周", "这周", "上周", "recent", "最近")):
+        explicit_days = 7
+    elif any(token in request for token in ("this month", "本月", "这个月")):
+        explicit_days = 30
+    elif any(token in request for token in ("past quarter", "last quarter", "本季度", "上季度")):
+        explicit_days = 90
+    elif any(token in request for token in ("past 6 months", "last half year", "半年", "六个月")):
+        explicit_days = 180
+    elif any(token in request for token in ("this year", "past year", "last year", "今年", "过去一年", "去年")):
+        explicit_days = 365
+
+    if explicit_days is not None:
+        return f"{max(1, min(explicit_days, 365))}d"
+
+    try:
+        configured_days = int(scan_window_days) if scan_window_days is not None else 0
+    except (TypeError, ValueError):
+        configured_days = 0
+    if configured_days > 0:
+        return f"{min(configured_days, 365)}d"
+
+    # 中文注释：缺少 Scan Plan 的旧调用保持原有计划时间，避免影响历史入口。
+    matched = re.fullmatch(r"(\d{1,3})d", str(planned_timeframe or "").strip())
+    return f"{min(max(int(matched.group(1)), 1), 365)}d" if matched else "30d"
+
+
+def _fallback_ask_plan(user_request: str, failure_reason: str) -> AskPlan:
+    """在 Sampling 没有返回文本时生成可执行的保守搜索计划。"""
+    normalized_request = str(user_request or "").strip()
+    lowered_request = normalized_request.casefold()
+    is_chinese = any("\u3400" <= char <= "\u9fff" for char in normalized_request)
+    urgent_terms = ("urgent", "asap", "time-sensitive", "紧急", "尽快", "重要")
+    is_urgent = any(term in lowered_request for term in urgent_terms)
+    timeframe = "7d" if is_urgent else "30d"
+    title = "紧急邮件" if is_chinese and is_urgent else "收件箱检查" if is_chinese else "Urgent emails" if is_urgent else "Inbox check"
+    description = (
+        "使用保守搜索计划检查近期收件箱。"
+        if is_chinese
+        else "Checking recent inbox messages with a conservative fallback plan."
+    )
+    task_prompt = (
+        "Identify time-sensitive, actionable, or explicitly requested emails. "
+        "Use only the provided emails and group findings by priority."
+        if is_urgent
+        else "Identify actionable emails using only the provided emails and group findings by priority."
+    )
+    return AskPlan(
+        plan_id=f"askplan_{uuid.uuid4().hex[:12]}",
+        user_request=normalized_request,
+        title=title,
+        description=description,
+        people=[],
+        topics=[],
+        timeframe=timeframe,
+        direction="inbox",
+        goal="general_qa",
+        task_prompt=task_prompt,
+        gmail_flags=[],
+        created_at=datetime.now(BEIJING_TZ).isoformat(),
+        confidence=0.3,
+        llm_meta={
+            "provider": "anna-sampling",
+            "model": None,
+            "usage": None,
+            "fallback_used": True,
+            "fallback_reason": str(failure_reason)[:240],
+        },
+    )
+
+
 # ── Main entry ────────────────────────────────────────────────────────
 
 async def plan_ask_request(
@@ -258,10 +354,8 @@ async def plan_ask_request(
     """Parse a natural-language email request into a structured AskPlan.
 
     Planner LLM outputs structured params + semantic expansion.
-    Zero Gmail syntax — code builds queries from AskPlan fields.
-
-    There is no fallback — if the LLM fails, the exception propagates.
-    Without semantic expansion, the Ask pipeline cannot produce useful results.
+    Zero Gmail syntax — code builds queries from AskPlan fields. Sampling
+    返回空文本或失败时，改用保守的确定性计划继续搜索，避免整个 Ask run 失败。
     """
     from ..llm_runtime.service import call_llm_json_safe
 
@@ -272,19 +366,22 @@ async def plan_ask_request(
 
     strict_anna_sampling = sampling_create_message is not None
 
-    result = await call_llm_json_safe(
-        sampling_create_message,
-        system_prompt=_PLANNER_SYSTEM_PROMPT,
-        user_message=user_message,
-        fallback={},
-        temperature=0.1,
-        max_tokens=ASK_PLANNER_MAX_TOKENS,
-        timeout=90.0,
-        metadata={"tool": "ask_planner"},
-        allow_fallback=False,
-        allow_sampling_provider_fallback=True,
-        max_attempts=3 if strict_anna_sampling else None,
-    )
+    try:
+        result = await call_llm_json_safe(
+            sampling_create_message,
+            system_prompt=_PLANNER_SYSTEM_PROMPT,
+            user_message=user_message,
+            fallback={},
+            temperature=0.1,
+            max_tokens=ASK_PLANNER_MAX_TOKENS,
+            timeout=90.0,
+            metadata={"tool": "ask_planner"},
+            allow_fallback=False,
+            allow_sampling_provider_fallback=True,
+            max_attempts=1 if strict_anna_sampling else None,
+        )
+    except Exception as exc:
+        return _fallback_ask_plan(user_request, str(exc))
 
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
     if not payload or not isinstance(payload, dict):

@@ -46,11 +46,11 @@ import type {
   ThreadContextPayload,
 } from "../types/mail";
 import {
-  CUSTOM_SCAN_MESSAGE_LIMIT,
   DEFAULT_MODE,
   MAILBOX_STORAGE_KEY,
   POLL_INTERVAL_MS,
   POLL_LIMIT,
+  isAiTurnEnabled,
   requestForMode,
 } from "./constants";
 import { createInitialState, removeAskHistoryEntry } from "./state";
@@ -271,6 +271,54 @@ function createId(prefix: string) {
 
 function prefersChinese(input: string) {
   return /[\u3400-\u9fff]/.test(input);
+}
+
+function buildAiTurnUiContext(args: {
+  mailbox: string;
+  selectedMailboxes: string[];
+  conversationId: string;
+  scanPlan: ScanPlan | null | undefined;
+  displayRangeDays?: number;
+  currentMailContext?: SendAiMessageOptions["currentMailContext"];
+  languageHint?: string;
+}) {
+  const mailbox = selectedOrPrimary(args.selectedMailboxes, args.mailbox);
+  const plan = normalizeScanPlan(args.scanPlan);
+  const rangeDays = clampInt(args.displayRangeDays, plan.scan_window_days, 1, 90);
+  const ctx = args.currentMailContext;
+  const thread = ctx && ctx.kind === "gmail_thread"
+    ? {
+        kind: "thread" as const,
+        mailbox: ctx.mailbox || mailbox,
+        message_id: ctx.latest_message_id || ctx.anchor_message_id || "",
+        thread_id: ctx.thread_id || "",
+        subject: "",
+        snippet: "",
+      }
+    : ctx && ctx.kind === "compose"
+      ? {
+          kind: "compose" as const,
+          mailbox: ctx.mailbox || mailbox,
+          message_id: "",
+          thread_id: "",
+          subject: ctx.subject || "",
+          snippet: String(ctx.body || "").slice(0, 240),
+        }
+      : { kind: "none" as const, mailbox, message_id: "", thread_id: "", subject: "", snippet: "" };
+  return {
+    conversation_id: args.conversationId,
+    mailbox,
+    selected_mailboxes: selectableMailboxes(args.selectedMailboxes, args.mailbox),
+    display_range_days: rangeDays,
+    max_messages: plan.max_messages,
+    screen: {
+      view: ctx?.kind === "compose" ? "compose" : ctx?.kind === "gmail_thread" ? "thread" : "inbox",
+      focus: ctx ? "detail" : "list",
+    },
+    current_thread: thread,
+    selected_threads: [],
+    language_hint: args.languageHint || "",
+  };
 }
 
 function scanPendingText(input: string) {
@@ -1088,15 +1136,30 @@ export function useAppController() {
   const loadScanPlanForRun = useCallback(async (mailbox: string): Promise<Required<Pick<ScanPlan, "scan_window_days" | "max_messages">>> => {
     const normalized = normalizedMailbox(mailbox);
     const visiblePlanMailbox = normalizedMailbox(state.configMailbox || state.mailbox);
+    let plan: Required<Pick<ScanPlan, "scan_window_days" | "max_messages">>;
     if (normalized && normalized === visiblePlanMailbox && state.scanPlan) {
-      return normalizeScanPlan(state.scanPlan);
+      plan = normalizeScanPlan(state.scanPlan);
+    } else {
+      try {
+        plan = normalizeScanPlan(await client.loadScanPlan(mailbox, state.storageProvider));
+      } catch {
+        plan = normalizeScanPlan(null);
+      }
     }
+
     try {
-      return normalizeScanPlan(await client.loadScanPlan(mailbox, state.storageProvider));
+      const settings = normalized && normalized === normalizedMailbox(state.mailbox)
+        ? state.inboxSettings
+        : (await client.loadInboxSettings(mailbox, state.storageProvider)).settings;
+      // Display range 是用户在 Settings 中可见的时间选择，AI 扫描必须使用同一范围。
+      return {
+        ...plan,
+        scan_window_days: clampInt(settings.display_range_days, plan.scan_window_days, 1, 90),
+      };
     } catch {
-      return normalizeScanPlan(null);
+      return plan;
     }
-  }, [client, state.configMailbox, state.mailbox, state.scanPlan, state.storageProvider]);
+  }, [client, state.configMailbox, state.inboxSettings, state.mailbox, state.scanPlan, state.storageProvider]);
 
   const checkGmailAuth = useCallback(async (mailboxOverride?: string): Promise<{ authorized: boolean; source: string }> => {
     const mailbox = mailboxOverride ?? state.mailbox;
@@ -2844,6 +2907,200 @@ export function useAppController() {
               : message,
           )
         : unresolvedBase;
+      // 中文注释：阶段 A 默认走 start_ai_turn；localStorage anna-inbox-use-ai-turn=0 可回退 aiRoute。
+      if (isAiTurnEnabled() && !options.forcedKind) {
+        const generationRun = {
+          runId: createId("generation"),
+          cancelled: false,
+          controller: new AbortController(),
+        };
+        aiGenerationRun.current = generationRun;
+        const isCurrentGeneration = () => aiGenerationRun.current === generationRun && !generationRun.cancelled;
+        const userMessage: AiChatMessage = options.retryUserMessage ?? {
+          id: createId("msg"),
+          role: "user",
+          content: userRequest,
+          timestamp: new Date().toISOString(),
+          kind: "chat",
+        };
+        const messagesWithUser = [...baseMessages, userMessage];
+        const pendingMessage: AiChatMessage = {
+          id: createId("msg"),
+          role: "assistant",
+          content: prefersChinese(userRequest) ? "thinking" : "thinking",
+          timestamp: new Date().toISOString(),
+          kind: "status",
+          pending: true,
+        };
+        setState((s) => ({
+          ...s,
+          customScanInput: "",
+          aiChatConversationId: conversationId,
+          aiChatMessages: [...messagesWithUser, pendingMessage],
+          aiChatLoading: true,
+          isCustomScanning: true,
+          scanError: "",
+          scanStatus: "Understanding request...",
+          customRunProgress: {
+            runId: "",
+            question: userRequest,
+            status: "queued",
+            stage: "routing",
+            stageKey: "planning",
+            progress: {},
+            partial: {},
+            startedAt: "",
+          },
+        }));
+        try {
+          const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
+          const scanScope = await loadScanPlanForRun(scanMailbox);
+          const runId = `at_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+          const uiContext = buildAiTurnUiContext({
+            mailbox: state.mailbox,
+            selectedMailboxes: state.selectedMailboxes,
+            conversationId,
+            scanPlan: state.scanPlan,
+            displayRangeDays: state.inboxSettings?.display_range_days,
+            currentMailContext: options.currentMailContext,
+            languageHint: prefersChinese(userRequest) ? "zh" : "en",
+          });
+          const started = await client.startAiTurn({
+            user_text: userRequest,
+            mailbox: scanMailbox,
+            ui_context: uiContext,
+            conversation_id: conversationId,
+            primary_count: scanScope.max_messages,
+            max_messages: scanScope.max_messages,
+            scan_window_days: scanScope.scan_window_days,
+            ai_provider: state.llmProvider,
+            storage_provider: state.storageProvider,
+            run_id: runId,
+            wait_timeout_seconds: 60,
+          });
+          if (!isCurrentGeneration()) return;
+          if (started.status === "failed" || started.error) {
+            throw new Error(started.error || "AI turn failed");
+          }
+          const completed = started.status === "done" && started.result
+            ? started
+            : await waitForCustomScanResult(client, runId, (status) => {
+              setState((s) => ({
+                ...s,
+                customRunProgress: makeCustomRunProgress(s.customRunProgress!, status, { runId, question: userRequest }),
+                scanStatus: scanStageLabel(status.stage, status.progress),
+              }));
+            }, generationRun.controller.signal);
+          if (!isCurrentGeneration()) return;
+          if (completed.status === "failed" || completed.error) {
+            throw new Error(completed.error || "AI turn failed");
+          }
+          const payload = (completed.result || {}) as Record<string, unknown>;
+          const kind = String(payload.kind || "chat");
+          const assistantText = String(payload.assistant_text || payload.summary || "").trim()
+            || (prefersChinese(userRequest) ? "已完成。" : "Done.");
+
+          if (kind === "scan") {
+            await loadActiveCards();
+            if (!isCurrentGeneration()) return;
+            await loadRunHistory();
+            if (!isCurrentGeneration()) return;
+            await loadCustomPlans();
+            if (!isCurrentGeneration()) return;
+            const result = buildCustomRunResult(runId, payload);
+            const finalMessages: AiChatMessage[] = [
+              ...messagesWithUser,
+              {
+                ...pendingMessage,
+                pending: false,
+                kind: "scan",
+                content: result.summary || result.plan_description || assistantText,
+                result,
+                timestamp: new Date().toISOString(),
+              },
+            ];
+            upsertAiConversationHistory(conversationId, finalMessages, { kind: "scan", query: userRequest, result });
+          } else if (kind === "clarify") {
+            const finalMessages: AiChatMessage[] = [
+              ...messagesWithUser,
+              {
+                ...pendingMessage,
+                pending: false,
+                kind: "clarify",
+                content: assistantText,
+                timestamp: new Date().toISOString(),
+              },
+            ];
+            upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
+          } else if (kind === "mail_context") {
+            const mailCtx = payload.mail_context && typeof payload.mail_context === "object"
+              ? payload.mail_context as Record<string, unknown>
+              : null;
+            const finalMessages: AiChatMessage[] = [
+              ...messagesWithUser,
+              {
+                ...pendingMessage,
+                pending: false,
+                kind: "mail_context",
+                content: assistantText,
+                mailContext: mailCtx && String(mailCtx.kind) === "thread"
+                  ? {
+                      kind: "gmail_thread",
+                      mailbox: String(mailCtx.mailbox || scanMailbox),
+                      thread_id: String(mailCtx.thread_id || ""),
+                      anchor_message_id: String(mailCtx.message_id || ""),
+                      latest_message_id: String(mailCtx.message_id || ""),
+                    }
+                  : options.currentMailContext || undefined,
+                timestamp: new Date().toISOString(),
+              },
+            ];
+            upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
+          } else {
+            const finalMessages: AiChatMessage[] = [
+              ...messagesWithUser,
+              {
+                ...pendingMessage,
+                pending: false,
+                kind: "chat",
+                content: assistantText,
+                timestamp: new Date().toISOString(),
+              },
+            ];
+            upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
+          }
+          setState((s) => ({ ...s, scanStatus: "", customRunProgress: null }));
+        } catch (error) {
+          if (!isCurrentGeneration() || isAbortError(error)) return;
+          const message = sanitizeToolError(error, userRequest);
+          const failedMessages: AiChatMessage[] = [
+            ...messagesWithUser,
+            {
+              ...pendingMessage,
+              pending: false,
+              kind: "error",
+              content: message,
+              timestamp: new Date().toISOString(),
+            },
+          ];
+          upsertAiConversationHistory(conversationId, failedMessages, { kind: "chat", query: userRequest });
+          setState((s) => ({
+            ...s,
+            scanError: message,
+            customRunProgress: s.customRunProgress
+              ? { ...s.customRunProgress, status: "failed", stageKey: "failed" }
+              : s.customRunProgress,
+          }));
+          showToast(message);
+        } finally {
+          if (aiGenerationRun.current === generationRun) {
+            aiGenerationRun.current = null;
+            setState((s) => ({ ...s, isCustomScanning: false, aiChatLoading: false }));
+          }
+        }
+        return;
+      }
+
       const decision = options.forcedKind
         ? { kind: options.forcedKind, reason: "clarification_action", confidence: "high" as const }
         : decideAiRoute(userRequest, {
@@ -3014,16 +3271,19 @@ export function useAppController() {
         customRunProgress: { runId: "", question: userRequest, status: "queued", stage: "planning", stageKey: "planning", progress: {}, partial: {}, startedAt: "" },
       }));
       try {
+        const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
+        const scanScope = await loadScanPlanForRun(scanMailbox);
         const runId = `cs_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
         const scanPromise = client.startCustomScan({
           user_request: scanRequest,
-          mailbox: selectedOrPrimary(state.selectedMailboxes, state.mailbox),
-          primary_count: CUSTOM_SCAN_MESSAGE_LIMIT,
-          max_messages: CUSTOM_SCAN_MESSAGE_LIMIT,
+          mailbox: scanMailbox,
+          primary_count: scanScope.max_messages,
+          max_messages: scanScope.max_messages,
+          scan_window_days: scanScope.scan_window_days,
           ai_provider: state.llmProvider,
           storage_provider: state.storageProvider,
           run_id: runId,
-          wait_timeout_seconds: 45,
+          wait_timeout_seconds: 60,
         });
         const started = await scanPromise;
         if (!isCurrentGeneration()) return;
@@ -3129,16 +3389,19 @@ export function useAppController() {
         customRunProgress: { runId: "", question: userRequest, status: "queued", stage: "planning", stageKey: "planning", progress: {}, partial: {}, startedAt: "" },
       }));
       try {
+        const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
+        const scanScope = await loadScanPlanForRun(scanMailbox);
         const runId = `cs_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
         const scanPromise = client.startCustomScan({
           user_request: userRequest,
-          mailbox: selectedOrPrimary(state.selectedMailboxes, state.mailbox),
-          primary_count: CUSTOM_SCAN_MESSAGE_LIMIT,
-          max_messages: CUSTOM_SCAN_MESSAGE_LIMIT,
+          mailbox: scanMailbox,
+          primary_count: scanScope.max_messages,
+          max_messages: scanScope.max_messages,
+          scan_window_days: scanScope.scan_window_days,
           ai_provider: state.llmProvider,
           storage_provider: state.storageProvider,
           run_id: runId,
-          wait_timeout_seconds: 45,
+          wait_timeout_seconds: 60,
         });
         const started = await scanPromise;
         if (started.status === "failed" || started.error) {
@@ -3192,16 +3455,19 @@ export function useAppController() {
         customRunProgress: { runId: "", question, status: "queued", stage: "planning_done", stageKey: "planning", progress: {}, partial: { plan: plan || {} }, startedAt: "" },
       }));
       try {
+        const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
+        const scanScope = await loadScanPlanForRun(scanMailbox);
         const runId = `rr_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
         const scanPromise = client.reRunCustomScan({
           plan_id: planId,
-          mailbox: selectedOrPrimary(state.selectedMailboxes, state.mailbox),
-          primary_count: CUSTOM_SCAN_MESSAGE_LIMIT,
-          max_messages: CUSTOM_SCAN_MESSAGE_LIMIT,
+          mailbox: scanMailbox,
+          primary_count: scanScope.max_messages,
+          max_messages: scanScope.max_messages,
+          scan_window_days: scanScope.scan_window_days,
           ai_provider: state.llmProvider,
           storage_provider: state.storageProvider,
           run_id: runId,
-          wait_timeout_seconds: 45,
+          wait_timeout_seconds: 60,
         });
         const started = await scanPromise;
         if (started.status === "failed" || started.error) {

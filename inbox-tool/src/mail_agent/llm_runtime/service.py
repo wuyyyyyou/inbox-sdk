@@ -123,12 +123,14 @@ def _repair_json(text: str) -> str:
     text = re.sub(r'"\s*\n\s*"', '",\n"', text)
     # Anna sampling 偶尔会在同一行的下一个 key 前漏逗号。
     text = re.sub(r'(?<=")\s+(?="[^"\r\n]{1,80}"\s*:)', ', ', text)
-    # Missing comma: }\n  "next_key"  →  },\n  "next_key"
+    # Missing comma: }\n  "next_key"  →  },\n  "next_key"（含缩进空格/制表）
     text = re.sub(r'}\s*\n\s*"', '},\n"', text)
+    text = re.sub(r'}\s+"', '}, "', text)
     # 数组里的相邻对象如果少逗号，json.loads 会报 Expecting delimiter。
     text = re.sub(r'}\s*{', '},{', text)
     # Missing comma: ]\n  "next_key"  →  ],\n  "next_key"
     text = re.sub(r']\s*\n\s*"', '],\n"', text)
+    text = re.sub(r']\s+"', '], "', text)
     text = re.sub(r'(?<=])\s+(?="[^"\r\n]{1,80}"\s*:)', ', ', text)
     # Missing comma: number\n  "next_key"  →  number,\n  "next_key"
     text = re.sub(r'(\d)\s*\n\s*"', r'\1,\n"', text)
@@ -136,6 +138,39 @@ def _repair_json(text: str) -> str:
     # Missing comma: true\n  "next_key" | false\n  "next_key" | null\n  "next_key"
     text = re.sub(r'(true|false|null)\s*\n\s*"', r'\1,\n"', text)
     text = re.sub(r'\b(true|false|null)\s+(?="[^"\r\n]{1,80}"\s*:)', r'\1, ', text)
+    # 中文注释：Ask answer 的 mail_links 数组里对象之间常漏逗号且夹杂换行缩进。
+    text = re.sub(r'}\s*\n\s*{', '},\n{', text)
+    return text
+
+
+def _balance_json_brackets(text: str) -> str:
+    """在字符串外补齐未闭合的 } / ]，用于模型截断输出的本地抢救。"""
+    in_string = False
+    escape = False
+    stack: list[str] = []
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if stack and stack[-1] == ch:
+                stack.pop()
+    if in_string:
+        text += '"'
+    # 中文注释：截断若落在值后，先去掉尾部悬挂逗号再补括号。
+    text = re.sub(r",\s*$", "", text.rstrip())
+    while stack:
+        text += stack.pop()
     return text
 
 
@@ -147,23 +182,27 @@ def parse_json_response(text: str) -> dict[str, Any]:
         text = fence.group(1).strip()
     start = text.find("{")
     end = text.rfind("}")
-    if start < 0 or end <= start:
+    if start < 0:
         raise ValueError("LLM response did not contain a JSON object")
-    text = text[start : end + 1]
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
-        repaired = _repair_json(text)
+    # 中文注释：优先截到最后一个 }；若模型截断未闭合，仍从首个 { 起做修复。
+    candidate = text[start : end + 1] if end > start else text[start:]
+    attempts = [candidate, _repair_json(candidate), _balance_json_brackets(_repair_json(candidate))]
+    last_error: json.JSONDecodeError | None = None
+    for attempt in attempts:
         try:
-            return json.loads(repaired)
-        except json.JSONDecodeError as repaired_exc:
-            start_excerpt = max(0, repaired_exc.pos - 140)
-            end_excerpt = min(len(repaired), repaired_exc.pos + 140)
-            excerpt = repaired[start_excerpt:end_excerpt].replace("\n", "\\n")
-            raise ValueError(
-                f"{repaired_exc.msg}: line {repaired_exc.lineno} column {repaired_exc.colno} "
-                f"(char {repaired_exc.pos}); excerpt={excerpt}"
-            ) from exc
+            payload = json.loads(attempt)
+            if isinstance(payload, dict):
+                return payload
+        except json.JSONDecodeError as exc:
+            last_error = exc
+    assert last_error is not None
+    start_excerpt = max(0, last_error.pos - 140)
+    end_excerpt = min(len(attempts[-1]), last_error.pos + 140)
+    excerpt = attempts[-1][start_excerpt:end_excerpt].replace("\n", "\\n")
+    raise ValueError(
+        f"{last_error.msg}: line {last_error.lineno} column {last_error.colno} "
+        f"(char {last_error.pos}); excerpt={excerpt}"
+    ) from last_error
 
 
 def _build_sampling_json_user_message(system_prompt: str, user_message: str, retry_note: str = "") -> str:
@@ -260,8 +299,8 @@ async def repair_json_with_sampling(
     metadata_payload["tool"] = "json_repair"
     metadata_payload["repair_for"] = original_tool
 
-    result = await sampling_create_message(
-        messages=[
+    request = {
+        "messages": [
             {
                 "role": "user",
                 "content": {
@@ -276,13 +315,14 @@ async def repair_json_with_sampling(
                 },
             }
         ],
-        max_tokens=max(512, min(int(max_tokens or 1024), 4096)),
-        system_prompt=_ascii_escape_for_host_transport(JSON_REPAIR_SYSTEM_PROMPT),
-        temperature=0.0,
-        include_context="none",
-        metadata={str(key): _ascii_escape_for_host_transport(str(value)) for key, value in metadata_payload.items()},
-        timeout=timeout,
-    )
+        "system_prompt": _ascii_escape_for_host_transport(JSON_REPAIR_SYSTEM_PROMPT),
+        "temperature": 0.0,
+        "include_context": "none",
+        "metadata": {str(key): _ascii_escape_for_host_transport(str(value)) for key, value in metadata_payload.items()},
+        "timeout": timeout,
+    }
+    request["max_tokens"] = 512
+    result = await sampling_create_message(**request)
     repaired_text = extract_sampling_text(result)
     if not isinstance(repaired_text, str) or not repaired_text.strip():
         raise ValueError(f"empty Anna JSON repair response ({_sampling_result_shape(result)})")
@@ -510,8 +550,8 @@ async def call_llm_json(
                     str(key): _ascii_escape_for_host_transport(str(value))
                     for key, value in (metadata or {}).items()
                 }
-                result = await sampling_create_message(
-                    messages=[
+                request = {
+                    "messages": [
                         {
                             "role": "user",
                             "content": {
@@ -522,14 +562,15 @@ async def call_llm_json(
                             },
                         }
                     ],
-                    max_tokens=max_tokens,
-                    system_prompt=_ascii_escape_for_host_transport(system_prompt),
-                    temperature=temperature,
-                    include_context="none",
-                    metadata=metadata_payload,
-                    timeout=timeout,
-                    stop_sequences=stop_sequences,
-                )
+                    "system_prompt": _ascii_escape_for_host_transport(system_prompt),
+                    "temperature": temperature,
+                    "include_context": "none",
+                    "metadata": metadata_payload,
+                    "timeout": timeout,
+                    "stop_sequences": stop_sequences,
+                    "max_tokens": max_tokens,
+                }
+                result = await sampling_create_message(**request)
                 text = extract_sampling_text(result)
                 if not isinstance(text, str) or not text.strip():
                     raise ValueError(f"empty Anna sampling response ({_sampling_result_shape(result)})")

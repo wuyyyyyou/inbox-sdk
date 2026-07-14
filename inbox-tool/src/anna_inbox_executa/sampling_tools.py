@@ -1,22 +1,121 @@
 from __future__ import annotations
 
+import json
+
 from anna_inbox_executa.common import *
 
+
+# 中文注释：Anna Host 按同一 invoke_id 累计计算 maxTokens；保留余量避免
+# 重试或 JSON repair 让后续小请求触发 -32007 MAX_TOKENS_EXCEEDED。
+ANNA_SAMPLING_TIMEOUT_SECONDS = 60.0
+ANNA_SAMPLING_TOTAL_TOKENS = 6000
+ANNA_SAMPLING_MAX_TOKENS_PER_CALL = 4096
+
+
+class SamplingBudgetExceeded(RuntimeError):
+    """本地累计 Sampling 预算耗尽，调用方应使用既有 fallback。"""
+
+
+def _sampling_prompt_bytes(request: dict[str, Any]) -> int:
+    """计算 Sampling 反向 JSON-RPC 的 UTF-8 请求字节数，不保留任何邮件内容。"""
+    # 中文注释：反向请求不能走 Host 文件上传；观测实际 frame 大小才能定位 JSON-RPC 溢出。
+    params = {
+        "messages": request.get("messages", []),
+        "maxTokens": request.get("max_tokens"),
+        "systemPrompt": request.get("system_prompt"),
+        "temperature": request.get("temperature"),
+        "includeContext": request.get("include_context", "none"),
+        "metadata": request.get("metadata", {}),
+        "_clientTimeoutS": request.get("timeout"),
+    }
+    payload = {"jsonrpc": "2.0", "method": "sampling/createMessage", "params": params}
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
+
+
+def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str) -> Any:
+    """为一个 Executa invoke 创建带累计预算、统一超时和安全日志的 sampler。"""
+    remaining_tokens = ANNA_SAMPLING_TOTAL_TOKENS
+    budget_lock = asyncio.Lock()
+
+    async def _budgeted_sampling(**kwargs: Any) -> dict[str, Any]:
+        """在调用 Host 前原子预留 token，避免发送必然超额的请求。"""
+        nonlocal remaining_tokens
+        requested_tokens = kwargs.get("max_tokens")
+        if not isinstance(requested_tokens, int) or requested_tokens <= 0:
+            raise ValueError("max_tokens must be a positive integer")
+
+        raw_metadata = kwargs.get("metadata")
+        metadata = {
+            str(key): str(value)
+            for key, value in raw_metadata.items()
+        } if isinstance(raw_metadata, dict) else {}
+        tool_name = metadata.get("tool", "unknown")
+        metadata["executa_invoke_id"] = invoke_id
+
+        async with budget_lock:
+            granted_tokens = min(
+                requested_tokens,
+                ANNA_SAMPLING_MAX_TOKENS_PER_CALL,
+                remaining_tokens,
+            )
+            if granted_tokens <= 0:
+                log(
+                    "anna sampling rejected: "
+                    f"tool={tool_name} requested_tokens={requested_tokens} "
+                    f"granted_tokens=0 remaining_tokens=0 "
+                    f"timeout_s={ANNA_SAMPLING_TIMEOUT_SECONDS} "
+                    "error_type=SamplingBudgetExceeded"
+                )
+                raise SamplingBudgetExceeded("Anna sampling token budget exhausted")
+            remaining_tokens -= granted_tokens
+            remaining_after_reservation = remaining_tokens
+
+        request = dict(kwargs)
+        request["max_tokens"] = granted_tokens
+        request["timeout"] = ANNA_SAMPLING_TIMEOUT_SECONDS
+        request["metadata"] = metadata
+        prompt_bytes = _sampling_prompt_bytes(request)
+        started = time.monotonic()
+        log(
+            "anna sampling started: "
+            f"tool={tool_name} requested_tokens={requested_tokens} "
+            f"granted_tokens={granted_tokens} remaining_tokens={remaining_after_reservation} "
+            f"timeout_s={ANNA_SAMPLING_TIMEOUT_SECONDS} prompt_bytes={prompt_bytes}"
+        )
+        try:
+            result = await sampling_fn(**request)
+        except Exception as exc:
+            log(
+                "anna sampling failed: "
+                f"tool={tool_name} requested_tokens={requested_tokens} "
+                f"granted_tokens={granted_tokens} remaining_tokens={remaining_after_reservation} "
+                f"timeout_s={ANNA_SAMPLING_TIMEOUT_SECONDS} "
+                f"prompt_bytes={prompt_bytes} "
+                f"elapsed_ms={int((time.monotonic() - started) * 1000)} "
+                f"error_type={type(exc).__name__}"
+            )
+            raise
+        log(
+            "anna sampling completed: "
+            f"tool={tool_name} requested_tokens={requested_tokens} "
+            f"granted_tokens={granted_tokens} remaining_tokens={remaining_after_reservation} "
+            f"timeout_s={ANNA_SAMPLING_TIMEOUT_SECONDS} "
+            f"prompt_bytes={prompt_bytes} "
+            f"elapsed_ms={int((time.monotonic() - started) * 1000)}"
+        )
+        return result
+
+    return _budgeted_sampling
+
+
 def _build_sampling_for_run(arguments: dict[str, Any], invoke_id: str) -> Any:
-    """Build sampling_create_message for a run based on ai_provider arg."""
+    """为 Anna LLM 创建带预算的 sampling 调用；非 Anna provider 返回 None 走本地/DashScope。
+
+    中文注释：Ask/Brief 生产路径统一使用 sampling/createMessage，不走 Host Agent Session。
+    """
     provider = str(arguments.get("ai_provider", "anna-llm")).strip()
     if provider == "anna-llm":
-        async def _sampling(**kwargs: Any) -> dict[str, Any]:
-            metadata = {str(key): str(value) for key, value in (kwargs.get("metadata") or {}).items()}
-            metadata["executa_invoke_id"] = invoke_id
-            kwargs["metadata"] = metadata
-            tool_name = metadata.get("tool", "unknown")
-            started = time.time()
-            log(f"anna ask sampling start: tool={tool_name} max_tokens={kwargs.get('max_tokens')} metadata={metadata}")
-            result = await sampling.create_message(**kwargs)
-            log(f"anna ask sampling done: tool={tool_name} elapsed_ms={int((time.time() - started) * 1000)} model={result.get('model')} shape={_sampling_result_shape(result)}")
-            return result
-        return _sampling
+        return build_budgeted_sampling(sampling.create_message, invoke_id=invoke_id)
     return None
 
 

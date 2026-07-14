@@ -67,6 +67,49 @@ async def test_local_json_repair_does_not_trigger_llm_repair() -> None:
     assert len(stub.calls) == 1
 
 
+async def test_local_json_repair_mail_links_missing_commas() -> None:
+    """Ask answer 常见：mail_links 对象字段/相邻对象漏逗号，须本地修好。"""
+    from mail_agent.llm_runtime.service import parse_json_response
+
+    broken = """
+    {
+      "title": "Partners",
+      "summary": "ok",
+      "sections": [{
+        "heading": "Items",
+        "items": [{
+          "subject": "partners",
+          "mail_links": [
+            {
+              "label": "partners"
+              "thread_id": "19f5e73b7c72c7b7"
+              "message_id": "19f5e73b7c72c7b7"
+            }
+            {
+              "label": "second",
+              "thread_id": "abc",
+              "message_id": "abc"
+            }
+          ]
+        }]
+      }]
+    }
+    """
+    payload = parse_json_response(broken)
+    assert payload["title"] == "Partners"
+    links = payload["sections"][0]["items"][0]["mail_links"]
+    assert links[0]["thread_id"] == "19f5e73b7c72c7b7"
+    assert links[1]["label"] == "second"
+
+
+async def test_local_json_repair_balances_truncated_object() -> None:
+    from mail_agent.llm_runtime.service import parse_json_response
+
+    payload = parse_json_response('{"title":"T","summary":"S","sections":[{"heading":"H","items":[{"subject":"x"')
+    assert payload["title"] == "T"
+    assert payload["sections"][0]["items"][0]["subject"] == "x"
+
+
 async def test_invalid_json_triggers_one_sampling_repair() -> None:
     from mail_agent.llm_runtime.service import call_llm_json
 
@@ -75,7 +118,7 @@ async def test_invalid_json_triggers_one_sampling_repair() -> None:
         stub,
         system_prompt="Return JSON only.",
         user_message='## Output format\n{"a": "string"}\n\n## Emails\nSECRET EMAIL BODY',
-        max_tokens=64,
+        max_tokens=4096,
         max_attempts=1,
         metadata={"tool": "unit_test"},
         allow_sampling_provider_fallback=False,
@@ -87,6 +130,7 @@ async def test_invalid_json_triggers_one_sampling_repair() -> None:
     repair_call = stub.calls[1]
     assert repair_call["metadata"]["tool"] == "json_repair"
     assert repair_call["metadata"]["repair_for"] == "unit_test"
+    assert repair_call["max_tokens"] == 512
     repair_prompt = repair_call["messages"][0]["content"]["text"]
     assert "SECRET EMAIL BODY" not in repair_prompt
     assert "## Output format" in repair_prompt
@@ -160,6 +204,8 @@ async def main() -> None:
     os.environ.pop("DASHSCOPE_API_KEY", None)
     await test_valid_json_does_not_trigger_repair()
     await test_local_json_repair_does_not_trigger_llm_repair()
+    await test_local_json_repair_mail_links_missing_commas()
+    await test_local_json_repair_balances_truncated_object()
     await test_invalid_json_triggers_one_sampling_repair()
     await test_repair_failure_uses_safe_fallback()
     await test_empty_sampling_response_does_not_trigger_repair()

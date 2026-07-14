@@ -38,6 +38,9 @@ docs/adr/
 **/.secrets/
 **/.data
 **/.local_storage
-/.claude/.claude/settings.local.json
 .history/
+inbox-tool/src/tests/
 anna-inbox/docs/superpowers/
+
+# design reference screenshots (local)
+example/

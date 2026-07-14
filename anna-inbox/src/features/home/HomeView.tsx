@@ -47,6 +47,7 @@ import {
   parseAiMessageMarkdown,
   type AiMessageInline,
 } from "./aiMessageFormatting";
+import { customExecutionSteps } from "../brief/runHelpers";
 import {
   getCachedMessageBody,
   getContactAvatarCache,
@@ -1387,13 +1388,18 @@ function AiAssistantMessage({
   };
 
   if (message.pending) {
+    const executionSteps = message.kind === "scan" && state.customRunProgress
+      ? customExecutionSteps(state.customRunProgress.stage, state.customRunProgress.progress)
+      : [];
     return (
       <div
         className="ai-message is-assistant is-thinking-inline"
         aria-live="polite"
         aria-busy="true"
       >
-        <p>Thinking...</p>
+        {executionSteps.length ? executionSteps.map((step) => (
+          <p key={step.label}>{step.status === "complete" ? "Completed: " : step.status === "active" ? "In progress: " : ""}{step.label}</p>
+        )) : <p>Thinking...</p>}
       </div>
     );
   }

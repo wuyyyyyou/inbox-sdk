@@ -22,7 +22,7 @@ Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 或 All 
 
 **Anna AI Sidebar**
 
-主界面左侧的对话入口。它根据请求和当前邮件上下文路由到普通对话、邮箱扫描或邮件上下文协助。
+主界面左侧的对话入口。默认调用 Executa `start_ai_turn`：由本地 Router 在白名单工具中选型（普通对话、收件箱搜索、当前邮件总结等），并透传只读屏上上下文。旧前端 `aiRoute` 三分支可作为旁路保留。
 
 **Local Draft**
 

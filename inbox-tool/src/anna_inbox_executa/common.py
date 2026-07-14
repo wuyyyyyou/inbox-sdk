@@ -676,7 +676,25 @@ DEFAULT_MANIFEST = {
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
                 {"name": "run_id", "type": "string", "description": "Client-generated run ID for polling progress before execution completes.", "required": False},
                 {"name": "max_messages", "type": "integer", "description": "Maximum messages to scan.", "required": False},
+                {"name": "scan_window_days", "type": "integer", "description": "Default Scan Plan day range when the request has no explicit time.", "required": False},
                 {"name": "primary_count", "type": "integer", "description": "How many recent Primary emails to fetch first.", "required": False},
+                {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
+                {"name": "storage_provider", "type": "string", "description": "Storage provider: local or aps.", "required": False},
+                {"name": "wait_timeout_seconds", "type": "integer", "description": "How long this invoke should wait before returning a pollable running state.", "required": False},
+            ],
+            "timeout": 600,
+        },
+        {
+            "name": "start_ai_turn",
+            "description": "Unified AI sidebar turn: local router selects whitelist tools (chat, search, summarize) then returns a pollable run.",
+            "parameters": [
+                {"name": "user_text", "type": "string", "description": "Natural language user message.", "required": True},
+                {"name": "mailbox", "type": "string", "description": "Primary mailbox email address.", "required": False},
+                {"name": "ui_context", "type": "object", "description": "Read-only screen context: current thread, selected mailboxes, display range, etc.", "required": False},
+                {"name": "conversation_id", "type": "string", "description": "Ephemeral sidebar conversation id for multi-turn registry (process-local).", "required": False},
+                {"name": "run_id", "type": "string", "description": "Client-generated run ID for polling.", "required": False},
+                {"name": "max_messages", "type": "integer", "description": "Max messages for inbox search tools.", "required": False},
+                {"name": "scan_window_days", "type": "integer", "description": "Default day range for inbox search.", "required": False},
                 {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
                 {"name": "storage_provider", "type": "string", "description": "Storage provider: local or aps.", "required": False},
                 {"name": "wait_timeout_seconds", "type": "integer", "description": "How long this invoke should wait before returning a pollable running state.", "required": False},
@@ -691,6 +709,7 @@ DEFAULT_MANIFEST = {
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
                 {"name": "run_id", "type": "string", "description": "Client-generated run ID for polling progress before execution completes.", "required": False},
                 {"name": "max_messages", "type": "integer", "description": "Maximum messages to scan.", "required": False},
+                {"name": "scan_window_days", "type": "integer", "description": "Default Scan Plan day range when the request has no explicit time.", "required": False},
                 {"name": "primary_count", "type": "integer", "description": "How many recent Primary emails to fetch first.", "required": False},
                 {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
                 {"name": "storage_provider", "type": "string", "description": "Storage provider: local or aps.", "required": False},
@@ -1262,10 +1281,21 @@ def _public_run_view(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _protocol_at_least(protocol_version: str, major: int, minor: int) -> bool:
+    """比较 Host 协议版本，兼容未来 2.x 版本而不把 2.1 当作旧协议。"""
+    try:
+        parts = protocol_version.split(".", 2)
+        received = (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+    except (TypeError, ValueError):
+        return False
+    return received >= (major, minor)
+
+
 def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
     global _platform_credentials_ready
     protocol_version = str((params or {}).get("protocolVersion") or "1.1")
-    v2 = protocol_version == PROTOCOL_VERSION_V2
+    # 中文注释：接受 2.0 及以后次版本（如 2.1），避免把更高 2.x 误判为未协商 v2。
+    v2 = _protocol_at_least(protocol_version, 2, 0)
     _platform_credentials_ready = v2
     host_caps = (params or {}).get("capabilities") or (params or {}).get("client_capabilities") or {}
     host_cap_list = sorted(host_caps.keys()) if isinstance(host_caps, dict) else []
@@ -1283,7 +1313,7 @@ def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
         host_upload.disable("Host upload unavailable because protocol v2 was not negotiated.")
         platform_credentials.disable("Platform credentials require Executa protocol 2.0.")
     return {
-        "protocolVersion": PROTOCOL_VERSION_V2 if v2 else "1.1",
+        "protocolVersion": protocol_version if v2 else "1.1",
         "serverInfo": {"name": TOOL_ID, "version": VERSION},
         "client_capabilities": {"sampling": {}, "storage": {}, "upload": {}} if v2 else {},
         "capabilities": {"sampling": {}, "storage": {}, "upload": {}} if v2 else {},

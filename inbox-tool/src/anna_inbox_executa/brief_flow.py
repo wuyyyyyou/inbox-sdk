@@ -49,19 +49,9 @@ async def run_mail_agent_pipeline(
     if not input_.user_request or not input_.mailbox_id:
         return {"success": False, "error": "user_request and mailbox are required"}
 
-    sampling_create_message = None
-    if provider == "anna-llm":
-        async def sampling_create_message_with_invoke(**kwargs: Any) -> dict[str, Any]:
-            metadata = {str(key): str(value) for key, value in (kwargs.get("metadata") or {}).items()}
-            metadata["executa_invoke_id"] = invoke_id
-            kwargs["metadata"] = metadata
-            log(f"anna sampling start: max_tokens={kwargs.get('max_tokens')} metadata={metadata}")
-            started = time.time()
-            result = await sampling.create_message(**kwargs)
-            log(f"anna sampling done: elapsed_ms={int((time.time() - started) * 1000)} model={result.get('model')} shape={_sampling_result_shape(result)}")
-            return result
-
-        sampling_create_message = sampling_create_message_with_invoke
+    sampling_create_message = _build_sampling_for_run(
+        {"ai_provider": provider}, invoke_id
+    )
 
     action_plan = await run_mail_task(
         input_,

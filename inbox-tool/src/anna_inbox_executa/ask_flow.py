@@ -5,6 +5,7 @@ from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.contact_memory_flow import _memory_mailboxes, _memory_mailboxes_async
 from anna_inbox_executa.brief_flow import _merge_partial
 
+
 async def run_custom_scan_background(run_id: str, plan: Any, arguments: dict[str, Any], invoke_id: str) -> None:
     """Background execution of a custom scan (plan already generated or loaded)."""
     MAIL_AGENT_RUNS[run_id]["status"] = "running"
@@ -143,7 +144,8 @@ def start_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, An
         _start_custom_scan_async(run_id, arguments, invoke_id),
         loop,
     )
-    wait_timeout = int(arguments.get("wait_timeout_seconds", 600))
+    # 中文注释：默认 60s 初等等待后返回可轮询状态；与前端 wait_timeout / invoke 余量对齐。
+    wait_timeout = int(arguments.get("wait_timeout_seconds", 60))
     try:
         future.result(timeout=wait_timeout)
     except FutureTimeoutError:
@@ -202,6 +204,8 @@ async def _start_custom_scan_async(run_id: str, arguments: dict[str, Any], invok
         result = await run_ask_pipeline(
             user_request=user_request,
             mailboxes=mailboxes,
+            scan_window_days=arguments.get("scan_window_days"),
+            max_messages=arguments.get("max_messages"),
             sampling_create_message=sampling,
             progress_callback=_update_progress,
         )
@@ -330,7 +334,8 @@ def re_run_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, A
         _re_run_custom_scan_async(run_id, plan_id, arguments, invoke_id),
         loop,
     )
-    wait_timeout = int(arguments.get("wait_timeout_seconds", 600))
+    # 中文注释：复跑与首扫同一合同：默认 60s 初等，超时后可轮询。
+    wait_timeout = int(arguments.get("wait_timeout_seconds", 60))
     try:
         future.result(timeout=wait_timeout)
     except FutureTimeoutError:
@@ -415,6 +420,8 @@ async def _re_run_custom_scan_async(run_id: str, plan_id: str, arguments: dict[s
             result = await run_ask_pipeline(
                 mailboxes=mailboxes,
                 plan=ask_plan,
+                scan_window_days=arguments.get("scan_window_days"),
+                max_messages=arguments.get("max_messages"),
                 sampling_create_message=sampling,
                 progress_callback=_update_progress,
             )

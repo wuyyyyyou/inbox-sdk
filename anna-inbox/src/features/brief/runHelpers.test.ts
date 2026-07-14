@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { customStageCopy, customStageKey, makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "./runHelpers";
+import { customExecutionSteps, customStageCopy, customStageKey, makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "./runHelpers";
 
 describe("run helpers", () => {
   it("maps backend stages to scan steps", () => {
@@ -33,5 +33,21 @@ describe("run helpers", () => {
     expect(progress.stageKey).toBe("searching");
     expect(progress.partial).toHaveProperty("plan");
     expect(progress.partial).toHaveProperty("sources");
+  });
+
+  it("renders only safe scan execution steps and counts", () => {
+    const steps = customExecutionSteps("search_done", {
+      scan_window_days: 7,
+      scanned: 12,
+      threads: 8,
+      query: "from:private@example.com confidential body",
+      subject: "Confidential roadmap",
+    });
+    const text = steps.map((step) => step.label).join(" ");
+    expect(text).toContain("Understanding request");
+    expect(text).toContain("Searching selected time range (7 days)");
+    expect(text).toContain("Found 12 emails in 8 threads");
+    expect(text).not.toContain("private@example.com");
+    expect(text).not.toContain("Confidential roadmap");
   });
 });

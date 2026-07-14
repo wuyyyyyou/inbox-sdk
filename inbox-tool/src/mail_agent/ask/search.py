@@ -273,6 +273,7 @@ async def execute_search(
     *,
     progress_callback: Any = None,
     max_broaden_attempts: int = 2,
+    max_messages: int = _DEFAULT_MAX_MESSAGES,
 ) -> list[MessageLite]:
     """Execute Gmail search with adaptive broadening.
 
@@ -284,6 +285,11 @@ async def execute_search(
     """
     from ..mail_providers.gmail.adapter import get_messages_lite_async, live_search_and_cache
 
+    # 中文注释：前端 Scan Plan 的数量上限必须覆盖每个查询，防止多查询合并后超量读取。
+    try:
+        message_cap = max(1, min(int(max_messages), _DEFAULT_MAX_MESSAGES))
+    except (TypeError, ValueError):
+        message_cap = _DEFAULT_MAX_MESSAGES
     current_queries = list(queries)
 
     for attempt in range(max_broaden_attempts + 1):
@@ -297,15 +303,15 @@ async def execute_search(
                 query_limit = int(query.get("max_results", _DEFAULT_MAX_PER_QUERY))
             except (TypeError, ValueError):
                 query_limit = _DEFAULT_MAX_PER_QUERY
-            query_limit = max(1, min(query_limit, _DEFAULT_MAX_MESSAGES))
+            query_limit = max(1, min(query_limit, message_cap - len(message_ids)))
             matched_ids = live_search_and_cache(mailbox, query_text, query_limit)
             for msg_id in matched_ids:
                 if msg_id not in seen_ids:
                     seen_ids.add(msg_id)
                     message_ids.append(msg_id)
-                if len(message_ids) >= _DEFAULT_MAX_MESSAGES:
+                if len(message_ids) >= message_cap:
                     break
-            if len(message_ids) >= _DEFAULT_MAX_MESSAGES:
+            if len(message_ids) >= message_cap:
                 break
 
         messages = await get_messages_lite_async(mailbox, message_ids)

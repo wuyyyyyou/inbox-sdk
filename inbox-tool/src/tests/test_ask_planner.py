@@ -40,6 +40,43 @@ def test_askplan_dataclass():
     print("[PASS] test_askplan_dataclass")
 
 
+class EmptySamplingStub:
+    """模拟 Anna Host 返回成功帧但没有可用文本的异常形态。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self, **_kwargs: Any) -> dict[str, Any]:
+        self.calls += 1
+        return {
+            "content": [],
+            "model": "test-model",
+            "role": "assistant",
+            "stopReason": "endTurn",
+            "usage": {},
+        }
+
+
+async def test_empty_sampling_response_uses_executable_fallback_plan() -> None:
+    from mail_agent.ask.planner import plan_ask_request
+
+    sampling = EmptySamplingStub()
+    plan = await plan_ask_request(
+        "Find urgent emails",
+        "owner@example.com",
+        sampling_create_message=sampling,
+    )
+
+    assert sampling.calls == 1
+    assert plan.direction == "inbox"
+    assert plan.timeframe == "7d"
+    assert plan.goal == "general_qa"
+    assert plan.topics == []
+    assert plan.llm_meta["fallback_used"] is True
+    assert plan.llm_meta["fallback_reason"]
+    print("[PASS] test_empty_sampling_response_uses_executable_fallback_plan")
+
+
 # ── Real sampling integration tests ────────────────────────────────────
 
 async def run_real_sampling_tests(sampling_create_message: Any):
@@ -122,6 +159,7 @@ def main():
 
     print("\n--- Unit test ---\n")
     test_askplan_dataclass()
+    asyncio.run(test_empty_sampling_response_uses_executable_fallback_plan())
     print("\n[ALL UNIT TESTS PASSED]\n")
 
     if args.real_sampling:
