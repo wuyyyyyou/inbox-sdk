@@ -255,13 +255,13 @@ def resolve_effective_timeframe(
 ) -> str:
     """根据用户明确时间或 Scan Plan 计算最终 Gmail 时间范围。
 
-    中文注释：Planner 的 timeframe 属于模型推断，不能在用户未指定时间时
+    Planner 的 timeframe 属于模型推断，不能在用户未指定时间时
     覆盖当前 Scan Plan；只有请求文本含明确相对时间时才允许覆盖默认范围。
     """
     request = str(user_request or "").strip().casefold()
     explicit_days: int | None = None
 
-    # 中文注释：优先匹配带数字的天/周/月表达，避免“最近”一词抢占更精确范围。
+    # 优先匹配带数字的天/周/月表达，避免“最近”一词抢占更精确范围。
     day_match = re.search(r"(?:last|past|recent)\s+(\d{1,3})\s+days?|最近\s*(\d{1,3})\s*天", request)
     week_match = re.search(r"(?:last|past|recent)\s+(\d{1,2})\s+weeks?|最近\s*(\d{1,2})\s*周", request)
     month_match = re.search(r"(?:last|past|recent)\s+(\d{1,2})\s+months?|最近\s*(\d{1,2})\s*个?月", request)
@@ -294,7 +294,7 @@ def resolve_effective_timeframe(
     if configured_days > 0:
         return f"{min(configured_days, 365)}d"
 
-    # 中文注释：缺少 Scan Plan 的旧调用保持原有计划时间，避免影响历史入口。
+    # 缺少 Scan Plan 的旧调用保持原有计划时间，避免影响历史入口。
     matched = re.fullmatch(r"(\d{1,3})d", str(planned_timeframe or "").strip())
     return f"{min(max(int(matched.group(1)), 1), 365)}d" if matched else "30d"
 

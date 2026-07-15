@@ -855,7 +855,7 @@ def make_error(code: int, message: str, data: dict[str, Any] | None = None) -> d
 
 
 def _sampling_result_shape(result: Any) -> str:
-    # 中文注释：只记录响应形态，不记录模型正文，便于定位 Anna sampling 空响应。
+    # 只记录响应形态，不记录模型正文，便于定位 Anna sampling 空响应。
     if not isinstance(result, dict):
         return type(result).__name__
     content = result.get("content")
@@ -991,7 +991,7 @@ _platform_credentials_status: dict[str, Any] = {
 def _set_platform_credentials_status(*, available: bool, code: str, message: str, action: str) -> None:
     """更新当前进程最近一次 Google 多账号查询的安全状态。
 
-    中文说明：该状态会随 ``list_mailboxes`` 返回前端，因此只允许保存固定
+    该状态会随 ``list_mailboxes`` 返回前端，因此只允许保存固定
     错误分类、通用提示和下一步动作。Reverse RPC 的 error data 可能含有平台
     内部凭据上下文，绝不能在这里保留、写日志或透传。
     """
@@ -1042,7 +1042,7 @@ def _set_storage_backend(provider: Any = "") -> str:
         init_storage_singleton(_local_storage, _local_files, scope="user", backend="local")
         _route_storage_response = lambda msg: False
     if selected != _active_storage_provider:
-        # 中文注释：调试开关允许前端按工具调用切换 APS 或本地 JSON 存储。
+        # 调试开关允许前端按工具调用切换 APS 或本地 JSON 存储。
         log("storage backend: aps" if selected == "aps" else f"storage backend: local-json dir={_local_data_dir}")
     _active_storage_provider = selected
     return selected
@@ -1074,7 +1074,7 @@ def refresh_platform_google_accounts() -> list[dict[str, Any]]:
     are intentionally neither stored nor returned from this function.
     """
     if not _platform_credentials_ready:
-        # 中文说明：本地旧 runtime 没有 Reverse RPC；仍允许其使用既有单 token
+        # 本地旧 runtime 没有 Reverse RPC；仍允许其使用既有单 token
         # 兼容路径，但前端可以根据该状态提示升级 runtime 才能发现多个账户。
         _set_platform_credentials_status(
             available=False,
@@ -1090,7 +1090,7 @@ def refresh_platform_google_accounts() -> list[dict[str, Any]]:
         payload = future.result(timeout=12.0)
     except CredentialsError as exc:
         from mail_agent.mail_providers.gmail.adapter import set_platform_accounts
-        # 中文说明：用户未向本 App 授予 Connected accounts 时，不能继续使用
+        # 用户未向本 App 授予 Connected accounts 时，不能继续使用
         # 默认注入 token 冒充完整账户列表；清空旧 metadata 防止断开授权后残留。
         set_platform_accounts([])
         if exc.code == -32061:
@@ -1174,7 +1174,7 @@ def _is_warning_stage(stage: str) -> bool:
 
 
 def _save_run_checkpoint(run_id: str) -> None:
-    # 中文注释：后台任务是进程内存态；落盘用于本地 runtime 重启后的轮询诊断。
+    # 后台任务是进程内存态；落盘用于本地 runtime 重启后的轮询诊断。
     with RUN_STATE_LOCK:
         state = MAIL_AGENT_RUNS.get(run_id)
         if not state:
@@ -1221,7 +1221,7 @@ def _get_run_state(run_id: str) -> dict[str, Any] | None:
 
 
 def _compact_run_payload(value: Any, *, text_limit: int = 1200) -> Any:
-    # 中文注释：轮询状态只需要展示摘要，完整邮件正文保留在持久化卡片和详情接口里。
+    # 轮询状态只需要展示摘要，完整邮件正文保留在持久化卡片和详情接口里。
     if isinstance(value, list):
         return [_compact_run_payload(item, text_limit=text_limit) for item in value]
     if isinstance(value, dict):
@@ -1244,7 +1244,7 @@ def _compact_run_result(result: Any) -> Any:
         return None
     if isinstance(result, dict) and result.get("tool") == "run_mail_agent":
         action_plan = result.get("action_plan") if isinstance(result.get("action_plan"), dict) else {}
-        # 中文注释：Brief 轮询完成后前端会再读持久化卡片，这里避免重复返回完整 cards/proposed_actions。
+        # Brief 轮询完成后前端会再读持久化卡片，这里避免重复返回完整 cards/proposed_actions。
         return {
             "success": result.get("success", True),
             "tool": result.get("tool"),
@@ -1294,7 +1294,7 @@ def _protocol_at_least(protocol_version: str, major: int, minor: int) -> bool:
 def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
     global _platform_credentials_ready
     protocol_version = str((params or {}).get("protocolVersion") or "1.1")
-    # 中文注释：接受 2.0 及以后次版本（如 2.1），避免把更高 2.x 误判为未协商 v2。
+    # 接受 2.0 及以后次版本（如 2.1），避免把更高 2.x 误判为未协商 v2。
     v2 = _protocol_at_least(protocol_version, 2, 0)
     _platform_credentials_ready = v2
     host_caps = (params or {}).get("capabilities") or (params or {}).get("client_capabilities") or {}

@@ -327,7 +327,7 @@ function AskHistoryEntryRow({ entry, index }: { entry: AskHistoryEntry; index: n
     <div className={`ask-history-entry ${expanded ? "is-expanded" : ""}`}>
       <button className="ask-history-row" onClick={() => {
         if (canContinueConversation) {
-          // 中文注释：带 messages 的历史记录代表一段可继续的侧栏对话，点击时恢复会话而不是只展开扫描预览。
+          // 带 messages 的历史记录代表一段可继续的侧栏对话，点击时恢复会话而不是只展开扫描预览。
           actions.openAiConversation(index);
           actions.setView("start");
           return;

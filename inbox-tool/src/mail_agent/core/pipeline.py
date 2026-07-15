@@ -766,7 +766,7 @@ async def run_custom_scan(
     )
 
     def _build_user_prompt(rendered_emails: str) -> str:
-        # 中文注释：执行阶段会多次降载重试，只替换邮件正文渲染，保持任务约束一致。
+        # 执行阶段会多次降载重试，只替换邮件正文渲染，保持任务约束一致。
         return f"""## Your Identity
 You are Anna, executive assistant to {mailbox}.
 In all output text, address your principal directly as "you" / "your".
@@ -847,7 +847,7 @@ Match by EMAIL ADDRESS (between < >), not by display name.
                 reason=last_error[:200],
             )
     if result is None:
-        # 中文注释：Anna 多轮降载仍失败时，返回可展示结果，避免 Ask 链路整体失败。
+        # Anna 多轮降载仍失败时，返回可展示结果，避免 Ask 链路整体失败。
         result = {
             "payload": {
                 "title": plan.title or "Scan incomplete",

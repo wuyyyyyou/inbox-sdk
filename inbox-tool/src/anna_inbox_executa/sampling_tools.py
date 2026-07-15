@@ -5,7 +5,7 @@ import json
 from anna_inbox_executa.common import *
 
 
-# 中文注释：Anna Host 按同一 invoke_id 累计计算 maxTokens；保留余量避免
+# Anna Host 按同一 invoke_id 累计计算 maxTokens；保留余量避免
 # 重试或 JSON repair 让后续小请求触发 -32007 MAX_TOKENS_EXCEEDED。
 ANNA_SAMPLING_TIMEOUT_SECONDS = 60.0
 ANNA_SAMPLING_TOTAL_TOKENS = 6000
@@ -18,7 +18,7 @@ class SamplingBudgetExceeded(RuntimeError):
 
 def _sampling_prompt_bytes(request: dict[str, Any]) -> int:
     """计算 Sampling 反向 JSON-RPC 的 UTF-8 请求字节数，不保留任何邮件内容。"""
-    # 中文注释：反向请求不能走 Host 文件上传；观测实际 frame 大小才能定位 JSON-RPC 溢出。
+    # 反向请求不能走 Host 文件上传；观测实际 frame 大小才能定位 JSON-RPC 溢出。
     params = {
         "messages": request.get("messages", []),
         "maxTokens": request.get("max_tokens"),
@@ -111,7 +111,7 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str) -> Any:
 def _build_sampling_for_run(arguments: dict[str, Any], invoke_id: str) -> Any:
     """为 Anna LLM 创建带预算的 sampling 调用；非 Anna provider 返回 None 走本地/DashScope。
 
-    中文注释：Ask/Brief 生产路径统一使用 sampling/createMessage，不走 Host Agent Session。
+    Ask/Brief 生产路径统一使用 sampling/createMessage，不走 Host Agent Session。
     """
     provider = str(arguments.get("ai_provider", "anna-llm")).strip()
     if provider == "anna-llm":

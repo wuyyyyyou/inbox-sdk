@@ -356,7 +356,7 @@ function persistAskHistory(history: AskHistoryEntry[]) {
   try {
     window.localStorage.setItem(AI_ASK_HISTORY_STORAGE_KEY, JSON.stringify(history.slice(0, 30)));
   } catch {
-    // 中文注释：localStorage 写入失败不影响主流程，最多只是刷新后不能恢复侧栏对话。
+    // localStorage 写入失败不影响主流程，最多只是刷新后不能恢复侧栏对话。
   }
 }
 
@@ -376,7 +376,7 @@ async function waitForCustomScanResult(
   onStatus: (status: RunStatus) => void,
   signal?: AbortSignal,
 ): Promise<RunStatus> {
-  // 中文注释：Ask 扫描可能超过单次工具调用预算；前端用 run_id 轮询，避免长时间阻塞导致 Executa 被 host 杀掉。
+  // Ask 扫描可能超过单次工具调用预算；前端用 run_id 轮询，避免长时间阻塞导致 Executa 被 host 杀掉。
   for (let attempt = 0; attempt < POLL_LIMIT; attempt += 1) {
     if (signal) await abortableSleep(POLL_INTERVAL_MS, signal);
     else await sleep(POLL_INTERVAL_MS);
@@ -761,7 +761,7 @@ export function useAppController() {
       return text.trim() || "你好，我在。你可以直接和我聊天，也可以让我帮你查找、整理或总结邮件。";
     } catch (error) {
       if (signal.aborted || isAbortError(error)) throw error;
-      // 中文注释：普通聊天依赖 Anna Host LLM；失败时不应该退化成邮箱扫描，避免再次打扰用户邮箱。
+      // 普通聊天依赖 Anna Host LLM；失败时不应该退化成邮箱扫描，避免再次打扰用户邮箱。
       const latestUser = [...messages].reverse().find((message) => message.role === "user")?.content || "";
       return prefersChinese(latestUser)
         ? "你好，我在。现在普通聊天模型暂时不可用，但你仍然可以让我帮你查找、整理或总结邮件。"
@@ -787,7 +787,7 @@ export function useAppController() {
       };
       const nextHistory = [entry, ...s.askHistory.filter((item) => item.conversationId !== conversationId)].slice(0, 30);
       persistAskHistory(nextHistory);
-      // 中文注释：Ask history 是“会话索引”；点击历史恢复 messages 后，用户可以继续在同一 conversationId 里追问。
+      // Ask history 是“会话索引”；点击历史恢复 messages 后，用户可以继续在同一 conversationId 里追问。
       return { ...s, askHistory: nextHistory, aiChatMessages: messages, aiChatConversationId: conversationId };
     });
   }, []);
@@ -2907,7 +2907,7 @@ export function useAppController() {
               : message,
           )
         : unresolvedBase;
-      // 中文注释：阶段 A 默认走 start_ai_turn；localStorage anna-inbox-use-ai-turn=0 可回退 aiRoute。
+      // 阶段 A 默认走 start_ai_turn；localStorage anna-inbox-use-ai-turn=0 可回退 aiRoute。
       if (isAiTurnEnabled() && !options.forcedKind) {
         const generationRun = {
           runId: createId("generation"),

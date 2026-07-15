@@ -194,7 +194,7 @@ async def _tool_search_and_answer(
     summary = str(result.get("summary") or result.get("plan_title") or "").strip()
     if not summary:
         summary = "Scan complete." if not _uses_chinese(user_text) else "扫描完成。"
-    # 中文注释：with_rank 在阶段 A 与 search 合并为同一 Ask 管线，避免重复 LLM。
+    # with_rank 在阶段 A 与 search 合并为同一 Ask 管线，避免重复 LLM。
     _ = with_rank
     return {
         "kind": "scan",
@@ -243,7 +243,7 @@ async def run_ai_turn(
     if progress_callback:
         progress_callback("routing_done", {"tools": tools, "router_fallback": bool(route.get("router_fallback"))})
 
-    # 中文注释：阶段 A 将 search + rank 合并为一次 Ask；多步时按首个主 tool 执行。
+    # 阶段 A 将 search + rank 合并为一次 Ask；多步时按首个主 tool 执行。
     primary = tools[0] if tools else "chat_general"
     if "search_mail" in tools or "rank_answer" in tools:
         primary = "search_mail"

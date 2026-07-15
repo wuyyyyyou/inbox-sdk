@@ -17,12 +17,12 @@ from .sampling_budget import ASK_ANSWER_MAX_TOKENS
 _logger = logging.getLogger(__name__)
 _BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
-# 中文注释：反向 JSON-RPC 不能使用文件传输；筛选请求需远低于 512 KiB 协议帧上限。
-# 中文注释：全部命中用于扫描统计，只有排序靠前的有限候选才能读取正文和线程。
+# 反向 JSON-RPC 不能使用文件传输；筛选请求需远低于 512 KiB 协议帧上限。
+# 全部命中用于扫描统计，只有排序靠前的有限候选才能读取正文和线程。
 _MAX_CONTEXT_CANDIDATES = 8
-# 中文注释：正文/线程 Gmail 读限并发，避免 8 封串行放大墙钟时间。
+# 正文/线程 Gmail 读限并发，避免 8 封串行放大墙钟时间。
 _CONTEXT_READ_CONCURRENCY = 4
-# 中文注释：即使有必要阅读片段，回答也必须综合事实，避免退化为邮件正文复制。
+# 即使有必要阅读片段，回答也必须综合事实，避免退化为邮件正文复制。
 _ASK_SYNTHESIS_INSTRUCTION = (
     "Summarize and synthesize the evidence in your own words. "
     "Do not copy email body verbatim, except for a short necessary quote or an exact subject."
@@ -50,7 +50,7 @@ def _uses_chinese(user_request: str) -> bool:
 
 
 def _answer_fallback(plan: AskPlan, detail: str = "") -> dict[str, Any]:
-    # 中文注释：用户侧只展示可行动摘要；解析器/stack 细节只写日志，避免把 excerpt 甩到侧栏。
+    # 用户侧只展示可行动摘要；解析器/stack 细节只写日志，避免把 excerpt 甩到侧栏。
     if detail:
         _logger.warning("ask answer fallback: detail=%s", str(detail)[:300])
     if _uses_chinese(plan.user_request):
@@ -69,7 +69,7 @@ async def _filter_candidates(
     sampling_create_message: Any = None,
 ) -> list[MessageLite]:
     """保留全部搜索命中，相关度筛选统一由本地排序在正文读取前完成。"""
-    # 中文注释：不再为筛选额外调用或重试 Sampling，避免空响应消耗预算并拖长 Answer 阶段。
+    # 不再为筛选额外调用或重试 Sampling，避免空响应消耗预算并拖长 Answer 阶段。
     _ = plan, sampling_create_message
     return list(messages)
 
@@ -88,7 +88,7 @@ def _fmt_ts(epoch_ms: str) -> str:
 
 def _select_candidates_for_context(candidates: list[MessageLite], plan: AskPlan) -> list[MessageLite]:
     """按请求相关度排序并选择有限候选，避免将所有正文交给模型。"""
-    # 中文注释：这里是确定性本地排序，不新增 Sampling 调用；关键词仅用于缩小正文读取集合。
+    # 这里是确定性本地排序，不新增 Sampling 调用；关键词仅用于缩小正文读取集合。
     terms = [str(term).casefold().strip() for topic in plan.topics for term in topic.get("search_terms", [])]
     terms.extend(re.findall(r"[\w\u3400-\u9fff]{2,}", plan.user_request.casefold()))
     terms = [term for term in terms if term]
@@ -126,7 +126,7 @@ async def _read_candidate_context(
     from ..mail_providers.gmail.adapter import normalize_mailbox, get_message_detail, get_thread_context
 
     normalized = normalize_mailbox(mailbox)
-    # 中文注释：即使未来有其他调用方绕过编排层，也不能读取无限量邮件正文。
+    # 即使未来有其他调用方绕过编排层，也不能读取无限量邮件正文。
     candidates = candidates[:_MAX_CONTEXT_CANDIDATES]
 
     # Collect unique senders for contact memory retrieval
@@ -164,7 +164,7 @@ async def _read_candidate_context(
 
     import asyncio as _asyncio
 
-    # 中文注释：Gmail adapter 为同步 I/O，放入线程池并行读取，用信号量限制并发。
+    # Gmail adapter 为同步 I/O，放入线程池并行读取，用信号量限制并发。
     semaphore = _asyncio.Semaphore(_CONTEXT_READ_CONCURRENCY)
     total = len(candidates)
 
@@ -313,7 +313,7 @@ async def _generate_answer(
             f"- If the emails below do not contain what the user is looking for, say so honestly."
         )
 
-    # 中文注释：Anna invoke 只尝试一次紧凑回答；失败直接返回安全 fallback，不能再消耗多轮 token。
+    # Anna invoke 只尝试一次紧凑回答；失败直接返回安全 fallback，不能再消耗多轮 token。
     variants = [{"name": "compact", "body_limit": 700, "thread_body_limit": 240, "max_thread_messages": 2}]
 
     result: dict[str, Any] | None = None
@@ -346,7 +346,7 @@ async def _generate_answer(
                 progress_callback("evaluate", {"variant": variant["name"], "reason": last_error[:200]})
 
     if result is None:
-        # 中文注释：不再把本地邮件列表伪装成 AI 回答；失败时返回明确错误摘要。
+        # 不再把本地邮件列表伪装成 AI 回答；失败时返回明确错误摘要。
         return _answer_fallback(plan, last_error or "Anna sampling failed")
 
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
@@ -479,11 +479,11 @@ def _apply_guard(
                         continue
                     add_source_link(link_mid, link_source)
 
-            # 中文注释：模型可能漏掉 mail_links；条目自身的合法 ID 仍应确定性补成链接。
+            # 模型可能漏掉 mail_links；条目自身的合法 ID 仍应确定性补成链接。
             if source and item_source_is_valid:
                 add_source_link(mid, source)
 
-            # 中文注释：若模型连 ID 也漏掉，只接受结果文本中完整出现的候选邮件主题，避免模糊匹配误跳转。
+            # 若模型连 ID 也漏掉，只接受结果文本中完整出现的候选邮件主题，避免模糊匹配误跳转。
             reference_text = _normalize_reference_text(" ".join(
                 str(item.get(field) or "") for field in ("subject", "context", "suggestion", "draft")
             ))
@@ -539,7 +539,7 @@ async def run_ask_pipeline(
             progress_callback("plan", {"stage": "plan"})
         plan = await plan_ask_request(user_request, primary_mailbox, sampling_create_message=sampling_create_message)
 
-    # 中文注释：模型计划只能决定检索意图，默认扫描时间必须服从用户当前 Scan Plan。
+    # 模型计划只能决定检索意图，默认扫描时间必须服从用户当前 Scan Plan。
     plan.timeframe = resolve_effective_timeframe(plan.user_request or user_request, scan_window_days, plan.timeframe)
 
     timeframe_match = re.fullmatch(r"(\d{1,3})d", plan.timeframe)
@@ -570,7 +570,7 @@ async def run_ask_pipeline(
                 "scan_window_days": timeframe_days,
             })
 
-        # 中文注释：多邮箱并发时最多 broaden 1 次，避免 0 结果时 Gmail 调用成倍放大。
+        # 多邮箱并发时最多 broaden 1 次，避免 0 结果时 Gmail 调用成倍放大。
         messages = await execute_search(
             mbox,
             queries,
@@ -638,12 +638,12 @@ async def run_ask_pipeline(
     # ── 4. Context ──────────────────────────────────────────────────
     context_candidates = _select_candidates_for_context(all_candidates, plan)
     if progress_callback:
-        # 中文注释：只展示安全数量，明确告知用户模型仅打开必要的有限上下文。
+        # 只展示安全数量，明确告知用户模型仅打开必要的有限上下文。
         progress_callback("read_context", {"current": 0, "total": len(context_candidates)})
     enriched = await _read_candidate_context(
         context_candidates, primary_mailbox,
         mailbox_by_message_id=candidate_mailboxes,
-        # 中文注释：联系人记忆会对每个联系人再发起 LLM 选择；Ask Session 每轮只允许规划与回答两次调用。
+        # 联系人记忆会对每个联系人再发起 LLM 选择；Ask Session 每轮只允许规划与回答两次调用。
         sampling_create_message=None,
         progress_callback=progress_callback,
     )

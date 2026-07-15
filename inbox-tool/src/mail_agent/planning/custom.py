@@ -117,7 +117,7 @@ _FALLBACK_PLAN_JSON = {
 
 
 def _fallback_plan_for_request(user_request: str) -> dict[str, Any]:
-    # 中文注释：Anna planner 偶发空响应时，用规则计划兜底，保证 Ask 链路还能继续执行。
+    # Anna planner 偶发空响应时，用规则计划兜底，保证 Ask 链路还能继续执行。
     request = str(user_request or "").strip()
     lowered = request.lower()
     is_count = any(term in lowered for term in ("how many", "count", "number of", "多少", "几个"))

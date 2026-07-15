@@ -29,14 +29,14 @@ def _public_ai_turn_state(run_id: str) -> dict[str, Any]:
 def start_ai_turn(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
     """启动一次 AI turn：阻塞至 wait_timeout，超时后返回可轮询状态。
 
-    中文注释：与 start_custom_scan 相同，保持 invoke 存活以便 Sampling 反向 RPC。
+    与 start_custom_scan 相同，保持 invoke 存活以便 Sampling 反向 RPC。
     """
     run_id = str(arguments.get("run_id") or "").strip()
     if not run_id or len(run_id) < 8:
         run_id = f"at_{uuid.uuid4().hex[:12]}"
     existing = MAIL_AGENT_RUNS.get(run_id)
     if existing:
-        # 中文注释：同一 run_id 重试必须复用后台任务，避免重复 LLM / Gmail 调用。
+        # 同一 run_id 重试必须复用后台任务，避免重复 LLM / Gmail 调用。
         return _public_ai_turn_state(run_id)
 
     MAIL_AGENT_RUNS[run_id] = {
@@ -60,7 +60,7 @@ def start_ai_turn(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
     try:
         future.result(timeout=wait_timeout)
     except FutureTimeoutError:
-        # 中文注释：超时不取消后台；前端用 get_mail_agent_run 继续轮询。
+        # 超时不取消后台；前端用 get_mail_agent_run 继续轮询。
         state = MAIL_AGENT_RUNS[run_id]
         state["status"] = "running"
         state["needs_continue"] = True
@@ -114,7 +114,7 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
         if kind == "mail_context" and isinstance(outcome.get("mail_context"), dict):
             result_data["mail_context"] = outcome["mail_context"]
         if kind == "scan" and isinstance(outcome.get("scan_result"), dict):
-            # 中文注释：展开 Ask 结果字段，便于前端复用 buildCustomRunResult。
+            # 展开 Ask 结果字段，便于前端复用 buildCustomRunResult。
             scan = outcome["scan_result"]
             result_data.update({
                 "plan_id": scan.get("plan_id", ""),

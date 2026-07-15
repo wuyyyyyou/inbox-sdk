@@ -144,12 +144,12 @@ def start_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, An
         _start_custom_scan_async(run_id, arguments, invoke_id),
         loop,
     )
-    # 中文注释：默认 60s 初等等待后返回可轮询状态；与前端 wait_timeout / invoke 余量对齐。
+    # 默认 60s 初等等待后返回可轮询状态；与前端 wait_timeout / invoke 余量对齐。
     wait_timeout = int(arguments.get("wait_timeout_seconds", 60))
     try:
         future.result(timeout=wait_timeout)
     except FutureTimeoutError:
-        # 中文注释：Ask 扫描可能超过 Anna 单次工具调用预算；超时不取消后台任务，
+        # Ask 扫描可能超过 Anna 单次工具调用预算；超时不取消后台任务，
         # 先把当前 run 状态返回给前端，前端用 get_mail_agent_run 继续轮询。
         state = MAIL_AGENT_RUNS[run_id]
         state["status"] = "running"
@@ -334,12 +334,12 @@ def re_run_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, A
         _re_run_custom_scan_async(run_id, plan_id, arguments, invoke_id),
         loop,
     )
-    # 中文注释：复跑与首扫同一合同：默认 60s 初等，超时后可轮询。
+    # 复跑与首扫同一合同：默认 60s 初等，超时后可轮询。
     wait_timeout = int(arguments.get("wait_timeout_seconds", 60))
     try:
         future.result(timeout=wait_timeout)
     except FutureTimeoutError:
-        # 中文注释：复跑保存计划同样可能耗时较长；保留后台任务并交给前端轮询。
+        # 复跑保存计划同样可能耗时较长；保留后台任务并交给前端轮询。
         state = MAIL_AGENT_RUNS[run_id]
         state["status"] = "running"
         state["needs_continue"] = True

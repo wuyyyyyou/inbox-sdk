@@ -138,7 +138,7 @@ def _repair_json(text: str) -> str:
     # Missing comma: true\n  "next_key" | false\n  "next_key" | null\n  "next_key"
     text = re.sub(r'(true|false|null)\s*\n\s*"', r'\1,\n"', text)
     text = re.sub(r'\b(true|false|null)\s+(?="[^"\r\n]{1,80}"\s*:)', r'\1, ', text)
-    # 中文注释：Ask answer 的 mail_links 数组里对象之间常漏逗号且夹杂换行缩进。
+    # Ask answer 的 mail_links 数组里对象之间常漏逗号且夹杂换行缩进。
     text = re.sub(r'}\s*\n\s*{', '},\n{', text)
     return text
 
@@ -167,7 +167,7 @@ def _balance_json_brackets(text: str) -> str:
                 stack.pop()
     if in_string:
         text += '"'
-    # 中文注释：截断若落在值后，先去掉尾部悬挂逗号再补括号。
+    # 截断若落在值后，先去掉尾部悬挂逗号再补括号。
     text = re.sub(r",\s*$", "", text.rstrip())
     while stack:
         text += stack.pop()
@@ -184,7 +184,7 @@ def parse_json_response(text: str) -> dict[str, Any]:
     end = text.rfind("}")
     if start < 0:
         raise ValueError("LLM response did not contain a JSON object")
-    # 中文注释：优先截到最后一个 }；若模型截断未闭合，仍从首个 { 起做修复。
+    # 优先截到最后一个 }；若模型截断未闭合，仍从首个 { 起做修复。
     candidate = text[start : end + 1] if end > start else text[start:]
     attempts = [candidate, _repair_json(candidate), _balance_json_brackets(_repair_json(candidate))]
     last_error: json.JSONDecodeError | None = None
@@ -330,7 +330,7 @@ async def repair_json_with_sampling(
 
 
 def extract_sampling_text(result: Any) -> str:
-    # 中文注释：不同 host 版本可能返回 content.text、content 字符串、content 数组或 OpenAI 风格 message.content。
+    # 不同 host 版本可能返回 content.text、content 字符串、content 数组或 OpenAI 风格 message.content。
     if not isinstance(result, dict):
         return ""
     content = result.get("content")
@@ -369,7 +369,7 @@ def extract_sampling_text(result: Any) -> str:
 
 
 def _sampling_result_shape(result: Any) -> str:
-    # 中文注释：错误信息只带响应形态，不带正文，避免日志泄漏邮件内容。
+    # 错误信息只带响应形态，不带正文，避免日志泄漏邮件内容。
     if not isinstance(result, dict):
         return type(result).__name__
     content = result.get("content")

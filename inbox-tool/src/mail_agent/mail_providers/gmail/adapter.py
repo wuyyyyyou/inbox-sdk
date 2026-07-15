@@ -111,7 +111,7 @@ def set_platform_accounts(accounts: list[dict[str, Any]]) -> None:
     next_map: dict[str, dict[str, Any]] = {}
     for raw in accounts:
         email = str(raw.get("email") or "").strip().lower()
-        # 中文说明：不同 Anna runtime 对同一账户主键分别使用 account_id 或 id。
+        # 不同 Anna runtime 对同一账户主键分别使用 account_id 或 id。
         # 统一为 account_id，避免非默认账户因字段名差异被静默过滤掉。
         account_id = str(raw.get("account_id") or raw.get("id") or "").strip()
         if _looks_like_email(email) and account_id:

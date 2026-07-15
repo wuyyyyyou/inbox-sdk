@@ -89,7 +89,7 @@ def _discover_mailboxes() -> list[dict[str, Any]]:
         })
 
     # 2. Compatibility fallback for legacy single-account injection.
-    # 中文说明：已明确收到平台“未授予 Connected accounts”错误时，默认 token
+    # 已明确收到平台“未授予 Connected accounts”错误时，默认 token
     # 只能代表一个账户，不能再伪装成多账户发现成功；其它旧 runtime 仍保留兼容。
     credentials_status = get_platform_credentials_status()
     if not results and credentials_status.get("code") != "not_granted":
@@ -138,7 +138,7 @@ def _sync_list_mailboxes() -> dict[str, Any]:
         "mailboxes": mailboxes,
         "selected": [item["email"] for item in mailboxes if item.get("selected")],
         "discovered": discovered,
-        # 中文说明：仅透传可安全展示的授权分类和下一步动作，绝不含 token。
+        # 仅透传可安全展示的授权分类和下一步动作，绝不含 token。
         "credentials_status": get_platform_credentials_status(),
     }
 

@@ -9,7 +9,7 @@ function loadSavedAskHistory(): AppState["askHistory"] {
     const parsed = JSON.parse(window.localStorage.getItem(AI_ASK_HISTORY_STORAGE_KEY) || "[]");
     return Array.isArray(parsed) ? parsed.slice(0, 30) : [];
   } catch {
-    // 中文注释：历史记录只是 UI 恢复能力，损坏时直接丢弃，避免阻塞 App 启动。
+    // 历史记录只是 UI 恢复能力，损坏时直接丢弃，避免阻塞 App 启动。
     return [];
   }
 }

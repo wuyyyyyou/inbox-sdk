@@ -10,7 +10,7 @@ from mail_agent.llm_runtime.service import call_llm_json_safe
 
 _logger = logging.getLogger(__name__)
 
-# 中文注释：阶段 A 仅开放聊天 / 搜索 / 总结；其余意图在后续阶段扩展。
+# 阶段 A 仅开放聊天 / 搜索 / 总结；其余意图在后续阶段扩展。
 AI_TURN_ALLOWED_TOOLS = frozenset({
     "chat_general",
     "clarify",
@@ -60,7 +60,7 @@ def _fallback_route(user_text: str, ui_context: dict[str, Any], reason: str) -> 
         str(current.get("message_id") or current.get("thread_id") or "").strip()
     )
     lowered = (user_text or "").casefold()
-    # 中文注释：降级只做粗粒度分流，正式选型仍以 Sampling Router 为准。
+    # 降级只做粗粒度分流，正式选型仍以 Sampling Router 为准。
     scan_hint = any(
         token in lowered
         for token in (
@@ -72,7 +72,7 @@ def _fallback_route(user_text: str, ui_context: dict[str, Any], reason: str) -> 
         token in lowered
         for token in ("summar", "总结", "概括", "这封", "this email", "this thread", "action item", "待办")
     )
-    # 中文注释：打开线程时的「总结这封邮件」会命中「邮件」关键词，须优先于全箱搜索。
+    # 打开线程时的「总结这封邮件」会命中「邮件」关键词，须优先于全箱搜索。
     if has_thread and summary_hint:
         return {
             "language": language,

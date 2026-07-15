@@ -21,7 +21,7 @@ from .planner import AskPlan
 
 _logger = logging.getLogger(__name__)
 
-# 中文注释：Ask 搜索默认最多读取的邮件数量，避免旧 scan_plan dict 被当成 max_threads。
+# Ask 搜索默认最多读取的邮件数量，避免旧 scan_plan dict 被当成 max_threads。
 _DEFAULT_MAX_MESSAGES = 200
 _DEFAULT_MAX_PER_QUERY = 100
 
@@ -285,7 +285,7 @@ async def execute_search(
     """
     from ..mail_providers.gmail.adapter import get_messages_lite_async, live_search_and_cache
 
-    # 中文注释：前端 Scan Plan 的数量上限必须覆盖每个查询，防止多查询合并后超量读取。
+    # 前端 Scan Plan 的数量上限必须覆盖每个查询，防止多查询合并后超量读取。
     try:
         message_cap = max(1, min(int(max_messages), _DEFAULT_MAX_MESSAGES))
     except (TypeError, ValueError):
