@@ -7,22 +7,23 @@
 - 所有的后端代码编写都要有详细清晰的`中文`注释，如果读取到的后端代码没有`中文`注释，应该及时补充
 - 所有文档必须在 `anna-inbox/docs/` 中，且文档必须为中文文档
 - 对于`提交前的审核`/`准备提交`的需求，需要完成以下几件事
-  - 更新当前版本号：如果不指定则按小版本加1，存在不明确的内容先与我沟通
+  - 更新当前版本号：App 与 Tool **独立**维护（见下方「版本约束」）；未指定时各自按小版本 +1，存在不明确的内容先与我沟通
   - 更新项目文档：`README.md` `CONTEXT.md` `AGENTS.md` 以及 `anna-inbox/docs` 下的文档，存在不明确的内容先与我沟通。更新内容包括：
-    - 版本号
+    - 版本号（App / Tool 分别写清）
     - 当前版本内容
     - 某个功能完成进度
     - 项目基线
 - 根据当前工作树内容生成git commit的中文消息，不要包含测试补充、文档更新、版本同步的消息，最后我审核后手动提交，message格式如下：
     ```md
-    version: x.x.x
+    version: (tool的版本号)
     - 消息内容...
     - 消息内容...
     ```
 
 ## 项目基线
 
-Anna Inbox 当前版本为 `2.0.19`。前端位于 `anna-inbox/`，后端 Executa 位于 `inbox-tool/`。
+- **App（前端）**：`2.0.20` — 位于 `anna-inbox/`
+- **Tool（Executa）**：`2.1.1` — 位于 `inbox-tool/`
 
 - `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表。
 - `anna-inbox/src/features/mail-detail/`：线程详情、正文、草稿和附件预览。
@@ -74,21 +75,31 @@ anna-app dev
 
 Anna App 本地开发读取 `anna-inbox/app.json` 和 `anna-inbox/executas/inbox-tool/executa.json`。旧 `anna-inbox/dev-wsl.sh` 不是权威入口。
 
-Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改其 `tool_id` 或版本后，同步：
+### 版本约束
+
+App 与 Tool **版本号解耦，互不强制对齐**：
+
+| 端 | 当前版本 | 权威文件 | 须同步的文件 |
+| --- | --- | --- | --- |
+| App | `2.0.20` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
+| Tool | `2.1.1` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
+
+规则：
+
+- 只改前端 / App 发布：只 bump **App** 版本（`anna-inbox/app.json`），**不要**改 Tool 版本。
+- 只改后端 / Executa 发布：只 bump **Tool** 版本；平台若报「同版本已发布且内容不同」，必须再 bump Tool（不可覆盖已发布版本）。
+- Tool 线自 `2.1.1` 起独立演进；App 线继续在 `2.0.x`（或后续自行决定）演进。
+- `min_version` 跟随 **Tool** 版本，不跟随 App 版本。
+- 提交前审核时，若未说明只升哪一端，先与我确认，再改版本号。
+
+Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改其 `tool_id` 或 **Tool** 版本后，同步：
 
 ```sh
 python scripts/sync/sync_executa_identity.py
 python scripts/sync/sync_executa_identity.py --check
 ```
 
-保持以下版本一致：
-
-- `anna-inbox/app.json`
-- `inbox-tool/manifest.json`
-- `inbox-tool/src/pyproject.toml`
-- `anna-inbox/executas/inbox-tool/executa.json`
-- `anna-inbox/manifest.json#required_executas[].min_version`
-- `./AGENTS.md`
+脚本会把 Tool 的 `version` 写入 `executa.json` 与 `min_version`；**不会**改 `anna-inbox/app.json` 或 `pyproject.toml`，发布前须单独核对。
 
 ## 测试
 
