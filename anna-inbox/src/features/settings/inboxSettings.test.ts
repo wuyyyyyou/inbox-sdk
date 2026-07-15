@@ -36,6 +36,13 @@ describe("inbox settings", () => {
     ]);
   });
 
+  it("normalizes missing or non-array custom_categories to an empty list", () => {
+    expect(clampInboxSettings({} as never).custom_categories).toEqual([]);
+    expect(clampInboxSettings({ custom_categories: null } as never).custom_categories).toEqual([]);
+    expect(clampInboxSettings({ custom_categories: {} } as never).custom_categories).toEqual([]);
+    expect(() => splitInboxMessages([], { ...DEFAULT_INBOX_SETTINGS, custom_categories: undefined as never })).not.toThrow();
+  });
+
   it("places starred then todo messages before remaining important messages without duplicates", () => {
     const messages = [
       { id: "star", starred: true, important: true },

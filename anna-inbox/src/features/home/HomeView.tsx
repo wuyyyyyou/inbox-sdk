@@ -3379,7 +3379,8 @@ export function HomeView() {
   useEffect(() => {
     if (!filter.startsWith("category:")) return;
     const id = filter.slice("category:".length);
-    if (!state.inboxSettings.custom_categories.some((split) => split.id === id))
+    const categories = state.inboxSettings.custom_categories || [];
+    if (!categories.some((split) => split.id === id))
       setFilter("important");
   }, [filter, state.inboxSettings.custom_categories]);
 
@@ -4011,7 +4012,7 @@ export function HomeView() {
       return [{ label: "", messages: displayedVisible }];
     }
     const selectedCustomSplit = filter.startsWith("category:")
-      ? state.inboxSettings.custom_categories.find(
+      ? (state.inboxSettings.custom_categories || []).find(
           (split) => split.id === filter.slice("category:".length),
         )
       : undefined;
@@ -5187,7 +5188,7 @@ export function HomeView() {
               [
                 ["important", "Important", inboxSplitMessages.important.length],
                 ["other", "Other", inboxSplitMessages.other.length],
-                ...state.inboxSettings.custom_categories
+                ...(state.inboxSettings.custom_categories || [])
                   .filter(
                     (split) =>
                       !split.hide_when_empty ||

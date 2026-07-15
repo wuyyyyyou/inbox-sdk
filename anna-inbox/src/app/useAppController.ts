@@ -3,6 +3,7 @@ import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { buildDraftPreferencesInstruction, resolveDraftPreferences } from "../features/handle/draftPreferences";
 import { sortInboxMessagesDesc } from "../features/home/inboxMessageOrder";
+import { clampInboxSettings } from "../features/settings/inboxSettings";
 import { connectRuntime } from "../runtime/runtimeLoader";
 import { triggerBrowserDownload } from "../shared/browserDownload";
 import {
@@ -1140,7 +1141,9 @@ export function useAppController() {
     setState((s) => ({ ...s, inboxSettingsLoading: true, inboxSettingsError: "" }));
     try {
       const payload = await client.loadInboxSettings(mailbox, state.storageProvider);
-      setState((s) => normalizedMailbox(s.mailbox) === mailbox ? { ...s, inboxSettings: payload.settings, inboxSettingsEtag: payload.etag || "", inboxSettingsLoading: false } : s);
+      // 平台/旧存储可能缺 custom_categories 或类型异常；统一 clamp 避免首页迭代白屏。
+      const settings = clampInboxSettings(payload.settings);
+      setState((s) => normalizedMailbox(s.mailbox) === mailbox ? { ...s, inboxSettings: settings, inboxSettingsEtag: payload.etag || "", inboxSettingsLoading: false } : s);
     } catch (error) {
       setState((s) => ({ ...s, inboxSettingsLoading: false, inboxSettingsError: error instanceof Error ? error.message : String(error) }));
     }
@@ -1149,10 +1152,10 @@ export function useAppController() {
   const saveInboxSettings = useCallback(async (patch: Partial<InboxSettings>) => {
     const previous = state.inboxSettings;
     const previousEtag = state.inboxSettingsEtag;
-    setState((s) => ({ ...s, inboxSettings: { ...s.inboxSettings, ...patch }, inboxSettingsLoading: true, inboxSettingsError: "" }));
+    setState((s) => ({ ...s, inboxSettings: clampInboxSettings({ ...s.inboxSettings, ...patch }), inboxSettingsLoading: true, inboxSettingsError: "" }));
     try {
       const payload = await client.saveInboxSettings(state.mailbox, patch, previousEtag, state.storageProvider);
-      setState((s) => ({ ...s, inboxSettings: payload.settings, inboxSettingsEtag: payload.etag || "", inboxSettingsLoading: false }));
+      setState((s) => ({ ...s, inboxSettings: clampInboxSettings(payload.settings), inboxSettingsEtag: payload.etag || "", inboxSettingsLoading: false }));
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1177,9 +1180,11 @@ export function useAppController() {
     }
 
     try {
-      const settings = normalized && normalized === normalizedMailbox(state.mailbox)
-        ? state.inboxSettings
-        : (await client.loadInboxSettings(mailbox, state.storageProvider)).settings;
+      const settings = clampInboxSettings(
+        normalized && normalized === normalizedMailbox(state.mailbox)
+          ? state.inboxSettings
+          : (await client.loadInboxSettings(mailbox, state.storageProvider)).settings,
+      );
       // Display range 是用户在 Settings 中可见的时间选择，AI 扫描必须使用同一范围。
       return {
         ...plan,

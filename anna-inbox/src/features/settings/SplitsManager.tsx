@@ -39,6 +39,7 @@ export function SplitsManager({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const queryInputRef = useRef<HTMLInputElement>(null);
+  const categories = Array.isArray(settings.custom_categories) ? settings.custom_categories : [];
   const parsed = useMemo(() => parseInboxQuery(draft.query), [draft.query]);
   const querySuggestions = useMemo(() => getInboxQuerySuggestions(draft.query), [draft.query]);
 
@@ -75,7 +76,7 @@ export function SplitsManager({
     }
     setSaving(true);
     setSaveError("");
-    const saved = await onChange({ custom_categories: replaceInboxSplit(settings.custom_categories, {
+    const saved = await onChange({ custom_categories: replaceInboxSplit(categories, {
       ...draft,
       id: draft.id,
       name: draft.name.trim(),
@@ -97,8 +98,8 @@ export function SplitsManager({
     setSaving(true);
     setSaveError("");
     const saved = await onChange({ custom_categories: editing
-      ? replaceInboxSplit(settings.custom_categories, next)
-      : [...settings.custom_categories, next] });
+      ? replaceInboxSplit(categories, next)
+      : [...categories, next] });
     setSaving(false);
     if (saved) {
       setScreen("list");
@@ -112,8 +113,8 @@ export function SplitsManager({
       {screen === "list" ? <>
         <p>Divide your inbox into tabs for different types of emails.</p>
         <h3>Custom splits</h3>
-        <ul className="splits-list">{settings.custom_categories.map((split) => <li key={split.id}><div><strong>{split.name}</strong><span>{split.query}</span></div><button type="button" onClick={() => startEdit(split)}>Edit</button><button style={{ color: "#e05c67" }} type="button" onClick={() => setDeletingId(split.id)}>Delete</button></li>)}</ul>
-        {!settings.custom_categories.length ? <p className="splits-empty">No custom splits yet.</p> : null}
+        <ul className="splits-list">{categories.map((split) => <li key={split.id}><div><strong>{split.name}</strong><span>{split.query}</span></div><button type="button" onClick={() => startEdit(split)}>Edit</button><button style={{ color: "#e05c67" }} type="button" onClick={() => setDeletingId(split.id)}>Delete</button></li>)}</ul>
+        {!categories.length ? <p className="splits-empty">No custom splits yet.</p> : null}
         <button className="splits-add" type="button" onClick={startCreate}>＋ Add split</button>
       </> : screen === "query" ? <>
         <p>Splits are defined by local search queries.</p>
@@ -136,7 +137,7 @@ export function SplitsManager({
         {saveError ? <p className="splits-error" role="alert">{saveError}</p> : null}
         <div className="splits-actions"><button type="button" disabled={saving} onClick={() => setScreen("list")}>Cancel</button><button type="button" disabled={saving || !canSave} onClick={save}>{saving ? "Saving…" : editing ? "Save" : "Create"}</button></div>
       </>}
-      {deletingId ? <div className="splits-confirm"><p>Delete this Split? Its saved query will be removed.</p><button type="button" onClick={() => setDeletingId("")}>Cancel</button><button type="button" onClick={() => { onChange({ custom_categories: settings.custom_categories.filter((split) => split.id !== deletingId) }); setDeletingId(""); }}>Delete</button></div> : null}
+      {deletingId ? <div className="splits-confirm"><p>Delete this Split? Its saved query will be removed.</p><button type="button" onClick={() => setDeletingId("")}>Cancel</button><button type="button" onClick={() => { onChange({ custom_categories: categories.filter((split) => split.id !== deletingId) }); setDeletingId(""); }}>Delete</button></div> : null}
     </section>
   </div>;
 }

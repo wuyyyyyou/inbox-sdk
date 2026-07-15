@@ -117,7 +117,8 @@ export function splitInboxMessages(
 ): InboxSplitMessages {
   const custom: Record<string, InboxMessage[]> = {};
   const customMessageIds = new Set<string>();
-  for (const split of settings.custom_categories) {
+  const categories = Array.isArray(settings.custom_categories) ? settings.custom_categories : [];
+  for (const split of categories) {
     const parsed = parseInboxQuery(split.query);
     const matched = parsed.expression && !parsed.error
       ? messages.filter((message) => matchInboxQuery(message, parsed))
