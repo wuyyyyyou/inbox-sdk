@@ -962,7 +962,11 @@ def get_cached_email(mailbox_arg: str, message_id: str) -> dict[str, Any]:
 
 
 
-def _check_gmail_api_status(mailbox: str = "") -> dict[str, Any]:
+def _check_gmail_api_status(
+    mailbox: str = "",
+    *,
+    timeout_seconds: float = CONNECTIVITY_CHECK_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     """探测 Gmail API 连通性与 RTT：对当前邮箱发起一次 users/me/profile。
 
     与 check_gmail_auth（仅查 token/账号元数据）不同，本工具会真实打 Gmail HTTP，
@@ -975,38 +979,56 @@ def _check_gmail_api_status(mailbox: str = "") -> dict[str, Any]:
     import urllib.error as _urlerr
     import urllib.parse as _urlparse
     import urllib.request as _urlreq
-    from mail_agent.mail_providers.gmail.adapter import get_access_token as adapter_get_access_token
+    from mail_agent.mail_providers.gmail.adapter import (
+        get_access_token as adapter_get_access_token,
+        get_platform_account,
+    )
 
-    started = _time.time()
+    started = _time.monotonic()
+    deadline = started + max(0.1, float(timeout_seconds))
+
+    def remaining_timeout(limit: float) -> float:
+        """返回当前阶段可用时间，确保账号、凭据和 Gmail HTTP 共用总预算。"""
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Gmail API connectivity check timed out")
+        return min(limit, remaining)
+
     requested = str(mailbox or "").strip().lower()
-    # mailbox 为空时回落到任意已授权账号，保证启动探测也能跑
+    # mailbox 为空时只复用已有账号快照，不能在延迟探测中再发一轮无限制的账号发现。
     target = requested
     if not target:
-        auth = _check_gmail_auth("")
-        target = str(auth.get("authorized_email") or "").strip().lower()
+        from mail_agent.mail_providers.gmail.adapter import get_platform_accounts
+        accounts = get_platform_accounts()
+        target = str((accounts[0] if accounts else {}).get("email") or "").strip().lower()
     if not target:
         return {
             "ok": False,
             "status": "unavailable",
             "message": "No Gmail mailbox available for API check.",
-            "elapsed_ms": int((_time.time() - started) * 1000),
+            "elapsed_ms": int((_time.monotonic() - started) * 1000),
             "mailbox": "",
         }
     try:
-        # 刷新平台 Connected accounts 元数据后再取 token，避免仅本地 token 路径
-        try:
-            refresh_platform_google_accounts()
-        except Exception:
-            pass
+        # 已有账号快照可直接取 token；仅缺失时才在 3 秒预算内刷新，避免状态轮询额外占用反向 RPC。
+        if not get_platform_account(target):
+            refresh_platform_google_accounts(
+                timeout_seconds=remaining_timeout(CONNECTIVITY_GMAIL_ACCOUNT_TIMEOUT_SECONDS),
+            )
         # 侧栏探测使用短超时；token 优先平台 credentials，再 fallback 本地
-        token = adapter_get_access_token(target)
+        token = adapter_get_access_token(
+            target,
+            platform_token_timeout_seconds=remaining_timeout(float("inf")),
+            token_refresh_timeout_seconds=remaining_timeout(float("inf")),
+            refresh_platform_accounts=False,
+        )
         url = GMAIL_API_BASE + "/users/me/profile?" + _urlparse.urlencode({"fields": "emailAddress"})
         request = _urlreq.Request(
             url,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
             method="GET",
         )
-        with _urlreq.urlopen(request, timeout=8.0) as response:
+        with _urlreq.urlopen(request, timeout=remaining_timeout(8.0)) as response:
             raw = response.read().decode("utf-8")
         profile = json.loads(raw) if raw else {}
         email = str((profile or {}).get("emailAddress") or "").strip().lower()
@@ -1014,7 +1036,7 @@ def _check_gmail_api_status(mailbox: str = "") -> dict[str, Any]:
             "ok": True,
             "status": "connected",
             "message": "Gmail API is connected.",
-            "elapsed_ms": int((_time.time() - started) * 1000),
+            "elapsed_ms": int((_time.monotonic() - started) * 1000),
             "mailbox": email or target,
         }
     except Exception as exc:
@@ -1030,7 +1052,7 @@ def _check_gmail_api_status(mailbox: str = "") -> dict[str, Any]:
             "ok": False,
             "status": status,
             "message": message[:240],
-            "elapsed_ms": int((_time.time() - started) * 1000),
+            "elapsed_ms": int((_time.monotonic() - started) * 1000),
             "mailbox": target,
         }
 

@@ -1230,8 +1230,16 @@ export function useAppController() {
   gmailApiStatusRef.current = state.gmailApiStatus;
   const mailboxForGmailCheckRef = useRef(state.mailbox);
   mailboxForGmailCheckRef.current = state.mailbox;
+  // 进行中探测去重：轮询/连点不叠发，避免与扫描争抢
+  const llmCheckInFlightRef = useRef(false);
+  const gmailCheckInFlightRef = useRef(false);
 
   const refreshSamplingStatus = useCallback(async (options?: { fromPoll?: boolean }): Promise<AppState["llmStatus"]> => {
+    if (llmCheckInFlightRef.current) {
+      // 已有探测在飞：轮询直接跳过；手动点击返回当前状态
+      return llmStatusRef.current;
+    }
+    llmCheckInFlightRef.current = true;
     const previous = llmStatusRef.current;
     // 轮询静默探测，避免侧栏每分钟闪 Checking…；手动/启动探测才显示 checking
     if (!options?.fromPoll) {
@@ -1255,6 +1263,8 @@ export function useAppController() {
         checked: true,
         message: error instanceof Error ? error.message : String(error),
       };
+    } finally {
+      llmCheckInFlightRef.current = false;
     }
     setState((s) => ({ ...s, llmStatus: next }));
     llmStatusRef.current = next;
@@ -1276,6 +1286,10 @@ export function useAppController() {
   refreshSamplingStatusRef.current = refreshSamplingStatus;
 
   const refreshGmailApiStatus = useCallback(async (options?: { fromPoll?: boolean }): Promise<AppState["gmailApiStatus"]> => {
+    if (gmailCheckInFlightRef.current) {
+      return gmailApiStatusRef.current;
+    }
+    gmailCheckInFlightRef.current = true;
     const previous = gmailApiStatusRef.current;
     if (!options?.fromPoll) {
       setState((s) => ({ ...s, gmailApiStatus: { ...s.gmailApiStatus, status: "checking", message: "Checking Gmail API..." } }));
@@ -1299,6 +1313,8 @@ export function useAppController() {
         checked: true,
         message: error instanceof Error ? error.message : String(error),
       };
+    } finally {
+      gmailCheckInFlightRef.current = false;
     }
     setState((s) => ({ ...s, gmailApiStatus: next }));
     gmailApiStatusRef.current = next;
@@ -1327,15 +1343,19 @@ export function useAppController() {
   }, []);
   refreshConnectivityStatusRef.current = refreshConnectivityStatus;
 
+  // 扫描 / AI turn 进行中不跑定时探测，避免与业务 invoke 争抢后端 worker
+  const connectivityBusy =
+    state.isScanning || state.isPreparingScan || state.isCustomScanning || state.aiChatLoading;
+
   // Settings 配置的连通性轮询；0 表示关闭；LLM 与 Gmail 并行
   useEffect(() => {
     const pollSeconds = Number(state.inboxSettings.llm_status_poll_seconds);
-    if (!state.runtime.connected || !Number.isFinite(pollSeconds) || pollSeconds <= 0) return;
+    if (!state.runtime.connected || connectivityBusy || !Number.isFinite(pollSeconds) || pollSeconds <= 0) return;
     const timer = window.setInterval(() => {
       void refreshConnectivityStatusRef.current({ fromPoll: true });
     }, pollSeconds * 1000);
     return () => window.clearInterval(timer);
-  }, [state.inboxSettings.llm_status_poll_seconds, state.runtime.connected]);
+  }, [connectivityBusy, state.inboxSettings.llm_status_poll_seconds, state.runtime.connected]);
 
   const ensureSamplingAvailable = useCallback(async (): Promise<boolean> => {
     if (state.llmProvider !== "anna-llm") return true;
@@ -1661,9 +1681,8 @@ export function useAppController() {
         const authWarning = (authResult as Record<string, unknown> | null | undefined)?.warning as string | undefined;
         setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: systemAuthorized, source: authResult?.source || "none" } }));
         if (authWarning) showToast(`Auth notice: ${authWarning}`);
-        // mailbox 就绪后并行探测 LLM 与 Gmail API（Gmail 使用当前邮箱）
+        // mailbox 就绪后，Gmail 探测使用当前邮箱。
         mailboxForGmailCheckRef.current = currentMailbox || mailboxForGmailCheckRef.current;
-        void refreshConnectivityStatus();
         if (!systemAuthorized) {
           setState((s) => ({
             ...s,
@@ -1680,6 +1699,8 @@ export function useAppController() {
           loadInboxSettings(currentMailbox),
           loadActiveCards(undefined, "all"),
         ]);
+        // 初始化请求释放后再运行端到端延迟探测，避免启动阶段挤占 Executa worker 与 Host 反向 RPC。
+        void refreshConnectivityStatus();
         console.info(`[inbox-startup] initialize elapsed_ms=${Math.round(performance.now() - startedAt)} mailbox=${currentMailbox || ""}`);
       }
     } catch (error) {

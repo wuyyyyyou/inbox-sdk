@@ -63,6 +63,9 @@ GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 MAX_STDIO_MESSAGE_BYTES = 512 * 1024
 MAX_INBOX_THREAD_RESPONSE_BYTES = 256 * 1024
+# 前端与 manifest 为连通性检测保留 15 秒；后端在 12 秒内结束，给 stdio 排队和响应写回预留余量。
+CONNECTIVITY_CHECK_TIMEOUT_SECONDS = 12.0
+CONNECTIVITY_GMAIL_ACCOUNT_TIMEOUT_SECONDS = 3.0
 
 DEFAULT_MANIFEST = {
     "name": DEFAULT_TOOL_ID,
@@ -1123,8 +1126,11 @@ loop_thread.start()
 from mail_agent.storage.sync_bridge import bind as bind_storage_sync_bridge
 bind_storage_sync_bridge(loop, loop_thread)
 
+# LLM / Gmail 连通性探测专用线程池：与 Brief/Ask 等长任务隔离，避免占满 RPC worker
+CONNECTIVITY_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="connectivity-check")
 
-def refresh_platform_google_accounts() -> list[dict[str, Any]]:
+
+def refresh_platform_google_accounts(timeout_seconds: float = 12.0) -> list[dict[str, Any]]:
     """Refresh in-memory Google account metadata through Anna Credentials.
 
     Account metadata is safe to retain for the active process; access tokens
@@ -1141,10 +1147,11 @@ def refresh_platform_google_accounts() -> list[dict[str, Any]]:
         )
         return []
     try:
+        timeout = max(0.1, float(timeout_seconds))
         future = asyncio.run_coroutine_threadsafe(
-            platform_credentials.list_accounts(provider="google"), loop,
+            platform_credentials.list_accounts(provider="google", timeout=timeout), loop,
         )
-        payload = future.result(timeout=12.0)
+        payload = future.result(timeout=timeout)
     except CredentialsError as exc:
         from mail_agent.mail_providers.gmail.adapter import set_platform_accounts
         # 用户未向本 App 授予 Connected accounts 时，不能继续使用
@@ -1191,13 +1198,14 @@ def refresh_platform_google_accounts() -> list[dict[str, Any]]:
     return normalized
 
 
-def resolve_platform_google_token(account_id: str) -> str:
+def resolve_platform_google_token(account_id: str, timeout_seconds: float = 35.0) -> str:
     """Get one short-lived token without logging, returning, or persisting it."""
     try:
+        timeout = max(0.1, float(timeout_seconds))
         future = asyncio.run_coroutine_threadsafe(
-            platform_credentials.get_token(provider="google", account_id=account_id), loop,
+            platform_credentials.get_token(provider="google", account_id=account_id, timeout=timeout), loop,
         )
-        payload = future.result(timeout=35.0)
+        payload = future.result(timeout=timeout)
     except CredentialsError as exc:
         raise ValueError(f"Google authorization is unavailable for this mailbox ({exc.code})") from exc
     except Exception as exc:

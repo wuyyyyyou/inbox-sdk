@@ -61,7 +61,7 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
         )
 
 
-def handle_line(line: str) -> None:
+def _decode_line(line: str) -> dict[str, Any] | None:
     # Windows 管道偶尔会在首行带 BOM，这里只清理协议行开头的 BOM。
     line = line.lstrip("\ufeff")
     # Diagnostic: check if stdin encoding is working for CJK text
@@ -77,20 +77,35 @@ def handle_line(line: str) -> None:
         message = json.loads(line)
     except json.JSONDecodeError:
         write_frame(make_response(None, error=make_error(-32700, "Parse error")))
-        return
+        return None
 
     if not isinstance(message, dict):
         write_frame(make_response(None, error=make_error(-32600, "Invalid request")))
-        return
+        return None
+    return message
 
-    if "method" not in message:
-        if not common.sampling.dispatch_response(message) and not common.dispatch_storage_response(message) and not common.dispatch_host_upload_response(message) and not common.dispatch_platform_credentials_response(message):
-            log(f"unmatched response id={message.get('id')!r}")
-        return
 
+def _dispatch_reverse_response(message: dict[str, Any]) -> None:
+    """立即分发 Host 反向 RPC 响应，不能排队到可能已被 invoke 占满的业务 worker。"""
+    if not common.sampling.dispatch_response(message) and not common.dispatch_storage_response(message) and not common.dispatch_host_upload_response(message) and not common.dispatch_platform_credentials_response(message):
+        log(f"unmatched response id={message.get('id')!r}")
+
+
+def _handle_request_frame(message: dict[str, Any]) -> None:
     response = handle_request(message)
     if response is not None and message.get("id") is not None:
         write_frame(response)
+
+
+def handle_line(line: str) -> None:
+    """同步处理单条协议帧，保留给本地调用与回归测试。"""
+    message = _decode_line(line)
+    if message is None:
+        return
+    if "method" not in message:
+        _dispatch_reverse_response(message)
+        return
+    _handle_request_frame(message)
 
 
 def main() -> None:
@@ -102,12 +117,19 @@ def main() -> None:
         _df.write(f"{beijing_now()} startup stdin={sys.stdin.encoding} stdout={sys.stdout.encoding}\n")
 
     log("ready")
-    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="mail-agent-rpc") as pool:
+    # 业务 invoke 并发执行；反向 RPC 响应在 stdin 线程直通，避免等待响应的 worker 相互饿死。
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="mail-agent-rpc") as pool:
         try:
             for raw_line in sys.stdin:
                 line = raw_line.strip()
                 if line:
-                    pool.submit(handle_line, line)
+                    message = _decode_line(line)
+                    if message is None:
+                        continue
+                    if "method" not in message:
+                        _dispatch_reverse_response(message)
+                    else:
+                        pool.submit(_handle_request_frame, message)
         except Exception as exc:
             with open(_diag_path, "a", encoding="utf-8") as _df:
                 import traceback

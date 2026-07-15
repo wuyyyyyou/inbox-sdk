@@ -185,7 +185,7 @@ class TestMultiTokenIntegration:
         ])
         requested_ids: list[str] = []
 
-        def resolve_token(account_id: str) -> str:
+        def resolve_token(account_id: str, _timeout_seconds: float) -> str:
             requested_ids.append(account_id)
             return f"short-lived-{account_id}"
 

@@ -75,7 +75,7 @@ _multi_token_refresh_locks: dict[str, threading.Lock] = {}
 _platform_account_map: dict[str, dict[str, Any]] = {}
 _platform_account_lock = threading.RLock()
 _platform_account_lister: Callable[[], list[dict[str, Any]]] | None = None
-_platform_token_resolver: Callable[[str], str] | None = None
+_platform_token_resolver: Callable[[str, float], str] | None = None
 _display_name_cache: dict[str, str] = {}
 _avatar_url_cache: dict[str, str] = {}
 _contact_avatar_cache: dict[str, dict[str, str]] = {}
@@ -93,7 +93,7 @@ def _looks_like_email(value: str) -> bool:
 
 def configure_platform_accounts(
     account_lister: Callable[[], list[dict[str, Any]]] | None,
-    token_resolver: Callable[[str], str] | None,
+    token_resolver: Callable[[str, float], str] | None,
 ) -> None:
     """Configure the Anna Credentials reverse-RPC bridge.
 
@@ -793,7 +793,8 @@ def _should_refresh_token(record: dict[str, Any]) -> bool:
         return False
 
 
-def _refresh_access_token(record: dict[str, Any]) -> None:
+def _refresh_access_token(record: dict[str, Any], *, timeout_seconds: float | None = None) -> None:
+    """刷新本地 OAuth token；传入预算时，全部重试共用同一个截止时间。"""
     client_id = record.get("client_id")
     client_secret = record.get("client_secret")
     refresh_token = record.get("refresh_token")
@@ -810,15 +811,24 @@ def _refresh_access_token(record: dict[str, Any]) -> None:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds)) if timeout_seconds is not None else None
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            request_timeout = 30.0
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Gmail token refresh timed out")
+                request_timeout = min(request_timeout, remaining)
+            with urllib.request.urlopen(request, timeout=request_timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             break
         except (urllib.error.URLError, ssl.SSLError, TimeoutError) as exc:
             last_error = exc
             if attempt >= 2:
+                raise
+            if deadline is not None and deadline - time.monotonic() <= 0:
                 raise
             logging.getLogger("mail_agent.gmail").warning(
                 "token refresh retry %s/3 for %s after %s",
@@ -841,10 +851,17 @@ def _refresh_access_token(record: dict[str, Any]) -> None:
         Path(str(token_file)).write_text(json.dumps(clean_record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return
 
-def get_access_token(mailbox: str) -> str:
+def get_access_token(
+    mailbox: str,
+    *,
+    platform_token_timeout_seconds: float = 35.0,
+    token_refresh_timeout_seconds: float | None = None,
+    refresh_platform_accounts: bool = True,
+) -> str:
     normalized = str(mailbox or "").strip().lower()
 
-    if not get_platform_account(normalized):
+    # 延迟探测已在调用方使用受限预算刷新过账号，禁止 adapter 再开启一轮默认 12 秒的发现。
+    if refresh_platform_accounts and not get_platform_account(normalized):
         _ensure_platform_accounts()
     platform_account = get_platform_account(normalized)
     if platform_account:
@@ -852,7 +869,8 @@ def get_access_token(mailbox: str) -> str:
             resolver = _platform_token_resolver
         if resolver is None:
             raise ValueError("Platform account is available but credentials/getToken is unavailable")
-        token = resolver(str(platform_account["account_id"]))
+        # 连通性探测传入剩余预算；正常 Gmail 业务沿用 35 秒的默认凭据预算。
+        token = resolver(str(platform_account["account_id"]), platform_token_timeout_seconds)
         if token:
             return token
         raise ValueError(f"Platform returned no Gmail access token for {mailbox}")
@@ -870,7 +888,7 @@ def get_access_token(mailbox: str) -> str:
                 record = dict(current)
             if _should_refresh_token(record):
                 try:
-                    _refresh_access_token(record)
+                    _refresh_access_token(record, timeout_seconds=token_refresh_timeout_seconds)
                 except (urllib.error.HTTPError, urllib.error.URLError, ssl.SSLError, TimeoutError) as exc:
                     # Anna may inject a fresh access token together with stale refresh
                     # metadata. Try the access token once instead of failing before the
@@ -919,7 +937,7 @@ def get_access_token(mailbox: str) -> str:
     record = _load_token_record(mailbox)
     if _should_refresh_token(record):
         try:
-            _refresh_access_token(record)
+            _refresh_access_token(record, timeout_seconds=token_refresh_timeout_seconds)
         except (urllib.error.HTTPError, urllib.error.URLError, ssl.SSLError, TimeoutError) as exc:
             if not record.get("access_token"):
                 if isinstance(exc, urllib.error.HTTPError):

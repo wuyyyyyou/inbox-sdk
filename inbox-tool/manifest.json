@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.1.3",
+  "version": "2.1.4",
   "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Brief workflows, Ask, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
@@ -146,6 +146,19 @@
       "name": "check_sampling_status",
       "description": "Lightweight Anna LLM sampling connectivity check.",
       "parameters": [],
+      "timeout": 15
+    },
+    {
+      "name": "check_gmail_api_status",
+      "description": "Lightweight Gmail API connectivity and latency check for an authorized mailbox.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Authorized Gmail mailbox to check. Uses the current authorized mailbox when omitted.",
+          "required": false
+        }
+      ],
       "timeout": 15
     },
     {

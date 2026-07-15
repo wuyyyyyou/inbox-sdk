@@ -58,6 +58,28 @@ def _resolve_continue_future(future: Any, *, run_id: str, timeout: float, label:
         }
 
 
+def _resolve_connectivity_future(future: Any, *, tool: str, started: float) -> dict[str, Any]:
+    """在后端总预算内等待检测，超时后取消排队任务并返回可展示的状态。"""
+    try:
+        return future.result(timeout=CONNECTIVITY_CHECK_TIMEOUT_SECONDS)
+    except FutureTimeoutError:
+        future.cancel()
+        label = "Anna LLM" if tool == "check_sampling_status" else "Gmail API"
+        return {
+            "ok": False,
+            "status": "error",
+            "message": f"{label} connectivity check timed out.",
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "error",
+            "message": str(exc)[:240] or "Connectivity check failed.",
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+
+
 def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     tool = params.get("tool")
     arguments = params.get("arguments") or {}
@@ -114,11 +136,37 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     if tool == "check_gmail_auth":
         return {"success": True, "tool": tool, "data": _check_gmail_auth(arguments.get("mailbox", ""))}
     if tool == "check_gmail_api_status":
-        # 同步 HTTP 探测；限制超时避免阻塞 dispatcher 过久
-        return {"success": True, "tool": tool, "data": _check_gmail_api_status(str(arguments.get("mailbox") or ""))}
+        # 专用池限制并发探测数；stdin 主线程会直接分发反向 RPC 响应，不能再被本等待阻塞。
+        mailbox = str(arguments.get("mailbox") or "")
+        started = time.monotonic()
+        future = CONNECTIVITY_POOL.submit(
+            _check_gmail_api_status,
+            mailbox,
+            timeout_seconds=CONNECTIVITY_CHECK_TIMEOUT_SECONDS,
+        )
+        return {"success": True, "tool": tool, "data": _resolve_connectivity_future(future, tool=tool, started=started)}
     if tool == "check_sampling_status":
-        future = asyncio.run_coroutine_threadsafe(_check_sampling_status(arguments, invoke_id), loop)
-        return {"success": True, "tool": tool, "data": future.result(timeout=12.0)}
+        # 在专用池等待 sampling，业务 worker 仅等待最多 12 秒的结构化探测结果。
+        def _run_sampling_status_check() -> dict[str, Any]:
+            coro_future = asyncio.run_coroutine_threadsafe(
+                _check_sampling_status(arguments, invoke_id),
+                loop,
+            )
+            try:
+                return coro_future.result(timeout=CONNECTIVITY_CHECK_TIMEOUT_SECONDS - 0.5)
+            except FutureTimeoutError:
+                # 取消尚未完成的 sampling 请求，避免外层已返回而 Host 侧仍保留无主检测。
+                coro_future.cancel()
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "message": "Anna LLM connectivity check timed out.",
+                    "elapsed_ms": int((CONNECTIVITY_CHECK_TIMEOUT_SECONDS - 0.5) * 1000),
+                }
+
+        started = time.monotonic()
+        future = CONNECTIVITY_POOL.submit(_run_sampling_status_check)
+        return {"success": True, "tool": tool, "data": _resolve_connectivity_future(future, tool=tool, started=started)}
     if tool == "get_sampling_debug":
         info = sampling.get_debug_info()
         info["executa_manifest_host_capabilities"] = MANIFEST.get("host_capabilities", [])

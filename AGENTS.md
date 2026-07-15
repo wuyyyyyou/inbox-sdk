@@ -22,8 +22,8 @@
 
 ## 项目基线
 
-- **App（前端）**：`2.0.22` — 位于 `anna-inbox/`
-- **Tool（Executa）**：`2.1.3` — 位于 `inbox-tool/`
+- **App（前端）**：`2.0.23` — 位于 `anna-inbox/`
+- **Tool（Executa）**：`2.1.4` — 位于 `inbox-tool/`
 
 - `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表。
 - `anna-inbox/src/features/mail-detail/`：线程详情、正文、草稿和附件预览。
@@ -36,6 +36,7 @@
 - `inbox-tool/src/mail_agent/storage/`：APS/local storage 的统一 async 层。
 - `inbox-tool/src/mail_agent/ask/`：Ask 规划、搜索和回答。
 - `inbox-tool/src/mail_agent/core/`、`cards/`、`judgment_engine/`：Brief 管线。
+- 连通性检测：反向 RPC 响应必须由 stdin 线程直接路由；LLM / Gmail 检测共用 12 秒后端总预算，避免与业务 worker 或正常邮箱操作互相阻塞。
 
 `anna-inbox/bundle/` 是构建产物，不手写、不提交。
 
@@ -81,14 +82,14 @@ App 与 Tool **版本号解耦，互不强制对齐**：
 
 | 端 | 当前版本 | 权威文件 | 须同步的文件 |
 | --- | --- | --- | --- |
-| App | `2.0.22` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
-| Tool | `2.1.3` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
+| App | `2.0.23` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
+| Tool | `2.1.4` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
 
 规则：
 
 - 只改前端 / App 发布：只 bump **App** 版本（`anna-inbox/app.json`），**不要**改 Tool 版本。
 - 只改后端 / Executa 发布：只 bump **Tool** 版本；平台若报「同版本已发布且内容不同」，必须再 bump Tool（不可覆盖已发布版本）。
-- Tool 线自 `2.1.1` 起独立演进；App 线继续在 `2.0.x`（或后续自行决定）演进。当前基线：App `2.0.22` / Tool `2.1.3`。
+- Tool 线自 `2.1.1` 起独立演进；App 线继续在 `2.0.x`（或后续自行决定）演进。当前基线：App `2.0.23` / Tool `2.1.4`。
 - `min_version` 跟随 **Tool** 版本，不跟随 App 版本。
 - 提交前审核时，若未说明只升哪一端，先与我确认，再改版本号。
 
