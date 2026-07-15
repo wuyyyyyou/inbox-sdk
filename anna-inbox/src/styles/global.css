@@ -817,6 +817,10 @@ body.is-resizing-ai-sidebar {
   color: #dc2626;
   font-variant-numeric: tabular-nums;
 }
+.ai-sidebar-foot .conn-checking {
+  color: #7e859a;
+  font-style: italic;
+}
 .ai-sidebar-foot > div {
   display: flex;
   gap: 3px;

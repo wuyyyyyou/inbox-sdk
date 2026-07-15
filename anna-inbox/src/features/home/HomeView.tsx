@@ -2505,7 +2505,7 @@ function AiSidebar({
           >
             <i className={state.llmStatus.status === "connected" ? "is-live" : ""} />
             {state.llmStatus.status === "checking" || (state.llmStatus.status === "unknown" && !state.llmStatus.checked) ? (
-              <span>LLM…</span>
+              <span>LLM · <span className="conn-checking">checking</span></span>
             ) : state.llmStatus.status === "connected" ? (
               <span>
                 LLM
@@ -2540,7 +2540,7 @@ function AiSidebar({
           >
             <i className={state.gmailApiStatus.status === "connected" ? "is-live" : ""} />
             {state.gmailApiStatus.status === "checking" || (state.gmailApiStatus.status === "unknown" && !state.gmailApiStatus.checked) ? (
-              <span>Gmail…</span>
+              <span>Gmail · <span className="conn-checking">checking</span></span>
             ) : state.gmailApiStatus.status === "connected" ? (
               <span>
                 Gmail

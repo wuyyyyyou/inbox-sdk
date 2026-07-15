@@ -967,11 +967,15 @@ def _check_gmail_api_status(mailbox: str = "") -> dict[str, Any]:
 
     与 check_gmail_auth（仅查 token/账号元数据）不同，本工具会真实打 Gmail HTTP，
     用于侧栏展示延迟并帮助用户区分「授权缺失」与「网络/API 超时」。
+
+    必须走 adapter.get_access_token：平台上通过 credentials/getToken 取短时 token，
+    不可用本文件仅读本地 token 文件的 get_access_token。
     """
     import time as _time
     import urllib.error as _urlerr
     import urllib.parse as _urlparse
     import urllib.request as _urlreq
+    from mail_agent.mail_providers.gmail.adapter import get_access_token as adapter_get_access_token
 
     started = _time.time()
     requested = str(mailbox or "").strip().lower()
@@ -989,8 +993,13 @@ def _check_gmail_api_status(mailbox: str = "") -> dict[str, Any]:
             "mailbox": "",
         }
     try:
-        # 侧栏探测使用短超时，避免拖垮轮询与 UI
-        token = get_access_token(target)
+        # 刷新平台 Connected accounts 元数据后再取 token，避免仅本地 token 路径
+        try:
+            refresh_platform_google_accounts()
+        except Exception:
+            pass
+        # 侧栏探测使用短超时；token 优先平台 credentials，再 fallback 本地
+        token = adapter_get_access_token(target)
         url = GMAIL_API_BASE + "/users/me/profile?" + _urlparse.urlencode({"fields": "emailAddress"})
         request = _urlreq.Request(
             url,
@@ -1015,7 +1024,7 @@ def _check_gmail_api_status(mailbox: str = "") -> dict[str, Any]:
         # 鉴权类失败标 unavailable，其余标 error（含超时/网络）
         lowered = message.lower()
         status = "unavailable" if any(
-            token in lowered for token in ("401", "403", "unauthorized", "auth", "token", "credential")
+            token in lowered for token in ("401", "403", "unauthorized", "auth", "token", "credential", "not found")
         ) else "error"
         return {
             "ok": False,
