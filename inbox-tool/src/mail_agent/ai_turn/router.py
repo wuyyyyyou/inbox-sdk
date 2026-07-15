@@ -89,6 +89,23 @@ def _has_last_draft(ui_context: dict[str, Any]) -> bool:
     return bool(str(last.get("body") or "").strip())
 
 
+def _has_inbox_search_intent(user_text: str) -> bool:
+    """识别明确的全邮箱检索请求，避免 Router 将其错误降级为普通聊天。
+
+    该判断只用于覆盖 ``chat_general``：用户明确要求查找、搜索、列举未读或紧急
+    邮件时，必须进入 ``search_mail``，由 Ask 管线返回经过候选校验的邮件链接。
+    写信、改稿等非聊天工具不会被这里改写，仍由结构化 Router 处理。
+    """
+    lowered = (user_text or "").casefold()
+    return any(
+        token in lowered
+        for token in (
+            "find", "search", "inbox", "email", "mail", "urgent", "unread", "invoice",
+            "找", "搜索", "收件箱", "邮件", "未读", "紧急", "发票",
+        )
+    )
+
+
 def _fallback_route(user_text: str, ui_context: dict[str, Any], reason: str) -> dict[str, Any]:
     """Router 失败时的确定性降级，保证 turn 仍可执行。"""
     language = "zh" if _uses_chinese(user_text) else "en"
@@ -174,13 +191,7 @@ def _fallback_route(user_text: str, ui_context: dict[str, Any], reason: str) -> 
         token in lowered
         for token in ("compose", "new email", "fyi", "outline", "写一封", "新邮件", "大纲")
     )
-    scan_hint = any(
-        token in lowered
-        for token in (
-            "find", "search", "inbox", "email", "mail", "urgent", "unread", "invoice",
-            "找", "搜索", "收件箱", "邮件", "未读", "紧急", "发票",
-        )
-    )
+    scan_hint = _has_inbox_search_intent(user_text)
     summary_hint = any(
         token in lowered
         for token in ("summar", "总结", "概括", "这封", "this email", "this thread", "action item", "待办")
@@ -303,6 +314,19 @@ def _normalize_route(payload: dict[str, Any], user_text: str, ui_context: dict[s
                 if language == "zh"
                 else "Provide a draft to revise first."
             )
+
+    # Router Sampling 偶尔会把「找未读邮件」这类明确检索误判为聊天。仅覆盖纯聊天
+    # 路径，使后续回答必须基于 Ask 候选并返回可验证的 mail_links。
+    if (
+        _has_inbox_search_intent(user_text)
+        and steps
+        and all(step["tool"] == "chat_general" for step in steps)
+    ):
+        clarify = None
+        steps = [
+            {"tool": "search_mail", "params": {}},
+            {"tool": "rank_answer", "params": {}},
+        ]
 
     if clarify and not steps:
         return {

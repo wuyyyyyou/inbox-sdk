@@ -1001,6 +1001,42 @@ body.is-resizing-ai-sidebar {
   height: 20px;
   pointer-events: none;
 }
+.ask-history-refresh {
+  position: absolute;
+  top: 50%;
+  right: 44px;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 7px;
+  color: #858b9e;
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-50%);
+  transition:
+    opacity 140ms ease,
+    color 140ms ease,
+    background 140ms ease;
+}
+.ask-history-item:hover .ask-history-refresh,
+.ask-history-item:focus-within .ask-history-refresh,
+.ask-history-item.is-active .ask-history-refresh {
+  opacity: 1;
+  pointer-events: auto;
+}
+.ask-history-refresh:hover,
+.ask-history-refresh:focus-visible {
+  color: #5068de;
+  background: #e9edfc;
+}
+.ask-history-refresh svg {
+  width: 20px;
+  height: 20px;
+  pointer-events: none;
+}
 .ask-history-empty {
   height: 100%;
   display: flex;
@@ -1412,6 +1448,7 @@ body.is-resizing-ai-sidebar {
   right: 0;
   max-height: 320px;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 6px;
   border: 1px solid #dfe2ea;
   border-radius: 10px;
@@ -1493,6 +1530,30 @@ body.is-resizing-ai-sidebar {
 .settings-content select {
   margin: 2px 8px 2px 0;
 }
+.settings-action-btn {
+  width: 100%;
+  border: 1px solid rgba(122, 138, 198, 0.3);
+  border-radius: 6px;
+  padding: 6px 14px;
+  color: #365fed;
+  background: #f5f5f7;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.settings-action-btn:hover {
+  background: #eef0f4;
+  border-color: rgba(122, 138, 198, 0.5);
+}
+.settings-action-btn:active {
+  background: #e8e9ed;
+}
+.settings-action-btn:disabled {
+  color: #a3a6b2;
+  background: #e8e9ed;
+  cursor: not-allowed;
+  border-color: transparent;
+}
 
 .splits-overlay {
   position: fixed;
@@ -1530,9 +1591,31 @@ body.is-resizing-ai-sidebar {
 .splits-list li div { flex: 1; min-width: 0; display: grid; gap: 2px; }
 .splits-list span { overflow: hidden; color: #777b8c; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .splits-list button, .splits-add, .splits-actions button, .splits-confirm button { border: 0; border-radius: 6px; padding: 7px 10px; color: #365fed; background: transparent; font: inherit; cursor: pointer; }
+.splits-list li button {
+  font-size: 13px;
+  font-weight: 500;
+  padding: 4px 10px !important;
+  border-radius: 6px;
+  transition: all 0.2s ease;
+}
+.splits-list li button:first-of-type {
+  color: #365fed !important;
+  background: #f0f3ff !important;
+}
+.splits-list li button:first-of-type:hover {
+  background: #dfe7ff !important;
+}
+.splits-list li button:last-of-type {
+  color: #e05c67 !important;
+  background: #fff5f5 !important;
+}
+.splits-list li button:last-of-type:hover {
+  background: #ffebe9 !important;
+}
 .splits-add { margin-top: 12px; font-weight: 600; }
 .splits-actions { justify-content: flex-end; gap: 8px; margin-top: 24px; }
-.splits-actions button:last-child, .splits-confirm button:last-child { color: #fff; background: #e05c67; }
+.splits-actions button:last-child { color: #fff; background: #365fed; }
+.splits-confirm button:last-child { color: #fff; background: #e05c67; }
 .splits-actions button:disabled { color: #a3a6b2; background: #e8e9ed; cursor: not-allowed; }
 .splits-switch { flex-direction: row !important; justify-content: space-between; }
 .splits-switch input { width: 38px; min-height: 20px; }
@@ -6244,13 +6327,11 @@ body {
 }
 
 .icon-btn {
-  width: 30px;
-  height: 30px;
   border-radius: 999px;
   color: var(--text-muted);
   background: rgba(255, 255, 255, 0.48);
   border-color: rgba(93, 82, 128, 0.08);
-  font-size: 12px;
+  font-size: 24px;
   font-weight: 500;
 }
 
@@ -11853,6 +11934,7 @@ body,
 }
 
 .ask-history-delete::after,
+.ask-history-refresh::after,
 .mail-row-actions button::after,
 .mail-detail-toolbar button::after,
 .mail-detail-overview-result::after {
@@ -11880,6 +11962,8 @@ body,
 
 .ask-history-delete:hover::after,
 .ask-history-delete:focus-visible::after,
+.ask-history-refresh:hover::after,
+.ask-history-refresh:focus-visible::after,
 .mail-detail-toolbar button:hover::after,
 .mail-detail-toolbar button:focus-visible::after,
 .mail-row-actions button:hover::after,

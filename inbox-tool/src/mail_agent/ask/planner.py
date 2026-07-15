@@ -299,6 +299,11 @@ def resolve_effective_timeframe(
     return f"{min(max(int(matched.group(1)), 1), 365)}d" if matched else "30d"
 
 
+def _uses_chinese_text(value: str) -> bool:
+    """判断用户侧文案是否包含中文字符。"""
+    return bool(re.search(r"[\u3400-\u9fff]", str(value or "")))
+
+
 def _fallback_ask_plan(user_request: str, failure_reason: str) -> AskPlan:
     """在 Sampling 没有返回文本时生成可执行的保守搜索计划。"""
     normalized_request = str(user_request or "").strip()
@@ -341,6 +346,20 @@ def _fallback_ask_plan(user_request: str, failure_reason: str) -> AskPlan:
             "fallback_reason": str(failure_reason)[:240],
         },
     )
+
+
+def normalize_user_facing_plan_copy(plan: AskPlan) -> AskPlan:
+    """按用户请求语言校验 Planner 会展示在侧栏中的文案。"""
+    # Planner 的 title/description 会直接作为搜索卡片标题和摘要展示。英文请求若被模型误答为中文，
+    # 不仅标题错误，还会触发前端将整张卡片的状态文案切换成中文，因此在协议边界统一降级为确定性英文文案。
+    if _uses_chinese_text(plan.user_request):
+        return plan
+    fallback = _fallback_ask_plan(plan.user_request, "invalid user-facing language")
+    if _uses_chinese_text(plan.title):
+        plan.title = fallback.title
+    if _uses_chinese_text(plan.description):
+        plan.description = fallback.description
+    return plan
 
 
 # ── Main entry ────────────────────────────────────────────────────────
@@ -447,4 +466,4 @@ async def plan_ask_request(
             "fallback_reason": result.get("fallback_reason", ""),
         },
     )
-    return plan
+    return normalize_user_facing_plan_copy(plan)

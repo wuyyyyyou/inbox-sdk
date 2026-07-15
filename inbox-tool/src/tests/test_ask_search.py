@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import types
 from pathlib import Path
+from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parents[1]
 if str(SRC) not in sys.path:
@@ -309,6 +311,36 @@ async def test_execute_search_uses_gmail_query():
     print("[PASS] test_execute_search_uses_gmail_query")
 
 
+async def test_execute_search_does_not_broaden_named_person_query():
+    """指定联系人未命中时不得移除 from: 并把无关收件箱邮件作为结果。"""
+    from mail_agent.ask.search import execute_search
+
+    calls: list[str] = []
+
+    def fake_live_search(_mailbox: str, query: str, _limit: int) -> list[str]:
+        calls.append(query)
+        return []
+
+    async def fake_get_messages(_mailbox: str, _message_ids: list[str]) -> list[str]:
+        return []
+
+    fake_adapter = types.SimpleNamespace(
+        live_search_and_cache=fake_live_search,
+        get_messages_lite_async=fake_get_messages,
+    )
+    with patch.dict(sys.modules, {"mail_agent.mail_providers.gmail.adapter": fake_adapter}):
+        messages = await execute_search(
+            "owner@example.com",
+            [{"query": "from:alice in:inbox newer_than:7d", "max_results": 25}],
+            max_broaden_attempts=2,
+            allow_broadening=False,
+        )
+
+    assert messages == []
+    assert calls == ["from:alice in:inbox newer_than:7d"]
+    print("[PASS] test_execute_search_does_not_broaden_named_person_query")
+
+
 # ── Main ────────────────────────────────────────────────────────────────
 
 async def main_async():
@@ -342,6 +374,7 @@ async def main_async():
 
     print("\n--- execute_search ---\n")
     await test_execute_search_uses_gmail_query()
+    await test_execute_search_does_not_broaden_named_person_query()
 
     print(f"\n[ALL TESTS PASSED]")
 

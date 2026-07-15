@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { InboxCustomCategory, InboxSettings } from "../../types/mail";
 import { applyInboxQuerySuggestion, getInboxQuerySuggestionPlaceholder, getInboxQuerySuggestions, parseInboxQuery, splitInboxQueryTokens } from "../search/inboxQuery";
+import { useApp } from "../../app/AppContext";
 
 type SplitDraft = Omit<InboxCustomCategory, "id"> & { id?: string };
 
@@ -31,6 +32,7 @@ export function SplitsManager({
   onClose: () => void;
   onChange: (patch: Partial<InboxSettings>) => Promise<boolean>;
 }) {
+  const { actions } = useApp();
   const [draft, setDraft] = useState<SplitDraft>(EMPTY_DRAFT);
   const [screen, setScreen] = useState<"list" | "form" | "query">("list");
   const [deletingId, setDeletingId] = useState("");
@@ -83,7 +85,9 @@ export function SplitsManager({
       query: draft.query.trim(),
     }) });
     setSaving(false);
-    if (saved) setScreen("form");
+    if (saved) {
+      setScreen("form");
+    }
     else setSaveError("Could not save this Split. Please try again.");
   };
   const save = async () => {
@@ -104,6 +108,7 @@ export function SplitsManager({
     if (saved) {
       setScreen("list");
       setDraft(EMPTY_DRAFT);
+      actions.showToast("Split saved.");
     } else setSaveError("Could not save this Split. Please try again.");
   };
 
@@ -113,7 +118,7 @@ export function SplitsManager({
       {screen === "list" ? <>
         <p>Divide your inbox into tabs for different types of emails.</p>
         <h3>Custom splits</h3>
-        <ul className="splits-list">{categories.map((split) => <li key={split.id}><div><strong>{split.name}</strong><span>{split.query}</span></div><button type="button" onClick={() => startEdit(split)}>Edit</button><button style={{ color: "#e05c67" }} type="button" onClick={() => setDeletingId(split.id)}>Delete</button></li>)}</ul>
+        <ul className="splits-list">{categories.map((split) => <li key={split.id}><div><strong>{split.name}</strong><span>{split.query}</span></div><button type="button" onClick={() => startEdit(split)}>Edit</button><button type="button" onClick={() => setDeletingId(split.id)}>Delete</button></li>)}</ul>
         {!categories.length ? <p className="splits-empty">No custom splits yet.</p> : null}
         <button className="splits-add" type="button" onClick={startCreate}>＋ Add split</button>
       </> : screen === "query" ? <>
@@ -124,7 +129,7 @@ export function SplitsManager({
             <span className="mail-search-highlight" aria-hidden="true">{splitInboxQueryTokens(draft.query).map((token, index, tokens) => <span className={`is-${token.kind}${parsed.error && index === tokens.length - 1 && !/\s$/u.test(draft.query) ? " is-editing" : ""}`} key={`${token.text}-${index}`}>{token.text}</span>)}</span>
             <input ref={queryInputRef} autoFocus value={draft.query} onChange={(event) => { setDraft((current) => ({ ...current, query: event.target.value })); setQueryFocused(true); setQuerySuggestionIndex(0); }} onFocus={() => setQueryFocused(true)} onBlur={() => window.setTimeout(() => setQueryFocused(false), 120)} onKeyDown={(event) => { if (event.key === "ArrowDown" && querySuggestions.length) { event.preventDefault(); setQuerySuggestionIndex((index) => (index + 1) % querySuggestions.length); } else if (event.key === "ArrowUp" && querySuggestions.length) { event.preventDefault(); setQuerySuggestionIndex((index) => (index - 1 + querySuggestions.length) % querySuggestions.length); } else if (event.key === "Enter") { event.preventDefault(); if (querySuggestions.length) applyQuerySuggestion(querySuggestions[querySuggestionIndex]); else if (parsed.expression && !parsed.error && !/\s$/u.test(draft.query)) { const next = `${draft.query} `; setDraft((current) => ({ ...current, query: next })); window.requestAnimationFrame(() => queryInputRef.current?.setSelectionRange(next.length, next.length)); } } }} placeholder="Type your search query" />
           </label>
-          {queryFocused ? <div className="mail-search-suggestions splits-query-suggestions" role="listbox">{querySuggestions.length ? querySuggestions.map((suggestion, index) => <button type="button" role="option" aria-selected={index === querySuggestionIndex} className={index === querySuggestionIndex ? "is-selected" : ""} key={suggestion} onMouseDown={(event) => event.preventDefault()} onMouseMove={() => setQuerySuggestionIndex(index)} onClick={() => applyQuerySuggestion(suggestion)}><strong>{suggestion}</strong>{getInboxQuerySuggestionPlaceholder(suggestion) ? <span>{getInboxQuerySuggestionPlaceholder(suggestion)}</span> : null}{index === querySuggestionIndex ? <kbd>Enter</kbd> : null}</button>) : parsed.error ? <p role="alert">{parsed.error}</p> : null}</div> : null}
+          {queryFocused && (querySuggestions.length > 0 || Boolean(parsed.error)) ? <div className="mail-search-suggestions splits-query-suggestions" role="listbox">{querySuggestions.length ? querySuggestions.map((suggestion, index) => <button type="button" role="option" aria-selected={index === querySuggestionIndex} className={index === querySuggestionIndex ? "is-selected" : ""} key={suggestion} onMouseDown={(event) => event.preventDefault()} onMouseMove={() => setQuerySuggestionIndex(index)} onClick={() => applyQuerySuggestion(suggestion)}><strong>{suggestion}</strong>{getInboxQuerySuggestionPlaceholder(suggestion) ? <span>{getInboxQuerySuggestionPlaceholder(suggestion)}</span> : null}{index === querySuggestionIndex ? <kbd>Enter</kbd> : null}</button>) : parsed.error ? <p role="alert">{parsed.error}</p> : null}</div> : null}
         </div>
         {saveError ? <p className="splits-error" role="alert">{saveError}</p> : null}
         <div className="splits-actions"><button type="button" disabled={saving} onClick={() => setScreen("form")}>Cancel</button><button type="button" disabled={saving || !parsed.expression || Boolean(parsed.error)} onClick={saveQuery}>{saving ? "Saving…" : "Save"}</button></div>
@@ -137,7 +142,7 @@ export function SplitsManager({
         {saveError ? <p className="splits-error" role="alert">{saveError}</p> : null}
         <div className="splits-actions"><button type="button" disabled={saving} onClick={() => setScreen("list")}>Cancel</button><button type="button" disabled={saving || !canSave} onClick={save}>{saving ? "Saving…" : editing ? "Save" : "Create"}</button></div>
       </>}
-      {deletingId ? <div className="splits-confirm"><p>Delete this Split? Its saved query will be removed.</p><button type="button" onClick={() => setDeletingId("")}>Cancel</button><button type="button" onClick={() => { onChange({ custom_categories: categories.filter((split) => split.id !== deletingId) }); setDeletingId(""); }}>Delete</button></div> : null}
+      {deletingId ? <div className="splits-confirm"><p>Delete this Split? Its saved query will be removed.</p><button type="button" onClick={() => setDeletingId("")}>Cancel</button><button type="button" onClick={async () => { const ok = await onChange({ custom_categories: categories.filter((split) => split.id !== deletingId) }); if (ok) actions.showToast("Split deleted."); setDeletingId(""); }}>Delete</button></div> : null}
     </section>
   </div>;
 }

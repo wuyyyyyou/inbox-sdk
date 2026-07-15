@@ -9,6 +9,7 @@ import {
   matchesDraftArtifact,
   mergeDraftArtifactBody,
   normalizeAttachmentKind,
+  resolveMessageThreadId,
   parseSnoozeInput,
   resolveAttachmentAccess,
   senderParts,
@@ -68,6 +69,11 @@ describe("mailDetailHelpers", () => {
       body: "Draft",
       source_prompt: "Prompt",
     })).toBe(true);
+  });
+
+  it("falls back to the message id when a thread id is unavailable", () => {
+    expect(resolveMessageThreadId({ id: "message-1" })).toBe("message-1");
+    expect(resolveMessageThreadId({ id: "message-1", thread_id: "thread-1" })).toBe("thread-1");
   });
 
   it("appends generated drafts with an explicit paragraph break", () => {

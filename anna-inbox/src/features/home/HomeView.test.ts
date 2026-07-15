@@ -60,6 +60,13 @@ describe("aiSearchStatus", () => {
     expect(aiSearchStatus({ title: "Inbox summary", sections: [{ items: [{ subject: "Update" }] }] }))
       .toBe("Found 1 relevant thread.");
   });
+
+  it("uses the English request language when a result title is malformed", () => {
+    expect(aiSearchStatus(
+      { title: "查找紧急邮件", sections: [{ items: [{ subject: "Update" }] }] },
+      "Find urgent emails",
+    )).toBe("Found 1 relevant thread.");
+  });
 });
 
 describe("senderParts", () => {

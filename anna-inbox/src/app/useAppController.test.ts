@@ -45,4 +45,11 @@ describe("AI scan invocation", () => {
     expect(controllerSource).toMatch(/isAiTurnEnabled\(/);
     expect(controllerSource).toMatch(/buildAiTurnUiContext\(/);
   });
+
+  it("resumes a timed-out sidebar turn by polling its existing run", () => {
+    expect(controllerSource).toMatch(/resumeAiConversation\(index: number\)/);
+    expect(controllerSource).toMatch(/resumeRunId: pendingRun\.runId/);
+    expect(controllerSource).toMatch(/options\.resumeRunId\s*\? await client\.getRun\(runId\)/);
+    expect(homeViewSource).toContain('aria-label="Refresh timed out request"');
+  });
 });

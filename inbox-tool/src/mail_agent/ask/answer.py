@@ -40,7 +40,8 @@ def _answer_language_instruction(user_request: str) -> str:
             "Keep email subjects, names, addresses, and quoted source text in their original language."
         )
     return (
-        "Write all generated natural-language fields in the same language as the user's request. "
+        "Write all generated natural-language fields in English. Do not output Chinese or another language "
+        "for generated copy. "
         "Keep email subjects, names, addresses, and quoted source text in their original language."
     )
 
@@ -60,6 +61,29 @@ def _answer_fallback(plan: AskPlan, detail: str = "") -> dict[str, Any]:
         summary = "Anna could not produce a usable answer. Try rephrasing, or open a specific email first."
         title = plan.title or "Scan incomplete"
     return {"title": title, "summary": summary, "sections": []}
+
+
+def _generated_copy_contains_chinese(payload: dict[str, Any]) -> bool:
+    """检查 Ask Answer 的非源邮件文案是否错误混入中文。"""
+    # 邮件主题、发件人和引用原文允许保留源语言，不能参与判断；只检查模型生成的标题、摘要、分组和行动建议。
+    copy_values = [payload.get("title"), payload.get("summary")]
+    sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        copy_values.extend((section.get("heading"), section.get("body")))
+        items = section.get("items") if isinstance(section.get("items"), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            copy_values.extend((item.get("context"), item.get("suggestion")))
+            gaps = item.get("reply_gaps") if isinstance(item.get("reply_gaps"), dict) else {}
+            copy_values.append(gaps.get("summary"))
+            questions = gaps.get("questions") if isinstance(gaps.get("questions"), list) else []
+            for question in questions:
+                if isinstance(question, dict):
+                    copy_values.extend((question.get("question"), question.get("hint")))
+    return any(_uses_chinese(str(value or "")) for value in copy_values)
 
 
 async def _filter_candidates(
@@ -352,6 +376,9 @@ async def _generate_answer(
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
     if not payload:
         return _answer_fallback(plan, "Anna returned empty analysis")
+    # 英文请求的模型输出若混入中文，不能把语言错误暴露到侧栏；保守降级优先于展示不一致的搜索结论。
+    if not _uses_chinese(plan.user_request) and _generated_copy_contains_chinese(payload):
+        return _answer_fallback(plan, "Anna returned Chinese generated copy for an English request")
     payload["llm_meta"] = {
         "provider": result.get("provider"),
         "model": result.get("model"),
@@ -394,7 +421,10 @@ def _apply_guard(
     """
     sections = result.get("sections")
     if not isinstance(sections, list):
-        return result
+        sections = []
+        result["sections"] = sections
+    sources = valid_sources or {}
+    linked_threads: set[tuple[str, str]] = set()
 
     for section in sections:
         if not isinstance(section, dict):
@@ -434,7 +464,6 @@ def _apply_guard(
                 item["thread_id"] = ""
                 _logger.warning("Ask guard stripped invalid thread_id: %s", tid[:40])
 
-            sources = valid_sources or {}
             source = sources.get(mid)
             item_source_is_valid = False
             if source:
@@ -499,6 +528,39 @@ def _apply_guard(
                     add_source_link(source_mid, candidate_source)
 
             item["mail_links"] = safe_links
+            linked_threads.update(seen_threads)
+
+    # 模型有时只在标题或摘要里列出邮件主题，未创建 sections/items；这时前端没有
+    # 可渲染的链接。只对摘要中完整出现的候选主题补一个结构化条目，目标 ID 始终
+    # 来自 Gmail 候选，短主题不做包含匹配以避免把无关文本错误链接到邮件。
+    narrative = _normalize_reference_text(
+        f"{result.get('title') or ''} {result.get('summary') or ''}"
+    )
+    narrative_items: list[dict[str, Any]] = []
+    for source_mid, source in sources.items():
+        subject = _normalize_reference_text(source.get("subject"))
+        mailbox = str(source.get("mailbox") or "").strip().lower()
+        thread_id = str(source.get("thread_id") or "").strip()
+        if (
+            len(narrative_items) >= 5
+            or len(subject) < 6
+            or subject not in narrative
+            or not mailbox
+            or not thread_id
+            or (mailbox, thread_id) in linked_threads
+        ):
+            continue
+        linked_threads.add((mailbox, thread_id))
+        narrative_items.append({
+            "subject": str(source.get("subject") or ""),
+            "mailbox": mailbox,
+            "message_id": source_mid,
+            "thread_id": thread_id,
+            "from": str(source.get("from") or ""),
+            "mail_links": [_mail_link_from_source(source_mid, source)],
+        })
+    if narrative_items:
+        sections.append({"items": narrative_items})
 
     return result
 
@@ -523,7 +585,7 @@ async def run_ask_pipeline(
     If `plan` is provided, skips the Planner LLM and uses the given plan directly
     (for re-running saved plans without re-planning).
     """
-    from .planner import plan_ask_request, resolve_effective_timeframe
+    from .planner import normalize_user_facing_plan_copy, plan_ask_request, resolve_effective_timeframe
     from .search import build_queries, execute_search
 
     if not mailboxes:
@@ -538,6 +600,8 @@ async def run_ask_pipeline(
         if progress_callback:
             progress_callback("plan", {"stage": "plan"})
         plan = await plan_ask_request(user_request, primary_mailbox, sampling_create_message=sampling_create_message)
+    # 已保存计划可绕过 Planner；仍须在执行入口执行同一语言边界校验。
+    plan = normalize_user_facing_plan_copy(plan)
 
     # 模型计划只能决定检索意图，默认扫描时间必须服从用户当前 Scan Plan。
     plan.timeframe = resolve_effective_timeframe(plan.user_request or user_request, scan_window_days, plan.timeframe)
@@ -556,6 +620,13 @@ async def run_ask_pipeline(
 
     primary_queries: list[dict[str, Any]] = []
     all_sources: list[dict[str, str]] = []
+    # 指定联系人属于精确检索意图。若移除 from:/to: 后继续扫描，返回的只是
+    # 同时间范围内的无关邮件，可能造成“找到结果”与“未找到该联系人”同时出现。
+    has_person_constraint = any(
+        str(person.get("name_hint") or "").strip()
+        for person in plan.people
+        if isinstance(person, dict)
+    )
 
     async def _search_one(mbox: str) -> tuple[str, list[MessageLite], list[MessageLite]]:
         """Search + filter for a single mailbox. Returns (mailbox, all_messages, candidates)."""
@@ -577,6 +648,7 @@ async def run_ask_pipeline(
             progress_callback=progress_callback,
             max_broaden_attempts=1 if len(mailboxes) > 1 else 2,
             max_messages=max_messages if max_messages is not None else 200,
+            allow_broadening=not has_person_constraint,
         )
         if not messages:
             return (mbox, [], [])

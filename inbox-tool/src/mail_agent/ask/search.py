@@ -5,8 +5,8 @@ build_queries(): constructs validated Gmail queries from AskPlan structured para
   - Topics: uses search_terms (NOT concept) for Gmail OR groups
   - Applies direction, timeframe, and syntax normalization
 
-execute_search(): runs Gmail query search with adaptive broadening.
-  - 0 results → progressively broaden the query
+execute_search(): runs Gmail query search with optional adaptive broadening.
+  - 0 results → progressively broaden the query when the caller permits it
   - Caches matched messages, then reads them as MessageLite objects
 """
 
@@ -274,12 +274,16 @@ async def execute_search(
     progress_callback: Any = None,
     max_broaden_attempts: int = 2,
     max_messages: int = _DEFAULT_MAX_MESSAGES,
+    allow_broadening: bool = True,
 ) -> list[MessageLite]:
     """Execute Gmail search with adaptive broadening.
 
     Attempt 1: search as-is
     Attempt 2 (0 results): broaden level 1 (drop person/topic filters)
     Attempt 3 (0 results): broaden level 2 (keep only direction + timeframe)
+
+    allow_broadening 为 false 时只执行原始查询。指定联系人的请求必须保留
+    from:/to: 条件；移除后会把“查找 Alice 的邮件”错误扩大为无关收件箱扫描。
 
     Uses Gmail query search, caches matched messages, and returns MessageLite.
     """
@@ -291,8 +295,9 @@ async def execute_search(
     except (TypeError, ValueError):
         message_cap = _DEFAULT_MAX_MESSAGES
     current_queries = list(queries)
+    broaden_attempts = max_broaden_attempts if allow_broadening else 0
 
-    for attempt in range(max_broaden_attempts + 1):
+    for attempt in range(broaden_attempts + 1):
         message_ids: list[str] = []
         seen_ids: set[str] = set()
         for query in current_queries:
@@ -321,7 +326,7 @@ async def execute_search(
                 _logger.info("Search broadened level %d, found %d messages", attempt, len(messages))
             return messages
 
-        if attempt < max_broaden_attempts:
+        if attempt < broaden_attempts:
             current_queries = [_broaden_query(q, attempt + 1) for q in queries]
             _logger.info("Search attempt %d returned 0 results, broadening to level %d",
                          attempt + 1, attempt + 1)

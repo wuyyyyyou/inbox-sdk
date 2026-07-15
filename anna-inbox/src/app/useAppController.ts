@@ -599,6 +599,7 @@ export interface AppActions {
   stopAiGeneration(): void;
   startNewAiConversation(): void;
   openAiConversation(index: number): void;
+  resumeAiConversation(index: number): void;
   deleteAiConversation(index: number): void;
   startCustomScan(): Promise<void>;
   reRunCustomPlan(planId: string): Promise<void>;
@@ -808,7 +809,12 @@ export function useAppController() {
   const upsertAiConversationHistory = useCallback((
     conversationId: string,
     messages: AiChatMessage[],
-    options: { kind: "chat" | "scan"; query: string; result?: CustomRunResult },
+    options: {
+      kind: "chat" | "scan";
+      query: string;
+      result?: CustomRunResult;
+      pendingRun?: AskHistoryEntry["pendingRun"];
+    },
   ) => {
     setState((s) => {
       const result = options.result || syntheticChatResult(messages);
@@ -820,6 +826,7 @@ export function useAppController() {
         result,
         timestamp,
         messages,
+        pendingRun: options.pendingRun,
       };
       const nextHistory = [entry, ...s.askHistory.filter((item) => item.conversationId !== conversationId)].slice(0, 30);
       persistAskHistory(nextHistory);
@@ -3005,6 +3012,26 @@ export function useAppController() {
         customRunProgress: null,
       }));
     },
+    resumeAiConversation(index: number) {
+      const entry = state.askHistory[index];
+      const pendingRun = entry?.pendingRun;
+      const messages = entry?.messages || [];
+      if (!pendingRun?.runId || state.isCustomScanning || state.aiChatLoading || aiGenerationRun.current) return;
+      let lastUserIndex = -1;
+      for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+        if (messages[messageIndex].role === "user") {
+          lastUserIndex = messageIndex;
+          break;
+        }
+      }
+      if (lastUserIndex < 0) return;
+      void actions.sendAiChatMessage({
+        prompt: pendingRun.question || messages[lastUserIndex].content,
+        baseMessages: messages.slice(0, lastUserIndex),
+        retryUserMessage: messages[lastUserIndex],
+        resumeRunId: pendingRun.runId,
+      });
+    },
     deleteAiConversation(index: number) {
       const entry = state.askHistory[index];
       if (!entry) return;
@@ -3120,10 +3147,11 @@ export function useAppController() {
             startedAt: "",
           },
         }));
+        let runId = options.resumeRunId || "";
         try {
           const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
           const scanScope = await loadScanPlanForRun(scanMailbox);
-          const runId = `at_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+          runId = runId || `at_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
           const uiContext = buildAiTurnUiContext({
             mailbox: state.mailbox,
             selectedMailboxes: state.selectedMailboxes,
@@ -3135,22 +3163,32 @@ export function useAppController() {
             messages: messagesWithUser,
             savedPromptId: options.savedPromptId,
           });
-          const started = await client.startAiTurn({
-            user_text: userRequest,
-            mailbox: scanMailbox,
-            ui_context: uiContext,
-            conversation_id: conversationId,
-            primary_count: scanScope.max_messages,
-            max_messages: scanScope.max_messages,
-            scan_window_days: scanScope.scan_window_days,
-            ai_provider: state.llmProvider,
-            storage_provider: state.storageProvider,
-            run_id: runId,
-            wait_timeout_seconds: 60,
-          });
+          const started = options.resumeRunId
+            ? await client.getRun(runId)
+            : await client.startAiTurn({
+              user_text: userRequest,
+              mailbox: scanMailbox,
+              ui_context: uiContext,
+              conversation_id: conversationId,
+              primary_count: scanScope.max_messages,
+              max_messages: scanScope.max_messages,
+              scan_window_days: scanScope.scan_window_days,
+              ai_provider: state.llmProvider,
+              storage_provider: state.storageProvider,
+              run_id: runId,
+              wait_timeout_seconds: 60,
+            });
           if (!isCurrentGeneration()) return;
           if (started.status === "failed" || started.error) {
             throw new Error(started.error || "AI turn failed");
+          }
+          if (started.status !== "done") {
+            // 后端任务可能仍在运行；先保存 runId，页面刷新后由用户主动继续查询。
+            upsertAiConversationHistory(conversationId, [...messagesWithUser, pendingMessage], {
+              kind: "chat",
+              query: userRequest,
+              pendingRun: { runId, question: userRequest },
+            });
           }
           const completed = started.status === "done" && started.result
             ? started
@@ -3229,6 +3267,7 @@ export function useAppController() {
                 kind: "scan",
                 content: result.summary || result.plan_description || assistantText,
                 result,
+                sourcePrompt: userRequest,
                 timestamp: new Date().toISOString(),
               },
             ];
@@ -3359,7 +3398,13 @@ export function useAppController() {
               timestamp: new Date().toISOString(),
             },
           ];
-          upsertAiConversationHistory(conversationId, failedMessages, { kind: "chat", query: userRequest });
+          upsertAiConversationHistory(conversationId, failedMessages, {
+            kind: "chat",
+            query: userRequest,
+            pendingRun: runId && isTransientConnectionError(error)
+              ? { runId, question: userRequest }
+              : undefined,
+          });
           setState((s) => ({
             ...s,
             scanError: message,

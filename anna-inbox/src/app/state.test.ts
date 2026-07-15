@@ -29,6 +29,7 @@ describe("createInitialState", () => {
       query: "hello",
       timestamp: "2026-06-30T10:00:00.000Z",
       result: { title: "hello", summary: "hi", sections: [] },
+      pendingRun: { runId: "at_pending123", question: "hello" },
       messages: [
         { id: "msg_user", role: "user", content: "hello", timestamp: "2026-06-30T10:00:00.000Z" },
         { id: "msg_assistant", role: "assistant", content: "hi", timestamp: "2026-06-30T10:00:01.000Z" },
@@ -45,6 +46,7 @@ describe("createInitialState", () => {
     expect(state.askHistory).toEqual(savedHistory);
     expect(state.aiChatMessages).toEqual([]);
     expect(state.aiChatConversationId).toBe("");
+    expect(state.askHistory[0].pendingRun).toEqual({ runId: "at_pending123", question: "hello" });
   });
 });
 

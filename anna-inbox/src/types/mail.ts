@@ -815,6 +815,11 @@ export interface AskHistoryEntry {
   conversationId?: string;
   kind?: "chat" | "scan";
   messages?: AiChatMessage[];
+  /** 页面刷新后由用户手动继续轮询的 AI turn。 */
+  pendingRun?: {
+    runId: string;
+    question: string;
+  };
 }
 
 /** 整理建议确认卡片（propose_inbox_actions，须用户确认后才 mutation） */
@@ -916,5 +921,7 @@ export interface SendAiMessageOptions {
   retryUserMessage?: AiChatMessage;
   /** 选中 Saved prompt 后注入 Router（作为 user 文本前缀） */
   savedPromptId?: string;
+  /** 恢复已提交的 AI turn，只查询既有 run，不重新提交请求。 */
+  resumeRunId?: string;
 }
 

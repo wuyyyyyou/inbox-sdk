@@ -221,6 +221,10 @@ export function matchesDraftArtifact(mailbox: string, threadId: string, artifact
     && artifact.thread_id === threadId;
 }
 
+export function resolveMessageThreadId(message: { id?: string; thread_id?: string } | null | undefined) {
+  return message?.thread_id || message?.id || "";
+}
+
 export function mergeDraftArtifactBody(current: string, generated: string, mode: "append" | "replace") {
   if (mode === "replace" || !current.trim()) return generated;
   return `${current.trimEnd()}\n\n${generated}`;

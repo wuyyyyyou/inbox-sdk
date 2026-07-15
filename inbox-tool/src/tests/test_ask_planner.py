@@ -40,6 +40,21 @@ def test_askplan_dataclass():
     print("[PASS] test_askplan_dataclass")
 
 
+def test_english_plan_copy_rejects_chinese():
+    """英文请求的用户侧计划文案不能因模型偏航显示中文。"""
+    from mail_agent.ask.planner import AskPlan, normalize_user_facing_plan_copy
+
+    plan = normalize_user_facing_plan_copy(AskPlan(
+        user_request="Find urgent emails",
+        title="查找紧急邮件",
+        description="检查需要立即处理的邮件。",
+    ))
+
+    assert plan.title == "Urgent emails"
+    assert plan.description == "Checking recent inbox messages with a conservative fallback plan."
+    print("[PASS] test_english_plan_copy_rejects_chinese")
+
+
 class EmptySamplingStub:
     """模拟 Anna Host 返回成功帧但没有可用文本的异常形态。"""
 
@@ -159,6 +174,7 @@ def main():
 
     print("\n--- Unit test ---\n")
     test_askplan_dataclass()
+    test_english_plan_copy_rejects_chinese()
     asyncio.run(test_empty_sampling_response_uses_executable_fallback_plan())
     print("\n[ALL UNIT TESTS PASSED]\n")
 

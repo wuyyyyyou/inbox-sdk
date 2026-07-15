@@ -65,6 +65,24 @@ async def test_normalize_rejects_unknown_tool():
     print("[PASS] test_normalize_rejects_unknown_tool")
 
 
+async def test_normalize_forces_explicit_search_out_of_chat():
+    """明确的收件箱检索不能被 Router Sampling 错路由为普通聊天。"""
+    from mail_agent.ai_turn.router import _normalize_route
+
+    route = _normalize_route(
+        {
+            "language": "zh",
+            "use_current_thread": False,
+            "clarify": None,
+            "steps": [{"tool": "chat_general", "params": {}}],
+        },
+        "帮我找最近7天内的未读邮件",
+        {},
+    )
+    assert [step["tool"] for step in route["steps"]] == ["search_mail", "rank_answer"]
+    print("[PASS] test_normalize_forces_explicit_search_out_of_chat")
+
+
 async def test_sampling_router_payload():
     from mail_agent.ai_turn.router import route_ai_turn
 
@@ -104,6 +122,7 @@ def main():
     asyncio.run(test_fallback_route_search())
     asyncio.run(test_fallback_route_summarize_with_thread())
     asyncio.run(test_normalize_rejects_unknown_tool())
+    asyncio.run(test_normalize_forces_explicit_search_out_of_chat())
     asyncio.run(test_sampling_router_payload())
     asyncio.run(test_chat_general_runner())
     print("[ALL TESTS PASSED]")

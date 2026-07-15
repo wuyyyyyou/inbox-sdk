@@ -108,3 +108,106 @@ export function parseAiMessageMarkdown(text: string): AiMessageBlock[] {
   }
   return blocks;
 }
+
+/** Visible character cost of one inline node (thread_ref is atomic). */
+function measureInlineNode(node: AiMessageInline): number {
+  if (node.type === "text" || node.type === "bold") return node.value.length;
+  if (node.type === "link") return node.label.length;
+  return 1;
+}
+
+export function measureAiMessageInline(nodes: AiMessageInline[]): number {
+  return nodes.reduce((sum, node) => sum + measureInlineNode(node), 0);
+}
+
+export function measureAiMessageBlocks(blocks: AiMessageBlock[]): number {
+  return blocks.reduce((sum, block) => {
+    if (block.type === "unordered_list" || block.type === "ordered_list") {
+      return sum + block.items.reduce((itemSum, item) => itemSum + measureAiMessageInline(item), 0);
+    }
+    return sum + measureAiMessageInline(block.content);
+  }, 0);
+}
+
+function sliceInlineNodes(
+  nodes: AiMessageInline[],
+  budget: number,
+): { nodes: AiMessageInline[]; remaining: number } {
+  if (budget <= 0) return { nodes: [], remaining: 0 };
+  const next: AiMessageInline[] = [];
+  let remaining = budget;
+  for (const node of nodes) {
+    if (remaining <= 0) break;
+    if (node.type === "text" || node.type === "bold") {
+      if (node.value.length <= remaining) {
+        next.push(node);
+        remaining -= node.value.length;
+      } else {
+        next.push({ type: node.type, value: node.value.slice(0, remaining) });
+        remaining = 0;
+      }
+      continue;
+    }
+    if (node.type === "link") {
+      if (node.label.length <= remaining) {
+        next.push(node);
+        remaining -= node.label.length;
+      } else {
+        next.push({ type: "link", label: node.label.slice(0, remaining), href: node.href });
+        remaining = 0;
+      }
+      continue;
+    }
+    // thread_ref: reveal atomically when at least one char of budget remains
+    next.push(node);
+    remaining -= 1;
+  }
+  return { nodes: next, remaining };
+}
+
+/**
+ * Reveal a prefix of already-parsed markdown blocks by visible character budget.
+ * Keeps block structure stable so typewriter never re-parses incomplete markdown.
+ */
+export function sliceAiMessageBlocks(blocks: AiMessageBlock[], maxChars: number): AiMessageBlock[] {
+  if (maxChars <= 0) return [];
+  const total = measureAiMessageBlocks(blocks);
+  if (maxChars >= total) return blocks;
+
+  const next: AiMessageBlock[] = [];
+  let remaining = maxChars;
+
+  for (const block of blocks) {
+    if (remaining <= 0) break;
+
+    if (block.type === "paragraph" || block.type === "heading") {
+      const sliced = sliceInlineNodes(block.content, remaining);
+      if (!sliced.nodes.length) break;
+      if (block.type === "heading") {
+        next.push({ type: "heading", level: block.level, content: sliced.nodes });
+      } else {
+        next.push({ type: "paragraph", content: sliced.nodes });
+      }
+      remaining = sliced.remaining;
+      continue;
+    }
+
+    const items: AiMessageInline[][] = [];
+    for (const item of block.items) {
+      if (remaining <= 0) break;
+      const sliced = sliceInlineNodes(item, remaining);
+      if (!sliced.nodes.length) break;
+      items.push(sliced.nodes);
+      remaining = sliced.remaining;
+    }
+    if (items.length) {
+      next.push(
+        block.type === "ordered_list"
+          ? { type: "ordered_list", items }
+          : { type: "unordered_list", items },
+      );
+    }
+  }
+
+  return next;
+}

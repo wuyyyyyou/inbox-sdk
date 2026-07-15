@@ -27,6 +27,7 @@ import type {
 import { SnoozePicker } from "./SnoozePicker";
 import { ComposeView } from "./ComposeView";
 import { MailDetailDrawer } from "../mail-detail/MailDetailDrawer";
+import { resolveMessageThreadId } from "../mail-detail/mailDetailHelpers";
 import {
   groupSplitMessages,
   splitInboxMessages,
@@ -43,8 +44,11 @@ import {
 } from "../search/inboxQuery";
 import { sortInboxMessagesDesc } from "./inboxMessageOrder";
 import {
+  measureAiMessageBlocks,
   parseAiMessageInline,
   parseAiMessageMarkdown,
+  sliceAiMessageBlocks,
+  type AiMessageBlock,
   type AiMessageInline,
 } from "./aiMessageFormatting";
 import { customExecutionSteps } from "../brief/runHelpers";
@@ -1136,20 +1140,23 @@ function aiResultCount(result: CustomRunResult) {
   );
 }
 
-export function aiSearchStatus(result: CustomRunResult) {
+export function aiSearchStatus(result: CustomRunResult, userRequest = "") {
   const itemCount = aiResultCount(result);
-  const chinese = /[\u3400-\u9fff]/.test(
-    [
-      result.title,
-      result.summary,
-      ...(result.sections || []).flatMap((section) => [
-        section.heading,
-        section.body,
-      ]),
-    ]
-      .filter(Boolean)
-      .join(" "),
-  );
+  // 搜索状态是本地 UI 文案，应以用户请求为准，不能被模型返回的单个异常标题改变语言。
+  const chinese = userRequest
+    ? /[\u3400-\u9fff]/.test(userRequest)
+    : /[\u3400-\u9fff]/.test(
+      [
+        result.title,
+        result.summary,
+        ...(result.sections || []).flatMap((section) => [
+          section.heading,
+          section.body,
+        ]),
+      ]
+        .filter(Boolean)
+        .join(" "),
+    );
   if (itemCount > 0)
     return chinese
       ? `找到 ${itemCount} 个相关邮件线程。`
@@ -1240,16 +1247,16 @@ function AiMessageInlineContent({
   });
 }
 
-function RichAssistantText({
-  text,
+function RichAssistantBlocks({
+  blocks,
   onOpenThread,
 }: {
-  text: string;
+  blocks: AiMessageBlock[];
   onOpenThread?: (threadId: string) => void;
 }) {
   return (
     <div className="ai-message-rich-text">
-      {parseAiMessageMarkdown(text).map((block, index) => {
+      {blocks.map((block, index) => {
         const key = `${block.type}-${index}`;
         if (block.type === "heading") {
           const Heading = `h${block.level + 2}` as "h3" | "h4" | "h5";
@@ -1303,6 +1310,21 @@ function RichAssistantText({
   );
 }
 
+function RichAssistantText({
+  text,
+  onOpenThread,
+}: {
+  text: string;
+  onOpenThread?: (threadId: string) => void;
+}) {
+  return (
+    <RichAssistantBlocks
+      blocks={parseAiMessageMarkdown(text)}
+      onOpenThread={onOpenThread}
+    />
+  );
+}
+
 function AnimatedAssistantText({
   text,
   animate,
@@ -1314,7 +1336,12 @@ function AnimatedAssistantText({
   onComplete?: () => void;
   onOpenThread?: (threadId: string) => void;
 }) {
-  const [visibleText, setVisibleText] = useState(animate ? "" : text);
+  // Parse full markdown once so typewriter never re-parses incomplete prefixes.
+  const blocks = useMemo(() => parseAiMessageMarkdown(text), [text]);
+  const totalChars = useMemo(() => measureAiMessageBlocks(blocks), [blocks]);
+  const [visibleChars, setVisibleChars] = useState(() =>
+    animate ? 0 : totalChars,
+  );
   const onCompleteRef = useRef(onComplete);
 
   useEffect(() => {
@@ -1323,31 +1350,39 @@ function AnimatedAssistantText({
 
   useEffect(() => {
     if (!animate) {
-      setVisibleText(text);
+      setVisibleChars(totalChars);
       onCompleteRef.current?.();
       return;
     }
-    if (!text) {
-      setVisibleText("");
+    if (!totalChars) {
+      setVisibleChars(0);
       onCompleteRef.current?.();
       return;
     }
-    setVisibleText("");
+    setVisibleChars(0);
     let frame = 0;
-    let timer = window.setInterval(() => {
-      frame += Math.max(1, Math.ceil(text.length / 36));
-      if (frame >= text.length) {
+    const step = Math.max(1, Math.ceil(totalChars / 36));
+    const timer = window.setInterval(() => {
+      frame += step;
+      if (frame >= totalChars) {
         window.clearInterval(timer);
-        setVisibleText(text);
+        setVisibleChars(totalChars);
         onCompleteRef.current?.();
         return;
       }
-      setVisibleText(text.slice(0, frame));
+      setVisibleChars(frame);
     }, 24);
     return () => window.clearInterval(timer);
-  }, [animate, text]);
+  }, [animate, text, totalChars]);
 
-  return <RichAssistantText text={visibleText} onOpenThread={onOpenThread} />;
+  const visibleBlocks =
+    !animate || visibleChars >= totalChars
+      ? blocks
+      : sliceAiMessageBlocks(blocks, visibleChars);
+
+  return (
+    <RichAssistantBlocks blocks={visibleBlocks} onOpenThread={onOpenThread} />
+  );
 }
 
 function AiAssistantMessage({
@@ -1979,7 +2014,7 @@ function AiAssistantMessage({
   return (
     <div className="ai-message is-assistant">
       <div className="ai-answer-meta">
-        {aiSearchStatus(result)}{" "}
+        {aiSearchStatus(result, message.sourcePrompt)}{" "}
         {result.plan_gmail_queries?.[0]?.query ? (
           <code>{result.plan_gmail_queries[0].query}</code>
         ) : null}
@@ -2346,6 +2381,19 @@ function AiSidebar({
                   >
                     <TrashIcon />
                   </button>
+                  {entry.pendingRun ? (
+                    <button
+                      className="ask-history-refresh"
+                      aria-label="Refresh timed out request"
+                      data-tooltip="Refresh task"
+                      onClick={() => {
+                        actions.resumeAiConversation(index);
+                        setHistoryOpen(false);
+                      }}
+                    >
+                      <RefreshIcon />
+                    </button>
+                  ) : null}
                 </div>
               );
             })
@@ -4242,7 +4290,7 @@ export function HomeView() {
   const currentMailContext = useMemo<AiMailContextRef | null>(() => {
     if (!selectedMessage) return null;
     const detailMailbox = selectedMessage.mailbox || mailbox;
-    const threadId = selectedMessage.thread_id || selectedMessage.id;
+    const threadId = resolveMessageThreadId(selectedMessage);
     return {
       kind: "gmail_thread",
       mailbox: detailMailbox,
@@ -4253,6 +4301,31 @@ export function HomeView() {
   }, [latestSelectedThreadMessage?.id, mailbox, selectedMessage]);
 
   const sidebarMailContext = composeAiContext || currentMailContext;
+
+  const applyDraftReplyArtifact = useCallback(
+    (artifact: DraftReplyArtifact, mode: "append" | "replace") => {
+      if (
+        !selectedMessage ||
+        !currentMailContext ||
+        currentMailContext.kind !== "gmail_thread" ||
+        currentMailContext.mailbox.trim().toLowerCase() !==
+          artifact.mailbox.trim().toLowerCase() ||
+        currentMailContext.thread_id !== artifact.thread_id
+      ) {
+        actions.showToast("Open the matching email thread before applying this draft.");
+        return;
+      }
+      if (drawerCloseTimer.current) {
+        window.clearTimeout(drawerCloseTimer.current);
+        drawerCloseTimer.current = null;
+      }
+      // 先让抽屉指向与 AI 草稿一致的邮件，再交由抽屉写入并保存草稿。
+      setDrawerMessage(selectedMessage);
+      setDrawerOpen(true);
+      setInsertRequest({ nonce: crypto.randomUUID(), artifact, mode });
+    },
+    [actions, currentMailContext, selectedMessage],
+  );
 
   const openComposeAiDraft = useCallback(
     (draft: Pick<ComposeDraft, "recipients" | "subject" | "body">) => {
@@ -4933,9 +5006,7 @@ export function HomeView() {
         collapsed={sidebarCollapsed}
         onToggle={() => setSidebarCollapsed((value) => !value)}
         currentMailContext={sidebarMailContext}
-        onUseArtifact={(artifact, mode) =>
-          setInsertRequest({ nonce: crypto.randomUUID(), artifact, mode })
-        }
+        onUseArtifact={applyDraftReplyArtifact}
         onUseComposeArtifact={(artifact, sourceContext) => {
           if (
             !composeOpen ||

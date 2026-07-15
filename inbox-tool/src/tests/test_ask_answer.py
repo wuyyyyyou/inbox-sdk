@@ -234,6 +234,29 @@ def test_guard_backfills_mail_link_from_exact_subject_mention():
     print("[PASS] test_guard_backfills_mail_link_from_exact_subject_mention")
 
 
+def test_guard_backfills_mail_link_from_summary_subject():
+    """模型只在摘要列出候选主题时，仍输出可供前端渲染的安全链接。"""
+    from mail_agent.ask.answer import _apply_guard
+
+    result = {
+        "title": "未读邮件",
+        "summary": "你需要查看 Project milestone confirmation 并决定下一步。",
+        "sections": [],
+    }
+    sources = {
+        "m1": {
+            "mailbox": "me@example.com", "thread_id": "t1",
+            "subject": "Project milestone confirmation",
+            "from": "Alice <alice@example.com>", "date": "Jul 07", "snippet": "Please confirm",
+        },
+    }
+    guarded = _apply_guard(result, {"m1"}, {"t1"}, sources)
+    item = guarded["sections"][0]["items"][0]
+    assert item["mail_links"][0]["message_id"] == "m1"
+    assert item["mail_links"][0]["thread_id"] == "t1"
+    print("[PASS] test_guard_backfills_mail_link_from_summary_subject")
+
+
 # ── Rendering tests ────────────────────────────────────────────────────
 
 def test_render_candidates_basic():
@@ -347,8 +370,22 @@ def test_answer_language_instruction():
     english = _answer_language_instruction("Organize my inbox")
     assert "Simplified Chinese" in chinese
     assert "original language" in chinese
-    assert "same language as the user's request" in english
+    assert "in English" in english
+    assert "Do not output Chinese" in english
     print("[PASS] test_answer_language_instruction")
+
+
+def test_english_generated_copy_rejects_chinese():
+    """源邮件字段以外的英文回答文案不得混入中文。"""
+    from mail_agent.ask.answer import _generated_copy_contains_chinese
+
+    assert _generated_copy_contains_chinese({"title": "查找紧急邮件", "summary": "Found one urgent email."})
+    assert not _generated_copy_contains_chinese({
+        "title": "Urgent emails",
+        "summary": "Found one urgent email.",
+        "sections": [{"heading": "Immediate action", "items": [{"subject": "紧急通知", "suggestion": "Reply today."}]}],
+    })
+    print("[PASS] test_english_generated_copy_rejects_chinese")
 
 
 def test_answer_requires_synthesis_instead_of_copying_email_body():
@@ -423,6 +460,7 @@ def main():
     test_guard_validates_and_materializes_mail_links()
     test_guard_backfills_mail_link_from_item_id()
     test_guard_backfills_mail_link_from_exact_subject_mention()
+    test_guard_backfills_mail_link_from_summary_subject()
 
     print("\n--- Rendering ---\n")
     test_render_candidates_basic()
@@ -433,6 +471,7 @@ def main():
     test_context_selection_limits_body_and_thread_reads()
     asyncio.run(test_filter_candidates_does_not_make_a_second_sampling_call())
     test_answer_language_instruction()
+    test_english_generated_copy_rejects_chinese()
     test_answer_requires_synthesis_instead_of_copying_email_body()
     test_answer_fallback_uses_request_language()
     test_empty_sampling_uses_error_fallback_not_local_mail_list()

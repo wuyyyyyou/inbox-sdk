@@ -34,6 +34,7 @@ import {
   mergeDraftArtifactBody,
   normalizeAttachmentKind,
   resolveAttachmentAccess,
+  resolveMessageThreadId,
   senderParts,
   splitAddresses,
   triggerAttachmentDownload,
@@ -681,6 +682,7 @@ export function MailDetailDrawer({
   const attachmentDownloadsRef = useRef<Set<string>>(new Set());
   const pendingThreadScrollTargetRef = useRef("");
   const draftLoadSequenceRef = useRef(0);
+  const suppressDraftLoadForRef = useRef("");
   const draftEditSequenceRef = useRef(0);
   const pendingDraftSavesRef = useRef(new Set<Promise<void>>());
   const composerCloseTimerRef = useRef<number | null>(null);
@@ -720,8 +722,9 @@ export function MailDetailDrawer({
     }, COMPOSER_TRANSITION_MS);
   };
 
-  const threadId = message?.thread_id || "";
+  const threadId = resolveMessageThreadId(message);
   const messageId = message?.id || "";
+  const draftStorageKey = `${mailbox.trim().toLowerCase()}:${threadId}`;
   const context = useMemo(() => (message ? buildMailContext(mailbox, message, page) : null), [mailbox, message, page]);
   const visibleThreadMessages = useMemo(
     () => page?.messages || [],
@@ -853,6 +856,7 @@ export function MailDetailDrawer({
     setDraft("");
     setDraftDirty(false);
     setDraftEtag("");
+    suppressDraftLoadForRef.current = "";
     setPreviewAttachment(null);
     invalidatePreviewCache();
     setPreviewText("");
@@ -993,6 +997,8 @@ export function MailDetailDrawer({
 
   useEffect(() => {
     if ((!composerOpen && !selectedIsDraft) || !threadId || !mailbox) return;
+    // 用户已明确替换或丢弃当前草稿时，不能再用持久化草稿自动回填编辑栏。
+    if (suppressDraftLoadForRef.current === draftStorageKey) return;
     const requestId = ++draftLoadSequenceRef.current;
     let cancelled = false;
     void getInboxThreadDraftRef.current(mailbox, threadId)
@@ -1011,7 +1017,7 @@ export function MailDetailDrawer({
     return () => {
       cancelled = true;
     };
-  }, [composerOpen, mailbox, message?.draft_body, selectedIsDraft, threadId]);
+  }, [composerOpen, draftStorageKey, mailbox, message?.draft_body, selectedIsDraft, threadId]);
 
   useEffect(() => {
     if (!composerOpen || !threadId || !mailbox || !draftDirty) return;
@@ -1062,15 +1068,31 @@ export function MailDetailDrawer({
   useEffect(() => {
     if (!insertRequest || !message || !threadId) return;
     const { artifact, mode, nonce } = insertRequest;
-    if (!matchesDraftArtifact(mailbox, threadId, artifact)) return;
+    if (!matchesDraftArtifact(mailbox, threadId, artifact)) {
+      onConsumeInsertRequest(nonce);
+      showToast("Open the matching email thread before applying this draft.");
+      return;
+    }
     onConsumeInsertRequest(nonce);
-    if (mode === "replace" && draft.trim() && !window.confirm("Replace the current draft reply?")) return;
+    if (mode === "replace") {
+      // Replace 是用户明确操作：直接覆盖编辑栏，不走 discard 或持久化草稿回填路径。
+      suppressDraftLoadForRef.current = draftStorageKey;
+      draftLoadSequenceRef.current += 1;
+      setComposerOpen(true);
+      draftEditSequenceRef.current += 1;
+      setDraft(artifact.body);
+      setDraftDirty(true);
+      requestAnimationFrame(() => bodyRef.current?.focus());
+      return;
+    }
+    // Append 仍保留编辑栏原文，并使已发起的旧草稿读取失效。
+    draftLoadSequenceRef.current += 1;
     setComposerOpen(true);
     draftEditSequenceRef.current += 1;
     setDraft((current) => mergeDraftArtifactBody(current, artifact.body, mode));
     setDraftDirty(true);
     requestAnimationFrame(() => bodyRef.current?.focus());
-  }, [draft, insertRequest, mailbox, message, onConsumeInsertRequest, threadId]);
+  }, [draft, draftStorageKey, insertRequest, mailbox, message, onConsumeInsertRequest, showToast, threadId]);
 
   const refreshThread = async () => {
     if (!threadId || !messageId) return;
@@ -1475,11 +1497,13 @@ export function MailDetailDrawer({
   };
 
   const discardDraft = async () => {
-    // Ignore any in-flight draft read that began before the discard action.
+    // Discard 是显式清空：阻止当前线程的持久化草稿在关闭后重新打开编辑栏。
+    suppressDraftLoadForRef.current = draftStorageKey;
     draftLoadSequenceRef.current += 1;
     draftEditSequenceRef.current += 1;
     setDraft("");
     setDraftDirty(false);
+    setDraftEtag("");
     closeComposer();
     setComposerExpanded(false);
     await Promise.allSettled([...pendingDraftSavesRef.current]);
