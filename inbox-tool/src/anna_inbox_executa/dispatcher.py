@@ -12,6 +12,25 @@ from anna_inbox_executa.mailbox_tools import *
 from anna_inbox_executa.card_tools import *
 from anna_inbox_executa.v2_tools import *
 
+async def _handle_ai_personalization_tool(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """阶段 B 个性化与确认执行工具分发。"""
+    if tool == "apply_proposed_actions":
+        return await apply_proposed_actions_tool(arguments)
+    if tool == "list_saved_prompts":
+        return await list_saved_prompts_tool(arguments)
+    if tool == "save_saved_prompt":
+        return await save_saved_prompt_tool(arguments)
+    if tool == "delete_saved_prompt":
+        return await delete_saved_prompt_tool(arguments)
+    if tool == "list_ai_memories":
+        return await list_ai_memories_tool(arguments)
+    if tool == "add_ai_memory":
+        return await add_ai_memory_tool(arguments)
+    if tool == "delete_ai_memory":
+        return await delete_ai_memory_tool(arguments)
+    return {"success": False, "error": f"unknown_tool:{tool}"}
+
+
 def _resolve_continue_future(future: Any, *, run_id: str, timeout: float, label: str) -> dict[str, Any]:
     try:
         return future.result(timeout=timeout)
@@ -129,6 +148,24 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "tool": tool, "data": re_run_custom_scan(arguments, invoke_id)}
     if tool == "start_ai_turn":
         return {"success": True, "tool": tool, "data": start_ai_turn(arguments, invoke_id)}
+    # 阶段 B：整理确认 / Saved prompts / AI Memory（均非 Router 静默 mutation）
+    if tool in (
+        "apply_proposed_actions",
+        "list_saved_prompts",
+        "save_saved_prompt",
+        "delete_saved_prompt",
+        "list_ai_memories",
+        "add_ai_memory",
+        "delete_ai_memory",
+    ):
+        future = asyncio.run_coroutine_threadsafe(
+            _handle_ai_personalization_tool(tool, arguments),
+            loop,
+        )
+        try:
+            return {"success": True, "tool": tool, "data": future.result(timeout=120.0)}
+        except Exception as exc:
+            return {"success": False, "tool": tool, "error": str(exc)}
     if tool == "get_authorized_email":
         discovered = _discover_mailboxes()
         authorized = [d["email"] for d in discovered if d.get("authorized")]

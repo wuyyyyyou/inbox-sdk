@@ -456,6 +456,20 @@ v1 **不**注册为 Router 可执行 mutation：`send_mail`、`delete_mail`、`a
 5. **AI Memories（v1）**：设置页/对话写入 + 每 turn 注入短偏好摘要（无邮件正文）。
 6. 去掉本地邮件列表成功伪装；统一错误摘要。
 
+**阶段 B 实现状态（2026-07-15）：已落地**
+
+| 项 | 位置 |
+| --- | --- |
+| 白名单扩展 | `mail_agent/ai_turn/router.py`（含 draft / revise / propose / remember） |
+| 写稿 / 整理 / 记忆工具 | `mail_agent/ai_turn/tools.py` |
+| 多轮 registry | `mail_agent/ai_turn/registry.py`（进程内，无正文） |
+| Saved prompts / Memory 存储 | `mail_agent/ai_turn/personalization.py`（APS/local KV） |
+| 确认执行 | `apply_proposed_actions`（manifest + dispatcher）；`mark_done`/`archive` → mark_read + 前端本地 Done |
+| 前端确认卡 / ↑ prompts / 设置 AI Personalization | `HomeView`、`SettingsView`、`useAppController`、`mailAgentClient` |
+| 测试 | `tests/test_ai_turn_phase_b.py`、既有 `test_ai_turn_router.py` |
+
+`mark_done` 与 Inbox Done 对齐：Gmail `batch_mark_read` + 前端 workflow `done` 标记；**不**做 Gmail archive 标签流水线。
+
 ### 阶段 C — 批量与清理
 
 1. `batch_draft` / `batch_outreach`。

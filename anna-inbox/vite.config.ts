@@ -9,6 +9,8 @@ export default defineConfig({
     outDir: "../bundle",
     emptyOutDir: true,
     sourcemap: false,
+    // 单入口 app.js 体量超过默认 500kB 属预期，不拆包以免影响 Anna App 加载路径
+    chunkSizeWarningLimit: 1500,
     rollupOptions: {
       output: {
         entryFileNames: "app.js",

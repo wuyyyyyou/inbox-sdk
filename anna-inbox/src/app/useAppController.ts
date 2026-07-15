@@ -15,6 +15,7 @@ import {
 import type {
   ActiveCardsPayload,
   AiChatMessage,
+  AiMailContextRef,
   AppState,
   AskHistoryEntry,
   AttachmentDownloadPayload,
@@ -281,6 +282,8 @@ function buildAiTurnUiContext(args: {
   displayRangeDays?: number;
   currentMailContext?: SendAiMessageOptions["currentMailContext"];
   languageHint?: string;
+  messages?: AiChatMessage[];
+  savedPromptId?: string;
 }) {
   const mailbox = selectedOrPrimary(args.selectedMailboxes, args.mailbox);
   const plan = normalizeScanPlan(args.scanPlan);
@@ -305,6 +308,19 @@ function buildAiTurnUiContext(args: {
           snippet: String(ctx.body || "").slice(0, 240),
         }
       : { kind: "none" as const, mailbox, message_id: "", thread_id: "", subject: "", snippet: "" };
+  // 多轮改写：注入上一轮 draft 或 Compose 正文
+  let lastDraft: { body: string; source: string } | undefined;
+  if (ctx && ctx.kind === "compose" && String(ctx.body || "").trim()) {
+    lastDraft = { body: String(ctx.body).slice(0, 8000), source: "compose_box" };
+  } else {
+    const recent = [...(args.messages || [])].reverse().find(
+      (message) => message.role === "assistant" && message.artifact && String((message.artifact as { body?: string }).body || "").trim(),
+    );
+    if (recent?.artifact) {
+      const body = String((recent.artifact as { body?: string }).body || "").slice(0, 8000);
+      if (body) lastDraft = { body, source: "assistant_artifact" };
+    }
+  }
   return {
     conversation_id: args.conversationId,
     mailbox,
@@ -317,6 +333,8 @@ function buildAiTurnUiContext(args: {
     },
     current_thread: thread,
     selected_threads: [],
+    last_draft: lastDraft,
+    saved_prompt_id: args.savedPromptId || "",
     language_hint: args.languageHint || "",
   };
 }
@@ -496,7 +514,7 @@ export interface AppActions {
   setProvider(kind: "llm" | "storage", value: string): void;
   setDrawer(drawer: "sources" | "history" | "memory" | "scanPlan", open: boolean): void;
   minimize(value: boolean): void;
-  openSettings(): void;
+  openSettings(focusSavedPrompts?: boolean): void;
   closeSettings(): void;
   loadInboxSettings(mailbox?: string): Promise<void>;
   saveInboxSettings(patch: Partial<InboxSettings>): Promise<boolean>;
@@ -602,6 +620,17 @@ export interface AppActions {
   generateDraftWithAnswers(answers: Record<string, string>): Promise<void>;
   generateAskDraftWithAnswers(actionKey: string, item: CustomRunResultItem, answers: Record<string, string>, mailbox?: string): Promise<void>;
   copyDraft(text: string): Promise<void>;
+  /** 用户确认整理建议后执行 mutation + 返回 local_done 供 UI 写 Done */
+  applyProposedActions(args: {
+    action: string;
+    items: Array<{ mailbox: string; message_id: string; thread_id: string; subject?: string }>;
+  }): Promise<{ local_done?: Array<{ mailbox?: string; message_id?: string; thread_id?: string }>; success?: boolean }>;
+  listSavedPrompts(): Promise<Array<{ id: string; title: string; body: string }>>;
+  saveSavedPrompt(args: { prompt_id?: string; title?: string; body: string }): Promise<boolean>;
+  deleteSavedPrompt(promptId: string): Promise<boolean>;
+  listAiMemories(): Promise<Array<{ id: string; text: string }>>;
+  addAiMemory(text: string): Promise<boolean>;
+  deleteAiMemory(memoryId: string): Promise<boolean>;
 }
 
 export function useAppController() {
@@ -1664,7 +1693,16 @@ export function useAppController() {
       if (drawer === "scanPlan" && open) void loadScanPlan();
       if (drawer === "memory" && open) void loadContactMemories();
     },
-    openSettings() { setState((s) => ({ ...s, settingsOpen: true })); void loadInboxSettings(); },
+    openSettings(focusSavedPrompts = false) {
+      setState((s) => ({
+        ...s,
+        settingsOpen: true,
+        settingsFocusRequest: focusSavedPrompts
+          ? s.settingsFocusRequest + 1
+          : s.settingsFocusRequest,
+      }));
+      void loadInboxSettings();
+    },
     closeSettings() { setState((s) => ({ ...s, settingsOpen: false })); },
     loadInboxSettings,
     saveInboxSettings,
@@ -2964,6 +3002,8 @@ export function useAppController() {
             displayRangeDays: state.inboxSettings?.display_range_days,
             currentMailContext: options.currentMailContext,
             languageHint: prefersChinese(userRequest) ? "zh" : "en",
+            messages: messagesWithUser,
+            savedPromptId: options.savedPromptId,
           });
           const started = await client.startAiTurn({
             user_text: userRequest,
@@ -3000,6 +3040,49 @@ export function useAppController() {
           const assistantText = String(payload.assistant_text || payload.summary || "").trim()
             || (prefersChinese(userRequest) ? "已完成。" : "Done.");
 
+          const parseMailContext = (): AiMailContextRef | undefined => {
+            const mailCtx = payload.mail_context && typeof payload.mail_context === "object"
+              ? payload.mail_context as Record<string, unknown>
+              : null;
+            if (mailCtx && String(mailCtx.kind) === "thread") {
+              return {
+                kind: "gmail_thread",
+                mailbox: String(mailCtx.mailbox || scanMailbox),
+                thread_id: String(mailCtx.thread_id || ""),
+                anchor_message_id: String(mailCtx.message_id || ""),
+                latest_message_id: String(mailCtx.message_id || ""),
+              };
+            }
+            return options.currentMailContext || undefined;
+          };
+
+          const parseArtifact = (): AiChatMessage["artifact"] => {
+            const raw = payload.artifact;
+            if (!raw || typeof raw !== "object") return null;
+            const art = raw as Record<string, unknown>;
+            const type = String(art.type || "");
+            if (type === "draft_reply") {
+              return {
+                type: "draft_reply",
+                mailbox: String(art.mailbox || scanMailbox),
+                thread_id: String(art.thread_id || ""),
+                body: String(art.body || ""),
+                source_prompt: String(art.source_prompt || userRequest),
+              };
+            }
+            if (type === "compose_draft") {
+              return {
+                type: "compose_draft",
+                mailbox: String(art.mailbox || scanMailbox),
+                body: String(art.body || ""),
+                source_prompt: String(art.source_prompt || userRequest),
+                mode: String(art.mode || "insert") === "replace" ? "replace" : "insert",
+                subject: String(art.subject || "") || undefined,
+              };
+            }
+            return null;
+          };
+
           if (kind === "scan") {
             await loadActiveCards();
             if (!isCurrentGeneration()) return;
@@ -3032,10 +3115,81 @@ export function useAppController() {
               },
             ];
             upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
+          } else if (kind === "draft") {
+            const finalMessages: AiChatMessage[] = [
+              ...messagesWithUser,
+              {
+                ...pendingMessage,
+                pending: false,
+                kind: "draft",
+                content: assistantText,
+                artifact: parseArtifact(),
+                mailContext: parseMailContext(),
+                sourcePrompt: userRequest,
+                timestamp: new Date().toISOString(),
+              },
+            ];
+            upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
+          } else if (kind === "propose") {
+            const raw = payload.proposed_actions;
+            const proposed = raw && typeof raw === "object" ? raw as Record<string, unknown> : null;
+            const itemsRaw = proposed && Array.isArray(proposed.items) ? proposed.items : [];
+            const finalMessages: AiChatMessage[] = [
+              ...messagesWithUser,
+              {
+                ...pendingMessage,
+                pending: false,
+                kind: "propose",
+                content: assistantText,
+                proposedActions: proposed
+                  ? {
+                      step_index: Number(proposed.step_index || 1),
+                      step_title: String(proposed.step_title || ""),
+                      rationale: String(proposed.rationale || ""),
+                      primary_action: String(proposed.primary_action || "mark_done"),
+                      allowed_actions: Array.isArray(proposed.allowed_actions)
+                        ? proposed.allowed_actions.map(String)
+                        : ["mark_done", "archive", "trash"],
+                      items: itemsRaw
+                        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+                        .map((item) => ({
+                          mailbox: String(item.mailbox || scanMailbox),
+                          message_id: String(item.message_id || ""),
+                          thread_id: String(item.thread_id || ""),
+                          subject: String(item.subject || ""),
+                          default_selected: item.default_selected !== false,
+                        })),
+                      requires_user_confirmation: true,
+                      followup_after_apply: String(proposed.followup_after_apply || ""),
+                      followup_after_skip: String(proposed.followup_after_skip || ""),
+                      followup_after_dismiss: String(proposed.followup_after_dismiss || ""),
+                      continue_prompt: String(proposed.continue_prompt || ""),
+                      language: String(proposed.language || "") || undefined,
+                      recommendation_groups: Array.isArray(proposed.recommendation_groups)
+                        ? proposed.recommendation_groups
+                          .filter((g): g is Record<string, unknown> => Boolean(g) && typeof g === "object")
+                          .map((g) => ({
+                            title: String(g.title || ""),
+                            subjects: Array.isArray(g.subjects) ? g.subjects.map(String) : [],
+                            items: Array.isArray(g.items)
+                              ? g.items
+                                .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+                                .map((item) => ({
+                                  mailbox: String(item.mailbox || scanMailbox),
+                                  message_id: String(item.message_id || ""),
+                                  thread_id: String(item.thread_id || ""),
+                                  subject: String(item.subject || ""),
+                                }))
+                              : undefined,
+                          }))
+                        : undefined,
+                    }
+                  : null,
+                timestamp: new Date().toISOString(),
+              },
+            ];
+            upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
           } else if (kind === "mail_context") {
-            const mailCtx = payload.mail_context && typeof payload.mail_context === "object"
-              ? payload.mail_context as Record<string, unknown>
-              : null;
             const finalMessages: AiChatMessage[] = [
               ...messagesWithUser,
               {
@@ -3043,15 +3197,7 @@ export function useAppController() {
                 pending: false,
                 kind: "mail_context",
                 content: assistantText,
-                mailContext: mailCtx && String(mailCtx.kind) === "thread"
-                  ? {
-                      kind: "gmail_thread",
-                      mailbox: String(mailCtx.mailbox || scanMailbox),
-                      thread_id: String(mailCtx.thread_id || ""),
-                      anchor_message_id: String(mailCtx.message_id || ""),
-                      latest_message_id: String(mailCtx.message_id || ""),
-                    }
-                  : options.currentMailContext || undefined,
+                mailContext: parseMailContext(),
                 timestamp: new Date().toISOString(),
               },
             ];
@@ -3062,7 +3208,7 @@ export function useAppController() {
               {
                 ...pendingMessage,
                 pending: false,
-                kind: "chat",
+                kind: kind === "memory" ? "memory" : "chat",
                 content: assistantText,
                 timestamp: new Date().toISOString(),
               },
@@ -3703,6 +3849,106 @@ export function useAppController() {
         showToast("Draft copied");
       } catch {
         showToast("Copy failed");
+      }
+    },
+    async applyProposedActions({ action, items }) {
+      try {
+        const result = await client.applyProposedActions({ action, items });
+        if (!result.success && result.error) {
+          showToast(result.error);
+          return { success: false };
+        }
+        const count = items.length;
+        // 文案语言由调用方 toast 覆盖；此处保持中性短提示
+        const label = action === "trash"
+          ? (count === 1 ? "Moved 1 thread to trash." : `Moved ${count} threads to trash.`)
+          : action === "archive"
+            ? (count === 1 ? "Archived 1 thread." : `Archived ${count} threads.`)
+            : (count === 1 ? "Marked 1 thread as done." : `Marked ${count} threads as done.`);
+        showToast(label);
+        const localDone = result.local_done || (result.requires_local_done ? items : []);
+        // 通知 Inbox 工作台写入本地 Done 标记（与 HomeView Done 语义对齐）
+        if (typeof window !== "undefined" && localDone.length && (action === "mark_done" || action === "archive")) {
+          window.dispatchEvent(new CustomEvent("anna-inbox-local-done", { detail: { items: localDone } }));
+        }
+        return {
+          success: result.success !== false,
+          local_done: localDone,
+        };
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+        return { success: false };
+      }
+    },
+    async listSavedPrompts() {
+      try {
+        const result = await client.listSavedPrompts();
+        return (result.prompts || []).map((item) => ({
+          id: String(item.id || ""),
+          title: String(item.title || ""),
+          body: String(item.body || ""),
+        })).filter((item) => item.id);
+      } catch {
+        return [];
+      }
+    },
+    async saveSavedPrompt(args) {
+      try {
+        const result = await client.saveSavedPrompt(args);
+        if (!result.success) {
+          showToast(result.error || "Failed to save prompt.");
+          return false;
+        }
+        showToast("Prompt saved.");
+        return true;
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+        return false;
+      }
+    },
+    async deleteSavedPrompt(promptId) {
+      try {
+        await client.deleteSavedPrompt(promptId);
+        showToast("Prompt deleted.");
+        return true;
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+        return false;
+      }
+    },
+    async listAiMemories() {
+      try {
+        const result = await client.listAiMemories();
+        return (result.memories || []).map((item) => ({
+          id: String(item.id || ""),
+          text: String(item.text || ""),
+        })).filter((item) => item.id);
+      } catch {
+        return [];
+      }
+    },
+    async addAiMemory(text) {
+      try {
+        const result = await client.addAiMemory(text, "settings");
+        if (!result.success) {
+          showToast(result.error || "Failed to add memory.");
+          return false;
+        }
+        showToast("Memory saved.");
+        return true;
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+        return false;
+      }
+    },
+    async deleteAiMemory(memoryId) {
+      try {
+        await client.deleteAiMemory(memoryId);
+        showToast("Memory deleted.");
+        return true;
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+        return false;
       }
     },
     setGapAnswers(cardKey, answers) {

@@ -22,15 +22,15 @@
 
 ## 项目基线
 
-Anna Inbox 当前版本为 `2.0.17`。前端位于 `anna-inbox/`，后端 Executa 位于 `inbox-tool/`。
+Anna Inbox 当前版本为 `2.0.18`。前端位于 `anna-inbox/`，后端 Executa 位于 `inbox-tool/`。
 
 - `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表。
 - `anna-inbox/src/features/mail-detail/`：线程详情、正文、草稿和附件预览。
 - `anna-inbox/src/app/useAppController.ts`：主要状态与工作流控制；AI 侧栏默认 `startAiTurn`。
 - `anna-inbox/src/api/mailAgentClient.ts`：所有 Executa 工具调用的统一 facade。
 - `anna-inbox/manifest.json`、`inbox-tool/src/anna_inbox_executa/common.py` 与 `mailbox_tools.py`：Google Connected accounts 声明、多账号发现状态和安全错误提示。
-- `inbox-tool/src/anna_inbox_executa/`：JSON-RPC 入口和工具分发（含 `start_ai_turn`）。
-- `inbox-tool/src/mail_agent/ai_turn/`：AI 侧栏本地 Router 与白名单 Runner（阶段 A）。
+- `inbox-tool/src/anna_inbox_executa/`：JSON-RPC 入口和工具分发（含 `start_ai_turn`、整理确认与 Saved prompts / Memory）。
+- `inbox-tool/src/mail_agent/ai_turn/`：AI 侧栏本地 Router 与白名单 Runner（阶段 A+B）。
 - `inbox-tool/src/mail_agent/mail_providers/gmail/adapter.py`：Gmail API、OAuth、本地缓存和正文解码。
 - `inbox-tool/src/mail_agent/storage/`：APS/local storage 的统一 async 层。
 - `inbox-tool/src/mail_agent/ask/`：Ask 规划、搜索和回答。

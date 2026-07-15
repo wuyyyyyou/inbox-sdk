@@ -658,9 +658,10 @@ body.is-resizing-ai-sidebar {
   transform: translateX(-50%);
 }
 .ai-composer textarea {
+  box-sizing: border-box;
   width: 100%;
   min-height: 62px;
-  padding: 0;
+  padding: 2px 1px 0;
   resize: none;
   border: 0;
   outline: 0;
@@ -693,6 +694,7 @@ body.is-resizing-ai-sidebar {
   display: flex;
   align-items: center;
   gap: 7px;
+  margin-left: auto;
 }
 .ai-composer-footer button {
   width: 31px;
@@ -1401,32 +1403,52 @@ body.is-resizing-ai-sidebar {
 }
 .settings-content {
   height: 100%;
+  overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 28px;
+  padding: 20px 22px;
 }
 .settings-content header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 22px;
+  margin-bottom: 12px;
 }
 .settings-content section {
   border-top: 1px solid rgba(0, 0, 0, 0.1);
-  padding-bottom: 18px;
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+.settings-content section > h2,
+.settings-content .drawer-title {
+  margin: 0 0 4px;
+  line-height: 1.25;
+}
+.settings-content section > h3,
+.settings-content section h3 {
+  margin: 10px 0 4px;
+  line-height: 1.25;
+  font-size: 16px;
+}
+.settings-content section > p,
+.settings-content section p {
+  margin: 0 0 8px;
+  line-height: 1.4;
+  color: #5b6478;
+  font-size: 13px;
 }
 .settings-content section > label,
 .settings-content section div > label {
   display: flex;
   align-items: center;
   gap: 4px;
-  margin: 10px 0;
+  margin: 6px 0;
 }
 .settings-content section input[type="radio"],
 .settings-content section input[type="checkbox"] { flex: 0 0 auto; margin: 0; }
 .settings-content section button,
 .settings-content select {
-  margin: 4px 8px 4px 0;
+  margin: 2px 8px 2px 0;
 }
 
 .splits-overlay {
@@ -12816,6 +12838,335 @@ body,
   background: rgba(235, 240, 255, 0.72);
   box-shadow: none;
   opacity: 0.72;
+}
+
+.ai-propose-card {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(111, 129, 214, 0.18);
+  background: rgba(244, 247, 255, 0.96);
+  box-shadow: 0 12px 28px rgba(65, 76, 130, 0.08);
+}
+
+.ai-propose-card strong {
+  font-size: 14px;
+  color: #24315f;
+}
+
+.ai-propose-step {
+  margin: 0;
+  font-weight: 650;
+  color: #3a4a86;
+}
+
+.ai-propose-rationale,
+.ai-propose-resolved {
+  margin: 0;
+  color: #5b678f;
+  font-size: 13px;
+}
+
+.ai-propose-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.ai-propose-list label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.ai-propose-link {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #3157db;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.ai-propose-link:hover {
+  text-decoration: underline;
+}
+
+.ai-propose-card select {
+  min-height: 36px;
+  border-radius: 9px;
+  border: 1px solid rgba(79, 109, 245, 0.2);
+  padding: 0 10px;
+  background: #fff;
+  color: #3a4a86;
+}
+
+.ai-propose-card.is-resolved {
+  opacity: 0.96;
+}
+
+.ai-propose-check {
+  display: inline-grid;
+  width: 16px;
+  min-width: 16px;
+  place-items: center;
+  color: #4f6df5;
+  font-weight: 700;
+}
+
+.ai-propose-list li.is-done .ai-propose-link {
+  color: #5b678f;
+}
+
+.ai-propose-followup {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(111, 129, 214, 0.12);
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.ai-propose-reco-group {
+  display: grid;
+  gap: 4px;
+}
+
+.ai-propose-reco-group strong {
+  font-size: 13px;
+  color: #24315f;
+}
+
+.ai-propose-reco-group ul,
+.ai-propose-reco-list {
+  list-style: disc;
+  margin: 0;
+  padding-left: 18px;
+  color: #4c5f99;
+  font-size: 13px;
+  display: grid;
+  gap: 6px;
+}
+
+.ai-propose-reco-list li {
+  display: list-item;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.ai-propose-reco-list .ai-propose-link {
+  display: inline;
+  text-align: left;
+  white-space: normal;
+}
+
+.ai-saved-prompts-panel {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: calc(100% + 8px);
+  z-index: 30;
+  max-height: 300px;
+  overflow: visible;
+  padding: 0;
+  border-radius: 14px;
+  border: 1px solid rgba(111, 129, 214, 0.18);
+  background: #fff;
+  box-shadow: 0 16px 36px rgba(45, 55, 98, 0.16);
+}
+
+.ai-saved-prompts-panel header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 12px;
+  border-bottom: 1px solid rgba(111, 129, 214, 0.12);
+  color: #777b88;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.ai-saved-prompts-panel .ai-saved-prompts-settings {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: #697086;
+  background: transparent;
+}
+
+.ai-saved-prompts-panel .ai-saved-prompts-settings:hover {
+  color: #405ad0;
+  background: rgba(79, 109, 245, 0.08);
+}
+
+.ai-saved-prompts-settings svg {
+  width: 16px;
+  height: 16px;
+}
+
+.ai-saved-prompts-list {
+  max-height: 250px;
+  box-sizing: border-box;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 5px;
+}
+
+.ai-saved-prompts-list:not(:has(.ai-saved-prompt-item:nth-child(4))) {
+  overflow-y: visible;
+}
+
+.ai-saved-prompts-panel .ai-saved-prompt-item {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 3px;
+  border-radius: 8px;
+}
+
+.ai-saved-prompts-panel .ai-saved-prompt-item:hover {
+  background: rgba(79, 109, 245, 0.08);
+}
+
+.ai-saved-prompts-panel .ai-saved-prompt-select {
+  min-width: 0;
+  flex: 1;
+  padding: 5px 3px;
+  border: 0;
+  color: #31416f;
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+}
+
+.ai-saved-prompt-delete,
+.settings-delete-button {
+  position: relative;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: #858b9e;
+  background: transparent;
+}
+
+.ai-saved-prompt-delete:hover,
+.ai-saved-prompt-delete:focus-visible,
+.settings-delete-button:hover,
+.settings-delete-button:focus-visible {
+  color: #bf5163;
+  background: #fff0f2;
+}
+
+.ai-saved-prompt-delete svg,
+.settings-delete-button svg {
+  width: 17px;
+  height: 17px;
+}
+
+.ai-saved-prompt-delete::after,
+.settings-delete-button::after {
+  position: absolute;
+  z-index: 24;
+  top: calc(100% + 7px);
+  right: 50%;
+  padding: 5px 7px;
+  border-radius: 6px;
+  color: #fff;
+  background: #1f2638;
+  content: attr(data-tooltip);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(50%) translateY(-3px);
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.ai-saved-prompt-delete:hover::after,
+.ai-saved-prompt-delete:focus-visible::after,
+.settings-delete-button:hover::after,
+.settings-delete-button:focus-visible::after {
+  opacity: 1;
+  transform: translateX(50%) translateY(0);
+}
+
+.ai-saved-prompts-empty {
+  padding: 13px 12px 16px;
+  color: #9296a4;
+  font-size: 13px;
+  font-style: italic;
+  text-align: center;
+}
+
+.settings-ai-personalization {
+  display: grid;
+  gap: 6px;
+}
+
+.settings-ai-personalization > h3 {
+  margin-top: 8px;
+}
+
+.settings-ai-personalization .settings-list {
+  display: grid;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.settings-ai-personalization .settings-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(122, 138, 198, 0.12);
+}
+
+.settings-ai-personalization .settings-row p {
+  margin: 2px 0 0;
+}
+
+.settings-ai-personalization .settings-delete-button {
+  margin: 0;
+  width: 32px;
+  height: 32px;
+}
+
+.settings-ai-personalization .settings-delete-button svg {
+  width: 22px;
+  height: 22px;
+}
+
+.settings-ai-personalization textarea,
+.settings-ai-personalization input[type="text"] {
+  width: 100%;
+  min-height: 36px;
+  border-radius: 8px;
+  border: 1px solid rgba(122, 138, 198, 0.25);
+  padding: 8px 10px;
 }
 
 @keyframes aiDraftArtifactIn {

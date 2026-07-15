@@ -433,6 +433,43 @@ export class MailAgentClient {
     return this.invoke<RunStatus>("start_ai_turn", args, { timeoutMs: CUSTOM_SCAN_INVOKE_TIMEOUT_MS, retry: "safe" });
   }
 
+  /** 用户确认整理建议后执行（非 Router 静默 mutation）。 */
+  applyProposedActions(args: { action: string; items: Array<Record<string, unknown>> }) {
+    return this.invoke<{
+      success?: boolean;
+      action?: string;
+      results?: Array<Record<string, unknown>>;
+      local_done?: Array<{ mailbox?: string; message_id?: string; thread_id?: string }>;
+      errors?: string[];
+      requires_local_done?: boolean;
+      error?: string;
+    }>("apply_proposed_actions", args);
+  }
+
+  listSavedPrompts() {
+    return this.invoke<{ success?: boolean; prompts?: Array<Record<string, unknown>>; etag?: string }>("list_saved_prompts", {});
+  }
+
+  saveSavedPrompt(args: { prompt_id?: string; title?: string; body: string }) {
+    return this.invoke<{ success?: boolean; prompt?: Record<string, unknown>; error?: string }>("save_saved_prompt", args);
+  }
+
+  deleteSavedPrompt(promptId: string) {
+    return this.invoke<{ success?: boolean; deleted?: number }>("delete_saved_prompt", { prompt_id: promptId });
+  }
+
+  listAiMemories() {
+    return this.invoke<{ success?: boolean; memories?: Array<Record<string, unknown>>; etag?: string }>("list_ai_memories", {});
+  }
+
+  addAiMemory(text: string, source = "settings") {
+    return this.invoke<{ success?: boolean; memory?: Record<string, unknown>; error?: string }>("add_ai_memory", { text, source });
+  }
+
+  deleteAiMemory(memoryId: string) {
+    return this.invoke<{ success?: boolean; deleted?: number }>("delete_ai_memory", { memory_id: memoryId });
+  }
+
   clearCards(mailbox: string, category: string) {
     return this.invoke<{ ok: boolean; removed: number }>("clear_cards", { mailbox, category });
   }

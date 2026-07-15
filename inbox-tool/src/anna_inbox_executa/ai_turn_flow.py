@@ -103,16 +103,25 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
 
         kind = str(outcome.get("kind") or "chat")
         result_data: dict[str, Any] = {
-            "success": True,
+            "success": kind != "error",
             "kind": kind,
             "assistant_text": str(outcome.get("assistant_text") or ""),
             "route": outcome.get("route") if isinstance(outcome.get("route"), dict) else {},
             "fallback_used": bool(outcome.get("fallback_used")),
         }
+        if kind == "error":
+            result_data["error"] = str(outcome.get("error") or "error")
         if kind == "clarify":
             result_data["clarify"] = str(outcome.get("clarify") or outcome.get("assistant_text") or "")
-        if kind == "mail_context" and isinstance(outcome.get("mail_context"), dict):
+        if kind in {"mail_context", "draft"} and isinstance(outcome.get("mail_context"), dict):
             result_data["mail_context"] = outcome["mail_context"]
+        if isinstance(outcome.get("artifact"), dict):
+            result_data["artifact"] = outcome["artifact"]
+        if kind == "propose" and isinstance(outcome.get("proposed_actions"), dict):
+            result_data["proposed_actions"] = outcome["proposed_actions"]
+            result_data["requires_user_confirmation"] = True
+        if kind == "memory" and isinstance(outcome.get("memory"), dict):
+            result_data["memory"] = outcome["memory"]
         if kind == "scan" and isinstance(outcome.get("scan_result"), dict):
             # 展开 Ask 结果字段，便于前端复用 buildCustomRunResult。
             scan = outcome["scan_result"]
@@ -133,13 +142,17 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
             })
             if not result_data["assistant_text"]:
                 result_data["assistant_text"] = str(scan.get("summary") or "")
+        # compose 路径也可能附带 scan_result
+        if kind == "draft" and isinstance(outcome.get("scan_result"), dict) and "summary" not in result_data:
+            scan = outcome["scan_result"]
+            result_data["search_summary"] = str(scan.get("summary") or "")[:500]
 
         MAIL_AGENT_RUNS[run_id].update({
-            "status": "done",
-            "stage": "done",
+            "status": "done" if kind != "error" else "failed",
+            "stage": "done" if kind != "error" else "failed",
             "updated_at": beijing_now(),
             "result": result_data,
-            "error": "",
+            "error": str(outcome.get("error") or "") if kind == "error" else "",
         })
         _save_run_checkpoint(run_id)
     except Exception as exc:
@@ -152,4 +165,59 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
         _save_run_checkpoint(run_id)
 
 
-__all__ = ["start_ai_turn"]
+async def apply_proposed_actions_tool(arguments: dict[str, Any]) -> dict[str, Any]:
+    """用户确认整理建议后执行 mutation（非 Router 路径）。"""
+    from mail_agent.ai_turn.tools import apply_proposed_actions
+
+    action = str(arguments.get("action") or "").strip()
+    items = arguments.get("items") if isinstance(arguments.get("items"), list) else []
+    return await apply_proposed_actions(action=action, items=items)
+
+
+async def list_saved_prompts_tool(_arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    from mail_agent.ai_turn.personalization import list_saved_prompts
+    return await list_saved_prompts()
+
+
+async def save_saved_prompt_tool(arguments: dict[str, Any]) -> dict[str, Any]:
+    from mail_agent.ai_turn.personalization import save_saved_prompt
+    return await save_saved_prompt(
+        prompt_id=str(arguments.get("prompt_id") or arguments.get("id") or ""),
+        title=str(arguments.get("title") or ""),
+        body=str(arguments.get("body") or arguments.get("text") or ""),
+    )
+
+
+async def delete_saved_prompt_tool(arguments: dict[str, Any]) -> dict[str, Any]:
+    from mail_agent.ai_turn.personalization import delete_saved_prompt
+    return await delete_saved_prompt(str(arguments.get("prompt_id") or arguments.get("id") or ""))
+
+
+async def list_ai_memories_tool(_arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    from mail_agent.ai_turn.personalization import list_ai_memories
+    return await list_ai_memories()
+
+
+async def add_ai_memory_tool(arguments: dict[str, Any]) -> dict[str, Any]:
+    from mail_agent.ai_turn.personalization import add_ai_memory
+    return await add_ai_memory(
+        str(arguments.get("text") or arguments.get("preference") or ""),
+        source=str(arguments.get("source") or "settings"),
+    )
+
+
+async def delete_ai_memory_tool(arguments: dict[str, Any]) -> dict[str, Any]:
+    from mail_agent.ai_turn.personalization import delete_ai_memory
+    return await delete_ai_memory(str(arguments.get("memory_id") or arguments.get("id") or ""))
+
+
+__all__ = [
+    "add_ai_memory_tool",
+    "apply_proposed_actions_tool",
+    "delete_ai_memory_tool",
+    "delete_saved_prompt_tool",
+    "list_ai_memories_tool",
+    "list_saved_prompts_tool",
+    "save_saved_prompt_tool",
+    "start_ai_turn",
+]

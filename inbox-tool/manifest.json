@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.0.17",
+  "version": "2.0.18",
   "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Brief workflows, Ask, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
@@ -1795,7 +1795,7 @@
     },
     {
       "name": "start_ai_turn",
-      "description": "Unified AI sidebar turn: local router selects whitelist tools (chat, search, summarize) then returns a pollable run.",
+      "description": "Unified AI sidebar turn: local router selects whitelist tools (chat, search, summarize, draft, propose, memory) then returns a pollable run.",
       "parameters": [
         {
           "name": "user_text",
@@ -1859,6 +1859,107 @@
         }
       ],
       "timeout": 600
+    },
+    {
+      "name": "apply_proposed_actions",
+      "description": "Apply user-confirmed inbox organize actions (mark_done/archive/trash). Never call without explicit UI confirmation.",
+      "parameters": [
+        {
+          "name": "action",
+          "type": "string",
+          "description": "mark_done | archive | trash",
+          "required": true
+        },
+        {
+          "name": "items",
+          "type": "array",
+          "description": "Selected items: mailbox, message_id, thread_id.",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "list_saved_prompts",
+      "description": "List AI sidebar saved prompts.",
+      "parameters": [],
+      "timeout": 60
+    },
+    {
+      "name": "save_saved_prompt",
+      "description": "Create or update a saved prompt.",
+      "parameters": [
+        {
+          "name": "prompt_id",
+          "type": "string",
+          "description": "Existing id to update; omit to create.",
+          "required": false
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "description": "Short title.",
+          "required": false
+        },
+        {
+          "name": "body",
+          "type": "string",
+          "description": "Prompt body text.",
+          "required": true
+        }
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "delete_saved_prompt",
+      "description": "Delete a saved prompt by id.",
+      "parameters": [
+        {
+          "name": "prompt_id",
+          "type": "string",
+          "description": "Prompt id.",
+          "required": true
+        }
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "list_ai_memories",
+      "description": "List AI personalization memory preference lines.",
+      "parameters": [],
+      "timeout": 60
+    },
+    {
+      "name": "add_ai_memory",
+      "description": "Add an AI memory preference (short behavior note, no email body).",
+      "parameters": [
+        {
+          "name": "text",
+          "type": "string",
+          "description": "Preference text.",
+          "required": true
+        },
+        {
+          "name": "source",
+          "type": "string",
+          "description": "chat | settings",
+          "required": false
+        }
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "delete_ai_memory",
+      "description": "Delete one AI memory entry.",
+      "parameters": [
+        {
+          "name": "memory_id",
+          "type": "string",
+          "description": "Memory id.",
+          "required": true
+        }
+      ],
+      "timeout": 60
     },
     {
       "name": "get_authorized_email",

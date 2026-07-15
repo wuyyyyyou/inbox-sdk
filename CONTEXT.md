@@ -22,7 +22,11 @@ Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 或 All 
 
 **Anna AI Sidebar**
 
-主界面左侧的对话入口。默认调用 Executa `start_ai_turn`：由本地 Router 在白名单工具中选型（普通对话、收件箱搜索、当前邮件总结等），并透传只读屏上上下文。旧前端 `aiRoute` 三分支可作为旁路保留。
+主界面左侧的对话入口。默认调用 Executa `start_ai_turn`：由本地 Router 在白名单工具中选型（对话、搜索、总结、写/改稿、整理建议、记忆等），并透传只读屏上上下文。整理类仅产出确认卡片，须用户确认后 mutation。旧前端 `aiRoute` 三分支可作为旁路保留。
+
+**Saved prompts / AI Memory**
+
+AI Personalization：可复用提示词与长期偏好短句（无邮件正文）。Memory 每 turn 注入；Saved prompts 经输入框 ↑ 选择。
 
 **Local Draft**
 
@@ -55,6 +59,6 @@ Brief 的扫描窗口、数量和行为偏好。
 ## Product boundaries
 
 - 2.0.1 只支持 Gmail；Outlook 仍是未来方向。
-- 设置入口暂时不在前端展示，后端配置和工具契约保留。
-- 邮件发送、标记已读、标签变更和移至垃圾箱必须来自明确用户操作。
+- 设置页含 AI Personalization（Saved prompts / Memory）。
+- 邮件发送、标记已读、标签变更、移至垃圾箱与整理确认必须来自明确用户操作。
 - 凭据不作为工具参数传递，也不得写入日志或持久化状态。

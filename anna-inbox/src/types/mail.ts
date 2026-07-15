@@ -724,6 +724,7 @@ export interface AppState {
   aiChatLoading: boolean;
   customTraceOpen: boolean;
   settingsOpen: boolean;
+  settingsFocusRequest: number;
   inboxSettings: InboxSettings;
   inboxSettingsEtag: string;
   inboxSettingsLoading: boolean;
@@ -801,15 +802,65 @@ export interface AskHistoryEntry {
   messages?: AiChatMessage[];
 }
 
+/** 整理建议确认卡片（propose_inbox_actions，须用户确认后才 mutation） */
+export interface ProposedInboxActionItem {
+  mailbox: string;
+  message_id: string;
+  thread_id: string;
+  subject?: string;
+  default_selected?: boolean;
+}
+
+export interface ProposedInboxActions {
+  step_index: number;
+  step_title: string;
+  rationale: string;
+  primary_action: "mark_done" | "archive" | "trash" | string;
+  allowed_actions: string[];
+  items: ProposedInboxActionItem[];
+  requires_user_confirmation: boolean;
+  /** 确认本批后的追问文案（对标 example/6.png） */
+  followup_after_apply?: string;
+  /** Skip 本批后的追问文案 */
+  followup_after_skip?: string;
+  /** 用户点「暂不」后仍展示的收尾建议文案 */
+  followup_after_dismiss?: string;
+  /** 用户点「继续」时注入的下一轮 user 文本 */
+  continue_prompt?: string;
+  language?: "zh" | "en" | string;
+  recommendation_groups?: Array<{
+    title: string;
+    subjects?: string[];
+    items?: ProposedInboxActionItem[];
+  }>;
+}
+
+export interface SavedPrompt {
+  id: string;
+  title: string;
+  body: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface AiMemoryItem {
+  id: string;
+  text: string;
+  source?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
 export interface AiChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   timestamp: string;
-  kind?: "chat" | "mail_context" | "scan" | "clarify" | "status" | "error" | "stopped";
+  kind?: "chat" | "mail_context" | "scan" | "clarify" | "status" | "error" | "stopped" | "draft" | "propose" | "memory";
   result?: CustomRunResult | null;
   pending?: boolean;
   artifact?: DraftReplyArtifact | ComposeDraftArtifact | SendPlanArtifact | null;
+  proposedActions?: ProposedInboxActions | null;
   replyGaps?: ReplyGaps;
   mailContext?: AiMailContextRef;
   mailSummaryLink?: AskMailLink;
@@ -848,5 +899,7 @@ export interface SendAiMessageOptions {
   clarificationMessageId?: string;
   baseMessages?: AiChatMessage[];
   retryUserMessage?: AiChatMessage;
+  /** 选中 Saved prompt 后注入 Router（作为 user 文本前缀） */
+  savedPromptId?: string;
 }
 

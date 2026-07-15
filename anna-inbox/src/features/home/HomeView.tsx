@@ -337,6 +337,12 @@ const HistoryIcon = () => (
     <path d="M12 8v5l3 2" />
   </Icon>
 );
+const SettingsIcon = () => (
+  <Icon>
+    <circle cx="12" cy="12" r="3" />
+    <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4v-.2a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1-2.8-2.8.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3v-4h.2a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1L7.2 4l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V2.6h4v.2a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L20 6.8l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1.2Z" />
+  </Icon>
+);
 const ChevronLeftIcon = () => (
   <Icon>
     <path d="m15 18-6-6 6-6" />
@@ -1372,6 +1378,68 @@ function AiAssistantMessage({
   const [assistantTextComplete, setAssistantTextComplete] = useState(
     () => !shouldAnimateAssistantText(message.timestamp),
   );
+  // 整理确认卡片：勾选状态与主动作
+  const proposed = message.proposedActions;
+  const [selectedProposeKeys, setSelectedProposeKeys] = useState<Set<string>>(() => {
+    const next = new Set<string>();
+    for (const item of proposed?.items || []) {
+      if (item.default_selected !== false) {
+        next.add(`${item.mailbox}|${item.message_id || item.thread_id}`);
+      }
+    }
+    return next;
+  });
+  const [proposeAction, setProposeAction] = useState(proposed?.primary_action || "mark_done");
+  const [proposeBusy, setProposeBusy] = useState(false);
+  const [proposeResolved, setProposeResolved] = useState<"none" | "applied" | "skipped">("none");
+  const [appliedCount, setAppliedCount] = useState(0);
+  /** none | choose（展示 Yes/Not now）| dismissed（Not now 后仍展示收尾建议） */
+  const [followupPhase, setFollowupPhase] = useState<"hidden" | "choose" | "dismissed">("hidden");
+  const proposeZh = Boolean(
+    proposed?.language === "zh"
+    || /[\u3400-\u9fff]/.test(message.content || "")
+    || /[\u3400-\u9fff]/.test(proposed?.followup_after_apply || "")
+    || /[\u3400-\u9fff]/.test(proposed?.step_title || ""),
+  );
+  const proposeLabels = proposeZh
+    ? {
+        skip: "跳过",
+        markDone: "标为已处理",
+        archive: "归档",
+        trash: "移到垃圾箱",
+        markDoneQ: (n: number) => `将 ${n} 封标为已处理？`,
+        archiveQ: (n: number) => `归档 ${n} 封邮件？`,
+        trashQ: (n: number) => `将 ${n} 封移到垃圾箱？`,
+        marked: (n: number) => `已将 ${n} 封标为已处理`,
+        archived: (n: number) => `已归档 ${n} 封`,
+        trashed: (n: number) => `已将 ${n} 封移到垃圾箱`,
+        skipped: "已跳过本批",
+        yesContinue: "是，继续",
+        notNow: "暂不",
+        continueFallback: "继续整理剩余邮件",
+        followApply: "本批已处理。需要我继续整理剩余邮件吗？",
+        followSkip: "已跳过本批。需要我继续为剩余邮件生成建议吗？",
+        followDismiss: "好的。我仍建议你关注下方这些可整理邮件。之后可以说「继续整理」。",
+      }
+    : {
+        skip: "Skip",
+        markDone: "Mark done",
+        archive: "Archive",
+        trash: "Move to trash",
+        markDoneQ: (n: number) => `Mark ${n} threads as done?`,
+        archiveQ: (n: number) => `Archive ${n} threads?`,
+        trashQ: (n: number) => `Move ${n} threads to trash?`,
+        marked: (n: number) => `Marked ${n} threads as done`,
+        archived: (n: number) => `Archived ${n} threads`,
+        trashed: (n: number) => `Moved ${n} threads to trash`,
+        skipped: "Skipped this batch",
+        yesContinue: "Yes, continue",
+        notNow: "Not now",
+        continueFallback: "Continue organizing the remaining emails",
+        followApply: "Would you like me to continue organizing the remaining emails?",
+        followSkip: "Would you like me to continue with suggestions for the remaining emails?",
+        followDismiss: "Okay. I still recommend reviewing the emails listed below. You can say “continue organizing” anytime.",
+      };
   const openThreadReference = (threadId: string) => {
     const context = message.mailContext || currentMailContext;
     const referenceMailbox = context?.mailbox || state.mailbox;
@@ -1543,6 +1611,211 @@ function AiAssistantMessage({
                   : "Resolved"}
               </span>
             )}
+          </div>
+        ) : null}
+        {proposed ? (
+          <div className={`ai-propose-card ${proposeResolved !== "none" ? "is-resolved" : ""}`}>
+            <strong>
+              {proposeResolved === "applied"
+                ? (proposeAction === "trash"
+                  ? proposeLabels.trashed(appliedCount)
+                  : proposeAction === "archive"
+                    ? proposeLabels.archived(appliedCount)
+                    : proposeLabels.marked(appliedCount))
+                : proposeResolved === "skipped"
+                  ? proposeLabels.skipped
+                  : proposeAction === "trash"
+                    ? proposeLabels.trashQ(selectedProposeKeys.size)
+                    : proposeAction === "archive"
+                      ? proposeLabels.archiveQ(selectedProposeKeys.size)
+                      : proposeLabels.markDoneQ(selectedProposeKeys.size)}
+            </strong>
+            {proposed.step_title ? <p className="ai-propose-step">{proposed.step_title}</p> : null}
+            {proposeResolved === "none" && proposed.rationale ? (
+              <p className="ai-propose-rationale">{proposed.rationale}</p>
+            ) : null}
+            <ul className="ai-propose-list">
+              {(proposed.items || []).map((item) => {
+                const key = `${item.mailbox}|${item.message_id || item.thread_id}`;
+                const wasSelected = selectedProposeKeys.has(key);
+                return (
+                  <li key={key} className={proposeResolved === "applied" && wasSelected ? "is-done" : ""}>
+                    <label>
+                      {proposeResolved === "none" ? (
+                        <input
+                          type="checkbox"
+                          checked={wasSelected}
+                          onChange={() => {
+                            setSelectedProposeKeys((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(key)) next.delete(key);
+                              else next.add(key);
+                              return next;
+                            });
+                          }}
+                        />
+                      ) : (
+                        <span className="ai-propose-check" aria-hidden="true">
+                          {proposeResolved === "applied" && wasSelected ? "✓" : "·"}
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        className="ai-propose-link"
+                        onClick={() =>
+                          onOpenMail({
+                            label: item.subject || "Thread",
+                            mailbox: item.mailbox,
+                            thread_id: item.thread_id,
+                            message_id: item.message_id,
+                          })
+                        }
+                      >
+                        {item.subject || item.thread_id || item.message_id || "Thread"}
+                      </button>
+                    </label>
+                  </li>
+                );
+              })}
+            </ul>
+            {proposeResolved === "none" ? (
+              <div className="ai-draft-artifact-actions">
+                <button
+                  className="is-secondary"
+                  disabled={proposeBusy}
+                  onClick={() => {
+                    setProposeResolved("skipped");
+                    setFollowupPhase("choose");
+                  }}
+                >
+                  {proposeLabels.skip}
+                </button>
+                <select
+                  value={proposeAction}
+                  disabled={proposeBusy}
+                  onChange={(event) => setProposeAction(event.target.value)}
+                  aria-label={proposeZh ? "整理动作" : "Organize action"}
+                >
+                  {(proposed.allowed_actions || ["mark_done", "archive", "trash"]).map((actionId) => (
+                    <option key={actionId} value={actionId}>
+                      {actionId === "trash"
+                        ? proposeLabels.trash
+                        : actionId === "archive"
+                          ? proposeLabels.archive
+                          : proposeLabels.markDone}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="is-primary"
+                  disabled={proposeBusy || selectedProposeKeys.size === 0}
+                  onClick={() => {
+                    void (async () => {
+                      setProposeBusy(true);
+                      try {
+                        const items = (proposed.items || []).filter((item) =>
+                          selectedProposeKeys.has(`${item.mailbox}|${item.message_id || item.thread_id}`),
+                        );
+                        const result = await actions.applyProposedActions({
+                          action: proposeAction,
+                          items,
+                        });
+                        if (result.success !== false) {
+                          setAppliedCount(items.length);
+                          setProposeResolved("applied");
+                          setFollowupPhase("choose");
+                        }
+                      } finally {
+                        setProposeBusy(false);
+                      }
+                    })();
+                  }}
+                >
+                  {proposeAction === "trash"
+                    ? proposeLabels.trash
+                    : proposeAction === "archive"
+                      ? proposeLabels.archive
+                      : proposeLabels.markDone}
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        {proposed && proposeResolved !== "none" && followupPhase !== "hidden" ? (
+          <div className="ai-propose-followup">
+            <RichAssistantText
+              text={
+                followupPhase === "dismissed"
+                  ? (proposed.followup_after_dismiss || proposeLabels.followDismiss)
+                  : proposeResolved === "applied"
+                    ? (proposed.followup_after_apply || proposeLabels.followApply)
+                    : (proposed.followup_after_skip || proposeLabels.followSkip)
+              }
+              onOpenThread={openThreadReference}
+            />
+            {(proposed.recommendation_groups || []).map((group) => {
+              const linkItems = (group.items && group.items.length
+                ? group.items
+                : (proposed.items || []).map((item) => ({
+                    mailbox: item.mailbox,
+                    message_id: item.message_id,
+                    thread_id: item.thread_id,
+                    subject: item.subject || "",
+                  }))
+              ).filter((item) => item.subject || item.thread_id || item.message_id);
+              if (!linkItems.length && !(group.subjects || []).length) return null;
+              return (
+                <div key={group.title} className="ai-propose-reco-group">
+                  <strong>{group.title}</strong>
+                  <ul className="ai-propose-reco-list">
+                    {linkItems.length
+                      ? linkItems.slice(0, 12).map((item) => (
+                        <li key={`${item.mailbox}|${item.message_id || item.thread_id}`}>
+                          <button
+                            type="button"
+                            className="ai-propose-link"
+                            onClick={() =>
+                              onOpenMail({
+                                label: item.subject || "Thread",
+                                mailbox: item.mailbox,
+                                thread_id: item.thread_id,
+                                message_id: item.message_id,
+                              })
+                            }
+                          >
+                            {item.subject || item.thread_id || item.message_id}
+                          </button>
+                        </li>
+                      ))
+                      : (group.subjects || []).slice(0, 12).map((subject) => (
+                        <li key={subject}>{subject}</li>
+                      ))}
+                  </ul>
+                </div>
+              );
+            })}
+            {followupPhase === "choose" ? (
+              <div className="ai-draft-artifact-actions">
+                <button
+                  className="is-primary"
+                  onClick={() => {
+                    setFollowupPhase("dismissed");
+                    void actions.sendAiChatMessage({
+                      currentMailContext,
+                      prompt: proposed.continue_prompt || proposeLabels.continueFallback,
+                    });
+                  }}
+                >
+                  {proposeLabels.yesContinue}
+                </button>
+                <button
+                  className="is-secondary"
+                  onClick={() => setFollowupPhase("dismissed")}
+                >
+                  {proposeLabels.notNow}
+                </button>
+              </div>
+            ) : null}
           </div>
         ) : null}
         {draftArtifact ? (
@@ -1850,8 +2123,12 @@ function AiSidebar({
   const { state, actions } = useApp();
   const [historyOpen, setHistoryOpen] = useState(false);
   const [showNewMessagePrompt, setShowNewMessagePrompt] = useState(false);
+  const [savedPromptsOpen, setSavedPromptsOpen] = useState(false);
+  const [composerFocused, setComposerFocused] = useState(false);
+  const [savedPrompts, setSavedPrompts] = useState<Array<{ id: string; title: string; body: string }>>([]);
   const conversationRef = useRef<HTMLDivElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const savedPromptsPanelRef = useRef<HTMLDivElement | null>(null);
   const pinnedToBottomRef = useRef(true);
   const scrollAfterSubmitRef = useRef(false);
   const running =
@@ -1864,7 +2141,7 @@ function AiSidebar({
   const starters = [
     "What needs my reply?",
     "Find urgent emails",
-    "Plan my day",
+    "Organize my inbox",
   ];
   const conversation = state.aiChatMessages;
 
@@ -1923,6 +2200,22 @@ function AiSidebar({
     return () => window.cancelAnimationFrame(frame);
   }, [conversation.length, running, scrollConversationToBottom]);
 
+  const openSavedPrompts = () => {
+    setSavedPromptsOpen(true);
+    void actions.listSavedPrompts().then(setSavedPrompts);
+  };
+
+  useEffect(() => {
+    if (!savedPromptsOpen) return;
+    const closeOnOutsidePointerDown = (event: PointerEvent) => {
+      if (!savedPromptsPanelRef.current?.contains(event.target as Node)) {
+        setSavedPromptsOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointerDown);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointerDown);
+  }, [savedPromptsOpen]);
+
   const submit = () => {
     if (llmOffline) {
       actions.showToast("LLM is offline. Please try again when it reconnects.");
@@ -1930,6 +2223,7 @@ function AiSidebar({
     }
     if (!state.customScanInput.trim() || running) return;
     setHistoryOpen(false);
+    setSavedPromptsOpen(false);
     setShowNewMessagePrompt(false);
     pinnedToBottomRef.current = true;
     scrollAfterSubmitRef.current = true;
@@ -2081,16 +2375,80 @@ function AiSidebar({
               : undefined
           }
         >
+          {savedPromptsOpen ? (
+            <div className="ai-saved-prompts-panel" ref={savedPromptsPanelRef} role="listbox" aria-label="Saved prompts">
+              <header>
+                <span>Saved prompts</span>
+                <button
+                  type="button"
+                  className="ai-saved-prompts-settings"
+                  onClick={() => {
+                    setSavedPromptsOpen(false);
+                    actions.openSettings(true);
+                  }}
+                  aria-label="Open Saved prompts settings"
+                  title="Saved prompts settings"
+                >
+                  <SettingsIcon />
+                </button>
+              </header>
+              {savedPrompts.length ? (
+                <div className="ai-saved-prompts-list">
+                  {savedPrompts.map((item) => (
+                    <div key={item.id} className="ai-saved-prompt-item" role="option">
+                      <button
+                        type="button"
+                        className="ai-saved-prompt-select"
+                        onClick={() => {
+                          actions.setInput("customScanInput", item.body);
+                          setSavedPromptsOpen(false);
+                        }}
+                      >
+                        <strong>{item.title || "Untitled"}</strong>
+                        <div>{item.body.slice(0, 80)}</div>
+                      </button>
+                      <button
+                        type="button"
+                        className="ai-saved-prompt-delete"
+                        aria-label={`Delete ${item.title || "saved prompt"}`}
+                        data-tooltip="Delete"
+                        onClick={() => {
+                          void actions.deleteSavedPrompt(item.id).then((deleted) => {
+                            if (deleted) {
+                              setSavedPrompts((current) =>
+                                current.filter((prompt) => prompt.id !== item.id),
+                              );
+                            }
+                          });
+                        }}
+                      >
+                        <TrashIcon />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="ai-saved-prompts-empty">No saved prompts</div>
+              )}
+            </div>
+          ) : null}
           <textarea
             ref={composerInputRef}
             value={state.customScanInput}
-            placeholder="Find, organize, ask anything…"
+            placeholder={composerFocused ? "Press ↑ for saved prompts" : "Find, organize, ask anything…"}
             rows={3}
             disabled={llmOffline}
+            onFocus={() => setComposerFocused(true)}
+            onBlur={() => setComposerFocused(false)}
             onChange={(event) =>
               actions.setInput("customScanInput", event.target.value)
             }
             onKeyDown={(event) => {
+              if (event.key === "ArrowUp" && !state.customScanInput.trim() && !event.shiftKey) {
+                event.preventDefault();
+                openSavedPrompts();
+                return;
+              }
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 submit();
@@ -2098,7 +2456,6 @@ function AiSidebar({
             }}
           />
           <div className="ai-composer-footer">
-            <span></span>
             <div className="ai-composer-actions">
               {state.aiChatLoading ? (
                 <button
@@ -2259,7 +2616,7 @@ function AccountRail() {
         aria-label="Open settings"
         title="Settings"
         data-tooltip="Settings"
-        onClick={actions.openSettings}
+        onClick={() => actions.openSettings()}
       >
         <svg
           width="20"
@@ -2790,6 +3147,44 @@ export function HomeView() {
     },
     [mailbox],
   );
+
+  // AI 整理确认：后端 mark_read 后由事件写入本地 Done（与 Inbox Done 对齐）
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent).detail as {
+        items?: Array<{ mailbox?: string; message_id?: string; thread_id?: string }>;
+      } | undefined;
+      const items = detail?.items || [];
+      if (!items.length) return;
+      const messages: InboxMessage[] = [];
+      for (const item of items) {
+        const itemMailbox = String(item.mailbox || "").trim().toLowerCase();
+        if (itemMailbox && itemMailbox !== String(mailbox || "").trim().toLowerCase()) continue;
+        const mid = String(item.message_id || "").trim();
+        const tid = String(item.thread_id || "").trim();
+        const found = state.inboxMessages.find(
+          (message) =>
+            (mid && message.id === mid) ||
+            (tid && (message.thread_id === tid || message.id === tid)),
+        );
+        if (found) messages.push(found);
+        else if (mid) {
+          messages.push({
+            id: mid,
+            thread_id: tid || mid,
+            subject: "",
+            snippet: "",
+            from: "",
+            date: "",
+            label_ids: [],
+          } as InboxMessage);
+        }
+      }
+      if (messages.length) setWorkflowFlag("done", messages, true);
+    };
+    window.addEventListener("anna-inbox-local-done", handler as EventListener);
+    return () => window.removeEventListener("anna-inbox-local-done", handler as EventListener);
+  }, [mailbox, setWorkflowFlag, state.inboxMessages]);
 
   const restoreWorkflowFlags = useCallback(
     (messages: InboxMessage[], previous: MailUiFlags) => {

@@ -686,11 +686,11 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "start_ai_turn",
-            "description": "Unified AI sidebar turn: local router selects whitelist tools (chat, search, summarize) then returns a pollable run.",
+            "description": "Unified AI sidebar turn: local router selects whitelist tools (chat, search, summarize, draft, propose, memory) then returns a pollable run.",
             "parameters": [
                 {"name": "user_text", "type": "string", "description": "Natural language user message.", "required": True},
                 {"name": "mailbox", "type": "string", "description": "Primary mailbox email address.", "required": False},
-                {"name": "ui_context", "type": "object", "description": "Read-only screen context: current thread, selected mailboxes, display range, etc.", "required": False},
+                {"name": "ui_context", "type": "object", "description": "Read-only screen context: current thread, last_draft, selected mailboxes, display range, etc.", "required": False},
                 {"name": "conversation_id", "type": "string", "description": "Ephemeral sidebar conversation id for multi-turn registry (process-local).", "required": False},
                 {"name": "run_id", "type": "string", "description": "Client-generated run ID for polling.", "required": False},
                 {"name": "max_messages", "type": "integer", "description": "Max messages for inbox search tools.", "required": False},
@@ -700,6 +700,55 @@ DEFAULT_MANIFEST = {
                 {"name": "wait_timeout_seconds", "type": "integer", "description": "How long this invoke should wait before returning a pollable running state.", "required": False},
             ],
             "timeout": 600,
+        },
+        {
+            "name": "apply_proposed_actions",
+            "description": "Apply user-confirmed inbox organize actions (mark_done/archive/trash). Never call without explicit UI confirmation.",
+            "parameters": [
+                {"name": "action", "type": "string", "description": "mark_done | archive | trash", "required": True},
+                {"name": "items", "type": "array", "description": "Selected items: mailbox, message_id, thread_id.", "required": True},
+            ],
+        },
+        {
+            "name": "list_saved_prompts",
+            "description": "List AI sidebar saved prompts.",
+            "parameters": [],
+        },
+        {
+            "name": "save_saved_prompt",
+            "description": "Create or update a saved prompt.",
+            "parameters": [
+                {"name": "prompt_id", "type": "string", "description": "Existing id to update; omit to create.", "required": False},
+                {"name": "title", "type": "string", "description": "Short title.", "required": False},
+                {"name": "body", "type": "string", "description": "Prompt body text.", "required": True},
+            ],
+        },
+        {
+            "name": "delete_saved_prompt",
+            "description": "Delete a saved prompt by id.",
+            "parameters": [
+                {"name": "prompt_id", "type": "string", "description": "Prompt id.", "required": True},
+            ],
+        },
+        {
+            "name": "list_ai_memories",
+            "description": "List AI personalization memory preference lines.",
+            "parameters": [],
+        },
+        {
+            "name": "add_ai_memory",
+            "description": "Add an AI memory preference (short behavior note, no email body).",
+            "parameters": [
+                {"name": "text", "type": "string", "description": "Preference text.", "required": True},
+                {"name": "source", "type": "string", "description": "chat | settings", "required": False},
+            ],
+        },
+        {
+            "name": "delete_ai_memory",
+            "description": "Delete one AI memory entry.",
+            "parameters": [
+                {"name": "memory_id", "type": "string", "description": "Memory id.", "required": True},
+            ],
         },
         {
             "name": "re_run_custom_scan",
@@ -1225,7 +1274,7 @@ def _compact_run_payload(value: Any, *, text_limit: int = 1200) -> Any:
     if isinstance(value, list):
         return [_compact_run_payload(item, text_limit=text_limit) for item in value]
     if isinstance(value, dict):
-        is_draft_artifact = str(value.get("type") or "") == "draft_reply"
+        is_draft_artifact = str(value.get("type") or "") in {"draft_reply", "compose_draft"}
         compact: dict[str, Any] = {}
         for key, item in value.items():
             if key in {"body", "body_text", "body_html", "raw", "raw_message"} and isinstance(item, str):
