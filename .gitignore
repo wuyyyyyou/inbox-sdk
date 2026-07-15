@@ -39,7 +39,6 @@ docs/adr/
 **/.data
 **/.local_storage
 .history/
-inbox-tool/src/tests/
 anna-inbox/docs/superpowers/
 
 # design reference screenshots (local)
