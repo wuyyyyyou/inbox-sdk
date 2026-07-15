@@ -113,6 +113,9 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "tool": tool, "data": resolve_contact_avatars(arguments.get("mailbox", ""), arguments.get("emails", []))}
     if tool == "check_gmail_auth":
         return {"success": True, "tool": tool, "data": _check_gmail_auth(arguments.get("mailbox", ""))}
+    if tool == "check_gmail_api_status":
+        # 同步 HTTP 探测；限制超时避免阻塞 dispatcher 过久
+        return {"success": True, "tool": tool, "data": _check_gmail_api_status(str(arguments.get("mailbox") or ""))}
     if tool == "check_sampling_status":
         future = asyncio.run_coroutine_threadsafe(_check_sampling_status(arguments, invoke_id), loop)
         return {"success": True, "tool": tool, "data": future.result(timeout=12.0)}

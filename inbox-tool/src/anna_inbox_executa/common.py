@@ -117,6 +117,13 @@ DEFAULT_MANIFEST = {
             "parameters": [],
         },
         {
+            "name": "check_gmail_api_status",
+            "description": "Lightweight Gmail API connectivity and latency check via users/me/profile.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address. Empty uses any authorized mailbox.", "required": False},
+            ],
+        },
+        {
             "name": "test_aps_storage",
             "description": "Smoke-test Anna Persistent Storage KV without touching Gmail or the mail-agent pipeline.",
             "parameters": [
@@ -303,6 +310,7 @@ DEFAULT_MANIFEST = {
                 {"name": "stars_limit", "type": "integer", "description": "Starred thread limit.", "required": False},
                 {"name": "todos_enabled", "type": "boolean", "description": "Show Todos section.", "required": False},
                 {"name": "todos_limit", "type": "integer", "description": "Todo thread limit.", "required": False},
+                {"name": "llm_status_poll_seconds", "type": "integer", "description": "LLM connectivity poll interval in seconds: 0, 30, 60, 120, or 300.", "required": False},
                 {"name": "custom_categories", "type": "array", "description": "Saved local Inbox Splits with id, name, query, hide_when_empty, and bundling_behavior.", "required": False},
             ],
         },

@@ -2137,7 +2137,8 @@ function AiSidebar({
     Boolean(
       state.customRunProgress && state.customRunProgress.status !== "failed",
     );
-  const llmOffline = !state.runtime.connected;
+  // 仅在明确探测失败时禁用输入；checking/unknown 不打断编辑
+  const llmOffline = state.llmStatus.status === "unavailable" || state.llmStatus.status === "error";
   const starters = [
     "What needs my reply?",
     "Find urgent emails",
@@ -2495,10 +2496,78 @@ function AiSidebar({
       </div>
 
       <div className="ai-sidebar-foot">
-        <span>
-          <i className={state.runtime.connected ? "is-live" : ""} />
-          {state.runtime.connected ? "LLM Connected" : "LLM Offline"}
-        </span>
+        <div className="ai-connectivity-status">
+          <button
+            type="button"
+            className="ai-conn-chip"
+            title="Check LLM connectivity"
+            onClick={() => void actions.refreshSamplingStatus()}
+          >
+            <i className={state.llmStatus.status === "connected" ? "is-live" : ""} />
+            {state.llmStatus.status === "checking" || (state.llmStatus.status === "unknown" && !state.llmStatus.checked) ? (
+              <span>LLM…</span>
+            ) : state.llmStatus.status === "connected" ? (
+              <span>
+                LLM
+                {typeof state.llmStatus.elapsed_ms === "number" ? (
+                  <>
+                    {" · "}
+                    <span
+                      className={
+                        state.llmStatus.elapsed_ms < 300
+                          ? "conn-latency is-fast"
+                          : state.llmStatus.elapsed_ms <= 800
+                            ? "conn-latency is-mid"
+                            : "conn-latency is-slow"
+                      }
+                    >
+                      {state.llmStatus.elapsed_ms}ms
+                    </span>
+                  </>
+                ) : null}
+              </span>
+            ) : (
+              <span>
+                LLM · <span className="conn-timeout">timeout</span>
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            className="ai-conn-chip"
+            title="Check Gmail API connectivity"
+            onClick={() => void actions.refreshGmailApiStatus()}
+          >
+            <i className={state.gmailApiStatus.status === "connected" ? "is-live" : ""} />
+            {state.gmailApiStatus.status === "checking" || (state.gmailApiStatus.status === "unknown" && !state.gmailApiStatus.checked) ? (
+              <span>Gmail…</span>
+            ) : state.gmailApiStatus.status === "connected" ? (
+              <span>
+                Gmail
+                {typeof state.gmailApiStatus.elapsed_ms === "number" ? (
+                  <>
+                    {" · "}
+                    <span
+                      className={
+                        state.gmailApiStatus.elapsed_ms < 300
+                          ? "conn-latency is-fast"
+                          : state.gmailApiStatus.elapsed_ms <= 800
+                            ? "conn-latency is-mid"
+                            : "conn-latency is-slow"
+                      }
+                    >
+                      {state.gmailApiStatus.elapsed_ms}ms
+                    </span>
+                  </>
+                ) : null}
+              </span>
+            ) : (
+              <span>
+                Gmail · <span className="conn-timeout">timeout</span>
+              </span>
+            )}
+          </button>
+        </div>
         <div>
           <button
             className={historyOpen ? "is-active" : ""}

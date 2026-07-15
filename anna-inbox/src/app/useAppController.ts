@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { buildDraftPreferencesInstruction, resolveDraftPreferences } from "../features/handle/draftPreferences";
@@ -632,6 +632,12 @@ export interface AppActions {
   listAiMemories(): Promise<Array<{ id: string; text: string }>>;
   addAiMemory(text: string): Promise<boolean>;
   deleteAiMemory(memoryId: string): Promise<boolean>;
+  /** 探测 Anna LLM 连通性与延迟；侧栏状态点击 / Toast Retry 可触发 */
+  refreshSamplingStatus(options?: { fromPoll?: boolean }): Promise<AppState["llmStatus"]>;
+  /** 探测 Gmail API 连通性与延迟；与 LLM 探测并行 */
+  refreshGmailApiStatus(options?: { fromPoll?: boolean }): Promise<AppState["gmailApiStatus"]>;
+  /** 并行刷新 LLM + Gmail API 状态 */
+  refreshConnectivityStatus(options?: { fromPoll?: boolean }): Promise<void>;
 }
 
 export function useAppController() {
@@ -1208,41 +1214,137 @@ export function useAppController() {
     }
   }, [client, state.mailbox]);
 
-  const refreshSamplingStatus = useCallback(async (): Promise<AppState["llmStatus"]> => {
-    setState((s) => ({ ...s, llmStatus: { ...s.llmStatus, status: "checking", message: "Checking Anna LLM..." } }));
+  // 供 Toast Retry / 轮询回调稳定调用最新探测函数，避免闭包陈旧
+  const refreshSamplingStatusRef = useRef<(options?: { fromPoll?: boolean }) => Promise<AppState["llmStatus"]>>(async () => ({
+    status: "unknown",
+    checked: false,
+  }));
+  const refreshGmailApiStatusRef = useRef<(options?: { fromPoll?: boolean }) => Promise<AppState["gmailApiStatus"]>>(async () => ({
+    status: "unknown",
+    checked: false,
+  }));
+  const refreshConnectivityStatusRef = useRef<(options?: { fromPoll?: boolean }) => Promise<void>>(async () => undefined);
+  const llmStatusRef = useRef(state.llmStatus);
+  llmStatusRef.current = state.llmStatus;
+  const gmailApiStatusRef = useRef(state.gmailApiStatus);
+  gmailApiStatusRef.current = state.gmailApiStatus;
+  const mailboxForGmailCheckRef = useRef(state.mailbox);
+  mailboxForGmailCheckRef.current = state.mailbox;
+
+  const refreshSamplingStatus = useCallback(async (options?: { fromPoll?: boolean }): Promise<AppState["llmStatus"]> => {
+    const previous = llmStatusRef.current;
+    // 轮询静默探测，避免侧栏每分钟闪 Checking…；手动/启动探测才显示 checking
+    if (!options?.fromPoll) {
+      setState((s) => ({ ...s, llmStatus: { ...s.llmStatus, status: "checking", message: "Checking Anna LLM..." } }));
+    }
+    let next: AppState["llmStatus"];
     try {
       const result = await client.checkSamplingStatus();
       const status = result.ok === false
         ? (result.status === "error" ? "error" : "unavailable")
         : (result.status || "connected");
-      const next: AppState["llmStatus"] = {
+      next = {
         status: status === "connected" ? "connected" : status === "error" ? "error" : "unavailable",
         checked: true,
         message: result.message || (status === "connected" ? "Anna LLM sampling is connected." : "Anna LLM sampling is unavailable."),
         elapsed_ms: result.elapsed_ms,
       };
-      setState((s) => ({ ...s, llmStatus: next }));
-      return next;
     } catch (error) {
-      const next: AppState["llmStatus"] = {
+      next = {
         status: "error",
         checked: true,
         message: error instanceof Error ? error.message : String(error),
       };
-      setState((s) => ({ ...s, llmStatus: next }));
-      return next;
     }
-  }, [client]);
+    setState((s) => ({ ...s, llmStatus: next }));
+    llmStatusRef.current = next;
+    // 失败时 toast + Retry；轮询仅在「刚从可用变为不可用」时提示，避免每分钟刷屏
+    if (next.status !== "connected") {
+      const transitionedToFail = previous.status === "connected" || previous.status === "unknown" || !previous.checked;
+      if (!options?.fromPoll || transitionedToFail) {
+        showToast("Anna LLM is unavailable. Please enable sampling permission for this Executa app, then try again.", {
+          actionLabel: "Retry",
+          onAction: () => {
+            void refreshSamplingStatusRef.current();
+          },
+          durationMs: 8_000,
+        });
+      }
+    }
+    return next;
+  }, [client, showToast]);
+  refreshSamplingStatusRef.current = refreshSamplingStatus;
+
+  const refreshGmailApiStatus = useCallback(async (options?: { fromPoll?: boolean }): Promise<AppState["gmailApiStatus"]> => {
+    const previous = gmailApiStatusRef.current;
+    if (!options?.fromPoll) {
+      setState((s) => ({ ...s, gmailApiStatus: { ...s.gmailApiStatus, status: "checking", message: "Checking Gmail API..." } }));
+    }
+    let next: AppState["gmailApiStatus"];
+    try {
+      const result = await client.checkGmailApiStatus(mailboxForGmailCheckRef.current || "");
+      const status = result.ok === false
+        ? (result.status === "error" ? "error" : "unavailable")
+        : (result.status || "connected");
+      next = {
+        status: status === "connected" ? "connected" : status === "error" ? "error" : "unavailable",
+        checked: true,
+        message: result.message || (status === "connected" ? "Gmail API is connected." : "Gmail API is unavailable."),
+        elapsed_ms: result.elapsed_ms,
+        mailbox: result.mailbox,
+      };
+    } catch (error) {
+      next = {
+        status: "error",
+        checked: true,
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+    setState((s) => ({ ...s, gmailApiStatus: next }));
+    gmailApiStatusRef.current = next;
+    if (next.status !== "connected") {
+      const transitionedToFail = previous.status === "connected" || previous.status === "unknown" || !previous.checked;
+      if (!options?.fromPoll || transitionedToFail) {
+        showToast("Gmail API is unavailable. Check network or re-authorize the mailbox, then try again.", {
+          actionLabel: "Retry",
+          onAction: () => {
+            void refreshGmailApiStatusRef.current();
+          },
+          durationMs: 8_000,
+        });
+      }
+    }
+    return next;
+  }, [client, showToast]);
+  refreshGmailApiStatusRef.current = refreshGmailApiStatus;
+
+  // LLM 与 Gmail API 并行探测，侧栏点击 / 轮询 / Toast Retry 共用
+  const refreshConnectivityStatus = useCallback(async (options?: { fromPoll?: boolean }) => {
+    await Promise.all([
+      refreshSamplingStatusRef.current(options),
+      refreshGmailApiStatusRef.current(options),
+    ]);
+  }, []);
+  refreshConnectivityStatusRef.current = refreshConnectivityStatus;
+
+  // Settings 配置的连通性轮询；0 表示关闭；LLM 与 Gmail 并行
+  useEffect(() => {
+    const pollSeconds = Number(state.inboxSettings.llm_status_poll_seconds);
+    if (!state.runtime.connected || !Number.isFinite(pollSeconds) || pollSeconds <= 0) return;
+    const timer = window.setInterval(() => {
+      void refreshConnectivityStatusRef.current({ fromPoll: true });
+    }, pollSeconds * 1000);
+    return () => window.clearInterval(timer);
+  }, [state.inboxSettings.llm_status_poll_seconds, state.runtime.connected]);
 
   const ensureSamplingAvailable = useCallback(async (): Promise<boolean> => {
     if (state.llmProvider !== "anna-llm") return true;
     const status = await refreshSamplingStatus();
     if (status.status === "connected") return true;
     const message = "Anna LLM is unavailable. Please enable sampling permission for this Executa app, then try again.";
-    showToast(message);
     setState((s) => ({ ...s, scanError: status.message ? `${message}\n${status.message}` : message }));
     return false;
-  }, [refreshSamplingStatus, showToast, state.llmProvider]);
+  }, [refreshSamplingStatus, state.llmProvider]);
 
   const resolveScanRequest = useCallback(async (mailboxOverride?: string): Promise<{ mailboxesToScan: string[]; scanMode: string } | null> => {
     if (!state.runtime.connected || state.isScanning || state.isPreparingScan) return null;
@@ -1528,7 +1630,6 @@ export function useAppController() {
       const runtime = await getRuntime();
       setState((s) => ({ ...s, runtime, loading: runtime.connected ? s.loading : false }));
       if (runtime.connected) {
-        void refreshSamplingStatus();
         const restoredMailbox = normalizedMailbox(await migrateSelectedMailboxFromLocalStorage(MAILBOX_STORAGE_KEY));
         const bootMailbox = restoredMailbox || normalizedMailbox(state.mailbox);
         if (restoredMailbox && restoredMailbox !== normalizedMailbox(state.mailbox)) {
@@ -1560,6 +1661,9 @@ export function useAppController() {
         const authWarning = (authResult as Record<string, unknown> | null | undefined)?.warning as string | undefined;
         setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: systemAuthorized, source: authResult?.source || "none" } }));
         if (authWarning) showToast(`Auth notice: ${authWarning}`);
+        // mailbox 就绪后并行探测 LLM 与 Gmail API（Gmail 使用当前邮箱）
+        mailboxForGmailCheckRef.current = currentMailbox || mailboxForGmailCheckRef.current;
+        void refreshConnectivityStatus();
         if (!systemAuthorized) {
           setState((s) => ({
             ...s,
@@ -1583,7 +1687,7 @@ export function useAppController() {
       showToast(`Init failed: ${msg}`);
       setState((s) => ({ ...s, loading: false, inboxLoading: false, inboxError: msg }));
     }
-  }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadInboxSettings, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshSamplingStatus, showToast, state.mailbox]);
+  }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadInboxSettings, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshConnectivityStatus, showToast, state.mailbox]);
 
   const actions: AppActions = {
     showToast,
@@ -3956,6 +4060,9 @@ export function useAppController() {
         return false;
       }
     },
+    refreshSamplingStatus,
+    refreshGmailApiStatus,
+    refreshConnectivityStatus,
     setGapAnswers(cardKey, answers) {
       setState((s) => ({ ...s, gapAnswersByCard: { ...s.gapAnswersByCard, [cardKey]: answers } }));
     },

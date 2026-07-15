@@ -1724,7 +1724,17 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
     if tool == "save_inbox_settings":
         if not mailbox:
             return {"error": "mailbox is required"}
-        fields = ("display_range_days", "time_section_mode", "stars_enabled", "stars_limit", "todos_enabled", "todos_limit", "custom_categories")
+        # 与 InboxSettings 字段对齐；含 LLM 状态轮询间隔
+        fields = (
+            "display_range_days",
+            "time_section_mode",
+            "stars_enabled",
+            "stars_limit",
+            "todos_enabled",
+            "todos_limit",
+            "llm_status_poll_seconds",
+            "custom_categories",
+        )
         payload = await set_inbox_settings(mailbox, {name: arguments[name] for name in fields if name in arguments}, if_match=str(arguments.get("if_match") or "") or None)
         settings = payload["settings"].__dict__.copy()
         settings["custom_categories"] = [category.__dict__ for category in payload["settings"].custom_categories]

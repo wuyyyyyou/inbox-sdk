@@ -1,7 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import type { InboxSettings } from "../../types/mail";
+import type { InboxSettings, LlmStatusPollSeconds } from "../../types/mail";
 import { useApp } from "../../app/AppContext";
+import { LLM_STATUS_POLL_OPTIONS } from "./inboxSettings";
 import { SplitsManager } from "./SplitsManager";
+
+const LLM_POLL_LABELS: Record<LlmStatusPollSeconds, string> = {
+  0: "Off",
+  30: "30 seconds",
+  60: "60 seconds",
+  120: "2 minutes",
+  300: "5 minutes",
+};
 
 function TrashIcon() {
   return (
@@ -66,6 +75,20 @@ export function SettingsView({ settings, loading, error, focusSavedPromptsReques
     <section><h2>Time sections</h2><p>Emails in your inbox are grouped by time period</p><label><input type="radio" checked={settings.time_section_mode === "detailed"} onChange={() => onChange({ time_section_mode: "detailed" })} />Today, Yesterday, Last 7 days, months</label><label><input type="radio" checked={settings.time_section_mode === "recent_then_months"} onChange={() => onChange({ time_section_mode: "recent_then_months" })} />Last 7 days, months</label><label><input type="radio" checked={settings.time_section_mode === "months_only"} onChange={() => onChange({ time_section_mode: "months_only" })} />Months</label></section>
     <section><h2>Important priority</h2>{(["stars", "todos"] as const).map((kind) => <div key={kind}><h3>{kind === "stars" ? "Stars" : "Todos"}</h3><label><input type="checkbox" checked={settings[`${kind}_enabled`]} onChange={(e) => onChange({ [`${kind}_enabled`]: e.target.checked })} />Show at the top of Important</label><select value={settings[`${kind}_limit`]} onChange={(e) => onChange({ [`${kind}_limit`]: Number(e.target.value) })}>{[5, 10, 20, 50].map((limit) => <option key={limit} value={limit}>{limit} threads</option>)}</select></div>)}</section>
     <section><h2>Splits</h2><p>Divide your inbox into tabs for different types of emails.</p><button type="button" onClick={() => setSplitsOpen(true)}>Manage splits</button></section>
+    <section>
+      <h2>Connectivity check</h2>
+      <p>How often to probe Anna LLM and Gmail API connectivity and latency in parallel.</p>
+      {LLM_STATUS_POLL_OPTIONS.map((seconds) => (
+        <label key={seconds}>
+          <input
+            type="radio"
+            checked={settings.llm_status_poll_seconds === seconds}
+            onChange={() => onChange({ llm_status_poll_seconds: seconds })}
+          />
+          {LLM_POLL_LABELS[seconds]}
+        </label>
+      ))}
+    </section>
     <section className="settings-ai-personalization" ref={savedPromptsSectionRef}>
       <h2>AI Personalization</h2>
       <p>Personalize Anna with saved prompts and memory. Inbox organization requires your confirmation; Anna never creates calendar events or changes your inbox silently.</p>

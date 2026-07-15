@@ -6,6 +6,7 @@ export type ResultFilter = "all" | "reply" | "review" | "cleanup";
 export type LlmProvider = "anna-llm" | "dashscope";
 export type StorageProvider = "aps" | "local";
 export type LlmStatusValue = "unknown" | "checking" | "connected" | "unavailable" | "error";
+export type ConnectivityStatusValue = LlmStatusValue;
 export type DraftLength = "Brief" | "Standard" | "Detailed";
 export type DraftWritingStyle = "Natural" | "Polished" | "Plain-spoken" | "Executive" | "Persuasive";
 export type DraftTone = "Warm" | "Direct" | "Diplomatic" | "Enthusiastic" | "Calm" | "Apologetic";
@@ -42,6 +43,15 @@ export interface LlmStatus {
   checked: boolean;
   message?: string;
   elapsed_ms?: number;
+}
+
+/** Gmail API 连通性与延迟（users/me/profile RTT） */
+export interface GmailApiStatus {
+  status: ConnectivityStatusValue;
+  checked: boolean;
+  message?: string;
+  elapsed_ms?: number;
+  mailbox?: string;
 }
 
 export interface MailboxInfo {
@@ -345,6 +355,9 @@ export interface CustomRunResultItem {
 }
 
 /** 当前邮箱的 Inbox 展示偏好；由 Executa 按邮箱地址独立持久化。 */
+/** LLM 连通性探测轮询间隔（秒）；0 表示关闭自动轮询 */
+export type LlmStatusPollSeconds = 0 | 30 | 60 | 120 | 300;
+
 export interface InboxSettings {
   mailbox: string;
   display_range_days: 7 | 30 | 60;
@@ -353,6 +366,7 @@ export interface InboxSettings {
   stars_limit: number;
   todos_enabled: boolean;
   todos_limit: number;
+  llm_status_poll_seconds: LlmStatusPollSeconds;
   custom_categories: InboxCustomCategory[];
   updated_at?: string;
 }
@@ -764,6 +778,7 @@ export interface AppState {
   resultFilter: ResultFilter;
   llmProvider: LlmProvider;
   llmStatus: LlmStatus;
+  gmailApiStatus: GmailApiStatus;
   storageProvider: StorageProvider;
   generatingDraft: boolean;
   draftDots: string;

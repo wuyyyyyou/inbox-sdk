@@ -34,12 +34,23 @@ async def test_inbox_settings_defaults_are_mailbox_scoped() -> None:
 
     assert first["settings"].mailbox == "one@example.com"
     assert first["settings"].display_range_days == 30
+    assert first["settings"].llm_status_poll_seconds == 60
     assert second["settings"].mailbox == "two@example.com"
     assert second["settings"].display_range_days == 30
 
-    saved = await set_inbox_settings("one@example.com", {"display_range_days": 60}, if_match=first["etag"])
+    saved = await set_inbox_settings(
+        "one@example.com",
+        {"display_range_days": 60, "llm_status_poll_seconds": 30},
+        if_match=first["etag"],
+    )
     assert saved["settings"].display_range_days == 60
+    assert saved["settings"].llm_status_poll_seconds == 30
     assert (await get_inbox_settings("two@example.com"))["settings"].display_range_days == 30
+    assert (await get_inbox_settings("two@example.com"))["settings"].llm_status_poll_seconds == 60
+
+    # 非法轮询档位应被忽略，保留原值
+    ignored = await set_inbox_settings("one@example.com", {"llm_status_poll_seconds": 15})
+    assert ignored["settings"].llm_status_poll_seconds == 30
 
     categories = [
         {"id": "invoices", "name": "Invoices", "query": "subject:invoice", "hide_when_empty": True, "bundling_behavior": "by_sender"},

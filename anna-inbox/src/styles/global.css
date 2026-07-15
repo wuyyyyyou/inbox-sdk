@@ -764,26 +764,65 @@ body.is-resizing-ai-sidebar {
   font-size: 14px;
 }
 
-.ai-sidebar-foot > span {
+.ai-sidebar-foot > span,
+.ai-sidebar-foot .ai-connectivity-status {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+.ai-sidebar-foot .ai-conn-chip {
+  width: auto;
+  height: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.ai-sidebar-foot .ai-conn-chip:hover {
+  color: #5265d8;
+  background: transparent;
 }
 .ai-sidebar-foot i {
   width: 10px;
   height: 10px;
   border-radius: 50%;
   background: #b2b6c1;
+  flex-shrink: 0;
 }
 .ai-sidebar-foot i.is-live {
   background: #47b87b;
   box-shadow: 0 0 0 3px rgba(71, 184, 123, 0.11);
 }
+/* 延迟：蓝 <300ms · 黄 300–800ms · 红 >800ms；失败 timeout 固定红色 */
+.ai-sidebar-foot .conn-latency.is-fast {
+  color: #3b82f6;
+  font-variant-numeric: tabular-nums;
+}
+.ai-sidebar-foot .conn-latency.is-mid {
+  color: #d97706;
+  font-variant-numeric: tabular-nums;
+}
+.ai-sidebar-foot .conn-latency.is-slow,
+.ai-sidebar-foot .conn-timeout {
+  color: #dc2626;
+  font-variant-numeric: tabular-nums;
+}
 .ai-sidebar-foot > div {
   display: flex;
   gap: 3px;
 }
-.ai-sidebar-foot button {
+/* 仅右侧工具按钮使用方块样式，避免覆盖左侧 LLM 状态文案按钮 */
+.ai-sidebar-foot > div button {
   width: 30px;
   height: 30px;
   display: grid;
@@ -792,11 +831,11 @@ body.is-resizing-ai-sidebar {
   color: #7e859a;
   background: transparent;
 }
-.ai-sidebar-foot button:hover {
+.ai-sidebar-foot > div button:hover {
   color: #5265d8;
   background: rgba(255, 255, 255, 0.55);
 }
-.ai-sidebar-foot button.is-active {
+.ai-sidebar-foot > div button.is-active {
   color: #5265d8;
   background: rgba(255, 255, 255, 0.7);
 }

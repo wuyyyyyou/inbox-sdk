@@ -105,6 +105,8 @@ class InboxSettings:
     stars_limit: int = 10
     todos_enabled: bool = True
     todos_limit: int = 10
+    # LLM 连通性探测轮询间隔（秒）；0 表示关闭自动轮询，默认 60
+    llm_status_poll_seconds: int = 60
     custom_categories: list[InboxCustomCategory] = field(default_factory=list)
     updated_at: str = field(default_factory=_now)
 

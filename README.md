@@ -107,9 +107,14 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"health","id":1}' | uv --directory inbo
 
 ## 版本与发布
 
-App、Executa manifest、开发 stub 和 Python package 当前统一为 `2.0.18`。
+App 与 Tool **版本解耦**（当前基线）：
 
-Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Executa 版本后运行：
+| 端 | 版本 | 权威文件 |
+| --- | --- | --- |
+| App | `2.0.21` | `anna-inbox/app.json` |
+| Tool | `2.1.2` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
+
+Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Tool 版本后运行：
 
 ```sh
 python scripts/sync/sync_executa_identity.py

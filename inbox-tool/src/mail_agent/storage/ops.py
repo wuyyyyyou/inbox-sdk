@@ -338,6 +338,9 @@ async def set_inbox_settings(
         settings.display_range_days = int(values["display_range_days"])
     if values.get("time_section_mode") in ("detailed", "recent_then_months", "months_only"):
         settings.time_section_mode = str(values["time_section_mode"])
+    # 仅允许 Settings 中暴露的轮询档位，非法值忽略以保留原配置
+    if values.get("llm_status_poll_seconds") in (0, 30, 60, 120, 300):
+        settings.llm_status_poll_seconds = int(values["llm_status_poll_seconds"])
     for field_name in ("stars_enabled", "todos_enabled"):
         if isinstance(values.get(field_name), bool):
             setattr(settings, field_name, values[field_name])

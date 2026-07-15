@@ -962,6 +962,70 @@ def get_cached_email(mailbox_arg: str, message_id: str) -> dict[str, Any]:
 
 
 
+def _check_gmail_api_status(mailbox: str = "") -> dict[str, Any]:
+    """探测 Gmail API 连通性与 RTT：对当前邮箱发起一次 users/me/profile。
+
+    与 check_gmail_auth（仅查 token/账号元数据）不同，本工具会真实打 Gmail HTTP，
+    用于侧栏展示延迟并帮助用户区分「授权缺失」与「网络/API 超时」。
+    """
+    import time as _time
+    import urllib.error as _urlerr
+    import urllib.parse as _urlparse
+    import urllib.request as _urlreq
+
+    started = _time.time()
+    requested = str(mailbox or "").strip().lower()
+    # mailbox 为空时回落到任意已授权账号，保证启动探测也能跑
+    target = requested
+    if not target:
+        auth = _check_gmail_auth("")
+        target = str(auth.get("authorized_email") or "").strip().lower()
+    if not target:
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "message": "No Gmail mailbox available for API check.",
+            "elapsed_ms": int((_time.time() - started) * 1000),
+            "mailbox": "",
+        }
+    try:
+        # 侧栏探测使用短超时，避免拖垮轮询与 UI
+        token = get_access_token(target)
+        url = GMAIL_API_BASE + "/users/me/profile?" + _urlparse.urlencode({"fields": "emailAddress"})
+        request = _urlreq.Request(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            method="GET",
+        )
+        with _urlreq.urlopen(request, timeout=8.0) as response:
+            raw = response.read().decode("utf-8")
+        profile = json.loads(raw) if raw else {}
+        email = str((profile or {}).get("emailAddress") or "").strip().lower()
+        return {
+            "ok": True,
+            "status": "connected",
+            "message": "Gmail API is connected.",
+            "elapsed_ms": int((_time.time() - started) * 1000),
+            "mailbox": email or target,
+        }
+    except Exception as exc:
+        message = str(exc) or "Gmail API check failed."
+        if isinstance(exc, _urlerr.HTTPError):
+            message = f"Gmail API request failed: {exc.code}"
+        # 鉴权类失败标 unavailable，其余标 error（含超时/网络）
+        lowered = message.lower()
+        status = "unavailable" if any(
+            token in lowered for token in ("401", "403", "unauthorized", "auth", "token", "credential")
+        ) else "error"
+        return {
+            "ok": False,
+            "status": status,
+            "message": message[:240],
+            "elapsed_ms": int((_time.time() - started) * 1000),
+            "mailbox": target,
+        }
+
+
 def _check_gmail_auth(mailbox: str) -> dict[str, Any]:
     """Check Gmail authorization status.
 

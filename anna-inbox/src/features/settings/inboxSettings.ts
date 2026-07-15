@@ -2,6 +2,9 @@ import type { InboxMessage, InboxSettings } from "../../types/mail";
 import { matchInboxQuery, parseInboxQuery } from "../search/inboxQuery";
 import { senderParts } from "../../shared/mailIdentity";
 
+/** Settings 中暴露的 LLM 状态轮询档位（秒） */
+export const LLM_STATUS_POLL_OPTIONS = [0, 30, 60, 120, 300] as const;
+
 export const DEFAULT_INBOX_SETTINGS: InboxSettings = {
   mailbox: "",
   display_range_days: 30,
@@ -10,6 +13,7 @@ export const DEFAULT_INBOX_SETTINGS: InboxSettings = {
   stars_limit: 10,
   todos_enabled: true,
   todos_limit: 10,
+  llm_status_poll_seconds: 60,
   custom_categories: [],
 };
 
@@ -59,6 +63,9 @@ export function clampInboxSettings(
     stars_limit: clampLimit(input.stars_limit, DEFAULT_INBOX_SETTINGS.stars_limit),
     todos_enabled: typeof input.todos_enabled === "boolean" ? input.todos_enabled : DEFAULT_INBOX_SETTINGS.todos_enabled,
     todos_limit: clampLimit(input.todos_limit, DEFAULT_INBOX_SETTINGS.todos_limit),
+    llm_status_poll_seconds: (LLM_STATUS_POLL_OPTIONS as readonly number[]).includes(Number(input.llm_status_poll_seconds))
+      ? (Number(input.llm_status_poll_seconds) as InboxSettings["llm_status_poll_seconds"])
+      : DEFAULT_INBOX_SETTINGS.llm_status_poll_seconds,
     custom_categories: Array.isArray(input.custom_categories) ? input.custom_categories
       .filter((category) => category && typeof category.id === "string" && typeof category.name === "string" && typeof category.query === "string")
       .map((category) => {

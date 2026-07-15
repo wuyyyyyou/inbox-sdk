@@ -16,12 +16,16 @@ describe("inbox settings", () => {
       stars_limit: 10,
       todos_enabled: true,
       todos_limit: 10,
+      llm_status_poll_seconds: 60,
     });
 
-    expect(clampInboxSettings({ display_range_days: 9, stars_limit: 1000 })).toMatchObject({
+    expect(clampInboxSettings({ display_range_days: 9, stars_limit: 1000, llm_status_poll_seconds: 15 as never })).toMatchObject({
       display_range_days: 30,
       stars_limit: 50,
+      llm_status_poll_seconds: 60,
     });
+    expect(clampInboxSettings({ llm_status_poll_seconds: 0 }).llm_status_poll_seconds).toBe(0);
+    expect(clampInboxSettings({ llm_status_poll_seconds: 120 }).llm_status_poll_seconds).toBe(120);
   });
 
   it("fills defaults for Split fields saved by earlier versions", () => {

@@ -139,6 +139,16 @@ export class MailAgentClient {
     return this.invoke<LlmStatus & { ok?: boolean; code?: string; provider?: string }>("check_sampling_status", {}, { timeoutMs: 15_000 });
   }
 
+  checkGmailApiStatus(mailbox = "") {
+    return this.invoke<{
+      ok?: boolean;
+      status?: string;
+      message?: string;
+      elapsed_ms?: number;
+      mailbox?: string;
+    }>("check_gmail_api_status", { mailbox }, { timeoutMs: 15_000 });
+  }
+
   listMailboxes(storageProvider: string) {
     return this.invoke<MailboxListPayload>("list_mailboxes", { storage_provider: storageProvider });
   }

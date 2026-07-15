@@ -59,6 +59,7 @@ Brief 的扫描窗口、数量和行为偏好。
 ## Product boundaries
 
 - 2.0.1 只支持 Gmail；Outlook 仍是未来方向。
-- 设置页含 AI Personalization（Saved prompts / Memory）。
+- 设置页含 AI Personalization（Saved prompts / Memory）与 Connectivity check（LLM / Gmail API 延迟轮询间隔，持久化到 inboxSettings）。
+- AI 侧栏底部展示 LLM 与 Gmail API 连通状态及延迟（ms）；点击各自手动重测，定时轮询并行刷新。
 - 邮件发送、标记已读、标签变更、移至垃圾箱与整理确认必须来自明确用户操作。
 - 凭据不作为工具参数传递，也不得写入日志或持久化状态。
