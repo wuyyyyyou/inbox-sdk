@@ -644,7 +644,16 @@ def list_inbox_emails(
     category_arg: Any = "inbox",
     clear_cache_arg: Any = False,
 ) -> dict[str, Any]:
-    """Return a compact, LLM-free Gmail inbox feed for the home screen."""
+    """刷新/拉取首页邮件：始终按 All mail 写入统一本地缓存，再返回首屏快照。
+
+    策略（与前端分类投影对齐）：
+    1. clear_cache=True 时先清空该邮箱 Gmail 缓存
+    2. 固定用 All mail query（含 trash/spam、排除 chats）从 Gmail 拉 metadata 并写入缓存
+    3. 缓存写入可用较高 limit；**RPC 响应**按 CACHED_FEED_RESPONSE_MAX_BYTES 截断，
+       避免单帧过大导致 host 杀进程（executa process exited）
+    4. 响应带 has_more / next_offset，前端用 list_cached_emails 继续读本地缓存
+    5. category 参数仅作诊断字段保留，不再驱动 Gmail query
+    """
     from mail_agent.mail_providers.gmail.adapter import (
         clear_mailbox_cache,
         live_search_metadata_and_cache,
@@ -658,12 +667,15 @@ def list_inbox_emails(
     authorized_email = str(profile.get("emailAddress") or "").strip().lower()
     if authorized_email and authorized_email != mailbox:
         raise ValueError(f"Gmail credential mismatch: selected {mailbox}, authorized {authorized_email}")
+    # 用户强制刷新时清空缓存，再重建 All mail 快照
     cache_reset = clear_mailbox_cache(mailbox) if clear_cache_arg is True else None
     days_input = 30 if days_arg in (None, "") else days_arg
     days = max(0, min(int(days_input), 3650))
+    # 缓存抓取上限；响应条数另受 48KiB 帧预算约束
     limit = max(1, min(int(limit_arg or 100), 500))
+    # 请求侧 category 仅记录意图；实际抓取固定为 all
     category = _normalize_inbox_category(category_arg)
-    query = _inbox_category_query(category, days)
+    query = _inbox_category_query("all", days)
     matched_ids = live_search_metadata_and_cache(mailbox, query, limit)
     by_id = {
         str(item.get("id") or ""): item
@@ -672,20 +684,50 @@ def list_inbox_emails(
     }
     thread_subjects = _thread_original_subjects(list(by_id.values()))
 
-    messages: list[dict[str, Any]] = []
+    all_messages: list[dict[str, Any]] = []
     for message_id in matched_ids:
         item = by_id.get(str(message_id))
         if not item:
             continue
-        messages.append(_compact_inbox_message(item, mailbox, thread_subjects))
-    messages.sort(key=_inbox_message_sort_key)
+        all_messages.append(_compact_inbox_message(item, mailbox, thread_subjects))
+    all_messages.sort(key=_inbox_message_sort_key)
 
+    # 按 JSON-RPC 帧预算截断返回条数（与 list_cached_emails 一致），缓存仍保留全量
+    messages: list[dict[str, Any]] = []
+    response_limit = min(limit, 100)
+    for item in all_messages:
+        if len(messages) >= response_limit:
+            break
+        candidate_messages = [*messages, item]
+        candidate_payload = {
+            "mailbox": mailbox,
+            "days": days,
+            "category": category,
+            "query": query,
+            "count": len(candidate_messages),
+            "offset": 0,
+            "next_offset": len(candidate_messages),
+            "has_more": len(all_messages) > len(candidate_messages),
+            "messages": candidate_messages,
+            "updated_at": beijing_now(),
+            "cache_reset": cache_reset,
+        }
+        if messages and _cached_rpc_frame_size("list_inbox_emails", candidate_payload) > CACHED_FEED_RESPONSE_MAX_BYTES:
+            break
+        messages = candidate_messages
+
+    next_offset = len(messages)
+    has_more = len(all_messages) > next_offset
     return {
         "mailbox": mailbox,
         "days": days,
         "category": category,
         "query": query,
         "count": len(messages),
+        "offset": 0,
+        "next_offset": next_offset,
+        "has_more": has_more,
+        "cached_total": len(all_messages),
         "messages": messages,
         "updated_at": beijing_now(),
         "cache_reset": cache_reset,
@@ -707,6 +749,10 @@ def list_cached_emails(
     category_arg: Any = "all",
     offset_arg: Any = 0,
 ) -> dict[str, Any]:
+    """从本地 All mail 缓存分页读取，并按 category 标签投影过滤。
+
+    不访问 Gmail；依赖 list_inbox_emails / list_gmail_emails_page 事先写入的统一缓存。
+    """
     from mail_agent.mail_providers.gmail.adapter import (
         cache_debug_info,
         ensure_cached_feed_index,
@@ -823,12 +869,19 @@ def list_gmail_emails_page(
     page_offset_arg: Any = 0,
     exclude_message_ids_arg: Any = None,
 ) -> dict[str, Any]:
-    """Return one transient Gmail page without writing summaries to the local cache."""
+    """加载更多：按 All mail 拉一页 Gmail，并合并写入统一本地缓存。
+
+    不再按 category 打 Gmail；分类由缓存标签投影完成。
+    category 参数仅作响应诊断字段保留。
+    """
     from mail_agent.mail_providers.gmail.adapter import (
         GMAIL_PAGE_SUMMARY_FETCH_MAX_WORKERS,
         fetch_message_summary,
         gmail_request,
+        message_summary,
         normalize_mailbox as adapter_normalize_mailbox,
+        read_cache,
+        write_index,
     )
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
@@ -836,7 +889,8 @@ def list_gmail_emails_page(
     days = max(0, min(int(days_input), 3650))
     limit = max(1, min(int(limit_arg or 100), 100))
     category = _normalize_inbox_category(category_arg)
-    query = _gmail_fallback_query(category, days)
+    # 加载更多固定扩 All mail 缓存，避免按分类重复打 Gmail
+    query = _gmail_fallback_query("all", days)
     current_token = str(page_token_arg or "")
     current_offset = max(0, int(page_offset_arg or 0))
     excluded = {
@@ -845,10 +899,30 @@ def list_gmail_emails_page(
         if str(message_id or "")
     } if isinstance(exclude_message_ids_arg, list) else set()
     messages: list[dict[str, Any]] = []
+    # 本页原始 summary，用于合并进本地 index（含 body 以外的元数据）
+    page_summaries: list[dict[str, Any]] = []
     pages_scanned = 0
+
+    def _merge_page_into_cache() -> None:
+        """将本页拉取到的 summary 合并进 All mail 本地缓存。"""
+        if not page_summaries:
+            return
+        existing = read_cache(mailbox)
+        by_id: dict[str, dict[str, Any]] = {}
+        for item in existing.get("messages") or []:
+            if isinstance(item, dict) and item.get("id"):
+                by_id[str(item["id"])] = item
+        for summary in page_summaries:
+            mid = str(summary.get("id") or "")
+            if not mid:
+                continue
+            by_id[mid] = message_summary(summary)
+        merged = sorted(by_id.values(), key=lambda item: int(item.get("internal_date") or 0), reverse=True)
+        write_index(mailbox, merged)
 
     def build_payload(token: str, offset: int, has_more: bool) -> dict[str, Any]:
         ordered_messages = sorted(messages, key=_inbox_message_sort_key)
+        _merge_page_into_cache()
         return {
             "mailbox": mailbox,
             "days": days,
@@ -869,9 +943,9 @@ def list_gmail_emails_page(
             "q": query,
             "maxResults": 100,
             "fields": "messages/id,nextPageToken",
+            # All mail 需包含 trash/spam，与 search_gmail 行为一致
+            "includeSpamTrash": "true",
         }
-        if category in {"all", "trash", "spam"}:
-            params["includeSpamTrash"] = "true"
         if request_token:
             params["pageToken"] = request_token
         page = gmail_request(mailbox, "/users/me/messages", params)
@@ -908,6 +982,7 @@ def list_gmail_emails_page(
                 summary = summaries.get(position)
                 if message_id in excluded or not summary:
                     continue
+                page_summaries.append(summary)
                 compact = _compact_inbox_message(summary, mailbox, thread_subjects)
                 candidate_messages = [*messages, compact]
                 next_position = position + 1

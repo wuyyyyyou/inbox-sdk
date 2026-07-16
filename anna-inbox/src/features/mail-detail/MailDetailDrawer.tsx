@@ -4,6 +4,7 @@ import type {
   AttachmentDownloadPayload,
   DraftReplyArtifact,
   InboxMessage,
+  InboxMessageDisplayBodyPayload,
   InboxThreadAssistPayload,
   InboxThreadMessage,
   InboxThreadPagePayload,
@@ -191,6 +192,19 @@ function MailDetailLoadingSkeleton() {
           <span className="mail-detail-loading-line is-short" />
         </div>
       </article>
+    </div>
+  );
+}
+
+function MailThreadBodyLoading() {
+  return (
+    <div className="mail-thread-message-loading" role="status" aria-label="Loading full message">
+      <div className="mail-detail-loading-body">
+        <span className="mail-detail-loading-line" />
+        <span className="mail-detail-loading-line" />
+        <span className="mail-detail-loading-line is-short" />
+      </div>
+      <p>Loading full message…</p>
     </div>
   );
 }
@@ -400,6 +414,16 @@ function singleMessagePageFromBody(
       attachments,
     }],
   };
+}
+
+async function resolveDisplayBodyPayload(payload: InboxMessageDisplayBodyPayload) {
+  const bodyUrl = String(payload.body_url || "").trim();
+  if (!bodyUrl) return payload;
+  // 超大正文不经过 JSON-RPC，而是从 Executa 的短期 loopback URL 读取；
+  // 即使读取成功也保留 body_url 标记，调用方据此避免写入 browserStorage。
+  const response = await fetch(bodyUrl, { cache: "no-store" });
+  if (!response.ok) throw new Error(`Failed to load message body (${response.status}).`);
+  return { ...payload, body_html: await response.text(), body_url: bodyUrl };
 }
 
 function expectedAttachmentCountForMessage(item: InboxThreadMessage, anchorMessage: InboxMessage | null) {
@@ -617,7 +641,7 @@ export function MailDetailDrawer({
     limit?: number;
     includeDisplayBody?: boolean;
   }) => Promise<InboxThreadPagePayload>;
-  loadInboxMessageDisplayBody: (mailbox: string, messageId: string) => Promise<{ body_text?: string; body_html?: string; body_truncated?: boolean }>;
+  loadInboxMessageDisplayBody: (mailbox: string, messageId: string) => Promise<InboxMessageDisplayBodyPayload>;
   loadInboxThreadAssist: (mailbox: string, threadId: string, latestMessageId: string, anchorMessageId?: string) => Promise<InboxThreadAssistPayload>;
   getInboxThreadDraft: (mailbox: string, threadId: string) => Promise<{ exists: boolean; body: string; etag?: string }>;
   saveInboxThreadDraft: (mailbox: string, threadId: string, body: string, ifMatch?: string, message?: Record<string, unknown>) => Promise<{ etag?: string }>;
@@ -667,6 +691,7 @@ export function MailDetailDrawer({
   const loadInboxEmailBodyRef = useRef(loadInboxEmailBody);
   const loadInboxThreadPageRef = useRef(loadInboxThreadPage);
   const loadInboxMessageDisplayBodyRef = useRef(loadInboxMessageDisplayBody);
+  const loadFullDisplayBodyRef = useRef<(item: InboxThreadMessage, force?: boolean) => Promise<void>>(async () => undefined);
   const loadInboxThreadAssistRef = useRef(loadInboxThreadAssist);
   const getInboxThreadDraftRef = useRef(getInboxThreadDraft);
   const saveInboxThreadDraftRef = useRef(saveInboxThreadDraft);
@@ -844,6 +869,9 @@ export function MailDetailDrawer({
     setPage(null);
     setLoading(true);
     setError("");
+    setDisplayBodyLoading(new Set());
+    setDisplayBodyLoaded(new Set());
+    setDisplayBodyErrors({});
     setAssist(null);
     setAssistLoading(false);
     setAssistError("");
@@ -884,6 +912,12 @@ export function MailDetailDrawer({
           if (!cancelled && assistRequestKeyRef.current === requestKey) setAssistLoading(false);
         });
     };
+    const loadFullAnchorMessage = (visiblePage: InboxThreadPagePayload) => {
+      // 首屏仍保持受限预览，选中邮件若被截断则立即经 body_url 加载完整正文。
+      // 仅加载用户打开的锚点邮件，避免打开长线程时并发请求全部历史正文。
+      const anchorItem = visiblePage.messages.find((item) => item.id === messageId);
+      if (anchorItem?.body_truncated) void loadFullDisplayBodyRef.current(anchorItem, true);
+    };
     const load = async () => {
       try {
         if (threadId) {
@@ -900,11 +934,16 @@ export function MailDetailDrawer({
             ) {
               void hydrateCachedThreadPageBodies(mailbox, visibleCachedPage)
                 .then((hydratedPage) => {
-                  if (cancelled || hydratedPage === visibleCachedPage) return;
-                  queueThreadScroll(hydratedPage, messageId);
-                  setPage(hydratedPage);
+                  if (cancelled) return;
+                  if (hydratedPage !== visibleCachedPage) {
+                    queueThreadScroll(hydratedPage, messageId);
+                    setPage(hydratedPage);
+                  }
+                  loadFullAnchorMessage(hydratedPage);
                 })
-                .catch(() => undefined);
+                .catch(() => {
+                  if (!cancelled) loadFullAnchorMessage(visibleCachedPage);
+                });
               return;
             }
           }
@@ -914,6 +953,7 @@ export function MailDetailDrawer({
           queueThreadScroll(visiblePage, messageId);
           setPage(visiblePage);
           void cacheThreadPage(mailbox, visiblePage);
+          loadFullAnchorMessage(visiblePage);
           requestAssist(visiblePage.latest_message_id || messageId);
         } else {
           const cachedBody = await getCachedMessageBody(mailbox, messageId, anchorMessage.internal_date);
@@ -933,7 +973,7 @@ export function MailDetailDrawer({
         const threadError = reason instanceof Error ? reason.message : String(reason);
         if (threadId) {
           try {
-            const display = await loadInboxMessageDisplayBodyRef.current(mailbox, messageId);
+            const display = await resolveDisplayBodyPayload(await loadInboxMessageDisplayBodyRef.current(mailbox, messageId));
             if (cancelled) return;
             setPage(singleMessagePageFromBody(mailbox, anchorMessage, {
               body_html: display.body_html || "",
@@ -941,12 +981,14 @@ export function MailDetailDrawer({
               body_truncated: Boolean(display.body_truncated),
               attachments: inboxMessageAttachments(anchorMessage),
             }));
-            void setCachedMessageBody(mailbox, anchorMessage, {
-              body_html: display.body_html || "",
-              body_text: display.body_text || "",
-              body_truncated: Boolean(display.body_truncated),
-              attachments: inboxMessageAttachments(anchorMessage),
-            });
+            if (!display.body_url) {
+              void setCachedMessageBody(mailbox, anchorMessage, {
+                body_html: display.body_html || "",
+                body_text: display.body_text || "",
+                body_truncated: Boolean(display.body_truncated),
+                attachments: inboxMessageAttachments(anchorMessage),
+              });
+            }
             setError("");
             requestAssist(messageId);
           } catch {
@@ -1148,8 +1190,8 @@ export function MailDetailDrawer({
     });
   };
 
-  const loadFullDisplayBody = async (item: InboxThreadMessage) => {
-    if (displayBodyLoading.has(item.id) || displayBodyLoaded.has(item.id)) return;
+  const loadFullDisplayBody = async (item: InboxThreadMessage, force = false) => {
+    if (!force && (displayBodyLoading.has(item.id) || displayBodyLoaded.has(item.id))) return;
     setDisplayBodyLoading((current) => new Set(current).add(item.id));
     setDisplayBodyErrors((current) => ({ ...current, [item.id]: "" }));
     try {
@@ -1167,13 +1209,15 @@ export function MailDetailDrawer({
         setDisplayBodyLoaded((current) => new Set(current).add(item.id));
         return;
       }
-      const display = await loadInboxMessageDisplayBody(mailbox, item.id);
-      void setCachedMessageBody(mailbox, threadMessageToInboxMessage(item, mailbox), {
-        body_html: display.body_html || "",
-        body_text: display.body_text || "",
-        body_truncated: Boolean(display.body_truncated),
-        attachments: item.attachments || [],
-      });
+      const display = await resolveDisplayBodyPayload(await loadInboxMessageDisplayBody(mailbox, item.id));
+      if (!display.body_url) {
+        void setCachedMessageBody(mailbox, threadMessageToInboxMessage(item, mailbox), {
+          body_html: display.body_html || "",
+          body_text: display.body_text || "",
+          body_truncated: Boolean(display.body_truncated),
+          attachments: item.attachments || [],
+        });
+      }
       setPage((current) => current ? {
         ...current,
         messages: current.messages.map((message) => message.id === item.id ? {
@@ -1197,6 +1241,7 @@ export function MailDetailDrawer({
       });
     }
   };
+  loadFullDisplayBodyRef.current = loadFullDisplayBody;
 
   const prepareAttachmentAccess = async (item: PreviewAttachmentRef, mode: "preview" | "download") => {
     const messageId = String(item.messageId || item.attachment.message_id || "").trim();
@@ -1582,7 +1627,9 @@ export function MailDetailDrawer({
           {page?.has_earlier ? <button className="mail-detail-load-earlier" onClick={() => void loadEarlier()}>Load earlier messages</button> : null}
           {loading && !page ? <MailDetailLoadingSkeleton /> : null}
           {error ? <div className="mail-detail-error">Thread failed to load. {error}</div> : null}
-          {(visibleThreadMessages.length ? visibleThreadMessages : []).map((item) => (
+          {(visibleThreadMessages.length ? visibleThreadMessages : []).map((item) => {
+            const waitForFullBody = item.id === messageId && item.body_truncated && !displayBodyLoaded.has(item.id);
+            return (
             <article key={item.id} className="mail-thread-message" data-message-id={item.id}>
               <div className="mail-thread-message-head">
                 <div className="mail-thread-message-author">
@@ -1605,8 +1652,8 @@ export function MailDetailDrawer({
                 </div>
                 <time>{formatAbsoluteDateTime(item.internal_date)}</time>
               </div>
-              {item.body_html ? <SafeEmailHtml className="mail-thread-message-body is-html" html={item.body_html} scaleToFit /> : <SafeEmailText className="mail-thread-message-body" text={item.body_text || ""} />}
-              {item.body_truncated ? (
+              {waitForFullBody ? <MailThreadBodyLoading /> : item.body_html ? <SafeEmailHtml className="mail-thread-message-body is-html" html={item.body_html} scaleToFit /> : <SafeEmailText className="mail-thread-message-body" text={item.body_text || ""} />}
+              {item.body_truncated && !waitForFullBody ? (
                 <p className="mail-thread-message-notice">
                   <span>{displayBodyLoaded.has(item.id) ? "This message exceeds the safe display limit." : "This message is too large to display completely."}</span>
                   {!displayBodyLoaded.has(item.id) ? (
@@ -1616,7 +1663,12 @@ export function MailDetailDrawer({
                   ) : null}
                 </p>
               ) : null}
-              {displayBodyErrors[item.id] ? <p className="mail-thread-message-notice is-error">{displayBodyErrors[item.id]}</p> : null}
+              {displayBodyErrors[item.id] ? (
+                <p className="mail-thread-message-notice is-error">
+                  <span>{displayBodyErrors[item.id]}</span>
+                  {waitForFullBody ? <button onClick={() => void loadFullDisplayBody(item)}>Retry</button> : null}
+                </p>
+              ) : null}
               <AttachmentSection
                 attachments={item.attachments}
                 expectedAttachmentCount={expectedAttachmentCountForMessage(item, message)}
@@ -1626,7 +1678,8 @@ export function MailDetailDrawer({
                 isDownloading={(attachment) => isAttachmentDownloading({ attachment, messageId: attachment.message_id || item.id })}
               />
             </article>
-          ))}
+            );
+          })}
           {showQuickReplies ? (
             <section className="mail-detail-quick-replies" aria-label="Quick reply prompts">
               {quickReplySuggestions.map((item) => (

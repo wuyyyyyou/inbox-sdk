@@ -189,7 +189,7 @@ export function ComposeView({
   const saveToDrafts = async () => {
     if (isEmpty) {
       actions.showToast(
-        "Add a recipient, subject, or message before saving a draft.",
+        "Add a recipient, subject, or body before saving a draft.",
       );
       return;
     }
@@ -246,7 +246,7 @@ export function ComposeView({
             </button>
           </div>
           <div className="mail-detail-summary">
-            <h2>{draftId ? "Edit draft" : "New message"}</h2>
+            <h2>{draftId ? "Edit draft" : "New email"}</h2>
             <p className="compose-header-copy">
               Compose an email from {mailbox}
             </p>

@@ -2540,7 +2540,13 @@ def modify_message_labels(
 
     add_set = {str(label).strip().upper() for label in (add_label_ids or []) if str(label).strip()}
     remove_set = {str(label).strip().upper() for label in (remove_label_ids or []) if str(label).strip()}
-    effective_allowlist = {str(label).strip().upper() for label in (allowlist or {"UNREAD", "IMPORTANT"}) if str(label).strip()}
+    # 收件箱批量栏需要 STARRED / INBOX / TRASH；自定义用户标签仍须显式传入 allowlist
+    default_allow = {"UNREAD", "IMPORTANT", "STARRED", "INBOX", "TRASH"}
+    effective_allowlist = {
+        str(label).strip().upper()
+        for label in (allowlist or default_allow)
+        if str(label).strip()
+    }
     disallowed = sorted((add_set | remove_set) - effective_allowlist)
     if disallowed:
         raise ValueError(f"Only these labels can be modified: {', '.join(sorted(effective_allowlist))}")

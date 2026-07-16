@@ -8,7 +8,6 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
-  type UIEvent as ReactUIEvent,
 } from "react";
 import { useApp } from "../../app/AppContext";
 import type {
@@ -110,6 +109,8 @@ const COMPACT_ACCOUNT_RAIL_WIDTH = 48;
 const CACHED_INBOX_BANNER_SKIP_KEY = "anna-inbox:cached-inbox-banner-skip";
 const INBOX_ALL_TIME_DAYS = 0;
 const INBOX_LAST_MONTH_DAYS = 30;
+/** 时间窗阶梯：从当前 display range 往后推一级 */
+const FEED_RANGE_STEPS = [7, 30, 60, INBOX_ALL_TIME_DAYS] as const;
 const DEFAULT_INBOX_FEED_WINDOW: InboxFeedWindow = {
   days: 30,
   nextOffset: 100,
@@ -120,6 +121,32 @@ const DEFAULT_INBOX_FEED_WINDOW: InboxFeedWindow = {
   gmailPageOffset: 0,
 };
 const INBOX_FEED_PAGE_SIZE = 100;
+
+/** 下一个更大时间窗；已是 All time 则返回 null */
+export function nextFeedRangeDays(currentDays: number): number | null {
+  const current = Number(currentDays);
+  if (current === INBOX_ALL_TIME_DAYS) return null;
+  const exact = FEED_RANGE_STEPS.indexOf(current as (typeof FEED_RANGE_STEPS)[number]);
+  if (exact >= 0 && exact < FEED_RANGE_STEPS.length - 1) {
+    return FEED_RANGE_STEPS[exact + 1];
+  }
+  for (const step of FEED_RANGE_STEPS) {
+    if (step === INBOX_ALL_TIME_DAYS || step > current) return step;
+  }
+  return INBOX_ALL_TIME_DAYS;
+}
+
+/** 需要底部「扩大时间窗」按钮的远程同步分类（本地 flags 分类除外） */
+function isExpandableMailboxView(view: MailboxView): boolean {
+  return (
+    view === "inbox" ||
+    view === "starred" ||
+    view === "sent" ||
+    view === "trash" ||
+    view === "spam" ||
+    view === "all"
+  );
+}
 const AI_CONVERSATION_BOTTOM_THRESHOLD = 24;
 const DETAIL_DRAWER_TRANSITION_MS = 360;
 
@@ -290,6 +317,18 @@ const InboxIcon = () => (
   <Icon>
     <path d="M4 5h16l-1.5 14h-13L4 5Z" />
     <path d="M5 14h4l1.5 2h3l1.5-2h4" />
+  </Icon>
+);
+const MoreDotsIcon = () => (
+  <Icon>
+    <circle cx="6" cy="12" r="1.4" />
+    <circle cx="12" cy="12" r="1.4" />
+    <circle cx="18" cy="12" r="1.4" />
+  </Icon>
+);
+const CloseSmallIcon = () => (
+  <Icon>
+    <path d="M7 7l10 10M17 7 7 17" />
   </Icon>
 );
 const SparkleIcon = () => (
@@ -622,6 +661,19 @@ function inboxRangeLabel(days: number) {
   return `Last ${days} days`;
 }
 
+function olderRangeButtonLabel(currentDays: number, nextDays: number | null) {
+  if (nextDays === null) return "";
+  if (nextDays === INBOX_ALL_TIME_DAYS) return "Show all older emails";
+  if (currentDays <= 0) return `Show emails from the last ${nextDays} days`;
+  return `Show emails older than ${currentDays} days (last ${nextDays} days)`;
+}
+
+/** 当前时间窗内继续展示更多（非扩窗） */
+function moreInPeriodButtonLabel(currentDays: number) {
+  if (currentDays === INBOX_ALL_TIME_DAYS) return "Show more in this period";
+  return `Show more from the last ${currentDays} days`;
+}
+
 function inboxLastSyncedLabel(value?: string) {
   if (!value) return "";
   const date = new Date(value);
@@ -639,7 +691,15 @@ function inboxLastSyncedLabel(value?: string) {
 }
 
 export function hasMessageLabel(message: InboxMessage, label: string) {
-  return (message.label_ids || []).includes(label);
+  const target = String(label || "").toUpperCase();
+  return (message.label_ids || []).some(
+    (item) => String(item).toUpperCase() === target,
+  );
+}
+
+/** Gmail 部分返回仅提供 UNREAD 标签，列表展示需兼容两种未读字段。 */
+export function isUnreadMessage(message: InboxMessage) {
+  return Boolean(message.unread) || hasMessageLabel(message, "UNREAD");
 }
 
 export function isImportantMessage(message: InboxMessage) {
@@ -700,16 +760,19 @@ export function isSentMessage(message: InboxMessage) {
   );
 }
 
-function inboxThreadProjectionKey(message: InboxMessage) {
+/** 列表投影键：有 thread_id 时按线程折叠（Gmail thread），否则回退 message.id。 */
+export function inboxThreadProjectionKey(message: InboxMessage) {
   const mailboxKey = String(message.mailbox || "")
     .trim()
     .toLowerCase();
   const threadKey = String(message.thread_id || "").trim();
   if (threadKey) return `${mailboxKey}:thread:${threadKey}`;
+  // compose 草稿无 thread_id，用稳定 id
   return `${mailboxKey}:message:${message.id}`;
 }
 
-function uniqueLatestInboxThreads<T extends InboxMessage>(messages: T[]) {
+/** 同一 thread 只保留最新一条，避免同会话多行导致多选/详情错乱。 */
+export function uniqueLatestInboxThreads<T extends InboxMessage>(messages: T[]) {
   const seen = new Set<string>();
   const unique: T[] = [];
   for (const message of sortInboxMessagesDesc(messages)) {
@@ -854,6 +917,40 @@ export function resolveSourceMessages(
   return uniqueLatestInboxThreads(source);
 }
 
+/**
+ * Inbox 搜索（含 is:unread）数据源：Inbox + Todos + Snoozed。
+ * 避免 workflow 未读被 inbox 视图排除后搜不到。
+ */
+export function mergeInboxSearchSourceMessages(
+  inboxMessages: InboxMessage[],
+  inboxSnapshotMessages: InboxMessage[],
+  flags: MailUiFlags,
+) {
+  const inboxResolved = resolveSourceMessages(
+    "inbox",
+    inboxMessages,
+    inboxSnapshotMessages,
+    flags,
+  );
+  const byId = new Map(inboxResolved.map((message) => [message.id, message]));
+  const currentMessages = new Map<string, InboxMessage>();
+  for (const message of [
+    ...Object.values(flags.saved),
+    ...inboxSnapshotMessages,
+    ...inboxMessages,
+  ]) {
+    if (message?.id) currentMessages.set(message.id, message);
+  }
+  for (const id of [...flags.todos, ...flags.snoozed]) {
+    if (byId.has(id)) continue;
+    const message = currentMessages.get(id);
+    if (!message || isTrashMessage(message) || isDoneMessage(message, flags))
+      continue;
+    byId.set(id, message);
+  }
+  return uniqueLatestInboxThreads([...byId.values()]);
+}
+
 function hasInboxMessageAttachment(message: InboxMessage) {
   const attachments = (message as InboxMessage & { attachments?: unknown[] })
     .attachments;
@@ -878,6 +975,7 @@ function InboxRow({
   avatarUrl,
   selectable = false,
   selectedForBatch = false,
+  entering = false,
   onBatchToggle,
   onComposeDraftDelete,
 }: {
@@ -897,6 +995,8 @@ function InboxRow({
   avatarUrl?: string;
   selectable?: boolean;
   selectedForBatch?: boolean;
+  /** 流式加载时的单行入场动画 */
+  entering?: boolean;
   onBatchToggle?: () => void;
   onComposeDraftDelete?: () => void;
 }) {
@@ -909,6 +1009,7 @@ function InboxRow({
   );
   const sentView = participant.outgoing;
   const sentMessage = isSentMessage(message);
+  const unread = isUnreadMessage(message);
   const isDone = isDoneMessage(message, flags);
   const isTodo = flags.todos.includes(message.id);
   const isSnoozed = flags.snoozed.includes(message.id);
@@ -928,7 +1029,7 @@ function InboxRow({
     "No preview available";
   return (
     <article
-      className={`mail-row ${mailboxView === "all" ? "is-all-mail" : ""} ${message.unread ? "is-unread" : ""} ${selected ? "is-selected" : ""}`}
+      className={`mail-row ${mailboxView === "all" ? "is-all-mail" : ""} ${unread ? "is-unread" : ""} ${selected ? "is-selected" : ""} ${entering ? "is-entering" : ""}`}
     >
       {selectable ? (
         <button
@@ -1055,7 +1156,9 @@ function InboxRow({
               className={starred ? "is-active is-starred" : ""}
               aria-label={starred ? "Unstar" : "Star"}
               data-tooltip={starred ? "Unstar" : "Star"}
-              onClick={() => void actions.setInboxStarred(message.id, !starred)}
+              onClick={() =>
+                onThreadAction(starred ? "unstar" : "star", message)
+              }
             >
               <StarIcon />
             </button>
@@ -1089,7 +1192,7 @@ function InboxRow({
             >
               <ClockIcon />
             </button>
-            {message.unread ? (
+            {unread ? (
               <button
                 aria-label="Mark as read"
                 data-tooltip="Mark as read"
@@ -1159,8 +1262,8 @@ export function aiSearchStatus(result: CustomRunResult, userRequest = "") {
     );
   if (itemCount > 0)
     return chinese
-      ? `找到 ${itemCount} 个相关邮件线程。`
-      : `Found ${itemCount} relevant thread${itemCount === 1 ? "" : "s"}.`;
+      ? `找到 ${itemCount} 封相关邮件。`
+      : `Found ${itemCount} relevant email${itemCount === 1 ? "" : "s"}.`;
   const queryCount = result.plan_gmail_queries?.length || 0;
   if (queryCount > 0)
     return chinese
@@ -1239,7 +1342,7 @@ function AiMessageInlineContent({
           className="ai-thread-reference"
           onClick={() => onOpenThread?.(node.threadId)}
         >
-          Open email thread
+          Open email
         </button>
       );
     }
@@ -1409,7 +1512,6 @@ function AiAssistantMessage({
   const { state, actions } = useApp();
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [submittingGap, setSubmittingGap] = useState(false);
-  const [clarificationInput, setClarificationInput] = useState("");
   const [assistantTextComplete, setAssistantTextComplete] = useState(
     () => !shouldAnimateAssistantText(message.timestamp),
   );
@@ -1461,12 +1563,12 @@ function AiAssistantMessage({
         markDone: "Mark done",
         archive: "Archive",
         trash: "Move to trash",
-        markDoneQ: (n: number) => `Mark ${n} threads as done?`,
-        archiveQ: (n: number) => `Archive ${n} threads?`,
-        trashQ: (n: number) => `Move ${n} threads to trash?`,
-        marked: (n: number) => `Marked ${n} threads as done`,
-        archived: (n: number) => `Archived ${n} threads`,
-        trashed: (n: number) => `Moved ${n} threads to trash`,
+        markDoneQ: (n: number) => `Mark ${n} email${n === 1 ? "" : "s"} as done?`,
+        archiveQ: (n: number) => `Archive ${n} email${n === 1 ? "" : "s"}?`,
+        trashQ: (n: number) => `Move ${n} email${n === 1 ? "" : "s"} to trash?`,
+        marked: (n: number) => `Marked ${n} email${n === 1 ? "" : "s"} as done`,
+        archived: (n: number) => `Archived ${n} email${n === 1 ? "" : "s"}`,
+        trashed: (n: number) => `Moved ${n} email${n === 1 ? "" : "s"} to trash`,
         skipped: "Skipped this batch",
         yesContinue: "Yes, continue",
         notNow: "Not now",
@@ -1483,7 +1585,7 @@ function AiAssistantMessage({
       return;
     }
     onOpenMail({
-      label: "Referenced thread",
+      label: "Referenced email",
       mailbox: referenceMailbox,
       thread_id: threadId,
       message_id: "",
@@ -1528,14 +1630,6 @@ function AiAssistantMessage({
         : null;
     const summaryLink = message.mailSummaryLink;
     const clarification = message.clarification;
-    const targetThreadOpen = Boolean(
-      draftArtifact &&
-      currentMailContext &&
-      currentMailContext.kind === "gmail_thread" &&
-      currentMailContext.mailbox.trim().toLowerCase() ===
-        draftArtifact.mailbox.trim().toLowerCase() &&
-      currentMailContext.thread_id === draftArtifact.thread_id,
-    );
     const submitReplyGap = async () => {
       if (
         !message.mailContext ||
@@ -1600,52 +1694,16 @@ function AiAssistantMessage({
           onComplete={() => setAssistantTextComplete(true)}
           onOpenThread={openThreadReference}
         />
-        {clarification ? (
-          <div className={`ai-clarification is-${clarification.status}`}>
-            {clarification.status === "pending" ? (
-              <>
-                {clarification.freeform_enabled ? (
-                  <input
-                    value={clarificationInput}
-                    placeholder="Add details (optional)"
-                    onChange={(event) =>
-                      setClarificationInput(event.target.value)
-                    }
-                  />
-                ) : null}
-                <div className="ai-clarification-actions">
-                  {clarification.actions.map((action) => (
-                    <button
-                      key={action.id}
-                      onClick={() =>
-                        void actions.sendAiChatMessage({
-                          currentMailContext,
-                          forcedKind: action.id,
-                          prompt:
-                            clarificationInput.trim() ||
-                            clarification.original_input,
-                          clarificationMessageId: message.id,
-                        })
-                      }
-                    >
-                      {action.label}
-                    </button>
-                  ))}
-                  <button
-                    className="is-dismiss"
-                    onClick={() => actions.dismissAiClarification(message.id)}
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </>
-            ) : (
-              <span>
-                {clarification.status === "dismissed"
-                  ? "Dismissed"
-                  : "Resolved"}
-              </span>
-            )}
+        {clarification && clarification.status === "pending" ? (
+          <div className="ai-clarification is-pending">
+            <div className="ai-clarification-actions">
+              <button
+                className="is-dismiss"
+                onClick={() => actions.dismissAiClarification(message.id)}
+              >
+                Dismiss
+              </button>
+            </div>
           </div>
         ) : null}
         {proposed ? (
@@ -1706,7 +1764,7 @@ function AiAssistantMessage({
                           })
                         }
                       >
-                        {item.subject || item.thread_id || item.message_id || "Thread"}
+                        {item.subject || item.thread_id || item.message_id || "Email"}
                       </button>
                     </label>
                   </li>
@@ -1853,53 +1911,73 @@ function AiAssistantMessage({
             ) : null}
           </div>
         ) : null}
-        {draftArtifact ? (
-          <div className="ai-draft-artifact">
-            <pre>{draftArtifact.body}</pre>
-            <div className="ai-draft-artifact-actions">
-              {targetThreadOpen ? (
-                <>
-                  <button
-                    className="is-primary"
-                    onClick={() => onUseArtifact(draftArtifact, "append")}
-                  >
-                    Append to draft reply
-                  </button>
+        {(() => {
+          // 批量写稿：优先 artifacts；单封仍用 artifact
+          const batchArtifacts =
+            Array.isArray(message.artifacts) && message.artifacts.length > 1
+              ? message.artifacts
+              : draftArtifact
+                ? [draftArtifact]
+                : [];
+          if (!batchArtifacts.length || (animate && !assistantTextComplete)) return null;
+          return batchArtifacts.map((item, index) => {
+            const itemOpen = Boolean(
+              currentMailContext &&
+              currentMailContext.kind === "gmail_thread" &&
+              currentMailContext.mailbox.trim().toLowerCase() ===
+                item.mailbox.trim().toLowerCase() &&
+              currentMailContext.thread_id === item.thread_id,
+            );
+            return (
+              <div className="ai-draft-artifact" key={`${item.thread_id}-${index}`}>
+                {item.subject || batchArtifacts.length > 1 ? (
+                  <strong className="ai-draft-artifact-title">
+                    {item.subject || item.thread_id || `Draft ${index + 1}`}
+                  </strong>
+                ) : null}
+                <pre>{item.body}</pre>
+                <div className="ai-draft-artifact-actions">
+                  {itemOpen ? (
+                    <>
+                      <button
+                        className="is-primary"
+                        onClick={() => onUseArtifact(item, "append")}
+                      >
+                        Append to draft reply
+                      </button>
+                      <button
+                        className="is-secondary"
+                        onClick={() => onUseArtifact(item, "replace")}
+                      >
+                        Replace draft reply
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      className="is-primary"
+                      onClick={() =>
+                        onOpenMail({
+                          label: item.subject || "Draft email",
+                          mailbox: item.mailbox,
+                          thread_id: item.thread_id,
+                          message_id: item.message_id || "",
+                        })
+                      }
+                    >
+                      Go to email
+                    </button>
+                  )}
                   <button
                     className="is-secondary"
-                    onClick={() => onUseArtifact(draftArtifact, "replace")}
+                    onClick={() => void actions.copyDraft(item.body)}
                   >
-                    Replace draft reply
+                    Copy draft
                   </button>
-                </>
-              ) : (
-                <button
-                  className="is-primary"
-                  onClick={() =>
-                    onOpenMail({
-                      label: "Draft thread",
-                      mailbox: draftArtifact.mailbox,
-                      thread_id: draftArtifact.thread_id,
-                      message_id:
-                        message.mailContext?.kind === "gmail_thread"
-                          ? message.mailContext.latest_message_id ||
-                            message.mailContext.anchor_message_id
-                          : "",
-                    })
-                  }
-                >
-                  Go to thread
-                </button>
-              )}
-              <button
-                className="is-secondary"
-                onClick={() => void actions.copyDraft(draftArtifact.body)}
-              >
-                Copy draft
-              </button>
-            </div>
-          </div>
-        ) : null}
+                </div>
+              </div>
+            );
+          });
+        })()}
         {composeArtifact ? (
           <div className="ai-draft-artifact">
             <pre>{composeArtifact.body}</pre>
@@ -2134,6 +2212,7 @@ function AiSidebar({
   collapsed,
   onToggle,
   currentMailContext,
+  selectedThreads,
   onUseArtifact,
   onUseComposeArtifact,
   onOpenMail,
@@ -2143,6 +2222,12 @@ function AiSidebar({
   collapsed: boolean;
   onToggle: () => void;
   currentMailContext: AiMailContextRef | null;
+  selectedThreads?: Array<{
+    mailbox: string;
+    message_id: string;
+    thread_id: string;
+    subject?: string;
+  }>;
   onUseArtifact: (
     artifact: DraftReplyArtifact,
     mode: "append" | "replace",
@@ -2264,7 +2349,10 @@ function AiSidebar({
     pinnedToBottomRef.current = true;
     scrollAfterSubmitRef.current = true;
     window.requestAnimationFrame(() => scrollConversationToBottom("smooth"));
-    void actions.sendAiChatMessage({ currentMailContext });
+    void actions.sendAiChatMessage({
+      currentMailContext,
+      selectedThreads: selectedThreads?.length ? selectedThreads : undefined,
+    });
   };
 
   const startNewChat = () => {
@@ -2320,7 +2408,8 @@ function AiSidebar({
             </div>
             <h1>How can I help you today?</h1>
             <p>
-              Ask Anna to find, organize, or summarize anything in your inbox.
+              Your AI assistant can search, summarize, draft/revise, and suggest
+              inbox organization.
             </p>
           </div>
         )}
@@ -2411,7 +2500,7 @@ function AiSidebar({
           <button
             className="ai-new-message-prompt"
             onClick={() => scrollConversationToBottom("smooth")}
-            aria-label="Scroll to new messages"
+            aria-label="Scroll to new emails"
           >
             有新消息 <span aria-hidden="true">↓</span>
           </button>
@@ -2484,7 +2573,7 @@ function AiSidebar({
           <textarea
             ref={composerInputRef}
             value={state.customScanInput}
-            placeholder={composerFocused ? "Press ↑ for saved prompts" : "Find, organize, ask anything…"}
+            placeholder={composerFocused ? "Press ↑ for saved prompts" : "Ask your AI assistant…"}
             rows={3}
             disabled={llmOffline}
             onFocus={() => setComposerFocused(true)}
@@ -2521,7 +2610,7 @@ function AiSidebar({
                   llmOffline || running || !state.customScanInput.trim()
                 }
                 onClick={submit}
-                aria-label="Ask Anna"
+                aria-label="Ask AI assistant"
               >
                 <SendIcon />
               </button>
@@ -2925,6 +3014,15 @@ export function HomeView() {
   const [selectedComposeDraftIds, setSelectedComposeDraftIds] = useState<
     Set<string>
   >(new Set());
+  /**
+   * 列表多选键：优先 mailbox|thread_id，无 thread 时用 mailbox|message:id。
+   * 与 inboxThreadProjectionKey 对齐，避免同会话多行勾选。
+   */
+  const [selectedListKeys, setSelectedListKeys] = useState<Set<string>>(
+    new Set(),
+  );
+  const [selectionMoreOpen, setSelectionMoreOpen] = useState(false);
+  const [batchBusy, setBatchBusy] = useState(false);
   const [batchConfirmDrafts, setBatchConfirmDrafts] = useState<
     ComposeDraft[] | null
   >(null);
@@ -3164,13 +3262,33 @@ export function HomeView() {
       ),
     [state.inboxDraftMessages, state.inboxSnapshotMessages],
   );
-  const sourceMessages = useMemo(() => {
-    const resolved = resolveSourceMessages(
-      mailboxView,
+  // 与 is:unread 一致：Inbox + Todos + Snoozed（排除 Done）
+  const workflowAwareInboxMessages = useMemo(
+    () =>
+      mergeInboxSearchSourceMessages(
+        inboxMessagesWithDrafts,
+        inboxSnapshotMessagesWithDrafts,
+        flags,
+      ).filter((message) => !isDoneMessage(message, flags)),
+    [
+      flags,
       inboxMessagesWithDrafts,
       inboxSnapshotMessagesWithDrafts,
-      flags,
-    );
+    ],
+  );
+  const sourceMessages = useMemo(() => {
+    // 搜索 / 自定义 Split：用 workflow 源，避免 todos 未读与 is:unread 不一致
+    const useWorkflowSource =
+      mailboxView === "inbox" &&
+      (filter === "search" || filter.startsWith("category:"));
+    const resolved = useWorkflowSource
+      ? workflowAwareInboxMessages
+      : resolveSourceMessages(
+          mailboxView,
+          inboxMessagesWithDrafts,
+          inboxSnapshotMessagesWithDrafts,
+          flags,
+        );
     if (mailboxView !== "drafts") return resolved;
     const composeMessages: InboxMessage[] = composeDrafts.map((draft) => ({
       id: `compose:${draft.id}`,
@@ -3188,25 +3306,27 @@ export function HomeView() {
     return [...composeMessages, ...resolved];
   }, [
     composeDrafts,
+    filter,
     flags,
     inboxMessagesWithDrafts,
     inboxSnapshotMessagesWithDrafts,
     mailbox,
     mailboxView,
+    workflowAwareInboxMessages,
   ]);
-  const inboxSplitMessages = useMemo(
-    () =>
-      splitInboxMessages(
-        sourceMessages.filter(
-          (message) =>
-            !flags.todos.includes(message.id) &&
-            !isDoneMessage(message, flags) &&
-            !flags.snoozed.includes(message.id),
-        ),
-        state.inboxSettings,
-      ),
-    [flags, sourceMessages, state.inboxSettings],
-  );
+  const inboxSplitMessages = useMemo(() => {
+    // Important/Other 仍排除 todos/snoozed（由置顶区展示）；自定义 Split 与 is:unread 同数据源
+    const plainInbox = workflowAwareInboxMessages.filter(
+      (message) =>
+        !flags.todos.includes(message.id) &&
+        !flags.snoozed.includes(message.id),
+    );
+    return splitInboxMessages(
+      plainInbox,
+      state.inboxSettings,
+      workflowAwareInboxMessages,
+    );
+  }, [flags.snoozed, flags.todos, state.inboxSettings, workflowAwareInboxMessages]);
   const [splitsOpen, setSplitsOpen] = useState(false);
 
   const messagesInThread = useCallback(
@@ -3455,12 +3575,17 @@ export function HomeView() {
     const splitMessageIds = splitMessages
       ? new Set(splitMessages.map((message) => message.id))
       : null;
+    // 搜索 / 自定义 Split 与 is:unread 对齐：保留 todos/snoozed
+    const includeWorkflowInInbox =
+      filter === "search" || filter.startsWith("category:");
     return sourceMessages.filter((message) => {
       const matchesView =
         mailboxView === "inbox"
-          ? !flags.todos.includes(message.id) &&
-            !isDoneMessage(message, flags) &&
-            !flags.snoozed.includes(message.id)
+          ? includeWorkflowInInbox
+            ? !isDoneMessage(message, flags)
+            : !flags.todos.includes(message.id) &&
+              !isDoneMessage(message, flags) &&
+              !flags.snoozed.includes(message.id)
           : mailboxView === "todos"
             ? flags.todos.includes(message.id)
             : mailboxView === "snoozed"
@@ -3501,11 +3626,58 @@ export function HomeView() {
       setFilter("important");
   }, [filter, state.inboxSettings.custom_categories]);
 
+  // 首屏阈值 + Show more：所有列表视图统一按 localLimit 截断展示
   const displayedVisible = useMemo(
-    () => (localCategory ? visible.slice(0, feedWindow.localLimit) : visible),
-    [feedWindow.localLimit, localCategory, visible],
+    () => visible.slice(0, feedWindow.localLimit),
+    [feedWindow.localLimit, visible],
   );
+  // 单行入场：新出现的 id 做 stagger 动画（切分类不播，见 skipEnterAnimRef）
+  const [enteringIds, setEnteringIds] = useState<Set<string>>(() => new Set());
+  const seenRowIdsRef = useRef<Set<string>>(new Set());
+  const skipEnterAnimRef = useRef(true);
+  useEffect(() => {
+    const nextIds = displayedVisible.map((message) => message.id).filter(Boolean);
+    if (skipEnterAnimRef.current) {
+      seenRowIdsRef.current = new Set(nextIds);
+      skipEnterAnimRef.current = false;
+      return;
+    }
+    const fresh = nextIds.filter((id) => !seenRowIdsRef.current.has(id));
+    for (const id of nextIds) seenRowIdsRef.current.add(id);
+    if (!fresh.length) return;
+    // 按单封依次挂上 is-entering，制造流式入场感
+    let cancelled = false;
+    const timers: number[] = [];
+    fresh.forEach((id, index) => {
+      timers.push(
+        window.setTimeout(() => {
+          if (cancelled) return;
+          setEnteringIds((current) => {
+            const next = new Set(current);
+            next.add(id);
+            return next;
+          });
+          timers.push(
+            window.setTimeout(() => {
+              if (cancelled) return;
+              setEnteringIds((current) => {
+                if (!current.has(id)) return current;
+                const next = new Set(current);
+                next.delete(id);
+                return next;
+              });
+            }, 280),
+          );
+        }, index * 28),
+      );
+    });
+    return () => {
+      cancelled = true;
+      for (const timer of timers) window.clearTimeout(timer);
+    };
+  }, [displayedVisible]);
   const pinnedImportantMessages = useMemo(() => {
+    // 必须先按 message.id 合并，再按 thread 折叠：否则同线程星标旧信与最新信会各占一行
     const byId = new Map<string, InboxMessage>();
     for (const message of [
       ...Object.values(flags.saved),
@@ -3514,9 +3686,11 @@ export function HomeView() {
     ]) {
       if (message.id && !isTrashMessage(message)) byId.set(message.id, message);
     }
-    return [...byId.values()].filter(
-      (message) =>
-        isStarredMessage(message) || flags.todos.includes(message.id),
+    return uniqueLatestInboxThreads(
+      [...byId.values()].filter(
+        (message) =>
+          isStarredMessage(message) || flags.todos.includes(message.id),
+      ),
     );
   }, [
     flags.saved,
@@ -3648,15 +3822,30 @@ export function HomeView() {
 
   const loadRemoteCategory = useCallback(
     async (category: MailboxView, targetDays = 7) => {
+      // 已有 All mail 快照时禁止重载（避免 append:false 冲掉快照或触发假刷新）
+      if (
+        state.inboxSnapshotMessages.length > 0 ||
+        state.inboxMessages.length > 0
+      ) {
+        setFeedWindow((current) => ({
+          ...current,
+          days: targetDays,
+          hasMore: false,
+          localLimit: INBOX_FEED_PAGE_SIZE,
+        }));
+        return true;
+      }
+      // 冷启动：统一读 All mail 缓存，再由 resolveSourceMessages 做标签投影
       const result = await actions.loadCachedInboxEmails(
-        category,
+        "all",
         targetDays,
         0,
         false,
       );
       if (!result.ok || mailboxViewRef.current !== category) return result.ok;
       if (result.count === 0 && !result.hasMore) {
-        const gmail = await loadGmailPage(category, targetDays, "", 0, []);
+        // 缓存为空时拉 All mail 并写入统一缓存，不按 category 打 Gmail
+        const gmail = await loadGmailPage("all", targetDays, "", 0, []);
         if (gmail?.ok && mailboxViewRef.current === category) {
           setFeedWindow({
             days: targetDays,
@@ -3673,7 +3862,7 @@ export function HomeView() {
       setFeedWindow({
         days: targetDays,
         nextOffset: result.nextOffset,
-        hasMore: true,
+        hasMore: result.hasMore,
         localLimit: INBOX_FEED_PAGE_SIZE,
         source: result.hasMore ? "cache" : "gmail",
         gmailPageToken: "",
@@ -3681,7 +3870,12 @@ export function HomeView() {
       });
       return true;
     },
-    [actions, loadGmailPage],
+    [
+      actions,
+      loadGmailPage,
+      state.inboxMessages.length,
+      state.inboxSnapshotMessages.length,
+    ],
   );
 
   const loadRemainingAllTimeInbox = useCallback(
@@ -3701,16 +3895,17 @@ export function HomeView() {
         if (currentSource === "gmail") {
           await new Promise((resolve) => window.setTimeout(resolve, 0));
         }
+        // All time 扩展同样走 All mail 缓存/Gmail，Inbox 视图由标签投影
         const result =
           currentSource === "cache"
             ? await actions.loadCachedInboxEmails(
-                "inbox",
+                "all",
                 INBOX_ALL_TIME_DAYS,
                 currentNextOffset,
                 true,
               )
             : await loadGmailPage(
-                "inbox",
+                "all",
                 INBOX_ALL_TIME_DAYS,
                 currentGmailPageToken,
                 currentGmailPageOffset,
@@ -3763,8 +3958,9 @@ export function HomeView() {
             }));
             return true;
           }
+          // 本地分类刷新也重建 All mail 缓存，保证标签投影数据完整
           const result = await actions.refreshInboxEmails(
-            "inbox",
+            "all",
             7,
             clearCache,
           );
@@ -3781,7 +3977,7 @@ export function HomeView() {
         }
         if (mailboxView === "inbox" && targetDays === INBOX_ALL_TIME_DAYS) {
           const result = await actions.refreshInboxEmails(
-            "inbox",
+            "all",
             INBOX_ALL_TIME_DAYS,
             clearCache,
           );
@@ -3813,7 +4009,7 @@ export function HomeView() {
           return loadedAll;
         }
         const result = await actions.refreshInboxEmails(
-          mailboxView,
+          "all",
           targetDays,
           clearCache,
         );
@@ -3821,7 +4017,8 @@ export function HomeView() {
           setFeedWindow({
             days: targetDays,
             nextOffset: result.nextOffset,
-            hasMore: true,
+            // 与刷新结果对齐，避免切分类后 hasMore 恒为 true 触发假分页
+            hasMore: result.hasMore,
             localLimit: INBOX_FEED_PAGE_SIZE,
             source: result.hasMore ? "cache" : "gmail",
             gmailPageToken: "",
@@ -3872,13 +4069,17 @@ export function HomeView() {
         await syncInbox(feedWindow.days);
         return;
       }
-      const category = mailboxView;
       const targetDays = feedWindow.days;
-      const excludeIds = sourceMessages
+      // 排除已在 All mail 快照中的 id，避免重复拉取
+      const excludeIds = [
+        ...state.inboxSnapshotMessages,
+        ...state.inboxMessages,
+      ]
         .map((message) => message.id)
         .filter(Boolean);
+      // 继续加载固定扩 All mail
       const result = await loadGmailPage(
-        category,
+        "all",
         targetDays,
         "",
         0,
@@ -3909,8 +4110,8 @@ export function HomeView() {
     feedWindow.days,
     loadGmailPage,
     localCategory,
-    mailboxView,
-    sourceMessages,
+    state.inboxMessages,
+    state.inboxSnapshotMessages,
     syncInbox,
   ]);
 
@@ -3936,193 +4137,231 @@ export function HomeView() {
     }
   }, [actions, authChecking, mailbox]);
 
-  const loadMoreInbox = useCallback(async () => {
-    if (
-      pageLoadInFlight.current ||
-      mailboxView !== "inbox" ||
-      feedWindow.days !== INBOX_LAST_MONTH_DAYS
-    )
-      return;
+  /** 将时间窗推进一级（7→30→60→ALL），只追加更早邮件，不清空已有列表 */
+  const expandFeedRange = useCallback(async () => {
+    const nextDays = nextFeedRangeDays(feedWindow.days);
+    if (nextDays === null || pageLoadInFlight.current) return;
     pageLoadInFlight.current = true;
     setFeedAction("more");
+    setCachedInboxRetryAction("load-more");
     try {
-      const initial = await actions.loadCachedInboxEmails(
-        "inbox",
-        INBOX_ALL_TIME_DAYS,
-        0,
-        false,
-      );
-      if (mailboxViewRef.current !== "inbox") return;
-      if (!initial.ok) {
-        setCachedInboxRetryAction("load-more");
-        actions.showToast("Failed to load emails older than 30 days.");
+      const result = await actions.expandInboxFeedWindow(nextDays);
+      if (!result.ok) {
+        actions.showToast(
+          nextDays === INBOX_ALL_TIME_DAYS
+            ? "Failed to load older emails."
+            : `Failed to load emails older than ${feedWindow.days} days.`,
+        );
         return;
       }
-      let source: InboxFeedWindow["source"] = initial.hasMore
-        ? "cache"
-        : "gmail";
-      let nextOffset = initial.nextOffset;
-      let gmailPageToken = "";
-      let gmailPageOffset = 0;
-      const excludeMessageIds = (initial.messages || [])
-        .map((message) => message.id)
-        .filter(Boolean);
-      const allTimeWindow = await loadRemainingAllTimeInbox(
-        source,
-        nextOffset,
-        gmailPageToken,
-        gmailPageOffset,
-        excludeMessageIds,
+      setFeedWindow((current) => ({
+        ...current,
+        days: nextDays,
+        nextOffset: result.nextOffset,
+        hasMore: result.hasMore,
+        localLimit: Math.max(current.localLimit, INBOX_FEED_PAGE_SIZE),
+        source: result.hasMore ? "cache" : "gmail",
+        gmailPageToken: "",
+        gmailPageOffset: 0,
+      }));
+      actions.showToast(
+        nextDays === INBOX_ALL_TIME_DAYS
+          ? `Loaded older emails. ${result.count} email${result.count === 1 ? "" : "s"} in this period.`
+          : `Showing last ${nextDays} days. ${result.count} email${result.count === 1 ? "" : "s"} in this period.`,
       );
-      if (!allTimeWindow) {
-        setCachedInboxRetryAction("load-more");
-        actions.showToast("Failed to load emails older than 30 days.");
-        return;
-      }
-      setFeedWindow(allTimeWindow);
-      actions.showToast("Loaded all inbox emails.");
     } finally {
       pageLoadInFlight.current = false;
       setFeedAction((current) => (current === "more" ? null : current));
     }
-  }, [actions, feedWindow.days, loadRemainingAllTimeInbox, mailboxView]);
+  }, [actions, feedWindow.days]);
 
-  const loadNextCategoryPage = useCallback(async () => {
-    if (mailboxView === "inbox" || pageLoadInFlight.current) return;
-    if (localCategory) {
-      if (feedWindow.localLimit < visible.length) {
-        setFeedWindow((current) => ({
-          ...current,
-          localLimit: current.localLimit + INBOX_FEED_PAGE_SIZE,
-        }));
-      }
+  const isInboxSyncing = state.inboxSnapshotLoading || feedAction === "refresh";
+  const days = feedWindow.days;
+  // 仅在「设置 display_range」或「邮箱」真正变更时重置窗口并同步。
+  // 故意不依赖 feedWindow.days：用户底部扩窗后不得被拉回设置值。
+  // 启动时默认 state 为 30，存储 hydrate 到 7 时只对齐标签，禁止 clearCache 闪屏。
+  const appliedDisplayRangeRef = useRef<{ mailbox: string; days: number } | null>(
+    null,
+  );
+  const settingsHydratedRef = useRef(false);
+  useEffect(() => {
+    const configuredDays = state.inboxSettings.display_range_days;
+    if (!mailbox) return;
+    const hasStoredSettings = Boolean(state.inboxSettingsEtag);
+    const applied = appliedDisplayRangeRef.current;
+    if (
+      applied &&
+      applied.mailbox === mailbox &&
+      applied.days === configuredDays
+    ) {
+      if (hasStoredSettings) settingsHydratedRef.current = true;
       return;
     }
-    if (!feedWindow.hasMore) return;
+    const isFirstBind = !applied;
+    const mailboxChanged = Boolean(applied && applied.mailbox !== mailbox);
+    const settingsChanged = Boolean(applied && applied.days !== configuredDays);
+    appliedDisplayRangeRef.current = { mailbox, days: configuredDays };
+    setFeedWindow((current) => {
+      if (current.days === configuredDays && !mailboxChanged) return current;
+      return {
+        ...current,
+        days: configuredDays,
+        ...(mailboxChanged
+          ? {
+              nextOffset: DEFAULT_INBOX_FEED_WINDOW.nextOffset,
+              hasMore: DEFAULT_INBOX_FEED_WINDOW.hasMore,
+              localLimit: DEFAULT_INBOX_FEED_WINDOW.localLimit,
+              source: DEFAULT_INBOX_FEED_WINDOW.source,
+              gmailPageToken: "",
+              gmailPageOffset: 0,
+            }
+          : {}),
+      };
+    });
+    if (isFirstBind) {
+      if (hasStoredSettings) settingsHydratedRef.current = true;
+      return;
+    }
+    if (mailboxChanged) {
+      void syncInbox(configuredDays, true);
+      return;
+    }
+    if (settingsChanged) {
+      // 首次从默认 settings 被存储值覆盖：preload 已按正确天数加载，只改标签
+      if (!settingsHydratedRef.current && hasStoredSettings) {
+        settingsHydratedRef.current = true;
+        return;
+      }
+      // 用户在设置里改 display range
+      void syncInbox(configuredDays, true);
+    }
+  }, [
+    mailbox,
+    state.inboxSettings.display_range_days,
+    state.inboxSettingsEtag,
+    syncInbox,
+  ]);
+  // 设置变更首屏条数时同步 localLimit（不低于当前已展开值时可回落到设置）
+  useEffect(() => {
+    const size = state.inboxSettings.initial_list_size || INBOX_FEED_PAGE_SIZE;
+    setFeedWindow((current) =>
+      current.localLimit === size
+        ? current
+        : { ...current, localLimit: Math.max(size, current.localLimit) },
+    );
+  }, [state.inboxSettings.initial_list_size]);
+  const lastSyncedLabel = inboxLastSyncedLabel(state.inboxUpdatedAt);
+  const nextRangeDays = nextFeedRangeDays(days);
+  const canExpandFeedRange =
+    isExpandableMailboxView(mailboxView) &&
+    filter !== "search" &&
+    nextRangeDays !== null &&
+    !state.inboxError &&
+    !state.inboxLoading &&
+    !isInboxSyncing &&
+    feedAction === null;
+  // Show more：先抬高展示上限；本地不够时再续拉 All mail 缓存/Gmail
+  const canShowMoreEmails =
+    mailboxView !== "drafts" &&
+    filter !== "search" &&
+    (feedWindow.localLimit < visible.length ||
+      (isExpandableMailboxView(mailboxView) && feedWindow.hasMore)) &&
+    !state.inboxError &&
+    feedAction === null;
+  const showMoreEmails = useCallback(async () => {
+    const step = state.inboxSettings.initial_list_size || INBOX_FEED_PAGE_SIZE;
+    const nextLimit = feedWindow.localLimit + step;
+    setFeedWindow((current) => ({
+      ...current,
+      localLimit: nextLimit,
+    }));
+    // 快照已够展示则只抬上限；否则续读缓存并写入快照
+    const snapshotCount =
+      state.inboxSnapshotMessages.length || state.inboxMessages.length;
+    if (snapshotCount >= nextLimit || !isExpandableMailboxView(mailboxView)) {
+      return;
+    }
+    if (pageLoadInFlight.current) return;
     pageLoadInFlight.current = true;
-    setFeedAction("category-page");
+    setFeedAction("more");
     try {
-      if (feedWindow.source === "cache") {
-        const result = await actions.loadCachedInboxEmails(
-          mailboxView,
-          feedWindow.days,
-          feedWindow.nextOffset,
-          true,
-        );
-        if (result.ok) {
-          setFeedWindow((current) => ({
-            ...current,
-            nextOffset: result.nextOffset,
-            hasMore: true,
-            source: result.hasMore ? "cache" : "gmail",
-            gmailPageToken: "",
-            gmailPageOffset: 0,
-          }));
-        }
-      } else {
-        const result = await loadGmailPage(
-          mailboxView,
-          feedWindow.days,
-          feedWindow.gmailPageToken,
-          feedWindow.gmailPageOffset,
-          sourceMessages.map((message) => message.id),
-        );
-        if (result?.ok) {
-          setFeedWindow((current) => ({
-            ...current,
-            hasMore: result.hasMore,
-            source: "gmail",
-            gmailPageToken: result.pageToken,
-            gmailPageOffset: result.pageOffset,
-          }));
+      const result = await actions.loadCachedInboxEmails(
+        "all",
+        feedWindow.days,
+        feedWindow.nextOffset,
+        true,
+      );
+      if (result.ok) {
+        setFeedWindow((current) => ({
+          ...current,
+          nextOffset: result.nextOffset,
+          hasMore: result.hasMore,
+          source: result.hasMore ? "cache" : "gmail",
+        }));
+        if (!result.hasMore && result.count === 0) {
+          // 缓存耗尽：拉一页 Gmail All mail 并 append
+          const excludeIds = [
+            ...state.inboxSnapshotMessages,
+            ...state.inboxMessages,
+          ]
+            .map((message) => message.id)
+            .filter(Boolean);
+          const gmail = await actions.loadGmailInboxEmailsPage(
+            "all",
+            feedWindow.days,
+            feedWindow.gmailPageToken,
+            feedWindow.gmailPageOffset,
+            excludeIds,
+          );
+          if (gmail.ok) {
+            setFeedWindow((current) => ({
+              ...current,
+              hasMore: gmail.hasMore,
+              source: "gmail",
+              gmailPageToken: gmail.pageToken,
+              gmailPageOffset: gmail.pageOffset,
+            }));
+          }
         }
       }
     } finally {
       pageLoadInFlight.current = false;
-      setFeedAction((current) =>
-        current === "category-page" ? null : current,
-      );
+      setFeedAction((current) => (current === "more" ? null : current));
     }
   }, [
     actions,
     feedWindow.days,
     feedWindow.gmailPageOffset,
     feedWindow.gmailPageToken,
-    feedWindow.hasMore,
     feedWindow.localLimit,
     feedWindow.nextOffset,
-    feedWindow.source,
-    loadGmailPage,
-    localCategory,
     mailboxView,
-    sourceMessages,
-    visible.length,
+    state.inboxMessages,
+    state.inboxSettings.initial_list_size,
+    state.inboxSnapshotMessages,
   ]);
-
-  const handleFeedScroll = useCallback(
-    (event: ReactUIEvent<HTMLElement>) => {
-      if (mailboxView === "inbox") return;
-      const feed = event.currentTarget;
-      if (
-        feed.scrollTop <= 0 ||
-        feed.scrollHeight - feed.scrollTop - feed.clientHeight > 80
-      )
-        return;
-      void loadNextCategoryPage();
-    },
-    [loadNextCategoryPage, mailboxView],
-  );
-
-  useEffect(() => {
-    if (
-      mailboxView === "inbox" ||
-      localCategory ||
-      !feedWindow.hasMore ||
-      state.inboxSnapshotLoading
-    )
-      return;
-    const frame = window.requestAnimationFrame(() => {
-      const feed = mailFeedRef.current;
-      if (feed && feed.scrollHeight <= feed.clientHeight + 1) {
-        void loadNextCategoryPage();
-      }
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [
-    displayedVisible.length,
-    feedWindow.hasMore,
-    loadNextCategoryPage,
-    localCategory,
-    mailboxView,
-    state.inboxSnapshotLoading,
-  ]);
-
-  const isInboxSyncing = state.inboxSnapshotLoading || feedAction === "refresh";
-  const days = feedWindow.days;
-  useEffect(() => {
-    const configuredDays = state.inboxSettings.display_range_days;
-    if (configuredDays === feedWindow.days || !mailbox) return;
-    setFeedWindow((current) => ({
-      ...DEFAULT_INBOX_FEED_WINDOW,
-      days: configuredDays,
-    }));
-    void syncInbox(configuredDays, true);
-  }, [
-    feedWindow.days,
-    mailbox,
-    state.inboxSettings.display_range_days,
-    syncInbox,
-  ]);
-  const lastSyncedLabel = inboxLastSyncedLabel(state.inboxUpdatedAt);
-  const canLoadMoreInbox =
-    mailboxView === "inbox" &&
-    filter !== "search" &&
-    days === INBOX_LAST_MONTH_DAYS;
-  const canShowOlderInboxActions =
-    !state.inboxError &&
-    !state.inboxLoading &&
-    !isInboxSyncing &&
-    feedAction === null;
+  const refreshDrafts = useCallback(async () => {
+    if (mailboxView !== "drafts" || pageLoadInFlight.current) return;
+    pageLoadInFlight.current = true;
+    setFeedAction("more");
+    try {
+      await Promise.all([
+        actions.listInboxThreadDrafts(mailbox, 100),
+        actions
+          .listComposeDrafts(mailbox)
+          .then((payload) => setComposeDrafts(payload.drafts || []))
+          .catch(() => setComposeDrafts([])),
+      ]);
+      actions.showToast("Drafts refreshed.");
+    } catch (reason) {
+      actions.showToast(
+        reason instanceof Error ? reason.message : String(reason),
+      );
+    } finally {
+      pageLoadInFlight.current = false;
+      setFeedAction((current) => (current === "more" ? null : current));
+    }
+  }, [actions, mailbox, mailboxView]);
 
   const grouped = useMemo(() => {
     if (mailboxView !== "inbox" || filter === "search") {
@@ -4144,10 +4383,14 @@ export function HomeView() {
       (message) =>
         !isStarredMessage(message) && !flags.todos.includes(message.id),
     );
+    // pinned（星标/Todo）与列表最新条可能是同 thread 不同 message_id，合并后先按 thread 折叠
     const source =
       filter === "important"
         ? splitImportantMessages(
-            [...pinnedImportantMessages, ...normalImportant],
+            uniqueLatestInboxThreads([
+              ...pinnedImportantMessages,
+              ...normalImportant,
+            ]),
             state.inboxSettings,
             new Set(flags.todos),
           ).flatMap((group) =>
@@ -4302,6 +4545,214 @@ export function HomeView() {
 
   const sidebarMailContext = composeAiContext || currentMailContext;
 
+  const listSelectionKey = useCallback(
+    (message: InboxMessage) => inboxThreadProjectionKey({
+      ...message,
+      mailbox: message.mailbox || mailbox,
+    }),
+    [mailbox],
+  );
+
+  // 勾选解析池：STARS/TODOS 可能来自 flags.saved / snapshot，不能只查 sourceMessages
+  const batchResolveMessages = useMemo(() => {
+    const byKey = new Map<string, InboxMessage>();
+    // 后写覆盖：优先用列表/快照里的新状态
+    for (const message of [
+      ...Object.values(flags.saved),
+      ...sourceMessages,
+      ...state.inboxDraftMessages,
+      ...state.inboxSnapshotMessages,
+      ...state.inboxMessages,
+      ...pinnedImportantMessages,
+      ...displayedVisible,
+    ]) {
+      if (!message?.id) continue;
+      byKey.set(listSelectionKey(message), message);
+    }
+    return byKey;
+  }, [
+    displayedVisible,
+    flags.saved,
+    listSelectionKey,
+    pinnedImportantMessages,
+    sourceMessages,
+    state.inboxDraftMessages,
+    state.inboxMessages,
+    state.inboxSnapshotMessages,
+  ]);
+
+  // 当前视图中已勾选的行（按 thread 键）
+  const selectedListMessages = useMemo(() => {
+    const resolved: InboxMessage[] = [];
+    for (const key of selectedListKeys) {
+      const message = batchResolveMessages.get(key);
+      if (message) resolved.push(message);
+    }
+    return resolved;
+  }, [batchResolveMessages, selectedListKeys]);
+  const selectedInboxMessages = selectedListMessages;
+
+  /** 同步本地 flags.saved 上的已读/星标，避免 STARS/TODOS 时间线仍读旧副本 */
+  const patchSavedMessages = useCallback(
+    (
+      messageIds: string[],
+      patch: (message: InboxMessage) => InboxMessage,
+    ) => {
+      const idSet = new Set(messageIds.filter(Boolean));
+      if (!idSet.size) return;
+      setFlags((current) => {
+        let changed = false;
+        const saved = { ...current.saved };
+        for (const id of idSet) {
+          const prev = saved[id];
+          if (!prev) continue;
+          saved[id] = patch(prev);
+          changed = true;
+        }
+        if (!changed) return current;
+        const next = { ...current, saved };
+        void setMailFlags(mailbox, next);
+        return next;
+      });
+    },
+    [mailbox],
+  );
+  const aiSelectedThreads = useMemo(
+    () =>
+      selectedInboxMessages
+        .filter((message) => !String(message.id || "").startsWith("compose:"))
+        .slice(0, 20)
+        .map((message) => ({
+          mailbox: message.mailbox || mailbox,
+          message_id: message.id,
+          thread_id: resolveMessageThreadId(message),
+          subject: message.subject || "",
+        })),
+    [mailbox, selectedInboxMessages],
+  );
+
+  const clearListSelection = useCallback(() => {
+    setSelectedListKeys(new Set());
+    setSelectionMoreOpen(false);
+  }, []);
+
+  useEffect(() => {
+    if (!selectionMoreOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      const wrap = document.querySelector(".inbox-selection-more-wrap");
+      if (wrap && !wrap.contains(target)) setSelectionMoreOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [selectionMoreOpen]);
+
+  const runBatchInboxAction = useCallback(
+    async (
+      action: "mark_read" | "mark_unread" | "star" | "unstar" | "archive" | "trash" | "mark_done",
+    ) => {
+      if (!selectedInboxMessages.length || batchBusy) return;
+      setBatchBusy(true);
+      setSelectionMoreOpen(false);
+      try {
+        const ids = selectedInboxMessages.map((message) => message.id);
+        const toastMessage = (count: number) =>
+          action === "trash" ? `Moved ${count} to trash.`
+            : action === "mark_done" ? `Marked ${count} done.`
+              : action === "star" ? `Starred ${count}.`
+                : action === "unstar" ? `Removed star from ${count}.`
+                  : action === "mark_unread" ? `Marked ${count} unread.`
+                    : `Marked ${count} read.`;
+        const showUndoToast = (
+          result: { count: number; undo?: () => Promise<boolean> },
+          previousFlags?: MailUiFlags,
+        ) => {
+          actions.showToast(toastMessage(result.count), {
+            actionLabel: "Undo",
+            durationMs: 6_000,
+            onAction: () => {
+              void result.undo?.().then((restored) => {
+                if (restored && previousFlags) {
+                  restoreWorkflowFlags(selectedInboxMessages, previousFlags);
+                }
+              });
+            },
+          });
+        };
+        if (action === "mark_done") {
+          // Gmail mark_read / 移出 INBOX 成功后再写本地 Done 样式
+          const previous = flags;
+          const result = await actions.batchInboxActions(ids, "mark_done");
+          if (!result.ok) {
+            actions.showToast("Failed to mark as done.");
+            return;
+          }
+          setWorkflowFlag("done", selectedInboxMessages, true);
+          clearListSelection();
+          showUndoToast(result, previous);
+          return;
+        }
+        const result = await actions.batchInboxActions(ids, action);
+        if (!result.ok) {
+          actions.showToast(
+            action === "mark_read" ? "Failed to mark as read."
+              : action === "mark_unread" ? "Failed to mark as unread."
+                : action === "star" ? "Failed to star."
+                  : action === "unstar" ? "Failed to remove star."
+                    : action === "trash" ? "Failed to move to trash."
+                      : "Batch action failed.",
+          );
+          return;
+        }
+        // STARS/TODOS 时间线读 flags.saved，需同步已读/星标
+        if (action === "mark_read" || action === "mark_unread" || action === "star" || action === "unstar") {
+          patchSavedMessages(ids, (message) => {
+            const labels = new Set(
+              (message.label_ids || []).map((label) => String(label).toUpperCase()),
+            );
+            if (action === "mark_read") labels.delete("UNREAD");
+            if (action === "mark_unread") labels.add("UNREAD");
+            if (action === "star") labels.add("STARRED");
+            if (action === "unstar") labels.delete("STARRED");
+            return {
+              ...message,
+              label_ids: [...labels],
+              unread: labels.has("UNREAD"),
+              starred: labels.has("STARRED"),
+            };
+          });
+        }
+        clearListSelection();
+        showUndoToast(result);
+      } finally {
+        setBatchBusy(false);
+      }
+    },
+    [
+      actions,
+      batchBusy,
+      clearListSelection,
+      flags,
+      patchSavedMessages,
+      restoreWorkflowFlags,
+      selectedInboxMessages,
+      setWorkflowFlag,
+    ],
+  );
+
+  const batchSnoozeSelected = useCallback(() => {
+    if (!selectedInboxMessages.length) return;
+    // 多选延后：打开第一个的 snooze 选择器，确认后应用到全部
+    const first = selectedInboxMessages[0];
+    setSnoozeTarget({
+      ...first,
+      // 用特殊标记：SnoozePicker 提交时若多选则批量
+      id: first.id,
+    });
+    setSelectionMoreOpen(false);
+  }, [selectedInboxMessages]);
+
   const applyDraftReplyArtifact = useCallback(
     (artifact: DraftReplyArtifact, mode: "append" | "replace") => {
       if (
@@ -4312,7 +4763,7 @@ export function HomeView() {
           artifact.mailbox.trim().toLowerCase() ||
         currentMailContext.thread_id !== artifact.thread_id
       ) {
-        actions.showToast("Open the matching email thread before applying this draft.");
+        actions.showToast("Open the matching email before applying this draft.");
         return;
       }
       if (drawerCloseTimer.current) {
@@ -4384,24 +4835,43 @@ export function HomeView() {
       }
       setExternalDetailMessage(null);
       setSelectedId(message.id);
-      if (
-        !(message.unread || hasMessageLabel(message, "UNREAD")) ||
-        !message.thread_id
-      )
+      if (!(message.unread || hasMessageLabel(message, "UNREAD"))) return;
+      // Gmail 标已读成功后再改 STARS/TODOS 本地 saved 样式
+      const markSavedRead = () => {
+        patchSavedMessages([message.id], (item) => ({
+          ...item,
+          unread: false,
+          label_ids: (item.label_ids || []).filter(
+            (label) => String(label).toUpperCase() !== "UNREAD",
+          ),
+        }));
+      };
+      const threadId = resolveMessageThreadId(message);
+      const targetMailbox = message.mailbox || mailbox;
+      if (message.thread_id) {
+        void actions
+          .updateInboxThreadState(targetMailbox, message.thread_id, "mark_read")
+          .then(() => markSavedRead())
+          .catch((reason) => {
+            actions.showToast(
+              reason instanceof Error ? reason.message : String(reason),
+            );
+          });
         return;
-      void actions
-        .updateInboxThreadState(
-          message.mailbox || mailbox,
-          message.thread_id,
-          "mark_read",
-        )
-        .catch((reason) => {
-          actions.showToast(
-            reason instanceof Error ? reason.message : String(reason),
-          );
-        });
+      }
+      // 无 thread_id 时按 message id 标已读（与 Done 同步路径一致）
+      if (threadId || message.id) {
+        void actions
+          .markInboxRead(message.id)
+          .then(() => markSavedRead())
+          .catch((reason) => {
+            actions.showToast(
+              reason instanceof Error ? reason.message : String(reason),
+            );
+          });
+      }
     },
-    [actions, composeDrafts, mailbox],
+    [actions, composeDrafts, mailbox, patchSavedMessages],
   );
 
   const openMailDetailFromAi = useCallback(
@@ -4447,7 +4917,7 @@ export function HomeView() {
           page.messages.find((item) => item.id === page.latest_message_id) ||
           page.messages.at(-1);
         if (!anchor)
-          throw new Error("The referenced thread could not be loaded.");
+          throw new Error("The referenced email could not be loaded.");
         const placeholder: InboxMessage = {
           id: anchor.id,
           thread_id: page.thread_id || target.thread_id,
@@ -4480,7 +4950,7 @@ export function HomeView() {
 
   const handleGmailThreadAction = useCallback(
     async (operation: InboxThreadStateOperation, message: InboxMessage) => {
-      if (!message.thread_id) return;
+      const targetMailbox = message.mailbox || mailbox;
       const reverse: Record<
         InboxThreadStateOperation,
         InboxThreadStateOperation
@@ -4504,27 +4974,104 @@ export function HomeView() {
         trash: "Moved to trash.",
         untrash: "Removed from trash.",
       };
+      // Gmail 成功后再改本地样式（含 STARS/TODOS 的 flags.saved）
+      const applyLocalAfterGmail = () => {
+        const threadMessages = messagesInThread(message);
+        const ids = threadMessages.length
+          ? threadMessages.map((item) => item.id)
+          : [message.id];
+        patchSavedMessages(ids, (item) => {
+          const labels = new Set(
+            (item.label_ids || []).map((label) => String(label).toUpperCase()),
+          );
+          if (operation === "mark_read") labels.delete("UNREAD");
+          if (operation === "mark_unread") labels.add("UNREAD");
+          if (operation === "star") labels.add("STARRED");
+          if (operation === "unstar") labels.delete("STARRED");
+          if (operation === "mark_important") labels.add("IMPORTANT");
+          if (operation === "mark_not_important") labels.delete("IMPORTANT");
+          if (operation === "trash") {
+            labels.delete("INBOX");
+            labels.add("TRASH");
+          }
+          if (operation === "untrash") labels.delete("TRASH");
+          return {
+            ...item,
+            label_ids: [...labels],
+            unread: labels.has("UNREAD"),
+            starred: labels.has("STARRED"),
+            important: labels.has("IMPORTANT"),
+          };
+        });
+      };
       try {
-        await actions.updateInboxThreadState(
-          mailbox,
-          message.thread_id,
-          operation,
-        );
-        closeDetailDrawer();
+        if (message.thread_id) {
+          await actions.updateInboxThreadState(
+            targetMailbox,
+            message.thread_id,
+            operation,
+          );
+        } else if (operation === "star" || operation === "unstar") {
+          // 列表星标无 thread_id 时按 message 级 STARRED 同步 Gmail
+          await actions.setInboxStarred(message.id, operation === "star");
+        } else {
+          return;
+        }
+        applyLocalAfterGmail();
+        if (message.thread_id) closeDetailDrawer();
         actions.showToast(notices[operation], {
           actionLabel: "Undo",
           onAction: () => {
-            void actions
-              .updateInboxThreadState(
-                mailbox,
-                message.thread_id || message.id,
-                reverse[operation],
-              )
-              .catch((reason) => {
+            void (async () => {
+              try {
+                if (message.thread_id) {
+                  await actions.updateInboxThreadState(
+                    targetMailbox,
+                    message.thread_id || message.id,
+                    reverse[operation],
+                  );
+                } else if (operation === "star" || operation === "unstar") {
+                  await actions.setInboxStarred(
+                    message.id,
+                    operation === "unstar",
+                  );
+                }
+                const undoOp = reverse[operation];
+                const threadMessages = messagesInThread(message);
+                const ids = threadMessages.length
+                  ? threadMessages.map((item) => item.id)
+                  : [message.id];
+                patchSavedMessages(ids, (item) => {
+                  const labels = new Set(
+                    (item.label_ids || []).map((label) =>
+                      String(label).toUpperCase(),
+                    ),
+                  );
+                  if (undoOp === "mark_read") labels.delete("UNREAD");
+                  if (undoOp === "mark_unread") labels.add("UNREAD");
+                  if (undoOp === "star") labels.add("STARRED");
+                  if (undoOp === "unstar") labels.delete("STARRED");
+                  if (undoOp === "mark_important") labels.add("IMPORTANT");
+                  if (undoOp === "mark_not_important") labels.delete("IMPORTANT");
+                  if (undoOp === "trash") {
+                    labels.delete("INBOX");
+                    labels.add("TRASH");
+                  }
+                  if (undoOp === "untrash") labels.delete("TRASH");
+                  return {
+                    ...item,
+                    label_ids: [...labels],
+                    unread: labels.has("UNREAD"),
+                    starred: labels.has("STARRED"),
+                    important: labels.has("IMPORTANT"),
+                  };
+                });
+              } catch (reason) {
                 actions.showToast(
                   reason instanceof Error ? reason.message : String(reason),
                 );
-              });
+              }
+            })();
           },
         });
       } catch (reason) {
@@ -4533,7 +5080,13 @@ export function HomeView() {
         );
       }
     },
-    [actions, closeDetailDrawer, mailbox],
+    [
+      actions,
+      closeDetailDrawer,
+      mailbox,
+      messagesInThread,
+      patchSavedMessages,
+    ],
   );
 
   const syncDoneMessagesRead = useCallback(
@@ -4710,39 +5263,56 @@ export function HomeView() {
       const target = snoozeTarget;
       if (!target) return;
       const previous = flags;
-      const messages = messagesInThread(target);
+      // 多选延后：若当前有勾选且包含目标，对全部勾选生效
+      const bulk =
+        selectedInboxMessages.length > 1 &&
+        selectedInboxMessages.some((message) => message.id === target.id)
+          ? selectedInboxMessages
+          : messagesInThread(target);
       setSnoozeTarget(null);
-      setWorkflowFlag("snoozed", messages, true, isoTime);
-      if (selectedId === target.id) {
+      setWorkflowFlag("snoozed", bulk, true, isoTime);
+      if (bulk.some((message) => message.id === selectedId)) {
         closeDetailDrawer();
       }
+      if (bulk.length > 1) clearListSelection();
       actions.showToast(
-        `Snoozed until ${new Date(isoTime).toLocaleString("en-US", {
-          month: "short",
-          day: "numeric",
-          year: "numeric",
-          hour: "numeric",
-          minute: "2-digit",
-        })}.`,
+        bulk.length > 1
+          ? `Snoozed ${bulk.length} email${bulk.length === 1 ? "" : "s"} until ${new Date(isoTime).toLocaleString("en-US", {
+              month: "short",
+              day: "numeric",
+              year: "numeric",
+              hour: "numeric",
+              minute: "2-digit",
+            })}.`
+          : `Snoozed until ${new Date(isoTime).toLocaleString("en-US", {
+              month: "short",
+              day: "numeric",
+              year: "numeric",
+              hour: "numeric",
+              minute: "2-digit",
+            })}.`,
         {
           actionLabel: "Undo",
-          onAction: () => restoreWorkflowFlags(messages, previous),
+          onAction: () => restoreWorkflowFlags(bulk, previous),
         },
       );
     },
     [
       actions,
+      clearListSelection,
       closeDetailDrawer,
       flags,
       messagesInThread,
       restoreWorkflowFlags,
       selectedId,
+      selectedInboxMessages,
       setWorkflowFlag,
       snoozeTarget,
     ],
   );
 
   const selectMailboxView = (next: MailboxView) => {
+    if (next !== mailboxView) clearListSelection();
     if (next === mailboxView && filter !== "search") {
       setFolderOpen(false);
       return;
@@ -4754,11 +5324,26 @@ export function HomeView() {
     setFolderOpen(false);
     setSelectedId("");
     setFilter("important");
-    setFeedWindow(DEFAULT_INBOX_FEED_WINDOW);
+    // 切分类：瞬间切换，不播入场动画
+    skipEnterAnimRef.current = true;
+    setEnteringIds(new Set());
+    const snapshotCount =
+      state.inboxSnapshotMessages.length || state.inboxMessages.length;
+    // 切分类不改 days，沿用当前 All mail 窗口（与 display_range 一致），避免触发强制刷新
+    const targetDays =
+      feedWindow.days ||
+      state.inboxSettings.display_range_days ||
+      INBOX_LAST_MONTH_DAYS;
+    const listCap = state.inboxSettings.initial_list_size || INBOX_FEED_PAGE_SIZE;
+    setFeedWindow((current) => ({
+      ...current,
+      days: targetDays,
+      localLimit: listCap,
+    }));
     if (next === "done") {
-      void actions
-        .loadCachedInboxEmails("sent", 7, 0, false)
-        .catch(() => undefined);
+      if (!snapshotCount) {
+        void loadRemoteCategory("done", targetDays);
+      }
       return;
     }
     if (next === "drafts") {
@@ -4772,13 +5357,12 @@ export function HomeView() {
     if (isLocalMailboxView(next)) {
       return;
     }
-    actions.resetInboxFeed();
-    if (!isLocalMailboxView(next)) {
-      void loadRemoteCategory(
-        next,
-        next === "inbox" ? INBOX_LAST_MONTH_DAYS : 7,
-      );
+    // 已有 All mail 快照：纯本地标签投影，立即展示
+    if (snapshotCount) {
+      return;
     }
+    // 冷启动无快照：读缓存 / 必要时拉 All mail
+    void loadRemoteCategory(next, targetDays);
   };
 
   const markTimelineDone = (messages: InboxMessage[]) => {
@@ -5006,6 +5590,7 @@ export function HomeView() {
         collapsed={sidebarCollapsed}
         onToggle={() => setSidebarCollapsed((value) => !value)}
         currentMailContext={sidebarMailContext}
+        selectedThreads={aiSelectedThreads}
         onUseArtifact={applyDraftReplyArtifact}
         onUseComposeArtifact={(artifact, sourceContext) => {
           if (
@@ -5376,44 +5961,164 @@ export function HomeView() {
           className={`mail-feed ${mailboxView === "trash" ? "is-trash-view" : ""}`}
           aria-live="polite"
           ref={mailFeedRef}
-          onScroll={handleFeedScroll}
         >
-          {mailboxView === "drafts" && sourceMessages.length ? (
-            <div className="draft-batch-bar">
+          {(mailboxView === "inbox" || mailboxView === "drafts") &&
+          selectedListKeys.size > 0 ? (
+            <div className="inbox-selection-bar" role="toolbar" aria-label="Bulk actions">
               <button
                 type="button"
-                className="draft-select draft-select-all"
-                aria-label="Select all drafts"
-                aria-pressed={
-                  sourceMessages.length > 0 &&
-                  sourceMessages.every((message) =>
-                    selectedComposeDraftIds.has(message.id),
-                  )
-                }
-                onClick={() =>
-                  setSelectedComposeDraftIds((current) =>
-                    current.size === sourceMessages.length
-                      ? new Set()
-                      : new Set(sourceMessages.map((message) => message.id)),
-                  )
-                }
+                className="inbox-selection-clear"
+                aria-label="Clear selection"
+                data-tooltip="Clear"
+                disabled={batchBusy}
+                onClick={clearListSelection}
               >
-                {sourceMessages.length > 0 &&
-                sourceMessages.every((message) =>
-                  selectedComposeDraftIds.has(message.id),
-                )
-                  ? "✓"
-                  : ""}
+                <CloseSmallIcon />
               </button>
-              <span>{selectedComposeDraftIds.size} selected</span>
-              <button
-                type="button"
-                className="refresh-mail-btn draft-batch-send"
-                disabled={!selectedComposeDraftIds.size}
-                onClick={() => scheduleComposeBatch()}
-              >
-                Send selected
-              </button>
+              <span className="inbox-selection-count">
+                {selectedListKeys.size}{" "}
+                {mailboxView === "drafts"
+                  ? selectedListKeys.size === 1
+                    ? "draft"
+                    : "drafts"
+                  : selectedListKeys.size === 1
+                    ? "email"
+                    : "emails"}
+              </span>
+              <div className="inbox-selection-actions">
+                {mailboxView === "drafts" ? (
+                  <button
+                    type="button"
+                    className="inbox-selection-icon-btn is-primary"
+                    aria-label="Send selected drafts"
+                    data-tooltip="Send"
+                    disabled={batchBusy || !selectedListMessages.length}
+                    onClick={() => {
+                      // 同步 compose 多选 id，复用既有批量发送
+                      const composeIds = selectedListMessages
+                        .filter((message) => String(message.id).startsWith("compose:"))
+                        .map((message) => message.id);
+                      setSelectedComposeDraftIds(new Set(composeIds));
+                      scheduleComposeBatch();
+                    }}
+                  >
+                    <SendIcon />
+                  </button>
+                ) : (
+                  <>
+                    <div className="inbox-selection-more-wrap">
+                      <button
+                        type="button"
+                        className="inbox-selection-icon-btn"
+                        aria-label="More actions"
+                        data-tooltip="More"
+                        aria-expanded={selectionMoreOpen}
+                        disabled={batchBusy}
+                        onClick={() => setSelectionMoreOpen((open) => !open)}
+                      >
+                        <MoreDotsIcon />
+                      </button>
+                      {selectionMoreOpen ? (
+                        <div className="inbox-selection-menu" role="menu">
+                          <button
+                            type="button"
+                            role="menuitem"
+                            disabled={batchBusy}
+                            onClick={() => void runBatchInboxAction("mark_read")}
+                          >
+                            <MailOpenIcon />
+                            <span>Mark as read</span>
+                          </button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            disabled={batchBusy}
+                            onClick={() => void runBatchInboxAction("mark_unread")}
+                          >
+                            <AllMailIcon />
+                            <span>Mark as unread</span>
+                          </button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            disabled={batchBusy}
+                            onClick={() => void runBatchInboxAction("unstar")}
+                          >
+                            <StarIcon />
+                            <span>Remove star</span>
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                    <button
+                      type="button"
+                      className="inbox-selection-icon-btn"
+                      aria-label="Batch draft with AI"
+                      data-tooltip="AI draft"
+                      disabled={batchBusy}
+                      onClick={() => {
+                        const previousInput = state.customScanInput;
+                        const wasSidebarCollapsed = sidebarCollapsed;
+                        setSidebarCollapsed(false);
+                        actions.setInput(
+                          "customScanInput",
+                          "Draft short replies for each selected email",
+                        );
+                        setAiComposerFocusKey((key) => key + 1);
+                        actions.showToast("AI draft prompt is ready.", {
+                          actionLabel: "Undo",
+                          onAction: () => {
+                            actions.setInput("customScanInput", previousInput);
+                            setSidebarCollapsed(wasSidebarCollapsed);
+                          },
+                        });
+                      }}
+                    >
+                      <SparkleIcon />
+                    </button>
+                    <button
+                      type="button"
+                      className="inbox-selection-icon-btn"
+                      aria-label="Star selected"
+                      data-tooltip="Star"
+                      disabled={batchBusy}
+                      onClick={() => void runBatchInboxAction("star")}
+                    >
+                      <StarIcon />
+                    </button>
+                    <button
+                      type="button"
+                      className="inbox-selection-icon-btn"
+                      aria-label="Snooze selected"
+                      data-tooltip="Snooze"
+                      disabled={batchBusy}
+                      onClick={batchSnoozeSelected}
+                    >
+                      <ClockIcon />
+                    </button>
+                    <button
+                      type="button"
+                      className="inbox-selection-icon-btn"
+                      aria-label="Move selected to trash"
+                      data-tooltip="Trash"
+                      disabled={batchBusy}
+                      onClick={() => void runBatchInboxAction("trash")}
+                    >
+                      <TrashIcon />
+                    </button>
+                    <button
+                      type="button"
+                      className="inbox-selection-icon-btn is-primary"
+                      aria-label="Mark selected done"
+                      data-tooltip="Done"
+                      disabled={batchBusy}
+                      onClick={() => void runBatchInboxAction("mark_done")}
+                    >
+                      <CheckIcon />
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
           ) : null}
           {state.inboxError &&
@@ -5431,7 +6136,7 @@ export function HomeView() {
                 <button
                   onClick={() =>
                     void (cachedInboxRetryAction === "load-more"
-                      ? loadMoreInbox()
+                      ? expandFeedRange()
                       : syncInbox(days))
                   }
                   disabled={isInboxSyncing || feedAction !== null}
@@ -5548,7 +6253,7 @@ export function HomeView() {
                   ).email.toLowerCase();
                   return (
                     <InboxRow
-                      key={message.id}
+                      key={listSelectionKey(message)}
                       message={message}
                       mailboxView={mailboxView}
                       mailbox={mailbox}
@@ -5562,19 +6267,33 @@ export function HomeView() {
                       }
                       onSnooze={openSnoozePicker}
                       onSelect={() => openMessageDetail(message)}
+                      entering={enteringIds.has(message.id)}
                       selectable={
-                        mailboxView === "drafts" && isDraftMessage(message)
+                        (mailboxView === "drafts" && isDraftMessage(message)) ||
+                        mailboxView === "inbox"
                       }
-                      selectedForBatch={selectedComposeDraftIds.has(message.id)}
-                      onBatchToggle={() =>
-                        setSelectedComposeDraftIds((current) => {
+                      selectedForBatch={selectedListKeys.has(
+                        listSelectionKey(message),
+                      )}
+                      onBatchToggle={() => {
+                        const key = listSelectionKey(message);
+                        setSelectedListKeys((current) => {
                           const next = new Set(current);
-                          const id = message.id;
-                          if (next.has(id)) next.delete(id);
-                          else next.add(id);
+                          if (next.has(key)) next.delete(key);
+                          else if (next.size < 50) next.add(key);
                           return next;
-                        })
-                      }
+                        });
+                        // drafts 发送路径仍依赖 compose id 集合
+                        if (mailboxView === "drafts") {
+                          setSelectedComposeDraftIds((current) => {
+                            const next = new Set(current);
+                            const id = message.id;
+                            if (next.has(id)) next.delete(id);
+                            else next.add(id);
+                            return next;
+                          });
+                        }
+                      }}
                       onComposeDraftDelete={
                         message.id.startsWith("compose:")
                           ? () => {
@@ -5607,15 +6326,38 @@ export function HomeView() {
               </div>
             ))
           )}
-          {canLoadMoreInbox && canShowOlderInboxActions ? (
+          {/* 优先：当前时间段内更多；其下才是扩时间窗 */}
+          {canShowMoreEmails ? (
             <button
               className="older-mail-btn"
-              onClick={() => void loadMoreInbox()}
+              type="button"
+              onClick={() => void showMoreEmails()}
+              disabled={feedAction !== null}
+            >
+              {feedAction === "more"
+                ? "Loading more in this period..."
+                : moreInPeriodButtonLabel(days)}
+            </button>
+          ) : null}
+          {canExpandFeedRange ? (
+            <button
+              className="older-mail-btn"
+              onClick={() => void expandFeedRange()}
               disabled={isInboxSyncing || feedAction !== null}
             >
               {feedAction === "more"
                 ? "Loading older emails..."
-                : "Show emails older than 30 days"}
+                : olderRangeButtonLabel(days, nextRangeDays)}
+            </button>
+          ) : null}
+          {mailboxView === "drafts" && !state.inboxLoading ? (
+            <button
+              className="older-mail-btn"
+              type="button"
+              onClick={() => void refreshDrafts()}
+              disabled={isInboxSyncing || feedAction !== null}
+            >
+              {feedAction === "more" ? "Refreshing drafts..." : "Refresh drafts"}
             </button>
           ) : null}
           {mailboxView === "trash" ? (

@@ -477,6 +477,18 @@ v1 **不**注册为 Router 可执行 mutation：`send_mail`、`delete_mail`、`a
 3. 回归：内部测试用例 + Shortwave 风格话术清单。
 4. 对外文案按 §16.1：称「AI 助理」，并写明无日历/无自动删除/整理须确认。
 
+**阶段 C 实现状态（2026-07-15）：已落地**
+
+| 项 | 位置 |
+| --- | --- |
+| `batch_draft` / `batch_outreach` | `mail_agent/ai_turn/tools.py` + Router 白名单 |
+| 多选 `selected_threads` | `buildAiTurnUiContext` + 收件箱列表勾选 |
+| 多 artifact 结果 | `ai_turn_flow` / `useAppController` / `HomeView` |
+| 删除前端业务路由 | 移除 `decideAiRoute` 旁路与 feature flag |
+| 旧路由文档 | `AI侧边栏意图路由优化方案.md` 标注「已由本地 Router 取代」 |
+| 测试 | `tests/test_ai_turn_phase_c.py` |
+| 文案 | 侧栏空态 / chat_general 能力边界（AI 助理） |
+
 ### 明确不做（本设计周期）
 
 - Host Agent Session 作为默认总控。

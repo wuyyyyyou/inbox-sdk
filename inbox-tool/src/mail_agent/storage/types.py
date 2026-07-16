@@ -107,6 +107,8 @@ class InboxSettings:
     todos_limit: int = 10
     # LLM 连通性探测轮询间隔（秒）；0 表示关闭自动轮询，默认 60
     llm_status_poll_seconds: int = 60
+    # 列表首屏展示 thread 数：100 / 200 / 400
+    initial_list_size: int = 100
     custom_categories: list[InboxCustomCategory] = field(default_factory=list)
     updated_at: str = field(default_factory=_now)
 

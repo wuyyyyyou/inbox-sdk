@@ -3,17 +3,6 @@ export const DEFAULT_MODE = "default_secretary";
 export const POLL_INTERVAL_MS = 2500;
 export const POLL_LIMIT = 240;
 export const CUSTOM_SCAN_MESSAGE_LIMIT = 50;
-/** 侧栏是否走后端 start_ai_turn；localStorage 设 anna-inbox-use-ai-turn=0 可回退 aiRoute。 */
-export const AI_TURN_FEATURE_KEY = "anna-inbox-use-ai-turn";
-
-export function isAiTurnEnabled(): boolean {
-  try {
-    const raw = String(window.localStorage.getItem(AI_TURN_FEATURE_KEY) || "1").trim().toLowerCase();
-    return raw !== "0" && raw !== "false" && raw !== "off";
-  } catch {
-    return true;
-  }
-}
 
 export const CATEGORY_TABS = [
   { id: "all", label: "All" },

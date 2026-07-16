@@ -5,6 +5,9 @@ import { senderParts } from "../../shared/mailIdentity";
 /** Settings 中暴露的 LLM 状态轮询档位（秒） */
 export const LLM_STATUS_POLL_OPTIONS = [0, 30, 60, 120, 300] as const;
 
+/** 列表首屏展示条数选项 */
+export const INITIAL_LIST_SIZE_OPTIONS = [100, 200, 400] as const;
+
 export const DEFAULT_INBOX_SETTINGS: InboxSettings = {
   mailbox: "",
   display_range_days: 30,
@@ -14,6 +17,7 @@ export const DEFAULT_INBOX_SETTINGS: InboxSettings = {
   todos_enabled: true,
   todos_limit: 10,
   llm_status_poll_seconds: 60,
+  initial_list_size: 100,
   custom_categories: [],
 };
 
@@ -66,6 +70,9 @@ export function clampInboxSettings(
     llm_status_poll_seconds: (LLM_STATUS_POLL_OPTIONS as readonly number[]).includes(Number(input.llm_status_poll_seconds))
       ? (Number(input.llm_status_poll_seconds) as InboxSettings["llm_status_poll_seconds"])
       : DEFAULT_INBOX_SETTINGS.llm_status_poll_seconds,
+    initial_list_size: (INITIAL_LIST_SIZE_OPTIONS as readonly number[]).includes(Number(input.initial_list_size))
+      ? (Number(input.initial_list_size) as InboxSettings["initial_list_size"])
+      : DEFAULT_INBOX_SETTINGS.initial_list_size,
     custom_categories: Array.isArray(input.custom_categories) ? input.custom_categories
       .filter((category) => category && typeof category.id === "string" && typeof category.name === "string" && typeof category.query === "string")
       .map((category) => {
@@ -117,18 +124,25 @@ function isInboxSplitImportant(message: InboxMessage): boolean {
   return Boolean(message.important || message.label_ids?.includes("IMPORTANT"));
 }
 
-/** 将自定义 Split 独立匹配；Other 仅保留未进入任何其他 Split 的邮件。 */
+/**
+ * 将自定义 Split 独立匹配；Other 仅保留未进入任何其他 Split 的邮件。
+ * @param customMatchMessages 可选：自定义 Split 的匹配源（如含 todos/snoozed），
+ *   与 is:unread 搜索对齐；Important/Other 仍只基于 messages。
+ */
 export function splitInboxMessages(
   messages: InboxMessage[],
   settings: InboxSettings,
+  customMatchMessages?: InboxMessage[],
 ): InboxSplitMessages {
   const custom: Record<string, InboxMessage[]> = {};
   const customMessageIds = new Set<string>();
   const categories = Array.isArray(settings.custom_categories) ? settings.custom_categories : [];
+  // 自定义 Split 可用更广数据源（Inbox + Todos + Snoozed），与 is:unread 一致
+  const customSource = customMatchMessages || messages;
   for (const split of categories) {
     const parsed = parseInboxQuery(split.query);
     const matched = parsed.expression && !parsed.error
-      ? messages.filter((message) => matchInboxQuery(message, parsed))
+      ? customSource.filter((message) => matchInboxQuery(message, parsed))
       : [];
     custom[split.id] = matched;
     matched.forEach((message) => customMessageIds.add(message.id));

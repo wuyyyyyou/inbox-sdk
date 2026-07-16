@@ -1,4 +1,4 @@
-"""AI turn 意图路由：Sampling 输出白名单 tool 计划（阶段 B）。"""
+"""AI turn 意图路由：Sampling 输出白名单 tool 计划（阶段 C）。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from mail_agent.llm_runtime.service import call_llm_json_safe
 
 _logger = logging.getLogger(__name__)
 
-# 阶段 B 白名单：聊天 / 搜索 / 总结 / 写改稿 / 整理建议 / 记忆；不含 mutation。
+# 阶段 C 白名单：聊天 / 搜索 / 总结 / 写改稿 / 批量 / 整理建议 / 记忆；不含 mutation。
 AI_TURN_ALLOWED_TOOLS = frozenset({
     "chat_general",
     "clarify",
@@ -21,6 +21,8 @@ AI_TURN_ALLOWED_TOOLS = frozenset({
     "revise_draft",
     "summarize_then_draft",
     "compose_new",
+    "batch_draft",
+    "batch_outreach",
     "propose_inbox_actions",
     "remember_preference",
 })
@@ -30,6 +32,12 @@ _THREAD_REQUIRED_TOOLS = frozenset({
     "summarize_thread",
     "draft_reply",
     "summarize_then_draft",
+})
+
+# 需要多选 selected_threads 的批量工具
+_BATCH_REQUIRED_TOOLS = frozenset({
+    "batch_draft",
+    "batch_outreach",
 })
 
 _ROUTER_MAX_TOKENS = 448
@@ -46,6 +54,8 @@ Whitelist tools:
 - revise_draft: revise an existing draft body (last_draft or compose body provided)
 - summarize_then_draft: summarize current thread then draft a reply
 - compose_new: write a new outbound email outline/body (not a reply)
+- batch_draft: short reply drafts for MULTIPLE selected emails (selected_threads_count >= 2)
+- batch_outreach: personalized outreach/DM for MULTIPLE selected emails (variables isolated)
 - propose_inbox_actions: SUGGEST organize actions only (mark done/archive/trash cards); never executes
 - remember_preference: user explicitly says remember / 记住 a preference
 
@@ -67,8 +77,9 @@ Rules:
 7. Organize my inbox / archive low priority / clean up → propose_inbox_actions (optionally after search_mail).
 8. Remember to… / 记住… → remember_preference.
 9. Search then write FYI / outline / new email → search_mail then compose_new.
-10. Hi/hello/what can you do → chat_general.
-11. Never invent tools outside the whitelist. Never choose send/delete/archive/trash/mark_read as tools.
+10. Multiple selected threads + draft/reply for each → batch_draft; personalized outreach/DM → batch_outreach.
+11. Hi/hello/what can you do → chat_general.
+12. Never invent tools outside the whitelist. Never choose send/delete/archive/trash/mark_read as tools.
 """
 
 
@@ -87,6 +98,14 @@ def _has_thread(ui_context: dict[str, Any]) -> bool:
 def _has_last_draft(ui_context: dict[str, Any]) -> bool:
     last = ui_context.get("last_draft") if isinstance(ui_context.get("last_draft"), dict) else {}
     return bool(str(last.get("body") or "").strip())
+
+
+def _selected_threads_count(ui_context: dict[str, Any]) -> int:
+    """统计多选线程数量（供批量工具与 Router 降级使用）。"""
+    selected = ui_context.get("selected_threads")
+    if not isinstance(selected, list):
+        return 0
+    return sum(1 for item in selected if isinstance(item, dict))
 
 
 def _has_inbox_search_intent(user_text: str) -> bool:
@@ -143,6 +162,40 @@ def _fallback_route(user_text: str, ui_context: dict[str, Any], reason: str) -> 
             "router_reason": reason[:200],
         }
 
+    selected_count = _selected_threads_count(ui_context)
+    batch_hint = any(
+        token in lowered
+        for token in (
+            "batch", "each of", "for each", "all selected", "these emails", "these threads",
+            "批量", "多封", "每封", "这些邮件", "勾选", "选中的",
+        )
+    )
+    outreach_hint = any(
+        token in lowered
+        for token in (
+            "outreach", "personalized", "personalize", "dm", "cold email",
+            "个性化", "触达", "私信", "外联",
+        )
+    )
+    draft_hint = any(
+        token in lowered
+        for token in (
+            "draft", "reply", "respond", "write a reply", "write back",
+            "起草", "回复", "写回信", "写回复",
+        )
+    )
+    # 多选 + 批量/多封意图 → batch；outreach 优先于普通 batch_draft
+    if selected_count >= 2 and (batch_hint or draft_hint or outreach_hint):
+        tool = "batch_outreach" if outreach_hint else "batch_draft"
+        return {
+            "language": language,
+            "use_current_thread": False,
+            "clarify": None,
+            "steps": [{"tool": tool, "params": {}}],
+            "router_fallback": True,
+            "router_reason": reason[:200],
+        }
+
     revise_hint = any(
         token in lowered
         for token in (
@@ -160,13 +213,6 @@ def _fallback_route(user_text: str, ui_context: dict[str, Any], reason: str) -> 
             "router_reason": reason[:200],
         }
 
-    draft_hint = any(
-        token in lowered
-        for token in (
-            "draft", "reply", "respond", "write a reply", "write back",
-            "起草", "回复", "写回信", "写回复",
-        )
-    )
     summarize_then = any(token in lowered for token in ("summar", "总结", "概括")) and draft_hint
     if has_thread and summarize_then:
         return {
@@ -284,6 +330,7 @@ def _normalize_route(payload: dict[str, Any], user_text: str, ui_context: dict[s
 
     has_thread = _has_thread(ui_context)
     has_draft = _has_last_draft(ui_context)
+    selected_count = _selected_threads_count(ui_context)
 
     if use_current and not has_thread:
         clarify = clarify or (
@@ -304,6 +351,21 @@ def _normalize_route(payload: dict[str, Any], user_text: str, ui_context: dict[s
                 else "Open an email first, then try again."
             )
         steps = filtered
+
+    # 批量工具：无多选时剔除并 clarify（单封走 draft_reply）
+    if selected_count < 2:
+        batch_steps = [s for s in steps if s["tool"] in _BATCH_REQUIRED_TOOLS]
+        if batch_steps:
+            steps = [s for s in steps if s["tool"] not in _BATCH_REQUIRED_TOOLS]
+            if not steps:
+                if selected_count == 1 and has_thread:
+                    steps = [{"tool": "draft_reply", "params": {}}]
+                else:
+                    clarify = clarify or (
+                        "请先勾选至少 2 封邮件，再请求批量起草。"
+                        if language == "zh"
+                        else "Select at least 2 emails before asking for batch drafts."
+                    )
 
     # revise 无 draft 时降级 clarify
     if any(s["tool"] == "revise_draft" for s in steps) and not has_draft:

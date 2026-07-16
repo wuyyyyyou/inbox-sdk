@@ -52,11 +52,10 @@ import {
   MAILBOX_STORAGE_KEY,
   POLL_INTERVAL_MS,
   POLL_LIMIT,
-  isAiTurnEnabled,
   requestForMode,
 } from "./constants";
 import { createInitialState, removeAskHistoryEntry } from "./state";
-import { buildRevisionPrompt, buildScanFollowupRequest, decideAiRoute, resolveMailContext } from "./aiRoute";
+import { buildRevisionPrompt } from "./aiRoute";
 import { connectedAccountsStatusMessage } from "./connectedAccounts";
 import { resolveMailboxSelection } from "./mailboxSelection";
 
@@ -285,6 +284,7 @@ function buildAiTurnUiContext(args: {
   languageHint?: string;
   messages?: AiChatMessage[];
   savedPromptId?: string;
+  selectedThreads?: SendAiMessageOptions["selectedThreads"];
 }) {
   const mailbox = selectedOrPrimary(args.selectedMailboxes, args.mailbox);
   const plan = normalizeScanPlan(args.scanPlan);
@@ -322,6 +322,16 @@ function buildAiTurnUiContext(args: {
       if (body) lastDraft = { body, source: "assistant_artifact" };
     }
   }
+  // 收件箱多选：上限 20，与设计文档一致；后端 batch 再截到 5
+  const selectedThreads = (args.selectedThreads || [])
+    .filter((item) => item && (item.message_id || item.thread_id) && item.mailbox)
+    .slice(0, 20)
+    .map((item) => ({
+      mailbox: String(item.mailbox || mailbox),
+      message_id: String(item.message_id || ""),
+      thread_id: String(item.thread_id || item.message_id || ""),
+      subject: String(item.subject || "").slice(0, 200),
+    }));
   return {
     conversation_id: args.conversationId,
     mailbox,
@@ -333,23 +343,11 @@ function buildAiTurnUiContext(args: {
       focus: ctx ? "detail" : "list",
     },
     current_thread: thread,
-    selected_threads: [],
+    selected_threads: selectedThreads,
     last_draft: lastDraft,
     saved_prompt_id: args.savedPromptId || "",
     language_hint: args.languageHint || "",
   };
-}
-
-function scanPendingText(input: string) {
-  return prefersChinese(input)
-    ? "我会搜索你的邮箱，找出和这个问题最相关的邮件。"
-    : "I'll search your inbox for emails that are relevant to this question.";
-}
-
-function chatPendingText(input: string) {
-  return prefersChinese(input)
-    ? "thinking"
-    : "thinking";
 }
 
 function isTransientConnectionError(error: unknown) {
@@ -491,6 +489,13 @@ type ToastOptions = {
   onSecondaryAction?: () => void;
 };
 
+type BatchInboxActionResult = {
+  ok: boolean;
+  count: number;
+  /** 撤销回调仅在批量操作成功后提供；调用方负责同步本地工作流状态。 */
+  undo?: () => Promise<boolean>;
+};
+
 type InboxPageResult = { ok: boolean; count: number; hasMore: boolean; nextOffset: number; messages?: InboxMessage[] };
 type GmailInboxPageResult = { ok: boolean; count: number; hasMore: boolean; pageToken: string; pageOffset: number; messages?: InboxMessage[] };
 
@@ -517,7 +522,7 @@ export interface AppActions {
   minimize(value: boolean): void;
   openSettings(focusSavedPrompts?: boolean): void;
   closeSettings(): void;
-  loadInboxSettings(mailbox?: string): Promise<void>;
+  loadInboxSettings(mailbox?: string): Promise<InboxSettings | null>;
   saveInboxSettings(patch: Partial<InboxSettings>): Promise<boolean>;
   checkGmailAuth(mailboxOverride?: string): Promise<{ authorized: boolean; source: string }>;
   checkAnyGmailAuth(): Promise<{ authorized: boolean; source: string }>;
@@ -528,6 +533,8 @@ export interface AppActions {
   loadActiveCards(): Promise<void>;
   loadInboxEmails(category?: string, days?: number, force?: boolean): Promise<boolean>;
   refreshInboxEmails(category?: string, days?: number, clearCache?: boolean): Promise<InboxPageResult>;
+  /** 扩大 All mail 时间窗并只追加新邮件，不清空已有快照 */
+  expandInboxFeedWindow(days: number): Promise<InboxPageResult>;
   loadCachedInboxEmails(category?: string, days?: number, offset?: number, append?: boolean): Promise<InboxPageResult>;
   loadGmailInboxEmailsPage(category: string, days: number, pageToken: string, pageOffset: number, excludeMessageIds: string[]): Promise<GmailInboxPageResult>;
   resetInboxFeed(): void;
@@ -564,6 +571,11 @@ export interface AppActions {
   setInboxStarred(messageId: string, starred: boolean): Promise<void>;
   markInboxRead(messageId: string): Promise<void>;
   trashInboxMessage(messageId: string): Promise<void>;
+  /** 收件箱多选批量操作（已读/未读/星标/归档/垃圾箱/Done） */
+  batchInboxActions(
+    messageIds: string[],
+    action: "mark_read" | "mark_unread" | "star" | "unstar" | "archive" | "trash" | "mark_done",
+  ): Promise<BatchInboxActionResult>;
   loadRunHistory(): Promise<void>;
   loadSelectedEmailBody(): Promise<void>;
   loadMoreThreadContext(): Promise<void>;
@@ -681,6 +693,9 @@ export function useAppController() {
     setToast(null);
   }, []);
 
+  // All mail 混排后 INBOX 占比可能偏低；刷新/预热多拉一些进缓存，投影后 Inbox 才够用
+  const ALL_MAIL_CACHE_FETCH_LIMIT = 400;
+
   const applyInboxSnapshotPayload = useCallback((payload: InboxFeedPayload, options: { error?: string; append?: boolean } = {}) => {
     const pageMessages = Array.isArray(payload.messages) ? payload.messages : [];
     setState((s) => {
@@ -691,7 +706,10 @@ export function useAppController() {
         : sortInboxMessagesDesc(pageMessages);
       return {
         ...s,
-        inboxMessages: snapshotMessages.filter((message) => (message.label_ids || []).includes("INBOX")),
+        // 标签大小写兼容，避免漏掉 INBOX 导致 Inbox 列表异常偏少
+        inboxMessages: snapshotMessages.filter((message) =>
+          (message.label_ids || []).some((label) => String(label).toUpperCase() === "INBOX"),
+        ),
         inboxSnapshotMessages: snapshotMessages,
         inboxUpdatedAt: String(payload.updated_at || s.inboxUpdatedAt || ""),
         inboxLoading: false,
@@ -731,24 +749,52 @@ export function useAppController() {
       setState((s) => ({ ...s, inboxSnapshotLoading: true }));
       try {
         const [cached] = await Promise.all([
-          client.listCachedEmails(mailbox, days, 100, "inbox", 0),
+          // 启动快照固定读 All mail 缓存，分类由前端标签投影
+          client.listCachedEmails(mailbox, days, 100, "all", 0),
           // A draft-index failure must not prevent the Inbox cache from opening.
           loadInboxThreadDrafts(mailbox).catch(() => undefined),
         ]);
         if (snapshotRequestMailbox.current !== mailbox) return false;
         const cachedMessages = Array.isArray(cached.messages) ? cached.messages : [];
-        // The startup snapshot is cache-first. If it has no messages in this
-        // exact window, query Gmail with the same day limit instead of making
-        // users switch to All time to see recent email.
-        const payload = cachedMessages.length
-          ? cached
-          : await client.listInboxEmails(mailbox, days, 100, "inbox");
+        // 流式：首屏立刻可见，后续页 append 边加载边渲染
+        if (cachedMessages.length) {
+          applyInboxSnapshotPayload(cached);
+          setState((s) => ({ ...s, inboxSnapshotLoading: false, inboxLoading: false }));
+          let nextOffset = Number(cached.next_offset ?? cachedMessages.length);
+          let hasMore = Boolean(cached.has_more);
+          let pages = 0;
+          while (hasMore && pages < 30) {
+            pages += 1;
+            const more = await client.listCachedEmails(mailbox, days, 100, "all", nextOffset);
+            if (snapshotRequestMailbox.current !== mailbox) return false;
+            applyInboxSnapshotPayload(more, { append: true });
+            const pageCount = Array.isArray(more.messages) ? more.messages.length : 0;
+            nextOffset = Number(more.next_offset ?? nextOffset + pageCount);
+            hasMore = Boolean(more.has_more) && pageCount > 0;
+            if (!pageCount) break;
+          }
+          console.info(`[inbox-startup] mailbox=${mailbox} days=${days} source=cache messages=${nextOffset} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
+          return nextOffset > 0;
+        }
+        const payload = await client.listInboxEmails(mailbox, days, ALL_MAIL_CACHE_FETCH_LIMIT, "all");
         if (snapshotRequestMailbox.current !== mailbox) return false;
         applyInboxSnapshotPayload(payload);
-        setState((s) => ({ ...s, inboxSnapshotLoading: false }));
-        const messageCount = Array.isArray(payload.messages) ? payload.messages.length : 0;
-        console.info(`[inbox-startup] mailbox=${mailbox} days=${days} source=${cachedMessages.length ? "cache" : "gmail"} messages=${messageCount} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
-        return messageCount > 0;
+        setState((s) => ({ ...s, inboxSnapshotLoading: false, inboxLoading: false }));
+        let nextOffset = Number(payload.next_offset ?? (Array.isArray(payload.messages) ? payload.messages.length : 0));
+        let hasMore = Boolean(payload.has_more);
+        let pages = 0;
+        while (hasMore && pages < 30) {
+          pages += 1;
+          const more = await client.listCachedEmails(mailbox, days, 100, "all", nextOffset);
+          if (snapshotRequestMailbox.current !== mailbox) return false;
+          applyInboxSnapshotPayload(more, { append: true });
+          const pageCount = Array.isArray(more.messages) ? more.messages.length : 0;
+          nextOffset = Number(more.next_offset ?? nextOffset + pageCount);
+          hasMore = Boolean(more.has_more) && pageCount > 0;
+          if (!pageCount) break;
+        }
+        console.info(`[inbox-startup] mailbox=${mailbox} days=${days} source=gmail messages=${nextOffset} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
+        return nextOffset > 0;
       } catch {
         if (snapshotRequestMailbox.current !== mailbox) return false;
         setState((s) => ({
@@ -766,45 +812,6 @@ export function useAppController() {
     });
     return snapshotPromise.current;
   }, [applyInboxSnapshotPayload, client, loadInboxThreadDrafts, state.mailbox, state.selectedMailboxes]);
-
-  const completeAiChat = useCallback(async (messages: AiChatMessage[], signal: AbortSignal): Promise<string> => {
-    if (signal.aborted) throw new DOMException("The request was aborted.", "AbortError");
-    const runtime = await getRuntime();
-    if (signal.aborted) throw new DOMException("The request was aborted.", "AbortError");
-    const llmPayload = {
-      messages: messages.slice(-10).map((message) => ({
-        role: message.role,
-        content: { type: "text", text: message.content },
-      })),
-      systemPrompt: [
-        "You are Anna, a concise and helpful inbox assistant.",
-        "Answer in the same language as the user's latest message.",
-        "For greetings, capability questions, and ordinary chat, answer naturally without claiming that you scanned email.",
-        "If the user asks for inbox-specific work, tell them you can search the inbox when they ask a concrete mail task.",
-        "For formatting, use only Markdown headings, bold text, ordered or unordered lists, and HTTPS/HTTP links in the form [label](https://example.com). Do not use HTML, tables, images, code blocks, or block quotes. If the user requests an unsupported format, say so plainly and offer an equivalent using the supported formats.",
-      ].join("\n"),
-      maxTokens: 500,
-      temperature: 0.4,
-      metadata: { tool: "ai_sidebar_chat" },
-    };
-    try {
-      const result = runtime.client?.llm && typeof runtime.client.llm.complete === "function"
-        ? await runtime.client.llm.complete(llmPayload, { timeoutMs: 60_000, signal })
-        : await runtime.client?.call?.("llm", "complete", llmPayload, { timeout: 60_000, timeoutMs: 60_000, signal });
-      const content = result && typeof result === "object" ? (result as { content?: { text?: unknown }; text?: unknown }).content : null;
-      const text = content && typeof content === "object"
-        ? String((content as { text?: unknown }).text || "")
-        : String((result as { text?: unknown } | undefined)?.text || "");
-      return text.trim() || "你好，我在。你可以直接和我聊天，也可以让我帮你查找、整理或总结邮件。";
-    } catch (error) {
-      if (signal.aborted || isAbortError(error)) throw error;
-      // 普通聊天依赖 Anna Host LLM；失败时不应该退化成邮箱扫描，避免再次打扰用户邮箱。
-      const latestUser = [...messages].reverse().find((message) => message.role === "user")?.content || "";
-      return prefersChinese(latestUser)
-        ? "你好，我在。现在普通聊天模型暂时不可用，但你仍然可以让我帮你查找、整理或总结邮件。"
-        : "Hi, I'm here. The chat model is temporarily unavailable, but you can still ask me to find, organize, or summarize email.";
-    }
-  }, [getRuntime]);
 
   const upsertAiConversationHistory = useCallback((
     conversationId: string,
@@ -888,30 +895,19 @@ export function useAppController() {
       setState((s) => ({ ...s, inboxMessages: [], inboxLoading: false, inboxError: "Connect a Gmail mailbox to load your inbox." }));
       return false;
     }
-    const cacheKey = `${mailbox}|${category}|${days}`;
+    // 内存缓存键统一为 all：后端始终返回 All mail 快照
+    const cacheKey = `${mailbox}|all|${days}`;
     const cached = inboxFeedCache.current.get(cacheKey);
     if (cached) {
-      setState((s) => ({
-        ...s,
-        inboxMessages: cached.payload.messages,
-        inboxUpdatedAt: String(cached.payload.updated_at || ""),
-        inboxLoading: false,
-        inboxError: "",
-      }));
+      applyInboxSnapshotPayload(cached.payload);
       if (!force && Date.now() - cached.loadedAt < 60_000) return true;
     }
     setState((s) => ({ ...s, inboxLoading: true, inboxError: "" }));
     try {
-      const payload = await client.listInboxEmails(mailbox, days, 100, category);
+      const payload = await client.listInboxEmails(mailbox, days, ALL_MAIL_CACHE_FETCH_LIMIT, "all");
       inboxFeedCache.current.set(cacheKey, { payload, loadedAt: Date.now() });
       if (requestId !== inboxRequestSequence.current) return false;
-      setState((s) => ({
-        ...s,
-        inboxMessages: Array.isArray(payload.messages) ? payload.messages : [],
-        inboxUpdatedAt: String(payload.updated_at || ""),
-        inboxLoading: false,
-        inboxError: "",
-      }));
+      applyInboxSnapshotPayload(payload);
       return true;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -921,7 +917,7 @@ export function useAppController() {
       return false;
     }
     return false;
-  }, [client, state.mailbox, state.selectedMailboxes]);
+  }, [applyInboxSnapshotPayload, client, state.mailbox, state.selectedMailboxes]);
 
   const refreshInboxEmails = useCallback(async (category = "inbox", days = 30, clearCache = false): Promise<InboxPageResult> => {
     const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
@@ -950,16 +946,30 @@ export function useAppController() {
     }));
 
     try {
-      const payload = await client.listInboxEmails(mailbox, days, 100, category, clearCache);
+      // 刷新：首屏立刻渲染，后续 list_cached 分页 append（边加载边展示）
+      const payload = await client.listInboxEmails(mailbox, days, ALL_MAIL_CACHE_FETCH_LIMIT, "all", clearCache);
       if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
-      inboxFeedCache.current.set(`${mailbox}|${category}|${days}`, { payload, loadedAt: Date.now() });
       applyInboxSnapshotPayload(payload);
-      const messages = Array.isArray(payload.messages) ? payload.messages : [];
-      const count = messages.length;
+      setState((s) => ({ ...s, inboxSnapshotLoading: false, inboxLoading: false }));
+      let nextOffset = Number(payload.next_offset ?? (Array.isArray(payload.messages) ? payload.messages.length : 0));
+      let hasMore = Boolean(payload.has_more);
+      let pages = 0;
+      while (hasMore && pages < 30) {
+        pages += 1;
+        const cached = await client.listCachedEmails(mailbox, days, 100, "all", nextOffset);
+        if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
+        applyInboxSnapshotPayload(cached, { append: true });
+        const pageCount = Array.isArray(cached.messages) ? cached.messages.length : 0;
+        nextOffset = Number(cached.next_offset ?? nextOffset + pageCount);
+        hasMore = Boolean(cached.has_more) && pageCount > 0;
+        if (!pageCount) break;
+      }
+      inboxFeedCache.current.set(`${mailbox}|all|${days}`, { payload, loadedAt: Date.now() });
+      const count = nextOffset;
       showToast(days > 7
-        ? `Inbox synced for the last ${days} days. ${count} messages loaded.`
-        : `Inbox refreshed. ${count} messages loaded.`);
-      return { ok: true, count, hasMore: count >= 100, nextOffset: count, messages };
+        ? `Inbox synced for the last ${days} days. ${count} email${count === 1 ? "" : "s"} loaded.`
+        : `Inbox refreshed. ${count} email${count === 1 ? "" : "s"} loaded.`);
+      return { ok: true, count, hasMore, nextOffset, messages: Array.isArray(payload.messages) ? payload.messages : [] };
     } catch (error) {
       if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
       const detail = error instanceof Error ? error.message : String(error);
@@ -978,6 +988,96 @@ export function useAppController() {
       }
     }
     return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
+  }, [applyInboxSnapshotPayload, client, state.mailbox, state.selectedMailboxes]);
+
+  const expandInboxFeedWindow = useCallback(async (days = 30): Promise<InboxPageResult> => {
+    const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
+    if (!mailbox || mailbox === "all") {
+      return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
+    }
+    const requestKey = `${mailbox}#expand:${++inboxRequestSequence.current}`;
+    snapshotRequestMailbox.current = requestKey;
+    const windowDays = Math.max(0, Math.min(Number(days) || 0, 3650));
+    setState((s) => ({
+      ...s,
+      inboxSnapshotLoading: true,
+      inboxError: "",
+    }));
+    try {
+      // 不清缓存、不替换快照：先把更宽窗口写入本地 All mail，再 append 分页补齐
+      await client.listInboxEmails(mailbox, windowDays, ALL_MAIL_CACHE_FETCH_LIMIT, "all", false);
+      if (snapshotRequestMailbox.current !== requestKey) {
+        return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
+      }
+      let nextOffset = 0;
+      let hasMore = true;
+      let pages = 0;
+      let appended = 0;
+      while (hasMore && pages < 30) {
+        pages += 1;
+        const cached = await client.listCachedEmails(mailbox, windowDays, 100, "all", nextOffset);
+        if (snapshotRequestMailbox.current !== requestKey) {
+          return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
+        }
+        applyInboxSnapshotPayload(cached, { append: true });
+        const pageCount = Array.isArray(cached.messages) ? cached.messages.length : 0;
+        appended += pageCount;
+        nextOffset = Number(cached.next_offset ?? nextOffset + pageCount);
+        hasMore = Boolean(cached.has_more) && pageCount > 0;
+        if (!pageCount) break;
+      }
+      // days=0 时缓存耗尽后可继续用 Gmail 页扩 All mail；append 按 id 去重
+      if (windowDays === 0) {
+        let gmailHasMore = true;
+        let pageToken = "";
+        let pageOffset = 0;
+        let gmailPages = 0;
+        const exclude = new Set<string>();
+        while (gmailHasMore && gmailPages < 10) {
+          gmailPages += 1;
+          const page = await client.listGmailEmailsPage(
+            mailbox,
+            0,
+            100,
+            "all",
+            pageToken,
+            pageOffset,
+            [...exclude],
+          );
+          if (snapshotRequestMailbox.current !== requestKey) {
+            return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
+          }
+          applyInboxSnapshotPayload(page, { append: true });
+          const pageMessages = Array.isArray(page.messages) ? page.messages : [];
+          for (const message of pageMessages) {
+            if (message.id) exclude.add(message.id);
+          }
+          appended += pageMessages.length;
+          pageToken = String(page.page_token || "");
+          pageOffset = Number(page.page_offset || 0);
+          gmailHasMore = Boolean(page.has_more) && pageMessages.length > 0;
+          if (!pageMessages.length) break;
+        }
+        hasMore = gmailHasMore;
+      }
+      return { ok: true, count: appended, hasMore, nextOffset };
+    } catch (error) {
+      if (snapshotRequestMailbox.current !== requestKey) {
+        return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error("[expandInboxFeedWindow] failed:", detail, error);
+      setState((s) => ({
+        ...s,
+        inboxSnapshotComplete: true,
+        inboxError: detail,
+      }));
+      return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
+    } finally {
+      if (snapshotRequestMailbox.current === requestKey) {
+        setState((s) => ({ ...s, inboxSnapshotLoading: false }));
+      }
+    }
   }, [applyInboxSnapshotPayload, client, state.mailbox, state.selectedMailboxes]);
 
   const loadActiveCards = useCallback(async (storageOverride?: string, mailboxOverride?: string, options: { timeoutMs?: number } = {}) => {
@@ -1148,17 +1248,30 @@ export function useAppController() {
     }
   }, [client, state.mailbox, state.storageProvider]);
 
-  const loadInboxSettings = useCallback(async (mailboxOverride?: string) => {
+  const loadInboxSettings = useCallback(async (mailboxOverride?: string): Promise<InboxSettings | null> => {
     const mailbox = normalizedMailbox(mailboxOverride || state.mailbox);
-    if (!mailbox) return;
+    if (!mailbox) return null;
     setState((s) => ({ ...s, inboxSettingsLoading: true, inboxSettingsError: "" }));
     try {
       const payload = await client.loadInboxSettings(mailbox, state.storageProvider);
       // 平台/旧存储可能缺 custom_categories 或类型异常；统一 clamp 避免首页迭代白屏。
       const settings = clampInboxSettings(payload.settings);
-      setState((s) => normalizedMailbox(s.mailbox) === mailbox ? { ...s, inboxSettings: settings, inboxSettingsEtag: payload.etag || "", inboxSettingsLoading: false } : s);
+      setState((s) => {
+        // 启动时 mailbox 可能尚未写入；只要请求邮箱匹配当前或当前仍为空则接受
+        const current = normalizedMailbox(s.mailbox);
+        if (current && current !== mailbox) return { ...s, inboxSettingsLoading: false };
+        return {
+          ...s,
+          mailbox: current || mailbox,
+          inboxSettings: settings,
+          inboxSettingsEtag: payload.etag || "",
+          inboxSettingsLoading: false,
+        };
+      });
+      return settings;
     } catch (error) {
       setState((s) => ({ ...s, inboxSettingsLoading: false, inboxSettingsError: error instanceof Error ? error.message : String(error) }));
+      return null;
     }
   }, [client, state.mailbox, state.storageProvider]);
 
@@ -1667,7 +1780,15 @@ export function useAppController() {
             briefMailboxFilter: [restoredMailbox],
           }));
         }
-        let inboxAvailable = bootMailbox ? await preloadMailboxSnapshot(bootMailbox, 30) : false;
+        // 先读 display_range，再按该天数预热，避免先 30 天闪一下再清空加载 7 天
+        let rangeDays = clampInboxSettings(state.inboxSettings).display_range_days;
+        if (bootMailbox) {
+          const bootSettings = await loadInboxSettings(bootMailbox);
+          if (bootSettings?.display_range_days) rangeDays = bootSettings.display_range_days;
+        }
+        let inboxAvailable = bootMailbox
+          ? await preloadMailboxSnapshot(bootMailbox, rangeDays)
+          : false;
         const mailboxState = await loadMailboxRegistry();
         let currentMailbox = mailboxState.primary || bootMailbox;
         if (!currentMailbox) {
@@ -1675,12 +1796,18 @@ export function useAppController() {
           currentMailbox = mailbox || state.mailbox;
         }
         if (currentMailbox && currentMailbox !== bootMailbox) {
-          inboxAvailable = await preloadMailboxSnapshot(currentMailbox, 30, true);
+          const switchedSettings = await loadInboxSettings(currentMailbox);
+          if (switchedSettings?.display_range_days) {
+            rangeDays = switchedSettings.display_range_days;
+          }
+          inboxAvailable = await preloadMailboxSnapshot(currentMailbox, rangeDays, true);
         }
-        void loadMailboxes().then((discoveredState) => {
+        void loadMailboxes().then(async (discoveredState) => {
           const discoveredPrimary = normalizedMailbox(discoveredState.primary);
           if (!discoveredPrimary || discoveredPrimary === currentMailbox) return;
-          void preloadMailboxSnapshot(discoveredPrimary, 30, true);
+          const discoveredSettings = await loadInboxSettings(discoveredPrimary);
+          const discoveredDays = discoveredSettings?.display_range_days || rangeDays;
+          void preloadMailboxSnapshot(discoveredPrimary, discoveredDays, true);
           void loadScanPlan(discoveredPrimary);
         }).catch(() => undefined);
         const authResult = await client.checkAnyGmailAuth();
@@ -1695,7 +1822,9 @@ export function useAppController() {
             ...s,
             loading: false,
             inboxLoading: false,
-            inboxError: inboxAvailable ? "" : "Connect Gmail to load the last 30 days of email.",
+            inboxError: inboxAvailable
+              ? ""
+              : `Connect Gmail to load the last ${rangeDays} days of email.`,
           }));
           return;
         }
@@ -1703,12 +1832,13 @@ export function useAppController() {
           loadRunHistory(),
           loadCustomPlans(),
           loadScanPlan(currentMailbox),
+          // settings 已在预热前加载；此处再拉一次保证 etag / 与当前邮箱对齐（不再触发 30 天预热）
           loadInboxSettings(currentMailbox),
           loadActiveCards(undefined, "all"),
         ]);
         // 初始化请求释放后再运行端到端延迟探测，避免启动阶段挤占 Executa worker 与 Host 反向 RPC。
         void refreshConnectivityStatus();
-        console.info(`[inbox-startup] initialize elapsed_ms=${Math.round(performance.now() - startedAt)} mailbox=${currentMailbox || ""}`);
+        console.info(`[inbox-startup] initialize elapsed_ms=${Math.round(performance.now() - startedAt)} mailbox=${currentMailbox || ""} range_days=${rangeDays}`);
       }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -1912,9 +2042,11 @@ export function useAppController() {
           actionCount: actionCount(visibleCards),
           inboxLoading: true,
         }));
-        await preloadMailboxSnapshot(primary, 30, true);
+        const switchedSettings = await loadInboxSettings(primary);
+        const rangeDays = switchedSettings?.display_range_days
+          || clampInboxSettings(state.inboxSettings).display_range_days;
+        await preloadMailboxSnapshot(primary, rangeDays, true);
         await loadScanPlan(primary);
-        await loadInboxSettings(primary);
       } catch (error) {
         closeAccountSwitchNotice();
         const message = error instanceof Error ? error.message : String(error);
@@ -1966,12 +2098,14 @@ export function useAppController() {
     },
     loadActiveCards,
     async loadInboxEmails(category = "inbox", days = 30, force = false) {
+      // 强制刷新时统一预热 All mail 快照
       if (force && (category === "inbox" || category === "all")) {
         return preloadMailboxSnapshot(undefined, days, true);
       }
       return loadInboxEmails(undefined, category, days, force);
     },
     refreshInboxEmails,
+    expandInboxFeedWindow,
     async loadCachedInboxEmails(category = "inbox", days = 30, offset = 0, append = false): Promise<InboxPageResult> {
       const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
       if (!mailbox || mailbox === "all") return { ok: false, count: 0, hasMore: false, nextOffset: offset };
@@ -2024,11 +2158,12 @@ export function useAppController() {
       const requestId = ++inboxRequestSequence.current;
       setState((s) => ({ ...s, inboxSnapshotLoading: true, inboxError: "" }));
       try {
+        // 加载更多固定扩 All mail 缓存；分类由前端标签投影
         const page = await client.listGmailEmailsPage(
           mailbox,
           days,
           100,
-          category,
+          "all",
           pageToken,
           pageOffset,
           excludeMessageIds,
@@ -2082,7 +2217,12 @@ export function useAppController() {
         inboxError: "",
       }));
     },
-    preloadMailboxSnapshot: (force = false) => preloadMailboxSnapshot(undefined, 30, force),
+    preloadMailboxSnapshot: (force = false) =>
+      preloadMailboxSnapshot(
+        undefined,
+        clampInboxSettings(state.inboxSettings).display_range_days,
+        force,
+      ),
     async loadInboxEmailBody(messageId, mailboxOverride) {
       const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
       if (!messageId || !mailbox) return "";
@@ -2153,10 +2293,9 @@ export function useAppController() {
       return client.prepareInboxAttachmentAccess(normalizedMailbox(mailbox), messageId, attachmentId, mode);
     },
     async modifyInboxMessageLabels(mailbox, messageIds, addLabelIds = [], removeLabelIds = []) {
+      // Gmail 成功后再改本地 label 样式，避免乐观更新与远端不一致
       const normalized = normalizedMailbox(mailbox);
       if (!normalized || !messageIds.length) return;
-      const prevInboxMessages = state.inboxMessages;
-      const prevSnapshotMessages = state.inboxSnapshotMessages;
       const addSet = new Set(addLabelIds.map((label) => label.toUpperCase()));
       const removeSet = new Set(removeLabelIds.map((label) => label.toUpperCase()));
       const patchMessage = (message: InboxFeedPayload["messages"][number]) => {
@@ -2168,20 +2307,16 @@ export function useAppController() {
           label_ids: [...labels],
           unread: labels.has("UNREAD"),
           important: labels.has("IMPORTANT"),
+          starred: labels.has("STARRED"),
         };
       };
+      const result = await client.modifyMessageLabels(normalized, messageIds, addLabelIds, removeLabelIds);
+      if (!result.ok) throw new Error(result.error || "Failed to modify message labels");
       setState((s) => ({
         ...s,
         inboxMessages: patchInboxMessageList(s.inboxMessages, messageIds, patchMessage),
         inboxSnapshotMessages: patchInboxMessageList(s.inboxSnapshotMessages, messageIds, patchMessage),
       }));
-      try {
-        const result = await client.modifyMessageLabels(normalized, messageIds, addLabelIds, removeLabelIds);
-        if (!result.ok) throw new Error(result.error || "Failed to modify message labels");
-      } catch (error) {
-        setState((s) => ({ ...s, inboxMessages: prevInboxMessages, inboxSnapshotMessages: prevSnapshotMessages }));
-        throw error;
-      }
     },
     async updateInboxThreadState(mailbox, threadId, operation) {
       const normalized = normalizedMailbox(mailbox);
@@ -2399,6 +2534,7 @@ export function useAppController() {
       };
     },
     async setInboxStarred(messageId, starred) {
+      // 先等 Gmail 成功再改本地样式，避免 STARS/TODOS 时间线仅前端生效、重同步后还原
       const message = state.inboxSnapshotMessages.find((item) => item.id === messageId)
         || state.inboxMessages.find((item) => item.id === messageId);
       const mailbox = normalizedMailbox(message?.mailbox || state.selectedMailboxes[0] || state.mailbox);
@@ -2409,25 +2545,18 @@ export function useAppController() {
         if (nextStarred) labels.add("STARRED"); else labels.delete("STARRED");
         return { ...item, starred: nextStarred, label_ids: [...labels] };
       };
+      const result = await client.setMessageStarred(mailbox, messageId, starred);
+      if (!result.ok) throw new Error(result.error || "Failed to update star");
       setState((s) => ({
         ...s,
         inboxMessages: s.inboxMessages.map((item) => patchMessage(item, starred) || item),
         inboxSnapshotMessages: s.inboxSnapshotMessages.map((item) => patchMessage(item, starred) || item),
       }));
-      try {
-        const result = await client.setMessageStarred(mailbox, messageId, starred);
-        if (!result.ok) throw new Error(result.error || "Failed to update star");
-      } catch (error) {
-        setState((s) => ({
-          ...s,
-          inboxMessages: s.inboxMessages.map((item) => patchMessage(item, !starred) || item),
-          inboxSnapshotMessages: s.inboxSnapshotMessages.map((item) => patchMessage(item, !starred) || item),
-        }));
-        showToast(error instanceof Error ? error.message : String(error));
-      }
     },
     async markInboxRead(messageId) {
-      const message = state.inboxMessages.find((item) => item.id === messageId);
+      // 同时查 snapshot：STARS/TODOS 邮件可能不在 inboxMessages（无 INBOX 标签）
+      const message = state.inboxMessages.find((item) => item.id === messageId)
+        || state.inboxSnapshotMessages.find((item) => item.id === messageId);
       const mailbox = normalizedMailbox(message?.mailbox || state.selectedMailboxes[0] || state.mailbox);
       if (!messageId || !mailbox) return;
       try {
@@ -2436,14 +2565,15 @@ export function useAppController() {
         setState((s) => ({
           ...s,
           inboxMessages: s.inboxMessages.map((item) => item.id === messageId
-            ? { ...item, unread: false, label_ids: (item.label_ids || []).filter((label) => label !== "UNREAD") }
+            ? { ...item, unread: false, label_ids: (item.label_ids || []).filter((label) => String(label).toUpperCase() !== "UNREAD") }
             : item),
           inboxSnapshotMessages: s.inboxSnapshotMessages.map((item) => item.id === messageId
-            ? { ...item, unread: false, label_ids: (item.label_ids || []).filter((label) => label !== "UNREAD") }
+            ? { ...item, unread: false, label_ids: (item.label_ids || []).filter((label) => String(label).toUpperCase() !== "UNREAD") }
             : item),
         }));
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
+        throw error;
       }
     },
     async trashInboxMessage(messageId) {
@@ -2463,6 +2593,150 @@ export function useAppController() {
         showToast("Moved to trash.");
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
+      }
+    },
+    async batchInboxActions(messageIds, action) {
+      const ids = Array.from(new Set((messageIds || []).map(String).filter(Boolean))).slice(0, 50);
+      if (!ids.length) return { ok: false, count: 0 };
+      // 按 mailbox 分组（多账号场景）；无本地副本时回退当前邮箱，避免 STARS/TODOS 批量静默失败
+      const byMailbox = new Map<string, string[]>();
+      const fallbackMailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
+      for (const id of ids) {
+        const message = state.inboxMessages.find((item) => item.id === id)
+          || state.inboxSnapshotMessages.find((item) => item.id === id);
+        const mailbox = normalizedMailbox(message?.mailbox || fallbackMailbox);
+        if (!mailbox) continue;
+        const list = byMailbox.get(mailbox) || [];
+        list.push(id);
+        byMailbox.set(mailbox, list);
+      }
+      if (!byMailbox.size) return { ok: false, count: 0 };
+
+      const prevInbox = state.inboxMessages;
+      const prevSnapshot = state.inboxSnapshotMessages;
+      const idSet = new Set(ids);
+      const originalById = new Map<string, InboxMessage>();
+      for (const message of [...prevSnapshot, ...prevInbox]) {
+        if (idSet.has(message.id)) originalById.set(message.id, message);
+      }
+
+      const idsWithOriginalLabel = (messageIds: string[], label: string) =>
+        messageIds.filter((id) => {
+          const original = originalById.get(id);
+          const hasLabel = (original?.label_ids || []).some(
+            (item) => String(item).toUpperCase() === label,
+          );
+          return (
+            hasLabel ||
+            (label === "UNREAD" && Boolean(original?.unread)) ||
+            (label === "STARRED" && Boolean(original?.starred))
+          );
+        });
+
+      const patchLocal = (message: InboxMessage) => {
+        if (!idSet.has(message.id)) return message;
+        const labels = new Set((message.label_ids || []).map((label) => String(label).toUpperCase()));
+        if (action === "mark_read") labels.delete("UNREAD");
+        if (action === "mark_unread") labels.add("UNREAD");
+        if (action === "star") labels.add("STARRED");
+        if (action === "unstar") labels.delete("STARRED");
+        if (action === "archive" || action === "mark_done") labels.delete("INBOX");
+        if (action === "trash") {
+          labels.delete("INBOX");
+          labels.add("TRASH");
+        }
+        return {
+          ...message,
+          label_ids: [...labels],
+          unread: labels.has("UNREAD"),
+          starred: labels.has("STARRED"),
+          important: labels.has("IMPORTANT"),
+        };
+      };
+
+      // Gmail 成功后再改本地样式；失败保持原状
+      try {
+        for (const [mailbox, groupIds] of byMailbox) {
+          if (action === "trash") {
+            const result = await client.trashFromAsk(mailbox, groupIds);
+            if (!result.ok) throw new Error(result.error || "Failed to trash messages");
+          } else if (action === "mark_read") {
+            const result = await client.markReadFromAsk(mailbox, groupIds);
+            if (!result.ok) throw new Error(result.error || "Failed to mark as read");
+          } else if (action === "mark_unread") {
+            const result = await client.modifyMessageLabels(mailbox, groupIds, ["UNREAD"], []);
+            if (!result.ok) throw new Error(result.error || "Failed to mark as unread");
+          } else if (action === "star") {
+            const result = await client.modifyMessageLabels(mailbox, groupIds, ["STARRED"], []);
+            if (!result.ok) throw new Error(result.error || "Failed to star");
+          } else if (action === "unstar") {
+            const result = await client.modifyMessageLabels(mailbox, groupIds, [], ["STARRED"]);
+            if (!result.ok) throw new Error(result.error || "Failed to unstar");
+          } else if (action === "archive" || action === "mark_done") {
+            // 移出收件箱：去掉 INBOX；Done 额外 mark_read
+            if (action === "mark_done") {
+              const result = await client.markReadFromAsk(mailbox, groupIds);
+              if (!result.ok) throw new Error(result.error || "Failed to mark as read");
+            }
+            const result = await client.modifyMessageLabels(mailbox, groupIds, [], ["INBOX"]);
+            if (!result.ok) throw new Error(result.error || "Failed to archive");
+          }
+        }
+        setState((s) => ({
+          ...s,
+          inboxMessages: action === "trash" || action === "archive" || action === "mark_done"
+            ? s.inboxMessages.filter((item) => !idSet.has(item.id))
+            : s.inboxMessages.map(patchLocal),
+          inboxSnapshotMessages: s.inboxSnapshotMessages.map(patchLocal),
+        }));
+        const n = ids.length;
+        const undo = async (): Promise<boolean> => {
+          try {
+            for (const [mailbox, groupIds] of byMailbox) {
+              const restoreLabel = async (label: "UNREAD" | "STARRED") => {
+                const originallyLabeled = idsWithOriginalLabel(groupIds, label);
+                const originallyUnlabeled = groupIds.filter(
+                  (id) => !originallyLabeled.includes(id),
+                );
+                if (originallyLabeled.length) {
+                  const result = await client.modifyMessageLabels(mailbox, originallyLabeled, [label], []);
+                  if (!result.ok) throw new Error(result.error || `Failed to restore ${label}`);
+                }
+                if (originallyUnlabeled.length) {
+                  const result = await client.modifyMessageLabels(mailbox, originallyUnlabeled, [], [label]);
+                  if (!result.ok) throw new Error(result.error || `Failed to restore ${label}`);
+                }
+              };
+
+              if (action === "mark_read" || action === "mark_unread") {
+                await restoreLabel("UNREAD");
+              } else if (action === "star" || action === "unstar") {
+                await restoreLabel("STARRED");
+              } else if (action === "trash") {
+                const result = await client.modifyMessageLabels(mailbox, groupIds, ["INBOX"], ["TRASH"]);
+                if (!result.ok) throw new Error(result.error || "Failed to restore messages from trash");
+              } else if (action === "archive" || action === "mark_done") {
+                const result = await client.modifyMessageLabels(mailbox, groupIds, ["INBOX"], []);
+                if (!result.ok) throw new Error(result.error || "Failed to restore messages to inbox");
+                if (action === "mark_done") await restoreLabel("UNREAD");
+              }
+            }
+            setState((current) => ({
+              ...current,
+              inboxMessages: prevInbox,
+              inboxSnapshotMessages: prevSnapshot,
+            }));
+            showToast(`Restored ${n}.`);
+            return true;
+          } catch (error) {
+            showToast(error instanceof Error ? error.message : String(error));
+            return false;
+          }
+        };
+        return { ok: true, count: n, undo };
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error));
+        return { ok: false, count: 0 };
       }
     },
     loadRunHistory,
@@ -3086,434 +3360,9 @@ export function useAppController() {
       }
       if (!userRequest || state.isCustomScanning || state.aiChatLoading || aiGenerationRun.current) return;
       const conversationId = state.aiChatConversationId || createId("chat");
-      const unresolvedBase = options.baseMessages
+      const baseMessages = options.baseMessages
         ?? (state.aiChatConversationId === conversationId ? state.aiChatMessages : []);
-      const baseMessages = options.clarificationMessageId
-        ? unresolvedBase.map((message) =>
-            message.id === options.clarificationMessageId && message.clarification
-              ? {
-                  ...message,
-                  clarification: {
-                    ...message.clarification,
-                    status: "resolved" as const,
-                    resolved_action: options.forcedKind,
-                  },
-                }
-              : message,
-          )
-        : unresolvedBase;
-      // 阶段 A 默认走 start_ai_turn；localStorage anna-inbox-use-ai-turn=0 可回退 aiRoute。
-      if (isAiTurnEnabled() && !options.forcedKind) {
-        const generationRun = {
-          runId: createId("generation"),
-          cancelled: false,
-          controller: new AbortController(),
-        };
-        aiGenerationRun.current = generationRun;
-        const isCurrentGeneration = () => aiGenerationRun.current === generationRun && !generationRun.cancelled;
-        const userMessage: AiChatMessage = options.retryUserMessage ?? {
-          id: createId("msg"),
-          role: "user",
-          content: userRequest,
-          timestamp: new Date().toISOString(),
-          kind: "chat",
-        };
-        const messagesWithUser = [...baseMessages, userMessage];
-        const pendingMessage: AiChatMessage = {
-          id: createId("msg"),
-          role: "assistant",
-          content: prefersChinese(userRequest) ? "thinking" : "thinking",
-          timestamp: new Date().toISOString(),
-          kind: "status",
-          pending: true,
-        };
-        setState((s) => ({
-          ...s,
-          customScanInput: "",
-          aiChatConversationId: conversationId,
-          aiChatMessages: [...messagesWithUser, pendingMessage],
-          aiChatLoading: true,
-          isCustomScanning: true,
-          scanError: "",
-          scanStatus: "Understanding request...",
-          customRunProgress: {
-            runId: "",
-            question: userRequest,
-            status: "queued",
-            stage: "routing",
-            stageKey: "planning",
-            progress: {},
-            partial: {},
-            startedAt: "",
-          },
-        }));
-        let runId = options.resumeRunId || "";
-        try {
-          const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
-          const scanScope = await loadScanPlanForRun(scanMailbox);
-          runId = runId || `at_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
-          const uiContext = buildAiTurnUiContext({
-            mailbox: state.mailbox,
-            selectedMailboxes: state.selectedMailboxes,
-            conversationId,
-            scanPlan: state.scanPlan,
-            displayRangeDays: state.inboxSettings?.display_range_days,
-            currentMailContext: options.currentMailContext,
-            languageHint: prefersChinese(userRequest) ? "zh" : "en",
-            messages: messagesWithUser,
-            savedPromptId: options.savedPromptId,
-          });
-          const started = options.resumeRunId
-            ? await client.getRun(runId)
-            : await client.startAiTurn({
-              user_text: userRequest,
-              mailbox: scanMailbox,
-              ui_context: uiContext,
-              conversation_id: conversationId,
-              primary_count: scanScope.max_messages,
-              max_messages: scanScope.max_messages,
-              scan_window_days: scanScope.scan_window_days,
-              ai_provider: state.llmProvider,
-              storage_provider: state.storageProvider,
-              run_id: runId,
-              wait_timeout_seconds: 60,
-            });
-          if (!isCurrentGeneration()) return;
-          if (started.status === "failed" || started.error) {
-            throw new Error(started.error || "AI turn failed");
-          }
-          if (started.status !== "done") {
-            // 后端任务可能仍在运行；先保存 runId，页面刷新后由用户主动继续查询。
-            upsertAiConversationHistory(conversationId, [...messagesWithUser, pendingMessage], {
-              kind: "chat",
-              query: userRequest,
-              pendingRun: { runId, question: userRequest },
-            });
-          }
-          const completed = started.status === "done" && started.result
-            ? started
-            : await waitForCustomScanResult(client, runId, (status) => {
-              setState((s) => ({
-                ...s,
-                customRunProgress: makeCustomRunProgress(s.customRunProgress!, status, { runId, question: userRequest }),
-                scanStatus: scanStageLabel(status.stage, status.progress),
-              }));
-            }, generationRun.controller.signal);
-          if (!isCurrentGeneration()) return;
-          if (completed.status === "failed" || completed.error) {
-            throw new Error(completed.error || "AI turn failed");
-          }
-          const payload = (completed.result || {}) as Record<string, unknown>;
-          const kind = String(payload.kind || "chat");
-          const assistantText = String(payload.assistant_text || payload.summary || "").trim()
-            || (prefersChinese(userRequest) ? "已完成。" : "Done.");
-
-          const parseMailContext = (): AiMailContextRef | undefined => {
-            const mailCtx = payload.mail_context && typeof payload.mail_context === "object"
-              ? payload.mail_context as Record<string, unknown>
-              : null;
-            if (mailCtx && String(mailCtx.kind) === "thread") {
-              return {
-                kind: "gmail_thread",
-                mailbox: String(mailCtx.mailbox || scanMailbox),
-                thread_id: String(mailCtx.thread_id || ""),
-                anchor_message_id: String(mailCtx.message_id || ""),
-                latest_message_id: String(mailCtx.message_id || ""),
-              };
-            }
-            return options.currentMailContext || undefined;
-          };
-
-          const parseArtifact = (): AiChatMessage["artifact"] => {
-            const raw = payload.artifact;
-            if (!raw || typeof raw !== "object") return null;
-            const art = raw as Record<string, unknown>;
-            const type = String(art.type || "");
-            if (type === "draft_reply") {
-              return {
-                type: "draft_reply",
-                mailbox: String(art.mailbox || scanMailbox),
-                thread_id: String(art.thread_id || ""),
-                body: String(art.body || ""),
-                source_prompt: String(art.source_prompt || userRequest),
-              };
-            }
-            if (type === "compose_draft") {
-              return {
-                type: "compose_draft",
-                mailbox: String(art.mailbox || scanMailbox),
-                body: String(art.body || ""),
-                source_prompt: String(art.source_prompt || userRequest),
-                mode: String(art.mode || "insert") === "replace" ? "replace" : "insert",
-                subject: String(art.subject || "") || undefined,
-              };
-            }
-            return null;
-          };
-
-          if (kind === "scan") {
-            await loadActiveCards();
-            if (!isCurrentGeneration()) return;
-            await loadRunHistory();
-            if (!isCurrentGeneration()) return;
-            await loadCustomPlans();
-            if (!isCurrentGeneration()) return;
-            const result = buildCustomRunResult(runId, payload);
-            const finalMessages: AiChatMessage[] = [
-              ...messagesWithUser,
-              {
-                ...pendingMessage,
-                pending: false,
-                kind: "scan",
-                content: result.summary || result.plan_description || assistantText,
-                result,
-                sourcePrompt: userRequest,
-                timestamp: new Date().toISOString(),
-              },
-            ];
-            upsertAiConversationHistory(conversationId, finalMessages, { kind: "scan", query: userRequest, result });
-          } else if (kind === "clarify") {
-            const finalMessages: AiChatMessage[] = [
-              ...messagesWithUser,
-              {
-                ...pendingMessage,
-                pending: false,
-                kind: "clarify",
-                content: assistantText,
-                timestamp: new Date().toISOString(),
-              },
-            ];
-            upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
-          } else if (kind === "draft") {
-            const finalMessages: AiChatMessage[] = [
-              ...messagesWithUser,
-              {
-                ...pendingMessage,
-                pending: false,
-                kind: "draft",
-                content: assistantText,
-                artifact: parseArtifact(),
-                mailContext: parseMailContext(),
-                sourcePrompt: userRequest,
-                timestamp: new Date().toISOString(),
-              },
-            ];
-            upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
-          } else if (kind === "propose") {
-            const raw = payload.proposed_actions;
-            const proposed = raw && typeof raw === "object" ? raw as Record<string, unknown> : null;
-            const itemsRaw = proposed && Array.isArray(proposed.items) ? proposed.items : [];
-            const finalMessages: AiChatMessage[] = [
-              ...messagesWithUser,
-              {
-                ...pendingMessage,
-                pending: false,
-                kind: "propose",
-                content: assistantText,
-                proposedActions: proposed
-                  ? {
-                      step_index: Number(proposed.step_index || 1),
-                      step_title: String(proposed.step_title || ""),
-                      rationale: String(proposed.rationale || ""),
-                      primary_action: String(proposed.primary_action || "mark_done"),
-                      allowed_actions: Array.isArray(proposed.allowed_actions)
-                        ? proposed.allowed_actions.map(String)
-                        : ["mark_done", "archive", "trash"],
-                      items: itemsRaw
-                        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
-                        .map((item) => ({
-                          mailbox: String(item.mailbox || scanMailbox),
-                          message_id: String(item.message_id || ""),
-                          thread_id: String(item.thread_id || ""),
-                          subject: String(item.subject || ""),
-                          default_selected: item.default_selected !== false,
-                        })),
-                      requires_user_confirmation: true,
-                      followup_after_apply: String(proposed.followup_after_apply || ""),
-                      followup_after_skip: String(proposed.followup_after_skip || ""),
-                      followup_after_dismiss: String(proposed.followup_after_dismiss || ""),
-                      continue_prompt: String(proposed.continue_prompt || ""),
-                      language: String(proposed.language || "") || undefined,
-                      recommendation_groups: Array.isArray(proposed.recommendation_groups)
-                        ? proposed.recommendation_groups
-                          .filter((g): g is Record<string, unknown> => Boolean(g) && typeof g === "object")
-                          .map((g) => ({
-                            title: String(g.title || ""),
-                            subjects: Array.isArray(g.subjects) ? g.subjects.map(String) : [],
-                            items: Array.isArray(g.items)
-                              ? g.items
-                                .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
-                                .map((item) => ({
-                                  mailbox: String(item.mailbox || scanMailbox),
-                                  message_id: String(item.message_id || ""),
-                                  thread_id: String(item.thread_id || ""),
-                                  subject: String(item.subject || ""),
-                                }))
-                              : undefined,
-                          }))
-                        : undefined,
-                    }
-                  : null,
-                timestamp: new Date().toISOString(),
-              },
-            ];
-            upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
-          } else if (kind === "mail_context") {
-            const finalMessages: AiChatMessage[] = [
-              ...messagesWithUser,
-              {
-                ...pendingMessage,
-                pending: false,
-                kind: "mail_context",
-                content: assistantText,
-                mailContext: parseMailContext(),
-                timestamp: new Date().toISOString(),
-              },
-            ];
-            upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
-          } else {
-            const finalMessages: AiChatMessage[] = [
-              ...messagesWithUser,
-              {
-                ...pendingMessage,
-                pending: false,
-                kind: kind === "memory" ? "memory" : "chat",
-                content: assistantText,
-                timestamp: new Date().toISOString(),
-              },
-            ];
-            upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
-          }
-          setState((s) => ({ ...s, scanStatus: "", customRunProgress: null }));
-        } catch (error) {
-          if (!isCurrentGeneration() || isAbortError(error)) return;
-          const message = sanitizeToolError(error, userRequest);
-          const failedMessages: AiChatMessage[] = [
-            ...messagesWithUser,
-            {
-              ...pendingMessage,
-              pending: false,
-              kind: "error",
-              content: message,
-              timestamp: new Date().toISOString(),
-            },
-          ];
-          upsertAiConversationHistory(conversationId, failedMessages, {
-            kind: "chat",
-            query: userRequest,
-            pendingRun: runId && isTransientConnectionError(error)
-              ? { runId, question: userRequest }
-              : undefined,
-          });
-          setState((s) => ({
-            ...s,
-            scanError: message,
-            customRunProgress: s.customRunProgress
-              ? { ...s.customRunProgress, status: "failed", stageKey: "failed" }
-              : s.customRunProgress,
-          }));
-          showToast(message);
-        } finally {
-          if (aiGenerationRun.current === generationRun) {
-            aiGenerationRun.current = null;
-            setState((s) => ({ ...s, isCustomScanning: false, aiChatLoading: false }));
-          }
-        }
-        return;
-      }
-
-      const decision = options.forcedKind
-        ? { kind: options.forcedKind, reason: "clarification_action", confidence: "high" as const }
-        : decideAiRoute(userRequest, {
-            messages: baseMessages,
-            currentMailContext: options.currentMailContext,
-          });
-
-      if (decision.kind === "clarify") {
-        const chinese = prefersChinese(userRequest);
-        const userMessage: AiChatMessage = {
-          id: createId("msg"),
-          role: "user",
-          content: userRequest,
-          timestamp: new Date().toISOString(),
-          kind: "clarify",
-        };
-        const clarificationMessage: AiChatMessage = {
-          id: createId("msg"),
-          role: "assistant",
-          content: chinese
-            ? "你想让我修改当前草稿，还是搜索邮箱？"
-            : "Do you want me to revise the current draft, or search your inbox?",
-          timestamp: new Date().toISOString(),
-          kind: "clarify",
-          clarification: {
-            original_input: userRequest,
-            question: chinese
-              ? "你想让我修改当前草稿，还是搜索邮箱？"
-              : "Do you want me to revise the current draft, or search your inbox?",
-            actions: [
-              { id: "mail_context", label: chinese ? "修改当前草稿" : "Revise current draft" },
-              { id: "scan", label: chinese ? "搜索邮箱" : "Search inbox" },
-              { id: "chat", label: chinese ? "普通聊天" : "Just chat" },
-            ],
-            freeform_enabled: true,
-            status: "pending",
-          },
-        };
-        setState((s) => ({
-          ...s,
-          customScanInput: "",
-          aiChatConversationId: conversationId,
-          aiChatMessages: [...baseMessages, userMessage, clarificationMessage],
-        }));
-        return;
-      }
-
-      if (decision.kind === "mail_context") {
-        const resolved = options.retryUserMessage?.mailContext
-          ? { context: options.retryUserMessage.mailContext, draftToRevise: undefined }
-          : resolveMailContext(baseMessages, options.currentMailContext);
-        if (!resolved) {
-          const finalMessages: AiChatMessage[] = [
-            ...baseMessages,
-            {
-              id: createId("msg"),
-              role: "user",
-              content: userRequest,
-              timestamp: new Date().toISOString(),
-              kind: "mail_context",
-            },
-            {
-              id: createId("msg"),
-              role: "assistant",
-              content: prefersChinese(userRequest)
-                ? "请先打开一封邮件，这样我才知道要修改哪一封草稿。"
-                : "Open an email first so I know what to revise.",
-              timestamp: new Date().toISOString(),
-              kind: "clarify",
-            },
-          ];
-          setState((s) => ({
-            ...s,
-            customScanInput: "",
-            aiChatConversationId: conversationId,
-            aiChatMessages: finalMessages,
-          }));
-          return;
-        }
-        await actions.submitMailContextPrompt({
-          visiblePrompt: userRequest,
-          context: resolved.context,
-          expectedArtifact: resolved.context.kind === "compose"
-            ? "compose_draft"
-            : (/\b(send|email|mail)\b|发送|发邮件|寄出/i.test(userRequest) ? "send_plan" : "draft_reply"),
-          draftToRevise: resolved.draftToRevise,
-          baseMessages,
-          retryUserMessage: options.retryUserMessage,
-        });
-        return;
-      }
-
+      // 阶段 C：侧栏仅走 start_ai_turn，已删除前端业务意图路由与旁路开关。
       const generationRun = {
         runId: createId("generation"),
         cancelled: false,
@@ -3521,20 +3370,18 @@ export function useAppController() {
       };
       aiGenerationRun.current = generationRun;
       const isCurrentGeneration = () => aiGenerationRun.current === generationRun && !generationRun.cancelled;
-      const isChatRequest = decision.kind === "chat";
-      const scanRequest = isChatRequest ? userRequest : buildScanFollowupRequest(baseMessages, userRequest);
       const userMessage: AiChatMessage = options.retryUserMessage ?? {
         id: createId("msg"),
         role: "user",
         content: userRequest,
         timestamp: new Date().toISOString(),
-        kind: isChatRequest ? "chat" : "scan",
+        kind: "chat",
       };
       const messagesWithUser = [...baseMessages, userMessage];
       const pendingMessage: AiChatMessage = {
         id: createId("msg"),
         role: "assistant",
-        content: isChatRequest ? chatPendingText(userRequest) : scanPendingText(userRequest),
+        content: "thinking",
         timestamp: new Date().toISOString(),
         kind: "status",
         pending: true,
@@ -3545,71 +3392,63 @@ export function useAppController() {
         aiChatConversationId: conversationId,
         aiChatMessages: [...messagesWithUser, pendingMessage],
         aiChatLoading: true,
-      }));
-
-      if (isChatRequest) {
-        try {
-          const reply = await completeAiChat(messagesWithUser, generationRun.controller.signal);
-          if (!isCurrentGeneration()) return;
-          const finalMessages = [...messagesWithUser, {
-            id: createId("msg"),
-            role: "assistant" as const,
-            content: reply,
-            timestamp: new Date().toISOString(),
-            kind: "chat" as const,
-          }];
-          upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
-        } catch (error) {
-          if (!isCurrentGeneration() || isAbortError(error)) return;
-          const message = sanitizeToolError(error, userRequest) || "Anna couldn't finish that reply.";
-          const failedMessages: AiChatMessage[] = [
-            ...messagesWithUser,
-            {
-              ...pendingMessage,
-              pending: false,
-              kind: "error",
-              content: message,
-              timestamp: new Date().toISOString(),
-            },
-          ];
-          upsertAiConversationHistory(conversationId, failedMessages, { kind: "chat", query: userRequest });
-          showToast(message);
-        } finally {
-          if (aiGenerationRun.current === generationRun) {
-            aiGenerationRun.current = null;
-            setState((s) => ({ ...s, aiChatLoading: false }));
-          }
-        }
-        return;
-      }
-
-      setState((s) => ({
-        ...s,
         isCustomScanning: true,
         scanError: "",
-        scanStatus: "Planning scan strategy...",
-        askItemActions: {},
-        customRunProgress: { runId: "", question: userRequest, status: "queued", stage: "planning", stageKey: "planning", progress: {}, partial: {}, startedAt: "" },
+        scanStatus: "Understanding request...",
+        customRunProgress: {
+          runId: "",
+          question: userRequest,
+          status: "queued",
+          stage: "routing",
+          stageKey: "planning",
+          progress: {},
+          partial: {},
+          startedAt: "",
+        },
       }));
+      let runId = options.resumeRunId || "";
       try {
         const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
         const scanScope = await loadScanPlanForRun(scanMailbox);
-        const runId = `cs_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
-        const scanPromise = client.startCustomScan({
-          user_request: scanRequest,
-          mailbox: scanMailbox,
-          primary_count: scanScope.max_messages,
-          max_messages: scanScope.max_messages,
-          scan_window_days: scanScope.scan_window_days,
-          ai_provider: state.llmProvider,
-          storage_provider: state.storageProvider,
-          run_id: runId,
-          wait_timeout_seconds: 60,
+        runId = runId || `at_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+        const uiContext = buildAiTurnUiContext({
+          mailbox: state.mailbox,
+          selectedMailboxes: state.selectedMailboxes,
+          conversationId,
+          scanPlan: state.scanPlan,
+          displayRangeDays: state.inboxSettings?.display_range_days,
+          currentMailContext: options.currentMailContext,
+          languageHint: prefersChinese(userRequest) ? "zh" : "en",
+          messages: messagesWithUser,
+          savedPromptId: options.savedPromptId,
+          selectedThreads: options.selectedThreads,
         });
-        const started = await scanPromise;
+        const started = options.resumeRunId
+          ? await client.getRun(runId)
+          : await client.startAiTurn({
+            user_text: userRequest,
+            mailbox: scanMailbox,
+            ui_context: uiContext,
+            conversation_id: conversationId,
+            primary_count: scanScope.max_messages,
+            max_messages: scanScope.max_messages,
+            scan_window_days: scanScope.scan_window_days,
+            ai_provider: state.llmProvider,
+            storage_provider: state.storageProvider,
+            run_id: runId,
+            wait_timeout_seconds: 60,
+          });
         if (!isCurrentGeneration()) return;
         if (started.status === "failed" || started.error) {
-          throw new Error(started.error || "Custom scan failed");
+          throw new Error(started.error || "AI turn failed");
+        }
+        if (started.status !== "done") {
+          // 后端任务可能仍在运行；先保存 runId，页面刷新后由用户主动继续查询。
+          upsertAiConversationHistory(conversationId, [...messagesWithUser, pendingMessage], {
+            kind: "chat",
+            query: userRequest,
+            pendingRun: { runId, question: userRequest },
+          });
         }
         const completed = started.status === "done" && started.result
           ? started
@@ -3622,27 +3461,210 @@ export function useAppController() {
           }, generationRun.controller.signal);
         if (!isCurrentGeneration()) return;
         if (completed.status === "failed" || completed.error) {
-          throw new Error(completed.error || "Custom scan failed");
+          throw new Error(completed.error || "AI turn failed");
         }
-        await loadActiveCards();
-        if (!isCurrentGeneration()) return;
-        await loadRunHistory();
-        if (!isCurrentGeneration()) return;
-        await loadCustomPlans();
-        if (!isCurrentGeneration()) return;
-        const result = buildCustomRunResult(runId, (completed.result || {}) as Record<string, unknown>);
-        const finalMessages: AiChatMessage[] = [
-          ...messagesWithUser,
-          {
-            ...pendingMessage,
-            pending: false,
-            kind: "scan",
-            content: result.summary || result.plan_description || "Anna finished scanning your inbox.",
-            result,
-            timestamp: new Date().toISOString(),
-          },
-        ];
-        upsertAiConversationHistory(conversationId, finalMessages, { kind: "scan", query: userRequest, result });
+        const payload = (completed.result || {}) as Record<string, unknown>;
+        const kind = String(payload.kind || "chat");
+        const assistantText = String(payload.assistant_text || payload.summary || "").trim()
+          || (prefersChinese(userRequest) ? "已完成。" : "Done.");
+
+        const parseMailContext = (): AiMailContextRef | undefined => {
+          const mailCtx = payload.mail_context && typeof payload.mail_context === "object"
+            ? payload.mail_context as Record<string, unknown>
+            : null;
+          if (mailCtx && String(mailCtx.kind) === "thread") {
+            return {
+              kind: "gmail_thread",
+              mailbox: String(mailCtx.mailbox || scanMailbox),
+              thread_id: String(mailCtx.thread_id || ""),
+              anchor_message_id: String(mailCtx.message_id || ""),
+              latest_message_id: String(mailCtx.message_id || ""),
+            };
+          }
+          return options.currentMailContext || undefined;
+        };
+
+        const parseDraftReply = (raw: unknown): import("../types/mail").DraftReplyArtifact | null => {
+          if (!raw || typeof raw !== "object") return null;
+          const art = raw as Record<string, unknown>;
+          if (String(art.type || "") !== "draft_reply") return null;
+          return {
+            type: "draft_reply",
+            mailbox: String(art.mailbox || scanMailbox),
+            thread_id: String(art.thread_id || ""),
+            body: String(art.body || ""),
+            source_prompt: String(art.source_prompt || userRequest),
+            message_id: String(art.message_id || "") || undefined,
+            subject: String(art.subject || "") || undefined,
+          };
+        };
+
+        const parseArtifact = (): AiChatMessage["artifact"] => {
+          const raw = payload.artifact;
+          if (!raw || typeof raw !== "object") return null;
+          const art = raw as Record<string, unknown>;
+          const type = String(art.type || "");
+          if (type === "draft_reply") {
+            return parseDraftReply(raw);
+          }
+          if (type === "compose_draft") {
+            return {
+              type: "compose_draft",
+              mailbox: String(art.mailbox || scanMailbox),
+              body: String(art.body || ""),
+              source_prompt: String(art.source_prompt || userRequest),
+              mode: String(art.mode || "insert") === "replace" ? "replace" : "insert",
+              subject: String(art.subject || "") || undefined,
+            };
+          }
+          return null;
+        };
+
+        const parseArtifacts = (): import("../types/mail").DraftReplyArtifact[] | undefined => {
+          const rawList = payload.artifacts;
+          if (!Array.isArray(rawList)) return undefined;
+          const list = rawList
+            .map((item) => parseDraftReply(item))
+            .filter((item): item is import("../types/mail").DraftReplyArtifact => Boolean(item && item.body));
+          return list.length ? list : undefined;
+        };
+
+        if (kind === "scan") {
+          await loadActiveCards();
+          if (!isCurrentGeneration()) return;
+          await loadRunHistory();
+          if (!isCurrentGeneration()) return;
+          await loadCustomPlans();
+          if (!isCurrentGeneration()) return;
+          const result = buildCustomRunResult(runId, payload);
+          const finalMessages: AiChatMessage[] = [
+            ...messagesWithUser,
+            {
+              ...pendingMessage,
+              pending: false,
+              kind: "scan",
+              content: result.summary || result.plan_description || assistantText,
+              result,
+              sourcePrompt: userRequest,
+              timestamp: new Date().toISOString(),
+            },
+          ];
+          upsertAiConversationHistory(conversationId, finalMessages, { kind: "scan", query: userRequest, result });
+        } else if (kind === "clarify") {
+          const finalMessages: AiChatMessage[] = [
+            ...messagesWithUser,
+            {
+              ...pendingMessage,
+              pending: false,
+              kind: "clarify",
+              content: assistantText,
+              timestamp: new Date().toISOString(),
+            },
+          ];
+          upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
+        } else if (kind === "draft") {
+          const artifacts = parseArtifacts();
+          const primary = parseArtifact() || (artifacts && artifacts[0]) || null;
+          const finalMessages: AiChatMessage[] = [
+            ...messagesWithUser,
+            {
+              ...pendingMessage,
+              pending: false,
+              kind: "draft",
+              content: assistantText,
+              artifact: primary,
+              artifacts,
+              mailContext: parseMailContext(),
+              sourcePrompt: userRequest,
+              timestamp: new Date().toISOString(),
+            },
+          ];
+          upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
+        } else if (kind === "propose") {
+          const raw = payload.proposed_actions;
+          const proposed = raw && typeof raw === "object" ? raw as Record<string, unknown> : null;
+          const itemsRaw = proposed && Array.isArray(proposed.items) ? proposed.items : [];
+          const finalMessages: AiChatMessage[] = [
+            ...messagesWithUser,
+            {
+              ...pendingMessage,
+              pending: false,
+              kind: "propose",
+              content: assistantText,
+              proposedActions: proposed
+                ? {
+                    step_index: Number(proposed.step_index || 1),
+                    step_title: String(proposed.step_title || ""),
+                    rationale: String(proposed.rationale || ""),
+                    primary_action: String(proposed.primary_action || "mark_done"),
+                    allowed_actions: Array.isArray(proposed.allowed_actions)
+                      ? proposed.allowed_actions.map(String)
+                      : ["mark_done", "archive", "trash"],
+                    items: itemsRaw
+                      .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+                      .map((item) => ({
+                        mailbox: String(item.mailbox || scanMailbox),
+                        message_id: String(item.message_id || ""),
+                        thread_id: String(item.thread_id || ""),
+                        subject: String(item.subject || ""),
+                        default_selected: item.default_selected !== false,
+                      })),
+                    requires_user_confirmation: true,
+                    followup_after_apply: String(proposed.followup_after_apply || ""),
+                    followup_after_skip: String(proposed.followup_after_skip || ""),
+                    followup_after_dismiss: String(proposed.followup_after_dismiss || ""),
+                    continue_prompt: String(proposed.continue_prompt || ""),
+                    language: String(proposed.language || "") || undefined,
+                    recommendation_groups: Array.isArray(proposed.recommendation_groups)
+                      ? proposed.recommendation_groups
+                        .filter((g): g is Record<string, unknown> => Boolean(g) && typeof g === "object")
+                        .map((g) => ({
+                          title: String(g.title || ""),
+                          subjects: Array.isArray(g.subjects) ? g.subjects.map(String) : [],
+                          items: Array.isArray(g.items)
+                            ? g.items
+                              .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+                              .map((item) => ({
+                                mailbox: String(item.mailbox || scanMailbox),
+                                message_id: String(item.message_id || ""),
+                                thread_id: String(item.thread_id || ""),
+                                subject: String(item.subject || ""),
+                              }))
+                            : undefined,
+                        }))
+                      : undefined,
+                  }
+                : null,
+              timestamp: new Date().toISOString(),
+            },
+          ];
+          upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
+        } else if (kind === "mail_context") {
+          const finalMessages: AiChatMessage[] = [
+            ...messagesWithUser,
+            {
+              ...pendingMessage,
+              pending: false,
+              kind: "mail_context",
+              content: assistantText,
+              mailContext: parseMailContext(),
+              timestamp: new Date().toISOString(),
+            },
+          ];
+          upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
+        } else {
+          const finalMessages: AiChatMessage[] = [
+            ...messagesWithUser,
+            {
+              ...pendingMessage,
+              pending: false,
+              kind: kind === "memory" ? "memory" : "chat",
+              content: assistantText,
+              timestamp: new Date().toISOString(),
+            },
+          ];
+          upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
+        }
         setState((s) => ({ ...s, scanStatus: "", customRunProgress: null }));
       } catch (error) {
         if (!isCurrentGeneration() || isAbortError(error)) return;
@@ -3657,8 +3679,20 @@ export function useAppController() {
             timestamp: new Date().toISOString(),
           },
         ];
-        upsertAiConversationHistory(conversationId, failedMessages, { kind: "chat", query: userRequest });
-        setState((s) => ({ ...s, scanError: message, customRunProgress: s.customRunProgress ? { ...s.customRunProgress, status: "failed", stageKey: "failed" } : s.customRunProgress }));
+        upsertAiConversationHistory(conversationId, failedMessages, {
+          kind: "chat",
+          query: userRequest,
+          pendingRun: runId && isTransientConnectionError(error)
+            ? { runId, question: userRequest }
+            : undefined,
+        });
+        setState((s) => ({
+          ...s,
+          scanError: message,
+          customRunProgress: s.customRunProgress
+            ? { ...s.customRunProgress, status: "failed", stageKey: "failed" }
+            : s.customRunProgress,
+        }));
         showToast(message);
       } finally {
         if (aiGenerationRun.current === generationRun) {
@@ -3685,15 +3719,9 @@ export function useAppController() {
         return;
       }
       const userMessage = state.aiChatMessages[userIndex];
-      const forcedKind = userMessage.kind === "scan"
-        ? "scan"
-        : userMessage.kind === "mail_context"
-          ? "mail_context"
-          : "chat";
       void actions.sendAiChatMessage({
         prompt: userMessage.content,
         currentMailContext: userMessage.mailContext,
-        forcedKind,
         baseMessages: state.aiChatMessages.slice(0, userIndex),
         retryUserMessage: userMessage,
       });
@@ -4036,10 +4064,10 @@ export function useAppController() {
         const count = items.length;
         // 文案语言由调用方 toast 覆盖；此处保持中性短提示
         const label = action === "trash"
-          ? (count === 1 ? "Moved 1 thread to trash." : `Moved ${count} threads to trash.`)
+          ? (count === 1 ? "Moved 1 email to trash." : `Moved ${count} emails to trash.`)
           : action === "archive"
-            ? (count === 1 ? "Archived 1 thread." : `Archived ${count} threads.`)
-            : (count === 1 ? "Marked 1 thread as done." : `Marked ${count} threads as done.`);
+            ? (count === 1 ? "Archived 1 email." : `Archived ${count} emails.`)
+            : (count === 1 ? "Marked 1 email as done." : `Marked ${count} emails as done.`);
         showToast(label);
         const localDone = result.local_done || (result.requires_local_done ? items : []);
         // 通知 Inbox 工作台写入本地 Done 标记（与 HomeView Done 语义对齐）

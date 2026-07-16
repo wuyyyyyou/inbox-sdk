@@ -1,4 +1,4 @@
-"""AI 侧栏统一 turn：本地 Router + 白名单工具（阶段 B）。"""
+"""AI 侧栏统一 turn：本地 Router + 白名单工具（阶段 C）。"""
 
 from .runner import run_ai_turn
 

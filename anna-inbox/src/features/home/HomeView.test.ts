@@ -1,5 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { PlusIcon, accountDisplayName, aiSearchStatus, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, mergeDraftOverlayMessages, messageParticipant, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+import { PlusIcon, accountDisplayName, aiSearchStatus, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+
+describe("nextFeedRangeDays", () => {
+  it("steps 7 → 30 → 60 → all time", () => {
+    expect(nextFeedRangeDays(7)).toBe(30);
+    expect(nextFeedRangeDays(30)).toBe(60);
+    expect(nextFeedRangeDays(60)).toBe(0);
+    expect(nextFeedRangeDays(0)).toBeNull();
+  });
+
+  it("jumps to the next larger step for irregular windows", () => {
+    expect(nextFeedRangeDays(14)).toBe(30);
+    expect(nextFeedRangeDays(45)).toBe(60);
+  });
+});
 
 describe("PlusIcon", () => {
   it("renders an accessible-hidden SVG plus glyph", () => {
@@ -32,6 +46,13 @@ describe("isGmailAuthorizationRequired", () => {
   });
 });
 
+describe("isUnreadMessage", () => {
+  it("uses Gmail's UNREAD label when the DTO boolean is absent", () => {
+    expect(isUnreadMessage({ id: "label-only", label_ids: ["INBOX", "UNREAD"] })).toBe(true);
+    expect(isUnreadMessage({ id: "read", label_ids: ["INBOX"] })).toBe(false);
+  });
+});
+
 describe("gmailTrashUrl", () => {
   it("targets Trash for the selected Gmail account", () => {
     expect(gmailTrashUrl(" user+work@example.com ")).toBe(
@@ -53,19 +74,19 @@ describe("isAiConversationNearBottom", () => {
 describe("aiSearchStatus", () => {
   it("uses Chinese status copy for Chinese scan results", () => {
     expect(aiSearchStatus({ title: "收件箱整理", sections: [{ items: [{ subject: "Update" }] }] }))
-      .toBe("找到 1 个相关邮件线程。");
+      .toBe("找到 1 封相关邮件。");
   });
 
   it("keeps English status copy for English scan results", () => {
     expect(aiSearchStatus({ title: "Inbox summary", sections: [{ items: [{ subject: "Update" }] }] }))
-      .toBe("Found 1 relevant thread.");
+      .toBe("Found 1 relevant email.");
   });
 
   it("uses the English request language when a result title is malformed", () => {
     expect(aiSearchStatus(
       { title: "查找紧急邮件", sections: [{ items: [{ subject: "Update" }] }] },
       "Find urgent emails",
-    )).toBe("Found 1 relevant thread.");
+    )).toBe("Found 1 relevant email.");
   });
 });
 
@@ -143,6 +164,63 @@ describe("cached message label fallbacks", () => {
   it("keeps the important icon visible on outgoing draft rows", () => {
     expect(shouldShowImportantIcon(true, true, true)).toBe(true);
     expect(shouldShowImportantIcon(true, true, false)).toBe(false);
+  });
+});
+
+describe("mergeInboxSearchSourceMessages", () => {
+  it("includes unread todos that are excluded from the plain inbox projection", () => {
+    const inboxMail = {
+      id: "inbox-1",
+      label_ids: ["INBOX", "UNREAD"],
+      unread: true,
+      internal_date: "200",
+    };
+    const todoOnly = {
+      id: "todo-1",
+      label_ids: ["UNREAD"],
+      unread: true,
+      internal_date: "300",
+    };
+    const flags = {
+      todos: [todoOnly.id],
+      snoozed: [],
+      done: [],
+      doneRemoved: [],
+      drafts: [],
+      saved: { [todoOnly.id]: todoOnly },
+    };
+
+    expect(resolveSourceMessages("inbox", [inboxMail], [inboxMail, todoOnly], flags).map((m) => m.id)).toEqual([
+      "inbox-1",
+    ]);
+    expect(
+      mergeInboxSearchSourceMessages([inboxMail], [inboxMail, todoOnly], flags).map((m) => m.id),
+    ).toEqual(["todo-1", "inbox-1"]);
+  });
+
+  it("prefers live Gmail unread state over a stale saved todo copy", () => {
+    const saved = {
+      id: "todo-1",
+      label_ids: ["INBOX", "UNREAD"],
+      unread: true,
+      internal_date: "100",
+    };
+    const live = {
+      ...saved,
+      label_ids: ["INBOX"],
+      unread: false,
+    };
+    const flags = {
+      todos: [saved.id],
+      snoozed: [],
+      done: [],
+      doneRemoved: [],
+      drafts: [],
+      saved: { [saved.id]: saved },
+    };
+    const merged = mergeInboxSearchSourceMessages([live], [live], flags);
+    expect(merged).toHaveLength(1);
+    expect(isUnreadMessage(merged[0])).toBe(false);
   });
 });
 
@@ -259,6 +337,39 @@ describe("resolveSourceMessages", () => {
     const flags = { todos: [], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: {} };
 
     expect(resolveSourceMessages("inbox", inbox, [], flags).map((message) => message.id)).toEqual(["thread-1-new", "thread-2"]);
+  });
+
+  it("collapses starred older messages with the latest thread message", async () => {
+    const { uniqueLatestInboxThreads } = await import("./HomeView");
+    const mixed = [
+      {
+        id: "old-starred",
+        thread_id: "thread-1",
+        label_ids: ["INBOX", "STARRED"],
+        internal_date: "1719360000000",
+        subject: "Feature Invite",
+        snippet: "Hi Kate",
+      },
+      {
+        id: "new-reply",
+        thread_id: "thread-1",
+        label_ids: ["INBOX"],
+        internal_date: "1720051200000",
+        subject: "Feature Invite",
+        snippet: "No worries",
+      },
+      {
+        id: "other",
+        thread_id: "thread-2",
+        label_ids: ["INBOX"],
+        internal_date: "1719446400000",
+        subject: "Other",
+      },
+    ];
+    expect(uniqueLatestInboxThreads(mixed).map((message) => message.id)).toEqual([
+      "new-reply",
+      "other",
+    ]);
   });
 
   it("treats sent mail as done by default", () => {

@@ -59,7 +59,7 @@ export function createInitialState(): AppState {
     customTraceOpen: false,
     settingsOpen: false,
     settingsFocusRequest: 0,
-    inboxSettings: { mailbox: "", display_range_days: 30, time_section_mode: "detailed", stars_enabled: true, stars_limit: 10, todos_enabled: true, todos_limit: 10, llm_status_poll_seconds: 60, custom_categories: [] },
+    inboxSettings: { mailbox: "", display_range_days: 30, time_section_mode: "detailed", stars_enabled: true, stars_limit: 10, todos_enabled: true, todos_limit: 10, llm_status_poll_seconds: 60, initial_list_size: 100, custom_categories: [] },
     inboxSettingsEtag: "",
     inboxSettingsLoading: false,
     inboxSettingsError: "",

@@ -12,7 +12,7 @@
     - 版本号（App / Tool 分别写清）
     - 当前版本内容
     - 某个功能完成进度
-    - 项目基线
+    - 项目基线文档（只保留当前Tool版本下的，修改完成以后前面版本的基线文档应该删除）
 - 根据当前工作树内容生成git commit的中文消息，不要包含测试补充、文档更新、版本同步的消息，最后我审核后手动提交，message格式如下：
     ```md
     version: (tool的版本号)
@@ -22,8 +22,8 @@
 
 ## 项目基线
 
-- **App（前端）**：`2.0.24` — 位于 `anna-inbox/`
-- **Tool（Executa）**：`2.1.5` — 位于 `inbox-tool/`
+- **App（前端）**：`2.0.25` — 位于 `anna-inbox/`
+- **Tool（Executa）**：`2.1.6` — 位于 `inbox-tool/`
 
 - `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表。
 - `anna-inbox/src/features/mail-detail/`：线程详情、正文、草稿和附件预览。
@@ -31,7 +31,7 @@
 - `anna-inbox/src/api/mailAgentClient.ts`：所有 Executa 工具调用的统一 facade。
 - `anna-inbox/manifest.json`、`inbox-tool/src/anna_inbox_executa/common.py` 与 `mailbox_tools.py`：Google Connected accounts 声明、多账号发现状态和安全错误提示。
 - `inbox-tool/src/anna_inbox_executa/`：JSON-RPC 入口和工具分发（含 `start_ai_turn`、整理确认与 Saved prompts / Memory）。
-- `inbox-tool/src/mail_agent/ai_turn/`：AI 侧栏本地 Router 与白名单 Runner（阶段 A+B）。
+- `inbox-tool/src/mail_agent/ai_turn/`：AI 侧栏本地 Router 与白名单 Runner（阶段 A+B+C）。
 - `inbox-tool/src/mail_agent/mail_providers/gmail/adapter.py`：Gmail API、OAuth、本地缓存和正文解码。
 - `inbox-tool/src/mail_agent/storage/`：APS/local storage 的统一 async 层。
 - `inbox-tool/src/mail_agent/ask/`：Ask 规划、搜索和回答。
@@ -82,14 +82,14 @@ App 与 Tool **版本号解耦，互不强制对齐**：
 
 | 端 | 当前版本 | 权威文件 | 须同步的文件 |
 | --- | --- | --- | --- |
-| App | `2.0.24` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
-| Tool | `2.1.5` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
+| App | `2.0.25` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
+| Tool | `2.1.6` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
 
 规则：
 
 - 只改前端 / App 发布：只 bump **App** 版本（`anna-inbox/app.json`），**不要**改 Tool 版本。
 - 只改后端 / Executa 发布：只 bump **Tool** 版本；平台若报「同版本已发布且内容不同」，必须再 bump Tool（不可覆盖已发布版本）。
-- Tool 线自 `2.1.1` 起独立演进；App 线继续在 `2.0.x`（或后续自行决定）演进。当前基线：App `2.0.24` / Tool `2.1.5`。
+- Tool 线自 `2.1.1` 起独立演进；App 线继续在 `2.0.x`（或后续自行决定）演进。当前基线：App `2.0.25` / Tool `2.1.6`。
 - `min_version` 跟随 **Tool** 版本，不跟随 App 版本。
 - 提交前审核时，若未说明只升哪一端，先与我确认，再改版本号。
 

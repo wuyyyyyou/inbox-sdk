@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from urllib.request import urlopen
 from unittest.mock import patch
 
 
@@ -45,7 +46,7 @@ def main() -> None:
     assert "body_html" not in prompt_payload
 
     # Newsletter HTML larger than the old 30k/24k thresholds must retain its
-    # layout when the complete response still fits under 256 KiB.
+    # layout when the complete response still fits under the 48 KiB host-safe budget.
     newsletter_html = "<html><body><table>" + ("<tr><td>Cloud update</td></tr>" * 1200) + "</table></body></html>"
     encoded_html = base64.urlsafe_b64encode(newsletter_html.encode("utf-8")).decode("ascii")
     newsletter_message = _message(2, payload={
@@ -59,6 +60,53 @@ def main() -> None:
     assert newsletter_display.get("body_html")
     assert "body_text" not in newsletter_display
     assert tools._inbox_message_display_rpc_frame_size(newsletter_display) <= tools.INBOX_THREAD_RESPONSE_MAX_BYTES
+
+    # JSON 转义后的超大 HTML 必须通过 loopback URL 读取，不能再次塞入 JSON-RPC。
+    oversized_html = "<html><body><p>" + ("汉" * 100_000) + "</p></body></html>"
+    oversized_message = _message(3, payload={
+        "mimeType": "text/html",
+        "body": {"data": base64.urlsafe_b64encode(oversized_html.encode("utf-8")).decode("ascii")},
+    })
+    oversized_display = tools._build_inbox_message_display_response("user@example.com", oversized_message)
+    assert oversized_display.get("body_url")
+    assert "body_html" not in oversized_display
+    assert tools._inbox_message_display_rpc_frame_size(oversized_display) <= tools.INBOX_THREAD_RESPONSE_MAX_BYTES
+    with urlopen(str(oversized_display["body_url"])) as response:
+        assert "汉" * 100 in response.read().decode("utf-8")
+
+    # 超长纯文本同样必须返回完整正文 URL，不能退化为截断后的 URL 列表预览。
+    oversized_text = "纯文本正文\n" + ("汉" * 100_000)
+    with patch(
+        "mail_agent.mail_providers.gmail.adapter.decode_body_for_display",
+        return_value={"html": "", "text": oversized_text},
+    ):
+        oversized_text_display = tools._build_inbox_message_display_response("user@example.com", _message(31))
+    assert oversized_text_display.get("body_url")
+    assert oversized_text_display["body_truncated"] is False
+    with urlopen(str(oversized_text_display["body_url"])) as response:
+        assert "纯文本正文" in response.read().decode("utf-8")
+
+    # CID 图片也必须改为同一短期 loopback 服务的 URL，避免 base64 data URI 膨胀正文。
+    cid_html = '<html><body><img src="cid:newsletter-logo"></body></html>'
+    cid_message = _message(4, payload={
+        "mimeType": "multipart/related",
+        "parts": [
+            {"mimeType": "text/html", "body": {"data": base64.urlsafe_b64encode(cid_html.encode("utf-8")).decode("ascii")}},
+            {
+                "mimeType": "image/png",
+                "headers": [{"name": "Content-ID", "value": "<newsletter-logo>"}],
+                "body": {"data": base64.urlsafe_b64encode(b"png-bytes").decode("ascii")},
+            },
+        ],
+    })
+    cid_display = tools._build_inbox_message_display_response("user@example.com", cid_message)
+    assert cid_display.get("body_url")
+    with urlopen(str(cid_display["body_url"])) as response:
+        rendered_cid_html = response.read().decode("utf-8")
+    assert "cid:newsletter-logo" not in rendered_cid_html
+    cid_url = rendered_cid_html.split('src="', 1)[1].split('"', 1)[0]
+    with urlopen(cid_url) as response:
+        assert response.read() == b"png-bytes"
 
     with patch(
         "mail_agent.mail_providers.gmail.adapter.decode_body_for_display",
@@ -167,7 +215,8 @@ def main() -> None:
             "thread-1",
             include_display_body=False,
         )
-    assert 0 < reduced_page["returned_count"] < 5
+    # 超长元数据会在序列化边界被裁剪；裁剪后仍应尽量保留完整首屏。
+    assert 0 < reduced_page["returned_count"] <= 5
     assert reduced_page["messages"][-1]["id"] == "m11"
     assert reduced_page["next_before_index"] == 12 - reduced_page["returned_count"]
     assert tools._inbox_thread_rpc_frame_size(reduced_page) <= tools.INBOX_THREAD_RESPONSE_MAX_BYTES

@@ -11,7 +11,13 @@ const homeViewSource = readFileSync(
 );
 
 describe("inbox startup settings", () => {
-  it("loads inbox settings for the initial mailbox", () => {
+  it("loads inbox settings before snapshot preload so display range is respected", () => {
+    expect(controllerSource).toMatch(
+      /const bootSettings = await loadInboxSettings\(bootMailbox\)/,
+    );
+    expect(controllerSource).toMatch(
+      /preloadMailboxSnapshot\(bootMailbox, rangeDays\)/,
+    );
     expect(controllerSource).toMatch(
       /await Promise\.all\(\[[\s\S]*?loadInboxSettings\(currentMailbox\),/,
     );
@@ -42,8 +48,10 @@ describe("AI scan invocation", () => {
 
   it("wires the unified startAiTurn path for the sidebar", () => {
     expect(controllerSource).toMatch(/client\.startAiTurn\(/);
-    expect(controllerSource).toMatch(/isAiTurnEnabled\(/);
     expect(controllerSource).toMatch(/buildAiTurnUiContext\(/);
+    expect(controllerSource).toMatch(/selected_threads:/);
+    expect(controllerSource).not.toMatch(/decideAiRoute\(/);
+    expect(controllerSource).not.toMatch(/isAiTurnEnabled\(/);
   });
 
   it("resumes a timed-out sidebar turn by polling its existing run", () => {

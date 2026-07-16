@@ -1,4 +1,4 @@
-"""AI turn 阶段 B 白名单工具实现：写稿、整理建议、记忆写入。"""
+"""AI turn 白名单工具实现：写稿、批量、整理建议、记忆写入（阶段 C）。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ _logger = logging.getLogger(__name__)
 
 _BODY_LIMIT = 2000
 _DRAFT_LIMIT = 8000
+# 批量写稿上限：控制 Sampling 次数与前端展示体积
+_BATCH_MAX_THREADS = 5
 
 
 def _uses_chinese(text: str) -> bool:
@@ -558,6 +560,268 @@ async def tool_propose_inbox_actions(
     }
 
 
+def _selected_thread_refs(ui_context: dict[str, Any]) -> list[dict[str, Any]]:
+    """从 ui_context.selected_threads 提取去重后的线程引用（上限 _BATCH_MAX_THREADS）。"""
+    raw = ui_context.get("selected_threads")
+    if not isinstance(raw, list):
+        return []
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        mailbox = str(item.get("mailbox") or ui_context.get("mailbox") or "").strip()
+        message_id = str(item.get("message_id") or "").strip()
+        thread_id = str(item.get("thread_id") or message_id).strip()
+        if not mailbox or not (message_id or thread_id):
+            continue
+        key = f"{mailbox}|{thread_id or message_id}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "mailbox": mailbox,
+            "message_id": message_id or thread_id,
+            "thread_id": thread_id or message_id,
+            "subject": str(item.get("subject") or "")[:200],
+        })
+        if len(out) >= _BATCH_MAX_THREADS:
+            break
+    return out
+
+
+async def _draft_one_thread(
+    user_text: str,
+    *,
+    mailbox: str,
+    message_id: str,
+    thread_id: str,
+    subject_hint: str,
+    language: str,
+    sampling_create_message: Any,
+    memory_summary: str,
+    mode: str,
+) -> dict[str, Any]:
+    """为单封邮件生成 draft 证据隔离（不跨线程复用正文）。"""
+    excerpt = await _load_thread_excerpt(mailbox, message_id, thread_id)
+    subject = excerpt["subject"] or subject_hint
+    body = excerpt["body"] or excerpt.get("snippet") or ""
+    fallback_text = (
+        f"已为「{subject or '邮件'}」准备草稿。"
+        if language == "zh"
+        else f"Draft ready for “{subject or 'this email'}”."
+    )
+    if sampling_create_message is None:
+        draft_body = (
+            f"您好，\n\n关于「{subject or '该邮件'}」，我已收到。\n\n此致"
+            if language == "zh"
+            else f"Hi,\n\nThanks for your email about {subject or 'this'}.\n\nBest regards"
+        )
+        return {
+            "ok": True,
+            "assistant_line": fallback_text,
+            "artifact": {
+                "type": "draft_reply",
+                "mailbox": mailbox,
+                "thread_id": thread_id,
+                "message_id": message_id,
+                "subject": subject,
+                "body": draft_body,
+                "source_prompt": user_text,
+            },
+            "fallback_used": True,
+        }
+
+    if mode == "batch_outreach":
+        system = (
+            "You write a short personalized outreach / follow-up email for ONE recipient only. "
+            "Return JSON only: {\"assistant_line\": string, \"draft_body\": string}. "
+            "Use only this email's evidence. Do not mix other threads. Never send. "
+            f"Language: {'Chinese' if language == 'zh' else 'English'}."
+        )
+    else:
+        system = (
+            "You draft a short reply for ONE email only. "
+            "Return JSON only: {\"assistant_line\": string, \"draft_body\": string}. "
+            "Use only this email's evidence. Do not invent facts. Never send. "
+            f"Language: {'Chinese' if language == 'zh' else 'English'}."
+        )
+    user_message = (
+        f"User request: {user_text}\n"
+        f"Mode: {mode}\n"
+        f"Subject: {subject}\n"
+        f"From: {excerpt.get('from_addr') or ''}\n"
+        f"Body excerpt:\n{body or '(empty)'}\n"
+    )
+    if memory_summary:
+        user_message += f"\n{memory_summary}\n"
+
+    result = await call_llm_json_safe(
+        sampling_create_message,
+        system_prompt=system,
+        user_message=user_message,
+        fallback={"assistant_line": fallback_text, "draft_body": ""},
+        temperature=0.3,
+        max_tokens=1600,
+        timeout=90.0,
+        metadata={"tool": f"ai_turn_{mode}"},
+        allow_fallback=True,
+        allow_sampling_provider_fallback=True,
+        max_attempts=1,
+    )
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    draft_body = str(payload.get("draft_body") or "").strip()[:_DRAFT_LIMIT]
+    assistant_line = str(payload.get("assistant_line") or fallback_text).strip()
+    if not draft_body:
+        return {
+            "ok": False,
+            "assistant_line": (
+                f"未能为「{subject or message_id}」生成草稿。"
+                if language == "zh"
+                else f"Could not draft for “{subject or message_id}”."
+            ),
+            "error": "draft_empty",
+            "mailbox": mailbox,
+            "thread_id": thread_id,
+            "message_id": message_id,
+            "subject": subject,
+            "fallback_used": True,
+        }
+    return {
+        "ok": True,
+        "assistant_line": assistant_line,
+        "artifact": {
+            "type": "draft_reply",
+            "mailbox": mailbox,
+            "thread_id": thread_id,
+            "message_id": message_id,
+            "subject": subject,
+            "body": draft_body,
+            "source_prompt": user_text,
+        },
+        "fallback_used": bool(result.get("fallback_used")),
+    }
+
+
+async def tool_batch_draft(
+    user_text: str,
+    ui_context: dict[str, Any],
+    *,
+    language: str,
+    sampling_create_message: Any,
+    memory_summary: str = "",
+    mode: str = "batch_draft",
+) -> dict[str, Any]:
+    """对多选线程逐封起草回复；每封独立 evidence，禁止串上下文。
+
+    mode:
+    - batch_draft：多封简短回复草稿（AI-015）
+    - batch_outreach：个性化触达/跟进（AI-016）
+    """
+    refs = _selected_thread_refs(ui_context)
+    if not refs:
+        clarify = (
+            "请先在收件箱勾选需要批量起草的邮件（最多 5 封），再试一次。"
+            if language == "zh"
+            else "Select up to 5 emails in the inbox first, then ask for batch drafts."
+        )
+        return {"kind": "clarify", "assistant_text": clarify, "clarify": clarify}
+
+    artifacts: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    any_fallback = False
+    for ref in refs:
+        item = await _draft_one_thread(
+            user_text,
+            mailbox=ref["mailbox"],
+            message_id=ref["message_id"],
+            thread_id=ref["thread_id"],
+            subject_hint=ref.get("subject") or "",
+            language=language,
+            sampling_create_message=sampling_create_message,
+            memory_summary=memory_summary,
+            mode=mode,
+        )
+        if item.get("fallback_used"):
+            any_fallback = True
+        if item.get("ok") and isinstance(item.get("artifact"), dict):
+            artifacts.append(item["artifact"])
+        else:
+            failures.append({
+                "mailbox": ref["mailbox"],
+                "thread_id": ref["thread_id"],
+                "message_id": ref["message_id"],
+                "subject": ref.get("subject") or "",
+                "error": str(item.get("error") or "failed"),
+            })
+
+    if not artifacts:
+        return {
+            "kind": "error",
+            "assistant_text": (
+                "批量草稿全部生成失败，请稍后重试。"
+                if language == "zh"
+                else "All batch drafts failed. Please try again."
+            ),
+            "error": "batch_draft_empty",
+            "fallback_used": True,
+        }
+
+    n = len(artifacts)
+    fail_n = len(failures)
+    if language == "zh":
+        assistant_text = f"已为 {n} 封邮件生成草稿（证据按封隔离，请逐封核对后发送）。"
+        if fail_n:
+            assistant_text += f" 另有 {fail_n} 封未能生成。"
+        if mode == "batch_outreach":
+            assistant_text = f"已为 {n} 封生成个性化跟进草稿（变量按收件人隔离）。" + (
+                f" 另有 {fail_n} 封失败。" if fail_n else ""
+            )
+    else:
+        assistant_text = (
+            f"Prepared {n} draft{'s' if n != 1 else ''} "
+            f"(one evidence set per message — review before sending)."
+        )
+        if fail_n:
+            assistant_text += f" {fail_n} could not be generated."
+        if mode == "batch_outreach":
+            assistant_text = (
+                f"Prepared {n} personalized outreach draft{'s' if n != 1 else ''} "
+                f"(variables isolated per recipient)."
+            )
+            if fail_n:
+                assistant_text += f" {fail_n} failed."
+
+    return {
+        "kind": "draft",
+        "assistant_text": assistant_text,
+        # 兼容单 artifact 前端：首封放 artifact，全部放 artifacts
+        "artifact": artifacts[0],
+        "artifacts": artifacts,
+        "batch_failures": failures,
+        "fallback_used": any_fallback,
+    }
+
+
+async def tool_batch_outreach(
+    user_text: str,
+    ui_context: dict[str, Any],
+    *,
+    language: str,
+    sampling_create_message: Any,
+    memory_summary: str = "",
+) -> dict[str, Any]:
+    """批量个性化 outreach；内部复用 batch_draft 隔离逻辑。"""
+    return await tool_batch_draft(
+        user_text,
+        ui_context,
+        language=language,
+        sampling_create_message=sampling_create_message,
+        memory_summary=memory_summary,
+        mode="batch_outreach",
+    )
+
+
 async def tool_remember_preference(
     user_text: str,
     *,
@@ -679,6 +943,8 @@ async def apply_proposed_actions(
 
 __all__ = [
     "apply_proposed_actions",
+    "tool_batch_draft",
+    "tool_batch_outreach",
     "tool_compose_new",
     "tool_draft_reply",
     "tool_propose_inbox_actions",

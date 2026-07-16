@@ -117,6 +117,15 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
             result_data["mail_context"] = outcome["mail_context"]
         if isinstance(outcome.get("artifact"), dict):
             result_data["artifact"] = outcome["artifact"]
+        # 批量写稿：多 artifact 按封隔离（阶段 C）
+        if isinstance(outcome.get("artifacts"), list):
+            result_data["artifacts"] = [
+                item for item in outcome["artifacts"] if isinstance(item, dict)
+            ][:20]
+            if not result_data.get("artifact") and result_data["artifacts"]:
+                result_data["artifact"] = result_data["artifacts"][0]
+        if isinstance(outcome.get("batch_failures"), list):
+            result_data["batch_failures"] = outcome["batch_failures"][:20]
         if kind == "propose" and isinstance(outcome.get("proposed_actions"), dict):
             result_data["proposed_actions"] = outcome["proposed_actions"]
             result_data["requires_user_confirmation"] = True

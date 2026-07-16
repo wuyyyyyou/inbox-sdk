@@ -17,6 +17,7 @@ describe("inbox settings", () => {
       todos_enabled: true,
       todos_limit: 10,
       llm_status_poll_seconds: 60,
+      initial_list_size: 100,
     });
 
     expect(clampInboxSettings({ display_range_days: 9, stars_limit: 1000, llm_status_poll_seconds: 15 as never })).toMatchObject({
@@ -26,6 +27,8 @@ describe("inbox settings", () => {
     });
     expect(clampInboxSettings({ llm_status_poll_seconds: 0 }).llm_status_poll_seconds).toBe(0);
     expect(clampInboxSettings({ llm_status_poll_seconds: 120 }).llm_status_poll_seconds).toBe(120);
+    expect(clampInboxSettings({ initial_list_size: 200 }).initial_list_size).toBe(200);
+    expect(clampInboxSettings({ initial_list_size: 50 as never }).initial_list_size).toBe(100);
   });
 
   it("fills defaults for Split fields saved by earlier versions", () => {
@@ -82,6 +85,33 @@ describe("inbox settings", () => {
     expect(result.custom.billing.map((message) => message.id)).toEqual(["bill", "report"]);
     expect(result.custom.reports.map((message) => message.id)).toEqual(["report"]);
     expect(result.other.map((message) => message.id)).toEqual(["other"]);
+  });
+
+  it("matches custom Splits against an expanded source so is:unread includes todos", () => {
+    const plain = [
+      { id: "inbox-unread", label_ids: ["INBOX", "UNREAD"], unread: true },
+      { id: "inbox-read", label_ids: ["INBOX"], unread: false },
+    ];
+    const expanded = [
+      ...plain,
+      { id: "todo-unread", label_ids: ["UNREAD"], unread: true },
+    ];
+    const result = splitInboxMessages(
+      plain,
+      {
+        ...DEFAULT_INBOX_SETTINGS,
+        custom_categories: [
+          { id: "unread", name: "Unread", query: "is:unread", hide_when_empty: false, bundling_behavior: "default" },
+        ],
+      },
+      expanded,
+    );
+
+    expect(result.custom.unread.map((message) => message.id)).toEqual([
+      "inbox-unread",
+      "todo-unread",
+    ]);
+    expect(result.other.map((message) => message.id)).toEqual(["inbox-read"]);
   });
 
   it("groups a Split by sender or leaves it ungrouped", () => {

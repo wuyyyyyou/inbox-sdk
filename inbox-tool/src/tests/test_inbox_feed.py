@@ -65,6 +65,7 @@ def main() -> None:
         starred = list_inbox_emails("USER@example.com", 30, 50, "starred")
         all_mail = list_inbox_emails("USER@example.com", 7, 500, "all", True)
 
+    # 刷新固定走 All mail query（含 days 窗口），与请求 category 无关
     assert captured == {"mailbox": "user@example.com", "query": "in:anywhere -in:chats newer_than:7d", "limit": 500}
     assert [item["id"] for item in result["messages"]] == ["new", "old"]
     assert result["messages"][0]["unread"] is True
@@ -75,8 +76,12 @@ def main() -> None:
     assert result["messages"][0]["body_preview"] == "Preview"
     assert "body_text" not in result["messages"][0]
     assert starred["category"] == "starred"
+    assert starred["query"] == "in:anywhere -in:chats newer_than:30d"
     assert all_mail["category"] == "all"
     assert all_mail["cache_reset"] == {"mailbox": "user@example.com"}
+    assert "has_more" in result
+    assert "next_offset" in result
+    assert result["cached_total"] == 2
     clear_cache.assert_called_once_with("user@example.com")
 
     default_query: dict[str, object] = {}
@@ -93,7 +98,36 @@ def main() -> None:
     ):
         default_feed = list_inbox_emails("USER@example.com")
     assert default_feed["days"] == 30
-    assert default_query == {"mailbox": "user@example.com", "query": "in:inbox newer_than:30d", "limit": 100}
+    assert default_query == {"mailbox": "user@example.com", "query": "in:anywhere -in:chats newer_than:30d", "limit": 100}
+
+    # list_inbox_emails 响应帧必须受 48KiB 预算约束（缓存仍可写入更多）
+    oversized_messages = [
+        {
+            "id": f"big-{index}",
+            "thread_id": f"thread-{index}",
+            "internal_date": str(1_720_000_000_000 - index),
+            "from": f"Sender {index} <sender-{index}@example.com> " + ("f" * 400),
+            "to": "recipient@example.com " + ("t" * 400),
+            "subject": "s" * 500,
+            "snippet": "p" * 120,
+            "body_preview": "b" * 120,
+            "label_ids": ["INBOX", "UNREAD"],
+            "attachments": [],
+        }
+        for index in range(100)
+    ]
+    oversized_ids = [item["id"] for item in oversized_messages]
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+        patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"emailAddress": "user@example.com"}),
+        patch("mail_agent.mail_providers.gmail.adapter.live_search_metadata_and_cache", return_value=oversized_ids),
+        patch("mail_agent.mail_providers.gmail.adapter.list_messages", return_value=oversized_messages),
+    ):
+        bounded_feed = list_inbox_emails("USER@example.com", 30, 100, "all")
+    assert 0 < bounded_feed["count"] < 100
+    assert bounded_feed["has_more"] is True
+    assert bounded_feed["cached_total"] == 100
+    assert _cached_rpc_frame_size("list_inbox_emails", bounded_feed) <= CACHED_FEED_RESPONSE_MAX_BYTES
 
     thread_subject_messages = [
         {
@@ -371,6 +405,9 @@ def main() -> None:
         patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
         patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"messages": [{"id": "gmail-1"}, {"id": "gmail-2"}, {"id": "gmail-3"}], "nextPageToken": "next-page"}) as gmail_request,
         patch("mail_agent.mail_providers.gmail.adapter.fetch_message_summary", side_effect=lambda mailbox, message_id: fetched_summaries.get(message_id)),
+        patch("mail_agent.mail_providers.gmail.adapter.read_cache", return_value={"messages": []}),
+        patch("mail_agent.mail_providers.gmail.adapter.write_index") as write_index,
+        patch("mail_agent.mail_providers.gmail.adapter.message_summary", side_effect=lambda item: item),
     ):
         all_mail_page = list_gmail_emails_page("USER@example.com", 30, 100, "all", "", 0, ["gmail-1"])
     assert [item["id"] for item in all_mail_page["messages"]] == ["gmail-2", "gmail-3"]
@@ -378,26 +415,35 @@ def main() -> None:
     assert all_mail_page["page_offset"] == 0
     assert all_mail_page["has_more"] is True
     assert gmail_request.call_args.args[2]["q"] == "in:anywhere -in:chats"
+    assert gmail_request.call_args.args[2]["includeSpamTrash"] == "true"
+    write_index.assert_called()
 
     with (
         patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
         patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"messages": [{"id": "gmail-2"}]}) as gmail_request,
         patch("mail_agent.mail_providers.gmail.adapter.fetch_message_summary", return_value=fetched_summaries["gmail-2"]),
+        patch("mail_agent.mail_providers.gmail.adapter.read_cache", return_value={"messages": []}),
+        patch("mail_agent.mail_providers.gmail.adapter.write_index"),
+        patch("mail_agent.mail_providers.gmail.adapter.message_summary", side_effect=lambda item: item),
     ):
+        # category=inbox 仅诊断字段；Gmail query 仍固定 All mail
         inbox_page = list_gmail_emails_page("USER@example.com", 30, 100, "inbox")
     assert [item["id"] for item in inbox_page["messages"]] == ["gmail-2"]
     assert inbox_page["has_more"] is False
-    assert gmail_request.call_args.args[2]["q"] == "in:inbox newer_than:30d"
+    assert gmail_request.call_args.args[2]["q"] == "in:anywhere -in:chats"
 
     with (
         patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
         patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"messages": [{"id": "gmail-2"}]}) as gmail_request,
         patch("mail_agent.mail_providers.gmail.adapter.fetch_message_summary", return_value=fetched_summaries["gmail-2"]),
+        patch("mail_agent.mail_providers.gmail.adapter.read_cache", return_value={"messages": []}),
+        patch("mail_agent.mail_providers.gmail.adapter.write_index"),
+        patch("mail_agent.mail_providers.gmail.adapter.message_summary", side_effect=lambda item: item),
     ):
         all_time_inbox_page = list_gmail_emails_page("USER@example.com", 0, 100, "inbox")
     assert [item["id"] for item in all_time_inbox_page["messages"]] == ["gmail-2"]
     assert all_time_inbox_page["has_more"] is False
-    assert gmail_request.call_args.args[2]["q"] == "in:inbox"
+    assert gmail_request.call_args.args[2]["q"] == "in:anywhere -in:chats"
 
     out_of_order_summaries = {
         "gmail-new": {
@@ -425,6 +471,9 @@ def main() -> None:
         patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
         patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"messages": [{"id": "gmail-old"}, {"id": "gmail-new"}]}),
         patch("mail_agent.mail_providers.gmail.adapter.fetch_message_summary", side_effect=lambda mailbox, message_id: out_of_order_summaries.get(message_id)),
+        patch("mail_agent.mail_providers.gmail.adapter.read_cache", return_value={"messages": []}),
+        patch("mail_agent.mail_providers.gmail.adapter.write_index"),
+        patch("mail_agent.mail_providers.gmail.adapter.message_summary", side_effect=lambda item: item),
     ):
         ordered_page = list_gmail_emails_page("USER@example.com", 30, 100, "all")
     assert [item["id"] for item in ordered_page["messages"]] == ["gmail-new", "gmail-old"]
@@ -514,6 +563,9 @@ def main() -> None:
         patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
         patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value=gmail_refs) as gmail_page_request,
         patch("mail_agent.mail_providers.gmail.adapter.fetch_message_summary", side_effect=fake_gmail_summary) as fetch_summary,
+        patch("mail_agent.mail_providers.gmail.adapter.read_cache", return_value={"messages": []}),
+        patch("mail_agent.mail_providers.gmail.adapter.write_index") as write_index,
+        patch("mail_agent.mail_providers.gmail.adapter.message_summary", side_effect=lambda item: item),
     ):
         transient_page = list_gmail_emails_page(
             "USER@example.com", 30, 100, "all", "", 0, ["gmail-1"],
@@ -525,6 +577,7 @@ def main() -> None:
     assert fetch_summary.call_count == 2
     assert gmail_page_request.call_args.args[2]["q"] == "in:anywhere -in:chats"
     assert gmail_page_request.call_args.args[2]["includeSpamTrash"] == "true"
+    write_index.assert_called()
     print("PASS inbox feed tests")
 
 

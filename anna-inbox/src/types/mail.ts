@@ -358,6 +358,9 @@ export interface CustomRunResultItem {
 /** LLM 连通性探测轮询间隔（秒）；0 表示关闭自动轮询 */
 export type LlmStatusPollSeconds = 0 | 30 | 60 | 120 | 300;
 
+/** 列表首屏展示条数（列表行）；超出显示 Show more */
+export type InitialListSize = 100 | 200 | 400;
+
 export interface InboxSettings {
   mailbox: string;
   display_range_days: 7 | 30 | 60;
@@ -367,6 +370,8 @@ export interface InboxSettings {
   todos_enabled: boolean;
   todos_limit: number;
   llm_status_poll_seconds: LlmStatusPollSeconds;
+  /** 首屏最多展示的邮件数；更大窗口仍可预拉取到本地 */
+  initial_list_size: InitialListSize;
   custom_categories: InboxCustomCategory[];
   updated_at?: string;
 }
@@ -508,6 +513,8 @@ export interface InboxMessageDisplayBodyPayload {
   thread_id: string;
   body_text?: string;
   body_html?: string;
+  /** 超大 HTML 的短期 loopback 地址；前端读取后不写入浏览器缓存。 */
+  body_url?: string;
   body_truncated?: boolean;
 }
 
@@ -565,6 +572,9 @@ export interface DraftReplyArtifact {
   thread_id: string;
   body: string;
   source_prompt: string;
+  /** 批量写稿时可选：来源 message / 主题，便于 UI 分行展示 */
+  message_id?: string;
+  subject?: string;
 }
 
 export interface MailPromptRunResult {
@@ -880,6 +890,8 @@ export interface AiChatMessage {
   result?: CustomRunResult | null;
   pending?: boolean;
   artifact?: DraftReplyArtifact | ComposeDraftArtifact | SendPlanArtifact | null;
+  /** 批量写稿：一条消息内多份 draft_reply（按封隔离） */
+  artifacts?: DraftReplyArtifact[];
   proposedActions?: ProposedInboxActions | null;
   replyGaps?: ReplyGaps;
   mailContext?: AiMailContextRef;
@@ -890,16 +902,9 @@ export interface AiChatMessage {
   clarification?: AiClarificationPayload;
 }
 
-export type AiRouteKind = "chat" | "mail_context" | "scan" | "clarify";
-
-export interface AiRouteDecision {
-  kind: AiRouteKind;
-  reason: string;
-  confidence: "high" | "medium" | "low";
-}
-
+/** 后端 clarify 文案提示；阶段 C 起不再用前端强制 kind 分流 */
 export interface AiClarificationAction {
-  id: "mail_context" | "scan" | "chat";
+  id: string;
   label: string;
 }
 
@@ -909,12 +914,19 @@ export interface AiClarificationPayload {
   actions: AiClarificationAction[];
   freeform_enabled: boolean;
   status: "pending" | "resolved" | "dismissed";
-  resolved_action?: AiClarificationAction["id"];
+  resolved_action?: string;
+}
+
+/** 收件箱多选线程，写入 ui_context.selected_threads */
+export interface AiSelectedThreadRef {
+  mailbox: string;
+  message_id: string;
+  thread_id: string;
+  subject?: string;
 }
 
 export interface SendAiMessageOptions {
   currentMailContext?: AiMailContextRef | null;
-  forcedKind?: Exclude<AiRouteKind, "clarify">;
   prompt?: string;
   clarificationMessageId?: string;
   baseMessages?: AiChatMessage[];
@@ -923,5 +935,7 @@ export interface SendAiMessageOptions {
   savedPromptId?: string;
   /** 恢复已提交的 AI turn，只查询既有 run，不重新提交请求。 */
   resumeRunId?: string;
+  /** 收件箱勾选线程（批量 draft / outreach） */
+  selectedThreads?: AiSelectedThreadRef[];
 }
 

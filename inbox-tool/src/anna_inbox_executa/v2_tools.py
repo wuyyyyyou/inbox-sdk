@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
+from html import escape as html_escape
 
 from anna_inbox_executa.common import *
 from anna_inbox_executa.card_tools import _handle_generate_draft_background, _handle_summarize_background, _serialize_card_for_frontend
-from anna_inbox_executa.gmail_tools import _dedup_body, _resolve_cid_images, _sanitize_email_html
+from anna_inbox_executa.gmail_tools import _dedup_body, _sanitize_email_html
 from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.storage_tools import *
 
@@ -14,6 +15,7 @@ _DOWNLOAD_SERVER: Any | None = None
 _DOWNLOAD_SERVER_THREAD: threading.Thread | None = None
 _DOWNLOAD_TOKENS: dict[str, dict[str, Any]] = {}
 _DOWNLOAD_TOKEN_TTL_SECONDS = 15 * 60
+_CID_IMAGE_RE = re.compile(r'''src\s*=\s*["']cid:([^"'\s]+)["']''', re.IGNORECASE)
 
 
 def _strip_quoted_reply_html(html: str) -> str:
@@ -365,8 +367,10 @@ def _cleanup_expired_download_tokens() -> None:
     expired = [token for token, meta in _DOWNLOAD_TOKENS.items() if float(meta.get("expires_at_ts") or 0) <= now]
     for token in expired:
         meta = _DOWNLOAD_TOKENS.pop(token, {})
-        file_path = meta.get("path")
-        if file_path:
+        file_paths = [meta.get("path"), *(meta.get("cid_paths") or [])]
+        for file_path in file_paths:
+            if not file_path:
+                continue
             try:
                 Path(str(file_path)).unlink()
             except OSError:
@@ -400,10 +404,7 @@ def _ensure_loopback_download_server() -> str:
             def do_GET(self) -> None:
                 _cleanup_expired_download_tokens()
                 path = urllib.parse.urlsplit(self.path).path
-                prefix = next(
-                    (candidate for candidate in ("/download/", "/preview/") if path.startswith(candidate)),
-                    "",
-                )
+                prefix = next((candidate for candidate in ("/download/", "/preview/", "/message/") if path.startswith(candidate)), "")
                 if not prefix:
                     self.send_error(404)
                     return
@@ -411,6 +412,31 @@ def _ensure_loopback_download_server() -> str:
                 meta = _DOWNLOAD_TOKENS.get(token)
                 if not meta:
                     self.send_error(404)
+                    return
+                if prefix == "/message/":
+                    remainder = path[len(prefix) + len(token):].lstrip("/")
+                    if remainder.startswith("cid/"):
+                        cid = urllib.parse.unquote(remainder[4:]).strip()
+                        cid_meta = (meta.get("cid_images") or {}).get(cid)
+                        if not isinstance(cid_meta, dict):
+                            self.send_error(404)
+                            return
+                        file_path = Path(str(cid_meta.get("path") or ""))
+                        mime_type = str(cid_meta.get("mime_type") or "image/*")
+                    else:
+                        file_path = Path(str(meta.get("path") or ""))
+                        mime_type = "text/html; charset=utf-8"
+                    if not file_path.exists():
+                        self.send_error(404)
+                        return
+                    data = file_path.read_bytes()
+                    self.send_response(200)
+                    self._send_cors_headers()
+                    self.send_header("Content-Type", mime_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
                     return
                 file_path = Path(str(meta.get("path") or ""))
                 if not file_path.exists():
@@ -478,6 +504,66 @@ def _loopback_attachment_download_payload(
         "download_url": access_url,
         "expires_at": datetime.fromtimestamp(expires_at_ts, tz=timezone.utc).isoformat(),
     }
+
+
+def _write_loopback_email_body(html: str, payload: dict[str, Any]) -> str:
+    """把超大邮件 HTML 与 CID 图片写入本地临时文件，避免经过 JSON-RPC stdout。
+
+    正文和每个 CID 图片都使用同一个随机 token 保护；HTML 内的 cid: 引用被替换为
+    loopback 图片 URL。这样保留 newsletter 的内嵌图片，又不会将图片转成 data URI
+    放大 JSON 响应。临时文件会在 token 过期后统一删除。
+    """
+    _cleanup_expired_download_tokens()
+    token = uuid.uuid4().hex
+    base_url = _ensure_loopback_download_server()
+    download_dir = _attachment_download_dir()
+    cid_images: dict[str, dict[str, str]] = {}
+    cid_paths: list[str] = []
+
+    def walk(part: dict[str, Any]) -> None:
+        headers = part.get("headers") if isinstance(part.get("headers"), list) else []
+        cid = ""
+        for header in headers:
+            if isinstance(header, dict) and str(header.get("name") or "").lower() == "content-id":
+                cid = str(header.get("value") or "").strip().strip("<>")
+                break
+        body = part.get("body") if isinstance(part.get("body"), dict) else {}
+        encoded = body.get("data")
+        mime_type = str(part.get("mimeType") or "").lower()
+        if cid and mime_type.startswith("image/") and encoded:
+            try:
+                raw = base64.urlsafe_b64decode(str(encoded) + "=" * (-len(str(encoded)) % 4))
+                image_path = download_dir / f"{token}-cid-{len(cid_images)}"
+                image_path.write_bytes(raw)
+                cid_images[cid] = {"path": str(image_path), "mime_type": mime_type}
+                cid_paths.append(str(image_path))
+            except Exception:
+                # 图片不可解码时保留原 cid 引用；页面正文仍可安全显示。
+                pass
+        for child in part.get("parts") or []:
+            if isinstance(child, dict):
+                walk(child)
+
+    walk(payload)
+
+    def replace_cid(match: re.Match[str]) -> str:
+        cid = match.group(1)
+        cid_key = cid.split("@", 1)[0] if "@" in cid else cid
+        resolved = cid_key if cid_key in cid_images else cid
+        if resolved not in cid_images:
+            return match.group(0)
+        return f'src="{base_url}/message/{token}/cid/{urllib.parse.quote(resolved, safe="")}"'
+
+    rendered_html = _CID_IMAGE_RE.sub(replace_cid, html)
+    body_path = download_dir / f"{token}-message.html"
+    body_path.write_text(rendered_html, encoding="utf-8")
+    _DOWNLOAD_TOKENS[token] = {
+        "path": str(body_path),
+        "cid_images": cid_images,
+        "cid_paths": cid_paths,
+        "expires_at_ts": time.time() + _DOWNLOAD_TOKEN_TTL_SECONDS,
+    }
+    return f"{base_url}/message/{token}"
 
 
 def _normalized_attachment_mime_type(attachment: dict[str, Any]) -> str:
@@ -556,7 +642,9 @@ INBOX_THREAD_PAGE_SIZE = 5
 INBOX_THREAD_PAGE_MAX = 50
 INBOX_FULL_BODY_LIMIT = 200000
 INBOX_PAGE_BODY_LIMIT = INBOX_FULL_BODY_LIMIT
-INBOX_THREAD_RESPONSE_MAX_BYTES = 256 * 1024
+# 必须与 common.py 的最终 stdout 防线保持一致。宿主约 64 KiB 即会硬结束
+# 子进程，因此这里使用 48 KiB 的业务预算，提前切换到正文 loopback URL。
+INBOX_THREAD_RESPONSE_MAX_BYTES = 48 * 1024
 INBOX_PAGE_BODY_LIMIT_STEPS = (200000, 120000, 80000, 48000, 24000, 12000, 6000, 3000, 1500, 750, 320)
 INBOX_PROMPT_MESSAGE_LIMIT = 8
 INBOX_PROMPT_BODY_LIMIT = 1200
@@ -791,19 +879,38 @@ def _compact_body_text(text: str, *, limit: int) -> tuple[str, bool]:
     return body[:limit].rstrip(), True
 
 
-def _display_body_payload(message: dict[str, Any], *, limit: int, prefer_html: bool = True) -> dict[str, Any]:
-    from mail_agent.actions.service import _strip_quoted_reply
+def _compact_thread_metadata(value: Any, *, limit: int) -> str:
+    """限制展示元数据长度，防止异常邮件头绕过正文响应预算。"""
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit].rstrip()
+
+
+def _display_body_source(message: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    """读取一次邮件展示源，避免在不同响应预算下反复解码超大 MIME 正文。"""
     from mail_agent.mail_providers.gmail.adapter import decode_body_for_display
 
     display = decode_body_for_display(message)
-    raw_html = str(display.get("html") or "")
-    raw_text = str(display.get("text") or "")
     payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+    return str(display.get("html") or ""), str(display.get("text") or ""), payload
+
+
+def _display_body_payload(
+    message: dict[str, Any],
+    *,
+    limit: int,
+    prefer_html: bool = True,
+    source: tuple[str, str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """构造线程页的小型正文预览，绝不把 CID 二进制内联进 JSON-RPC。"""
+    from mail_agent.actions.service import _strip_quoted_reply
+
+    raw_html, raw_text, _payload = source or _display_body_source(message)
 
     if prefer_html and raw_html.strip():
         sanitized_html = _sanitize_email_html(_strip_quoted_reply_html(raw_html))
-        sanitized_html = _resolve_cid_images(sanitized_html, payload)
-        if len(sanitized_html) <= limit:
+        # CID 图片转 data URI 会让几 KB HTML 膨胀为数 MB。线程页只给不含
+        # CID 的完整 HTML；含 CID 的邮件交由单封 URL 正文链路加载。
+        if not _CID_IMAGE_RE.search(sanitized_html) and len(sanitized_html) <= limit:
             return {
                 "body_html": sanitized_html,
                 "body_truncated": False,
@@ -813,14 +920,14 @@ def _display_body_payload(message: dict[str, Any], *, limit: int, prefer_html: b
         compact_text, text_truncated = _compact_body_text(_strip_quoted_reply(raw_text), limit=limit)
         return {
             "body_text": compact_text,
-            "body_truncated": text_truncated,
+            "body_truncated": text_truncated or bool(raw_html.strip()),
         }
 
     fallback_text = _strip_quoted_reply(_dedup_body(str(message.get("body_text") or "")))
     compact_text, text_truncated = _compact_body_text(fallback_text, limit=limit)
     return {
         "body_text": compact_text,
-        "body_truncated": text_truncated,
+        "body_truncated": text_truncated or bool(raw_html.strip()),
     }
 
 
@@ -828,15 +935,15 @@ def _serialize_inbox_thread_message(message: dict[str, Any], *, include_display_
     from mail_agent.mail_providers.gmail.adapter import attachment_metadata_from_message
 
     payload = {
-        "id": str(message.get("id") or ""),
-        "thread_id": str(message.get("thread_id") or ""),
-        "internal_date": str(message.get("internal_date") or ""),
-        "from": str(message.get("from") or ""),
-        "to": str(message.get("to") or ""),
-        "cc": str(message.get("cc") or ""),
-        "bcc": str(message.get("bcc") or ""),
-        "subject": str(message.get("subject") or ""),
-        "label_ids": _normalize_label_ids(message.get("label_ids")),
+        "id": _compact_thread_metadata(message.get("id"), limit=256),
+        "thread_id": _compact_thread_metadata(message.get("thread_id"), limit=256),
+        "internal_date": _compact_thread_metadata(message.get("internal_date"), limit=64),
+        "from": _compact_thread_metadata(message.get("from"), limit=4096),
+        "to": _compact_thread_metadata(message.get("to"), limit=4096),
+        "cc": _compact_thread_metadata(message.get("cc"), limit=4096),
+        "bcc": _compact_thread_metadata(message.get("bcc"), limit=4096),
+        "subject": _compact_thread_metadata(message.get("subject"), limit=4096),
+        "label_ids": [_compact_thread_metadata(label, limit=256) for label in _normalize_label_ids(message.get("label_ids"))[:50]],
         "attachments": attachment_metadata_from_message(message),
     }
     if include_display_body:
@@ -869,15 +976,39 @@ def _build_inbox_message_display_response(mailbox: str, message: dict[str, Any])
         "message_id": str(message.get("id") or ""),
         "thread_id": str(message.get("thread_id") or ""),
     }
-    for body_limit in INBOX_PAGE_BODY_LIMIT_STEPS:
-        data = {**base, **_display_body_payload(message, limit=body_limit)}
-        if _inbox_message_display_rpc_frame_size(data) <= INBOX_THREAD_RESPONSE_MAX_BYTES:
-            return data
+    raw_html, raw_text, payload = _display_body_source(message)
+    if raw_html.strip():
+        sanitized_html = _sanitize_email_html(_strip_quoted_reply_html(raw_html))
+        # 只有不含 CID 的小 HTML 才直走 JSON-RPC。其余 HTML 一律通过本地
+        # loopback 读取，确保在序列化响应之前就停止正文的协议膨胀。
+        inline_data = {**base, "body_html": sanitized_html, "body_truncated": False}
+        if not _CID_IMAGE_RE.search(sanitized_html) and _inbox_message_display_rpc_frame_size(inline_data) <= INBOX_THREAD_RESPONSE_MAX_BYTES:
+            return inline_data
+        return {
+            **base,
+            "body_url": _write_loopback_email_body(sanitized_html, payload),
+            "body_truncated": False,
+        }
+
+    from mail_agent.actions.service import _strip_quoted_reply
+
+    # 纯文本邮件也必须遵守“完整正文或 body_url”的约定：不能为了通过
+    # JSON-RPC 上限而回退给前端一段被截断的 URL 列表式预览。
+    plain_text = _strip_quoted_reply(raw_text) if raw_text.strip() else _strip_quoted_reply(
+        _dedup_body(str(message.get("body_text") or "")),
+    )
+    inline_data = {**base, "body_text": plain_text, "body_truncated": False}
+    if _inbox_message_display_rpc_frame_size(inline_data) <= INBOX_THREAD_RESPONSE_MAX_BYTES:
+        return inline_data
+    plain_html = (
+        "<!doctype html><html><body><pre style=\"white-space:pre-wrap;word-break:break-word\">"
+        f"{html_escape(plain_text)}"
+        "</pre></body></html>"
+    )
     return {
         **base,
-        "body_text": "",
-        "body_truncated": True,
-        "error": "Message body exceeds the 256 KiB response limit.",
+        "body_url": _write_loopback_email_body(plain_html, payload),
+        "body_truncated": False,
     }
 
 
@@ -1032,7 +1163,7 @@ def _build_inbox_thread_page(
         "has_earlier": True,
         "next_before_index": end_index,
         "latest_message_id": latest_message_id,
-        "error": "Thread metadata exceeds the 256 KiB response limit.",
+        "error": "Thread metadata exceeds the 48 KiB response limit.",
     }
 
 
@@ -1733,6 +1864,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             "todos_enabled",
             "todos_limit",
             "llm_status_poll_seconds",
+            "initial_list_size",
             "custom_categories",
         )
         payload = await set_inbox_settings(mailbox, {name: arguments[name] for name in fields if name in arguments}, if_match=str(arguments.get("if_match") or "") or None)

@@ -62,7 +62,10 @@ STDOUT_LOCK = threading.Lock()
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 MAX_STDIO_MESSAGE_BYTES = 512 * 1024
-MAX_INBOX_THREAD_RESPONSE_BYTES = 256 * 1024
+# Anna Desktop 的 tools.invoke 宿主在约 64 KiB 的单帧附近会直接结束子进程，
+# 而不是返回可捕获的 JSON-RPC 错误。预留协议包装、请求 ID 和运行时余量后，
+# Inbox 详情统一以 48 KiB 为上限；大正文必须走 loopback / 文件通道。
+MAX_INBOX_THREAD_RESPONSE_BYTES = 48 * 1024
 # 前端与 manifest 为连通性检测保留 15 秒；后端在 12 秒内结束，给 stdio 排队和响应写回预留余量。
 CONNECTIVITY_CHECK_TIMEOUT_SECONDS = 12.0
 CONNECTIVITY_GMAIL_ACCOUNT_TIMEOUT_SECONDS = 3.0
@@ -154,23 +157,23 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "list_inbox_emails",
-            "description": "List compact Gmail inbox messages from a recent day window without running Brief or an LLM.",
+            "description": "Refresh All-mail Gmail metadata into the local cache and return a compact snapshot. Category is diagnostic only; classification is done from the All-mail cache.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
                 {"name": "days", "type": "integer", "description": "Recent day window, from 1 to 30.", "required": False},
-                {"name": "limit", "type": "integer", "description": "Maximum messages to return, from 1 to 500.", "required": False},
-                {"name": "category", "type": "string", "description": "Inbox category: inbox, todos, starred, snoozed, done, drafts, sent, trash, spam, or all.", "required": False},
-                {"name": "clear_cache", "type": "boolean", "description": "Clear this mailbox's Gmail cache before fetching a fresh snapshot.", "required": False},
+                {"name": "limit", "type": "integer", "description": "Maximum All-mail messages to fetch into cache, from 1 to 500.", "required": False},
+                {"name": "category", "type": "string", "description": "Diagnostic category label only. Fetch always uses All mail.", "required": False},
+                {"name": "clear_cache", "type": "boolean", "description": "Clear this mailbox's Gmail cache before rebuilding the All-mail snapshot.", "required": False},
             ],
         },
         {
             "name": "list_cached_emails",
-            "description": "List compact local Gmail message summaries for one mailbox.",
+            "description": "List compact messages from the local All-mail cache, optionally projected by category labels.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
                 {"name": "days", "type": "integer", "description": "Recent day window to filter cached mail, from 1 to 30.", "required": False},
                 {"name": "limit", "type": "integer", "description": "Maximum cached messages to return per page, from 1 to 100.", "required": False},
-                {"name": "category", "type": "string", "description": "Cached category filter: inbox, todos, starred, snoozed, done, drafts, sent, trash, spam, or all.", "required": False},
+                {"name": "category", "type": "string", "description": "Project All-mail cache by labels: inbox, todos, starred, snoozed, done, drafts, sent, trash, spam, or all.", "required": False},
                 {"name": "offset", "type": "integer", "description": "Zero-based offset within the filtered cached messages.", "required": False},
             ],
         },
@@ -314,6 +317,7 @@ DEFAULT_MANIFEST = {
                 {"name": "todos_enabled", "type": "boolean", "description": "Show Todos section.", "required": False},
                 {"name": "todos_limit", "type": "integer", "description": "Todo thread limit.", "required": False},
                 {"name": "llm_status_poll_seconds", "type": "integer", "description": "LLM connectivity poll interval in seconds: 0, 30, 60, 120, or 300.", "required": False},
+                {"name": "initial_list_size", "type": "integer", "description": "Initial list thread count: 100, 200, or 400.", "required": False},
                 {"name": "custom_categories", "type": "array", "description": "Saved local Inbox Splits with id, name, query, hide_when_empty, and bundling_behavior.", "required": False},
             ],
         },
@@ -328,12 +332,12 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "list_gmail_emails_page",
-            "description": "List one transient compact Gmail page without writing message summaries to the local cache.",
+            "description": "Load one All-mail Gmail page, merge summaries into the local All-mail cache, and return compact messages.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
                 {"name": "days", "type": "integer", "description": "Recent day window, from 1 to 30.", "required": False},
                 {"name": "limit", "type": "integer", "description": "Maximum messages to return, from 1 to 100.", "required": False},
-                {"name": "category", "type": "string", "description": "Gmail category filter.", "required": False},
+                {"name": "category", "type": "string", "description": "Diagnostic category label only. Fetch always uses All mail.", "required": False},
                 {"name": "page_token", "type": "string", "description": "Opaque Gmail page token returned by the previous page.", "required": False},
                 {"name": "page_offset", "type": "integer", "description": "Offset within the current Gmail page after response byte limiting.", "required": False},
                 {"name": "exclude_message_ids", "type": "array", "description": "Already rendered message IDs to skip.", "required": False},
@@ -644,8 +648,8 @@ DEFAULT_MANIFEST = {
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
                 {"name": "message_ids", "type": "array", "description": "Gmail message IDs to modify.", "required": True},
-                {"name": "add_label_ids", "type": "array", "description": "System label IDs to add. Allowlist: UNREAD, IMPORTANT.", "required": False},
-                {"name": "remove_label_ids", "type": "array", "description": "System label IDs to remove. Allowlist: UNREAD, IMPORTANT.", "required": False},
+                {"name": "add_label_ids", "type": "array", "description": "System label IDs to add. Allowlist: UNREAD, IMPORTANT, STARRED, INBOX, TRASH.", "required": False},
+                {"name": "remove_label_ids", "type": "array", "description": "System label IDs to remove. Allowlist: UNREAD, IMPORTANT, STARRED, INBOX, TRASH.", "required": False},
             ],
         },
         {
@@ -945,7 +949,7 @@ def _encoded_frame_size(message: dict[str, Any]) -> int:
 
 
 def _limit_inbox_thread_response_frame(message: dict[str, Any]) -> dict[str, Any]:
-    """Final guard: never emit a thread-page JSON-RPC frame over 256 KiB."""
+    """最终防线：绝不输出超过 48 KiB 的线程页 JSON-RPC 帧。"""
     result = message.get("result") if isinstance(message.get("result"), dict) else None
     if not result or result.get("tool") != "get_inbox_thread_page":
         return message
@@ -989,7 +993,7 @@ def _limit_inbox_thread_response_frame(message: dict[str, Any]) -> dict[str, Any
             "messages": [],
             "returned_count": 0,
             "has_earlier": True,
-            "error": "Thread metadata exceeds the 256 KiB response limit.",
+            "error": "Thread metadata exceeds the 48 KiB response limit.",
         })
         messages = data["messages"]
         if _encoded_frame_size(message) > MAX_INBOX_THREAD_RESPONSE_BYTES:
@@ -1002,7 +1006,7 @@ def _limit_inbox_thread_response_frame(message: dict[str, Any]) -> dict[str, Any
                 "has_earlier": True,
                 "next_before_index": data.get("next_before_index"),
                 "latest_message_id": str(data.get("latest_message_id") or ""),
-                "error": "Thread response exceeds the 256 KiB limit.",
+                "error": "Thread response exceeds the 48 KiB limit.",
             }
         break
     return message

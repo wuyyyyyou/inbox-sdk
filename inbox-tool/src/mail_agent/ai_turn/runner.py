@@ -1,4 +1,4 @@
-"""AI turn 白名单工具执行与结果组装（阶段 B）。"""
+"""AI turn 白名单工具执行与结果组装（阶段 C）。"""
 
 from __future__ import annotations
 
@@ -230,7 +230,7 @@ async def _tool_search_and_answer(
 
 
 def _primary_tool(tools: list[str]) -> str:
-    """从 steps 选出主执行工具（阶段 B 多步策略）。"""
+    """从 steps 选出主执行工具（阶段 C 多步策略）。"""
     if not tools:
         return "chat_general"
     # 整理建议优先于纯搜索
@@ -238,6 +238,10 @@ def _primary_tool(tools: list[str]) -> str:
         return "propose_inbox_actions"
     if "remember_preference" in tools:
         return "remember_preference"
+    if "batch_outreach" in tools:
+        return "batch_outreach"
+    if "batch_draft" in tools:
+        return "batch_draft"
     if "revise_draft" in tools:
         return "revise_draft"
     if "summarize_then_draft" in tools:
@@ -272,6 +276,8 @@ async def run_ai_turn(
         get_saved_prompt,
     )
     from mail_agent.ai_turn.tools import (
+        tool_batch_draft,
+        tool_batch_outreach,
         tool_compose_new,
         tool_draft_reply,
         tool_propose_inbox_actions,
@@ -330,8 +336,17 @@ async def run_ai_turn(
         """写入多轮摘要 registry。"""
         kind = str(outcome.get("kind") or "")
         has_draft = bool(
-            isinstance(outcome.get("artifact"), dict)
-            and str(outcome["artifact"].get("body") or "").strip()
+            (
+                isinstance(outcome.get("artifact"), dict)
+                and str(outcome["artifact"].get("body") or "").strip()
+            )
+            or (
+                isinstance(outcome.get("artifacts"), list)
+                and any(
+                    isinstance(item, dict) and str(item.get("body") or "").strip()
+                    for item in outcome["artifacts"]
+                )
+            )
         )
         candidate_count = 0
         if isinstance(outcome.get("proposed_actions"), dict):
@@ -415,6 +430,28 @@ async def run_ai_turn(
             memory_summary=memory_summary,
             mode=primary,
         )
+        outcome["route"] = route
+        return _record(primary, outcome)
+
+    if primary in {"batch_draft", "batch_outreach"}:
+        if progress_callback:
+            progress_callback("draft", {"stage": primary})
+        if primary == "batch_outreach":
+            outcome = await tool_batch_outreach(
+                text,
+                context,
+                language=language,
+                sampling_create_message=sampling_create_message,
+                memory_summary=memory_summary,
+            )
+        else:
+            outcome = await tool_batch_draft(
+                text,
+                context,
+                language=language,
+                sampling_create_message=sampling_create_message,
+                memory_summary=memory_summary,
+            )
         outcome["route"] = route
         return _record(primary, outcome)
 
