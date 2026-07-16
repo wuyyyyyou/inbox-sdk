@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import type { InboxSettings, LlmStatusPollSeconds } from "../../types/mail";
+import type { InboxAutoSyncSeconds, InboxSettings, LlmStatusPollSeconds } from "../../types/mail";
 import { useApp } from "../../app/AppContext";
-import { LLM_STATUS_POLL_OPTIONS } from "./inboxSettings";
+import { AUTO_SYNC_OPTIONS, LLM_STATUS_POLL_OPTIONS } from "./inboxSettings";
 import { SplitsManager } from "./SplitsManager";
 
 const LLM_POLL_LABELS: Record<LlmStatusPollSeconds, string> = {
@@ -10,6 +10,14 @@ const LLM_POLL_LABELS: Record<LlmStatusPollSeconds, string> = {
   60: "60 seconds",
   120: "2 minutes",
   300: "5 minutes",
+};
+
+const AUTO_SYNC_LABELS: Record<InboxAutoSyncSeconds, string> = {
+  0: "Off",
+  15: "15 seconds",
+  30: "30 seconds",
+  60: "60 seconds",
+  120: "2 minutes",
 };
 
 function TrashIcon() {
@@ -89,6 +97,20 @@ export function SettingsView({ settings, loading, error, focusSavedPromptsReques
     <section><h2>Time sections</h2><p>Emails in your inbox are grouped by time period</p><label><input type="radio" checked={settings.time_section_mode === "detailed"} onChange={() => onChange({ time_section_mode: "detailed" })} />Today, Yesterday, Last 7 days, months</label><label><input type="radio" checked={settings.time_section_mode === "recent_then_months"} onChange={() => onChange({ time_section_mode: "recent_then_months" })} />Last 7 days, months</label><label><input type="radio" checked={settings.time_section_mode === "months_only"} onChange={() => onChange({ time_section_mode: "months_only" })} />Months</label></section>
     <section><h2>Important priority</h2>{(["stars", "todos"] as const).map((kind) => <div key={kind}><h3>{kind === "stars" ? "Stars" : "Todos"}</h3><label><input type="checkbox" checked={settings[`${kind}_enabled`]} onChange={(e) => onChange({ [`${kind}_enabled`]: e.target.checked })} />Show at the top of Important</label><select value={settings[`${kind}_limit`]} onChange={(e) => onChange({ [`${kind}_limit`]: Number(e.target.value) })}>{[5, 10, 20, 50].map((limit) => <option key={limit} value={limit}>{limit} emails</option>)}</select></div>)}</section>
     <section><h2>Splits</h2><p>Divide your inbox into tabs for different types of emails.</p><button className="settings-action-btn" type="button" onClick={() => setSplitsOpen(true)}>+ Manage splits</button></section>
+    <section>
+      <h2>Automatic refresh</h2>
+      <p>Check Gmail changes while this mailbox is open. Refresh pauses while the app is hidden or Anna is working.</p>
+      {AUTO_SYNC_OPTIONS.map((seconds) => (
+        <label key={seconds}>
+          <input
+            type="radio"
+            checked={settings.auto_sync_seconds === seconds}
+            onChange={() => onChange({ auto_sync_seconds: seconds })}
+          />
+          {AUTO_SYNC_LABELS[seconds]}
+        </label>
+      ))}
+    </section>
     <section>
       <h2>Connectivity check</h2>
       <p>How often to probe Anna LLM and Gmail API connectivity and latency in parallel.</p>

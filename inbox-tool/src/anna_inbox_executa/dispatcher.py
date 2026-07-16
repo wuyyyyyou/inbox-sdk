@@ -115,6 +115,8 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
                 arguments.get("offset", 0),
             ),
         }
+    if tool == "sync_inbox_cache":
+        return {"success": True, "tool": tool, "data": sync_inbox_cache(arguments.get("mailbox", ""))}
     if tool == "list_gmail_emails_page":
         return {
             "success": True,

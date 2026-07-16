@@ -49,4 +49,50 @@ describe("unwrapToolResult", () => {
     );
     vi.useRealTimers();
   });
+
+  it("reconnects and retries a safe read on the replacement runtime", async () => {
+    const disconnectedInvoke = vi.fn().mockRejectedValue(new Error("fetch failed"));
+    const recoveredInvoke = vi.fn().mockResolvedValue({ success: true, data: { run_id: "run-1", status: "done" } });
+    let current = {
+      connected: true,
+      mode: "host",
+      client: { tools: { invoke: disconnectedInvoke } },
+    } as never;
+    const reconnect = vi.fn(async () => {
+      current = {
+        connected: true,
+        mode: "host",
+        client: { tools: { invoke: recoveredInvoke } },
+      } as never;
+      return current;
+    });
+    const client = new MailAgentClient(async () => current, reconnect);
+
+    await expect(client.getRun("run-1")).resolves.toMatchObject({ run_id: "run-1", status: "done" });
+    expect(reconnect).toHaveBeenCalledTimes(1);
+    expect(recoveredInvoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores the runtime but does not replay a mail mutation", async () => {
+    const disconnectedInvoke = vi.fn().mockRejectedValue(new Error("fetch failed"));
+    const recoveredInvoke = vi.fn().mockResolvedValue({ success: true, data: { ok: true } });
+    let current = {
+      connected: true,
+      mode: "host",
+      client: { tools: { invoke: disconnectedInvoke } },
+    } as never;
+    const reconnect = vi.fn(async () => {
+      current = {
+        connected: true,
+        mode: "host",
+        client: { tools: { invoke: recoveredInvoke } },
+      } as never;
+      return current;
+    });
+    const client = new MailAgentClient(async () => current, reconnect);
+
+    await expect(client.setMessageStarred("user@example.com", "message-1", true)).rejects.toThrow("fetch failed");
+    expect(reconnect).toHaveBeenCalledTimes(1);
+    expect(recoveredInvoke).not.toHaveBeenCalled();
+  });
 });

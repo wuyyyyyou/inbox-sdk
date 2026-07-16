@@ -178,6 +178,13 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "sync_inbox_cache",
+            "description": "Incrementally synchronize third-party Gmail changes into the existing All-mail cache using Gmail History API. Does not modify Gmail.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
+            ],
+        },
+        {
             "name": "get_cached_email",
             "description": "Read one bounded Gmail text body by id, fetching and caching it when the body is not cached yet.",
             "parameters": [
@@ -317,6 +324,7 @@ DEFAULT_MANIFEST = {
                 {"name": "todos_enabled", "type": "boolean", "description": "Show Todos section.", "required": False},
                 {"name": "todos_limit", "type": "integer", "description": "Todo thread limit.", "required": False},
                 {"name": "llm_status_poll_seconds", "type": "integer", "description": "LLM connectivity poll interval in seconds: 0, 30, 60, 120, or 300.", "required": False},
+                {"name": "auto_sync_seconds", "type": "integer", "description": "Gmail History automatic refresh interval in seconds: 0, 15, 30, 60, or 120.", "required": False},
                 {"name": "initial_list_size", "type": "integer", "description": "Initial list thread count: 100, 200, or 400.", "required": False},
                 {"name": "custom_categories", "type": "array", "description": "Saved local Inbox Splits with id, name, query, hide_when_empty, and bundling_behavior.", "required": False},
             ],
@@ -353,6 +361,7 @@ DEFAULT_MANIFEST = {
                 {"name": "before_index", "type": "integer", "description": "Exclusive thread index boundary for older-page pagination.", "required": False},
                 {"name": "limit", "type": "integer", "description": "Maximum messages to return in this page. Defaults to 5.", "required": False},
                 {"name": "include_display_body", "type": "boolean", "description": "Whether to include bounded display HTML/text for each message.", "required": False},
+                {"name": "force_refresh", "type": "boolean", "description": "Explicitly refresh the Gmail thread instead of using the complete local thread cache.", "required": False},
             ],
         },
         {

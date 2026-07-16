@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PlusIcon, accountDisplayName, aiSearchStatus, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+import { PlusIcon, accountDisplayName, aiSearchStatus, aiThinkingElapsedLabel, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
 
 describe("nextFeedRangeDays", () => {
   it("steps 7 → 30 → 60 → all time", () => {
@@ -87,6 +87,16 @@ describe("aiSearchStatus", () => {
       { title: "查找紧急邮件", sections: [{ items: [{ subject: "Update" }] }] },
       "Find urgent emails",
     )).toBe("Found 1 relevant email.");
+  });
+});
+
+describe("aiThinkingElapsedLabel", () => {
+  it("formats the elapsed Thinking duration from the pending-message start time", () => {
+    expect(aiThinkingElapsedLabel("2026-07-16T12:00:00.000Z", Date.parse("2026-07-16T12:01:05.000Z"))).toBe("1m 5s");
+  });
+
+  it("ignores an invalid Thinking start time", () => {
+    expect(aiThinkingElapsedLabel("invalid", Date.now())).toBe("");
   });
 });
 

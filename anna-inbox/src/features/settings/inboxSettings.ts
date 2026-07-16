@@ -4,6 +4,7 @@ import { senderParts } from "../../shared/mailIdentity";
 
 /** Settings 中暴露的 LLM 状态轮询档位（秒） */
 export const LLM_STATUS_POLL_OPTIONS = [0, 30, 60, 120, 300] as const;
+export const AUTO_SYNC_OPTIONS = [0, 15, 30, 60, 120] as const;
 
 /** 列表首屏展示条数选项 */
 export const INITIAL_LIST_SIZE_OPTIONS = [100, 200, 400] as const;
@@ -17,6 +18,7 @@ export const DEFAULT_INBOX_SETTINGS: InboxSettings = {
   todos_enabled: true,
   todos_limit: 10,
   llm_status_poll_seconds: 60,
+  auto_sync_seconds: 15,
   initial_list_size: 100,
   custom_categories: [],
 };
@@ -70,6 +72,9 @@ export function clampInboxSettings(
     llm_status_poll_seconds: (LLM_STATUS_POLL_OPTIONS as readonly number[]).includes(Number(input.llm_status_poll_seconds))
       ? (Number(input.llm_status_poll_seconds) as InboxSettings["llm_status_poll_seconds"])
       : DEFAULT_INBOX_SETTINGS.llm_status_poll_seconds,
+    auto_sync_seconds: (AUTO_SYNC_OPTIONS as readonly number[]).includes(Number(input.auto_sync_seconds))
+      ? (Number(input.auto_sync_seconds) as InboxSettings["auto_sync_seconds"])
+      : DEFAULT_INBOX_SETTINGS.auto_sync_seconds,
     initial_list_size: (INITIAL_LIST_SIZE_OPTIONS as readonly number[]).includes(Number(input.initial_list_size))
       ? (Number(input.initial_list_size) as InboxSettings["initial_list_size"])
       : DEFAULT_INBOX_SETTINGS.initial_list_size,

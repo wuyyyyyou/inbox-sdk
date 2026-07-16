@@ -12,6 +12,7 @@ import type {
   CustomPlanSummary,
   LlmStatus,
   InboxFeedPayload,
+  InboxCacheSyncPayload,
   InboxEmailDetailPayload,
   InboxMessageDisplayBodyPayload,
   InboxThreadDraftPayload,
@@ -62,6 +63,11 @@ export function isRetryableToolInvocationError(error: unknown) {
   return /unexpected token\s+['"]?<|<!doctype html|text\/html|failed to fetch|network(?:error| request)?|fetch failed|econnreset|enotfound|etimedout|timeout|\b(?:429|5\d\d)\b/i.test(message);
 }
 
+export function isRuntimeTransportError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /anna runtime is not connected|tools\.invoke timed out|window\.(?:hello|ready|heartbeat) timed out|failed to fetch|fetch failed|econnreset|enotfound|etimedout|executa process exited|runtime.*(?:disconnect|closed|terminated)/i.test(message);
+}
+
 function waitForRetry(delayMs: number) {
   return new Promise<void>((resolve) => globalThis.setTimeout(resolve, delayMs));
 }
@@ -86,13 +92,12 @@ export function unwrapToolResult(result: unknown): unknown {
 }
 
 export class MailAgentClient {
-  constructor(private readonly getRuntime: () => Promise<RuntimeState>) {}
+  constructor(
+    private readonly getRuntime: () => Promise<RuntimeState>,
+    private readonly reconnectRuntime?: () => Promise<RuntimeState>,
+  ) {}
 
   async invoke<T = unknown>(method: string, args: Record<string, unknown> = {}, options: { timeoutMs?: number; retry?: "safe" } = {}): Promise<T> {
-    const runtime = await this.getRuntime();
-    if (!runtime.connected || !runtime.client) {
-      throw new Error(runtime.error || "Anna runtime is not connected.");
-    }
     const timeoutMs = options.timeoutMs || INVOKE_TIMEOUT_MS;
     const invokeArgs = {
       tool_id: TOOL_ID,
@@ -101,6 +106,12 @@ export class MailAgentClient {
       timeoutMs,
     };
     for (let attempt = 0; ; attempt += 1) {
+      const runtime = await this.getRuntime();
+      if (!runtime.connected || !runtime.client) {
+        const error = new Error(runtime.error || "Anna runtime is not connected.");
+        if (this.reconnectRuntime) await this.reconnectRuntime().catch(() => undefined);
+        throw error;
+      }
       try {
         const result = runtime.client.tools && typeof runtime.client.tools.invoke === "function"
           ? await runtime.client.tools.invoke(invokeArgs, { timeoutMs })
@@ -114,6 +125,10 @@ export class MailAgentClient {
         const code = err.code !== undefined ? `[${err.code}] ` : "";
         const message = err.message || String(error);
         const wrapped = new Error(`[tool:${method}] ${code}${message}${traceback ? `\n\n${traceback}` : ""}`);
+        if (isRuntimeTransportError(wrapped) && this.reconnectRuntime) {
+          // 只恢复 transport；非幂等邮件操作仍向调用方报告本次失败，绝不自动重放。
+          await this.reconnectRuntime().catch(() => undefined);
+        }
         if (options.retry === "safe" && attempt < SAFE_RETRY_DELAYS_MS.length && isRetryableToolInvocationError(wrapped)) {
           await waitForRetry(SAFE_RETRY_DELAYS_MS[attempt]);
           continue;
@@ -218,6 +233,10 @@ export class MailAgentClient {
     return this.invoke<InboxFeedPayload>("list_cached_emails", { mailbox, days, limit, category, offset }, { timeoutMs: 30_000 });
   }
 
+  syncInboxCache(mailbox: string) {
+    return this.invoke<InboxCacheSyncPayload>("sync_inbox_cache", { mailbox }, { timeoutMs: 60_000, retry: "safe" });
+  }
+
   listGmailEmailsPage(mailbox: string, days = 30, limit = 100, category = "all", pageToken = "", pageOffset = 0, excludeMessageIds: string[] = []) {
     return this.invoke<InboxFeedPayload>("list_gmail_emails_page", {
       mailbox,
@@ -239,6 +258,7 @@ export class MailAgentClient {
     beforeIndex?: number | null;
     limit?: number;
     includeDisplayBody?: boolean;
+    forceRefresh?: boolean;
   } = {}) {
     return this.invoke<InboxThreadPagePayload>(
       "get_inbox_thread_page",
@@ -249,6 +269,7 @@ export class MailAgentClient {
         before_index: options.beforeIndex,
         limit: options.limit ?? 5,
         include_display_body: options.includeDisplayBody ?? true,
+        force_refresh: options.forceRefresh ?? false,
       },
       { timeoutMs: 120_000 },
     );

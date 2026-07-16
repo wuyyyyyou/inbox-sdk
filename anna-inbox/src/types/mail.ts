@@ -95,6 +95,7 @@ export interface AnnaRuntimeClient {
   llm?: { complete?: (args: unknown, options?: { timeoutMs?: number; signal?: AbortSignal }) => Promise<unknown> };
   window?: { set_title?: (args: { title: string }) => Promise<unknown> };
   call?: (ns: string, method: string, args?: unknown, options?: { timeout?: number; timeoutMs?: number; signal?: AbortSignal }) => Promise<unknown>;
+  dispose?: () => void;
 }
 
 export interface ToolInvokeArgs {
@@ -210,6 +211,19 @@ export interface InboxFeedPayload {
   page_token?: string;
   page_offset?: number;
   messages: InboxMessage[];
+  updated_at?: string;
+}
+
+export interface InboxCacheSyncPayload {
+  mailbox?: string;
+  mode?: "history" | "baseline_required" | "history_expired";
+  history_id?: string;
+  added?: number;
+  updated?: number;
+  deleted?: number;
+  cache_total?: number;
+  resync_required?: boolean;
+  resync_reason?: "cursor_missing" | "history_expired";
   updated_at?: string;
 }
 
@@ -357,6 +371,7 @@ export interface CustomRunResultItem {
 /** 当前邮箱的 Inbox 展示偏好；由 Executa 按邮箱地址独立持久化。 */
 /** LLM 连通性探测轮询间隔（秒）；0 表示关闭自动轮询 */
 export type LlmStatusPollSeconds = 0 | 30 | 60 | 120 | 300;
+export type InboxAutoSyncSeconds = 0 | 15 | 30 | 60 | 120;
 
 /** 列表首屏展示条数（列表行）；超出显示 Show more */
 export type InitialListSize = 100 | 200 | 400;
@@ -370,6 +385,7 @@ export interface InboxSettings {
   todos_enabled: boolean;
   todos_limit: number;
   llm_status_poll_seconds: LlmStatusPollSeconds;
+  auto_sync_seconds: InboxAutoSyncSeconds;
   /** 首屏最多展示的邮件数；更大窗口仍可预拉取到本地 */
   initial_list_size: InitialListSize;
   custom_categories: InboxCustomCategory[];
@@ -746,6 +762,7 @@ export interface AppState {
   aiChatMessages: AiChatMessage[];
   aiChatConversationId: string;
   aiChatLoading: boolean;
+  mailDetailOpen: boolean;
   customTraceOpen: boolean;
   settingsOpen: boolean;
   settingsFocusRequest: number;
@@ -889,6 +906,8 @@ export interface AiChatMessage {
   kind?: "chat" | "mail_context" | "scan" | "clarify" | "status" | "error" | "stopped" | "draft" | "propose" | "memory";
   result?: CustomRunResult | null;
   pending?: boolean;
+  /** AI Thinking 开始时间；结果消息保留该值以展示冻结的思考耗时。 */
+  thinkingStartedAt?: string;
   artifact?: DraftReplyArtifact | ComposeDraftArtifact | SendPlanArtifact | null;
   /** 批量写稿：一条消息内多份 draft_reply（按封隔离） */
   artifacts?: DraftReplyArtifact[];

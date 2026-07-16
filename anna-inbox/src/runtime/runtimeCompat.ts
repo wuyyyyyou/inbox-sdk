@@ -98,6 +98,13 @@ export const AnnaAppRuntimeCompat = {
     const hello = await call("window", "hello", {
       client_info: { sdk: "bundle-compat", version: "0.1.0" },
     }) as Record<string, unknown>;
+    let heartbeatTimer: number | null = null;
+    const dispose = () => {
+      if (heartbeatTimer !== null) {
+        window.clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    };
     const runtime = {
       windowUuid: hello.window_uuid,
       appId: hello.app_id,
@@ -117,10 +124,11 @@ export const AnnaAppRuntimeCompat = {
       window: namespaceProxy("window"),
       call,
       on: subscribe,
+      dispose,
     };
 
     await call("window", "ready", {});
-    window.setInterval(() => {
+    heartbeatTimer = window.setInterval(() => {
       call("window", "heartbeat", {}).catch(() => {});
     }, HEARTBEAT_MS);
     return runtime;

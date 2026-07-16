@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from contextvars import copy_context
 
 from anna_inbox_executa.common import *
 
@@ -660,10 +661,13 @@ def list_inbox_emails(
         list_messages,
         gmail_request,
         normalize_mailbox as adapter_normalize_mailbox,
+        set_cached_mailbox_history_cursor,
     )
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
-    profile = gmail_request(mailbox, "/users/me/profile", {"fields": "emailAddress"})
+    # 身份校验沿用原有 Gmail 请求入口；后续摘要批次会在 adapter 内只取一次
+    # 短期 token。这样首页刷新最多两次凭据反向 RPC，而非每封摘要各取一次。
+    profile = gmail_request(mailbox, "/users/me/profile", {"fields": "emailAddress,historyId"})
     authorized_email = str(profile.get("emailAddress") or "").strip().lower()
     if authorized_email and authorized_email != mailbox:
         raise ValueError(f"Gmail credential mismatch: selected {mailbox}, authorized {authorized_email}")
@@ -677,6 +681,9 @@ def list_inbox_emails(
     category = _normalize_inbox_category(category_arg)
     query = _inbox_category_query("all", days)
     matched_ids = live_search_metadata_and_cache(mailbox, query, limit)
+    # All-mail 快照已写入缓存后才记录 cursor；快照写入失败不能把未建立的基线
+    # 伪装为可增量同步状态。
+    set_cached_mailbox_history_cursor(mailbox, str(profile.get("historyId") or ""), scope_days=days)
     by_id = {
         str(item.get("id") or ""): item
         for item in list_messages(mailbox)
@@ -860,6 +867,14 @@ def list_cached_emails(
     }
 
 
+def sync_inbox_cache(mailbox_arg: str) -> dict[str, Any]:
+    """只读同步第三方 Gmail 客户端的变更到 All-mail 缓存。"""
+    from mail_agent.mail_providers.gmail.adapter import normalize_mailbox as adapter_normalize_mailbox, sync_cached_mailbox_history
+
+    mailbox = adapter_normalize_mailbox(mailbox_arg)
+    return sync_cached_mailbox_history(mailbox)
+
+
 def list_gmail_emails_page(
     mailbox_arg: str,
     days_arg: Any = 30,
@@ -876,6 +891,7 @@ def list_gmail_emails_page(
     """
     from mail_agent.mail_providers.gmail.adapter import (
         GMAIL_PAGE_SUMMARY_FETCH_MAX_WORKERS,
+        _gmail_request_token_scope,
         fetch_message_summary,
         gmail_request,
         message_summary,
@@ -948,7 +964,11 @@ def list_gmail_emails_page(
         }
         if request_token:
             params["pageToken"] = request_token
-        page = gmail_request(mailbox, "/users/me/messages", params)
+        # 首个 Gmail 请求会在受限上下文中取一次 token；复制该上下文给摘要 worker，
+        # 避免“加载更多”因 100 个摘要产生 100 次 credentials/getToken 反向 RPC。
+        with _gmail_request_token_scope():
+            page = gmail_request(mailbox, "/users/me/messages", params)
+            worker_context = copy_context()
         refs = [
             str(ref.get("id"))
             for ref in (page.get("messages") or [])
@@ -965,7 +985,7 @@ def list_gmail_emails_page(
             if positions:
                 with ThreadPoolExecutor(max_workers=min(GMAIL_PAGE_SUMMARY_FETCH_MAX_WORKERS, len(positions))) as pool:
                     futures = {
-                        pool.submit(fetch_message_summary, mailbox, refs[position]): position
+                        pool.submit(worker_context.copy().run, fetch_message_summary, mailbox, refs[position]): position
                         for position in positions
                     }
                     for future, position in ((future, futures[future]) for future in futures):

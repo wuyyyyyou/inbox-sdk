@@ -40,20 +40,23 @@ function normalizeDocumentMarkup(root: HTMLElement) {
 }
 
 function hasFixedEmailLayout(root: HTMLElement) {
-  if (root.querySelector("table, tbody, thead, tfoot, tr, td, th, colgroup, col, center")) {
-    return true;
-  }
+  const hasExplicitFixedWidth = (node: Element) => {
+    const width = Number((node.getAttribute("width") || "").replace(/px$/i, ""));
+    const style = (node.getAttribute("style") || "").toLowerCase();
+    return (Number.isFinite(width) && width >= 600)
+      || /(?:^|;)\s*(?:width|min-width)\s*:\s*(?:[6-9]\d{2,}|[1-9]\d{3,})px/.test(style);
+  };
+  // 普通响应式 table 由容器宽度自然收缩，不能仅因存在 table 就整体 transform 缩小。
+  if (Array.from(root.querySelectorAll("table, td, th, center")).some(hasExplicitFixedWidth)) return true;
   if (Array.from(root.querySelectorAll("[width]")).some((node) => {
     const width = Number((node.getAttribute("width") || "").replace(/px$/i, ""));
-    return Number.isFinite(width) && width >= 320;
+    return Number.isFinite(width) && width >= 600;
   })) {
     return true;
   }
   return Array.from(root.querySelectorAll("[style]")).some((node) => {
     const style = (node.getAttribute("style") || "").toLowerCase();
-    return /(?:^|;)\s*display\s*:\s*(?:table|inline-block|flex|grid)/.test(style)
-      || /(?:^|;)\s*(?:width|min-width|max-width)\s*:\s*(?:[3-9]\d{2,}|[1-9]\d{3,})px/.test(style)
-      || /(?:^|;)\s*margin(?:-left|-right)?\s*:\s*auto/.test(style);
+    return /(?:^|;)\s*(?:width|min-width)\s*:\s*(?:[6-9]\d{2,}|[1-9]\d{3,})px/.test(style);
   });
 }
 

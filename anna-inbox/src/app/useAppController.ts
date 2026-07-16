@@ -517,6 +517,7 @@ export interface AppActions {
   toggleCustomTrace(): void;
   toggleThreadContext(cardId: string): void;
   toggleSnoozeMenu(cardId: string): void;
+  setMailDetailOpen(open: boolean): void;
   setProvider(kind: "llm" | "storage", value: string): void;
   setDrawer(drawer: "sources" | "history" | "memory" | "scanPlan", open: boolean): void;
   minimize(value: boolean): void;
@@ -669,15 +670,42 @@ export function useAppController() {
   const draftRequestSequence = useRef(0);
   const snapshotRequestMailbox = useRef("");
   const snapshotPromise = useRef<Promise<boolean> | null>(null);
+  const runtimeReconnectPromise = useRef<Promise<AppState["runtime"]> | null>(null);
+  const inboxAutoSyncTimer = useRef<number | null>(null);
+  const inboxAutoSyncInFlight = useRef(false);
+  const inboxAutoSyncPending = useRef<{ mailbox: string; days: number } | null>(null);
 
   const getRuntime = useCallback(async () => {
     if (!runtimePromise.current) {
       runtimePromise.current = connectRuntime();
     }
-    return runtimePromise.current;
+    const currentPromise = runtimePromise.current;
+    const runtime = await currentPromise;
+    if (!runtime.connected && runtimePromise.current === currentPromise) {
+      runtimePromise.current = null;
+    }
+    return runtime;
   }, []);
 
-  const client = useMemo(() => new MailAgentClient(getRuntime), [getRuntime]);
+  const reconnectRuntime = useCallback(async () => {
+    if (runtimeReconnectPromise.current) return runtimeReconnectPromise.current;
+    const reconnect = (async () => {
+      const previous = runtimePromise.current ? await runtimePromise.current.catch(() => undefined) : undefined;
+      previous?.client?.dispose?.();
+      runtimePromise.current = null;
+      const runtime = await getRuntime();
+      setState((current) => ({ ...current, runtime }));
+      return runtime;
+    })();
+    runtimeReconnectPromise.current = reconnect;
+    try {
+      return await reconnect;
+    } finally {
+      if (runtimeReconnectPromise.current === reconnect) runtimeReconnectPromise.current = null;
+    }
+  }, [getRuntime]);
+
+  const client = useMemo(() => new MailAgentClient(getRuntime, reconnectRuntime), [getRuntime, reconnectRuntime]);
 
   const showToast = useCallback((message: string, options?: ToastOptions) => {
     setToast({ message, ...options });
@@ -812,6 +840,87 @@ export function useAppController() {
     });
     return snapshotPromise.current;
   }, [applyInboxSnapshotPayload, client, loadInboxThreadDrafts, state.mailbox, state.selectedMailboxes]);
+
+  // 第三方 Gmail 客户端变更只在前台、当前邮箱稳定且没有 AI/列表重任务时同步。
+  // 使用递归 timeout 而不是 interval，避免平台较慢时堆叠多个 History invoke。
+  useEffect(() => {
+    const AUTO_SYNC_INTERVAL_MS = Number(state.inboxSettings.auto_sync_seconds) * 1000;
+    const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
+    const canSync = state.runtime.connected
+      && Boolean(mailbox && mailbox !== "all")
+      && !state.aiChatLoading
+      && !state.isCustomScanning
+      && !state.inboxSnapshotLoading
+      && AUTO_SYNC_INTERVAL_MS > 0;
+    if (!canSync) return;
+
+    let disposed = false;
+    const clearTimer = () => {
+      if (inboxAutoSyncTimer.current) {
+        window.clearTimeout(inboxAutoSyncTimer.current);
+        inboxAutoSyncTimer.current = null;
+      }
+    };
+    let sync: () => Promise<void>;
+    const schedule = (delay = AUTO_SYNC_INTERVAL_MS) => {
+      clearTimer();
+      inboxAutoSyncTimer.current = window.setTimeout(() => { void sync(); }, delay);
+    };
+    sync = async () => {
+      if (
+        disposed
+        || document.visibilityState !== "visible"
+        || inboxAutoSyncInFlight.current
+      ) {
+        if (!disposed && document.visibilityState === "visible") schedule();
+        return;
+      }
+      inboxAutoSyncInFlight.current = true;
+      try {
+        const result = await client.syncInboxCache(mailbox);
+        if (disposed || document.visibilityState !== "visible") return;
+        if (result.resync_required) {
+          // History cursor 过期时才重建缓存；常规增量同步绝不重新抓取 All-mail。
+          await client.listInboxEmails(mailbox, state.inboxSettings.display_range_days, ALL_MAIL_CACHE_FETCH_LIMIT, "all", true);
+        }
+        if (state.mailDetailOpen) {
+          // 详情抽屉依赖当前列表对象和最新线程标识；打开期间替换快照会导致
+          // 正文、滚动位置和附件状态反复重置，因此仅标记关闭后的待刷新。
+          inboxAutoSyncPending.current = { mailbox, days: state.inboxSettings.display_range_days };
+        } else if (!disposed && document.visibilityState === "visible") {
+          await preloadMailboxSnapshot(mailbox, state.inboxSettings.display_range_days, true);
+        }
+      } catch {
+        // 自动同步失败不干扰用户当前阅读；下一轮按同一 cursor 安全重试。
+      } finally {
+        inboxAutoSyncInFlight.current = false;
+        if (!disposed && document.visibilityState === "visible") schedule();
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void sync();
+      } else {
+        clearTimer();
+      }
+    };
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    schedule();
+    return () => {
+      disposed = true;
+      clearTimer();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [client, preloadMailboxSnapshot, state.aiChatLoading, state.inboxSettings.auto_sync_seconds, state.inboxSettings.display_range_days, state.inboxSnapshotLoading, state.isCustomScanning, state.mailDetailOpen, state.mailbox, state.runtime.connected, state.selectedMailboxes]);
+
+  useEffect(() => {
+    if (state.mailDetailOpen) return;
+    const pending = inboxAutoSyncPending.current;
+    if (!pending) return;
+    inboxAutoSyncPending.current = null;
+    void preloadMailboxSnapshot(pending.mailbox, pending.days, true);
+  }, [preloadMailboxSnapshot, state.mailDetailOpen]);
 
   const upsertAiConversationHistory = useCallback((
     conversationId: string,
@@ -1847,6 +1956,14 @@ export function useAppController() {
     }
   }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadInboxSettings, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshConnectivityStatus, showToast, state.mailbox]);
 
+  // 初次连接失败不会再永久缓存 mock runtime；前台保持每 5 秒尝试一次完整初始化，
+  // 成功后 effect 自动停止。业务 mutation 不在此处重放，仍需用户再次确认。
+  useEffect(() => {
+    if (state.runtime.connected || state.runtime.mode !== "mock") return;
+    const timer = window.setTimeout(() => { void initialize(); }, 5_000);
+    return () => window.clearTimeout(timer);
+  }, [initialize, state.runtime.connected, state.runtime.mode]);
+
   const actions: AppActions = {
     showToast,
     closeDrawers() {
@@ -1931,6 +2048,9 @@ export function useAppController() {
     },
     toggleSnoozeMenu(cardId) {
       setState((s) => ({ ...s, snoozeMenuCardId: s.snoozeMenuCardId === cardId ? "" : cardId }));
+    },
+    setMailDetailOpen(open) {
+      setState((s) => s.mailDetailOpen === open ? s : { ...s, mailDetailOpen: open });
     },
     setProvider(kind, value) {
       if (kind === "llm" && (value === "dashscope" || value === "anna-llm")) {
@@ -2391,11 +2511,13 @@ export function useAppController() {
           ? "compose_draft"
           : (/\bsummar(?:ize|ise|y|ization|isation)\b/i.test(request.visiblePrompt) ? "summary" : "draft_reply"));
       const isDraftRequest = requestedArtifact === "draft_reply" || requestedArtifact === "send_plan" || requestedArtifact === "compose_draft";
+      const thinkingStartedAt = new Date().toISOString();
       const pendingMessage: AiChatMessage = {
         id: createId("msg"),
         role: "assistant",
         content: "Thinking...",
-        timestamp: new Date().toISOString(),
+        timestamp: thinkingStartedAt,
+        thinkingStartedAt,
         kind: "status",
         pending: true,
         mailContext: context,
@@ -2452,6 +2574,7 @@ export function useAppController() {
             role: "assistant",
             content: payload.assistant_text || "I reviewed the thread.",
             timestamp: new Date().toISOString(),
+            thinkingStartedAt: pendingMessage.thinkingStartedAt,
             kind: "mail_context",
             artifact: isDraftRequest && payload.artifact
               ? { ...payload.artifact, source_prompt: request.visiblePrompt }
@@ -3378,11 +3501,13 @@ export function useAppController() {
         kind: "chat",
       };
       const messagesWithUser = [...baseMessages, userMessage];
+      const thinkingStartedAt = new Date().toISOString();
       const pendingMessage: AiChatMessage = {
         id: createId("msg"),
         role: "assistant",
         content: "thinking",
-        timestamp: new Date().toISOString(),
+        timestamp: thinkingStartedAt,
+        thinkingStartedAt,
         kind: "status",
         pending: true,
       };

@@ -1067,9 +1067,20 @@ def _read_cached_thread_messages(mailbox: str, thread_id: str) -> list[dict[str,
     return messages
 
 
-def _load_thread_messages(mailbox: str, thread_id: str) -> list[dict[str, Any]]:
-    from mail_agent.mail_providers.gmail.adapter import refresh_thread_cache
+def _load_thread_messages(mailbox: str, thread_id: str, *, force_refresh: bool = False) -> list[dict[str, Any]]:
+    from mail_agent.mail_providers.gmail.adapter import list_messages, normalize_mailbox, refresh_thread_cache
 
+    cached_messages = _read_cached_thread_messages(mailbox, thread_id)
+    normalized_mailbox = normalize_mailbox(mailbox)
+    expected_count = sum(
+        1
+        for summary in list_messages(normalized_mailbox)
+        if str(summary.get("thread_id") or "") == str(thread_id or "")
+    )
+    # 仅当该线程所有 index 消息都有完整缓存时才跳过 Gmail；长线程在只缓存
+    # 部分正文时必须刷新，否则“加载更早邮件”会被错误地截断。
+    if cached_messages and len(cached_messages) == expected_count and not force_refresh:
+        return cached_messages
     try:
         messages = refresh_thread_cache(mailbox, thread_id)
         if messages:
@@ -1077,7 +1088,7 @@ def _load_thread_messages(mailbox: str, thread_id: str) -> list[dict[str, Any]]:
             return messages
     except Exception as exc:
         log(f"refresh_thread_cache failed for {thread_id}: {type(exc).__name__}: {exc}")
-    return _read_cached_thread_messages(mailbox, thread_id)
+    return cached_messages
 
 
 def _build_inbox_thread_page(
@@ -1088,8 +1099,9 @@ def _build_inbox_thread_page(
     before_index: int | None = None,
     limit: int = INBOX_THREAD_PAGE_SIZE,
     include_display_body: bool = True,
+    force_refresh: bool = False,
 ) -> dict[str, Any]:
-    messages = _visible_thread_messages(_load_thread_messages(mailbox, thread_id))
+    messages = _visible_thread_messages(_load_thread_messages(mailbox, thread_id, force_refresh=force_refresh))
     if not messages:
         return {
             "mailbox": mailbox,
@@ -1864,6 +1876,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             "todos_enabled",
             "todos_limit",
             "llm_status_poll_seconds",
+            "auto_sync_seconds",
             "initial_list_size",
             "custom_categories",
         )
@@ -1893,6 +1906,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             before_index=before_index,
             limit=limit,
             include_display_body=include_display_body,
+            force_refresh=bool(arguments.get("force_refresh", False)),
         )
 
     if tool == "get_inbox_message_display_body":

@@ -421,9 +421,15 @@ async function resolveDisplayBodyPayload(payload: InboxMessageDisplayBodyPayload
   if (!bodyUrl) return payload;
   // 超大正文不经过 JSON-RPC，而是从 Executa 的短期 loopback URL 读取；
   // 即使读取成功也保留 body_url 标记，调用方据此避免写入 browserStorage。
-  const response = await fetch(bodyUrl, { cache: "no-store" });
-  if (!response.ok) throw new Error(`Failed to load message body (${response.status}).`);
-  return { ...payload, body_html: await response.text(), body_url: bodyUrl };
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(bodyUrl, { cache: "no-store", signal: controller.signal });
+    if (!response.ok) throw new Error(`Failed to load message body (${response.status}).`);
+    return { ...payload, body_html: await response.text(), body_url: bodyUrl };
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 function expectedAttachmentCountForMessage(item: InboxThreadMessage, anchorMessage: InboxMessage | null) {
@@ -640,6 +646,7 @@ export function MailDetailDrawer({
     beforeIndex?: number | null;
     limit?: number;
     includeDisplayBody?: boolean;
+    forceRefresh?: boolean;
   }) => Promise<InboxThreadPagePayload>;
   loadInboxMessageDisplayBody: (mailbox: string, messageId: string) => Promise<InboxMessageDisplayBodyPayload>;
   loadInboxThreadAssist: (mailbox: string, threadId: string, latestMessageId: string, anchorMessageId?: string) => Promise<InboxThreadAssistPayload>;
@@ -1141,7 +1148,7 @@ export function MailDetailDrawer({
     setLoading(true);
     setError("");
     try {
-      const refreshed = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: messageId, limit: 5, includeDisplayBody: true });
+      const refreshed = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: messageId, limit: 5, includeDisplayBody: true, forceRefresh: true });
       const visiblePage = withoutGmailDraftThreadMessages(refreshed);
       queueThreadScroll(visiblePage, messageId);
       setPage(visiblePage);
@@ -1530,7 +1537,7 @@ export function MailDetailDrawer({
       setDraft("");
       setDraftDirty(false);
       showToast("Reply sent.");
-      const refreshed = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: message?.id, limit: 5, includeDisplayBody: true });
+      const refreshed = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: message?.id, limit: 5, includeDisplayBody: true, forceRefresh: true });
       const visiblePage = withoutGmailDraftThreadMessages(refreshed);
       queueThreadScroll(visiblePage, message?.id || "");
       setPage(visiblePage);
@@ -1628,7 +1635,10 @@ export function MailDetailDrawer({
           {loading && !page ? <MailDetailLoadingSkeleton /> : null}
           {error ? <div className="mail-detail-error">Thread failed to load. {error}</div> : null}
           {(visibleThreadMessages.length ? visibleThreadMessages : []).map((item) => {
-            const waitForFullBody = item.id === messageId && item.body_truncated && !displayBodyLoaded.has(item.id);
+            const waitForFullBody = item.id === messageId
+              && item.body_truncated
+              && !displayBodyLoaded.has(item.id)
+              && !displayBodyErrors[item.id];
             return (
             <article key={item.id} className="mail-thread-message" data-message-id={item.id}>
               <div className="mail-thread-message-head">

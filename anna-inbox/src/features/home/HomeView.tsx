@@ -1279,6 +1279,28 @@ function aiTimeLabel(value?: string) {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+export function aiThinkingElapsedLabel(startedAt?: string, endedAt = Date.now()) {
+  const startedMs = new Date(startedAt || "").getTime();
+  if (!Number.isFinite(startedMs)) return "";
+  const elapsedSeconds = Math.max(0, Math.floor((endedAt - startedMs) / 1000));
+  const minutes = Math.floor(elapsedSeconds / 60);
+  const seconds = elapsedSeconds % 60;
+  return minutes ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function AiThinkingElapsed({ startedAt }: { startedAt?: string }) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [startedAt]);
+
+  const elapsed = aiThinkingElapsedLabel(startedAt, now);
+  return elapsed ? <span className="ai-thinking-elapsed">{elapsed}</span> : null;
+}
+
 function relativeTimeLabel(value?: string) {
   if (!value) return "";
   const date = new Date(value);
@@ -1607,6 +1629,10 @@ function AiAssistantMessage({
         {executionSteps.length ? executionSteps.map((step) => (
           <p key={step.label}>{step.status === "complete" ? "Completed: " : step.status === "active" ? "In progress: " : ""}{step.label}</p>
         )) : <p>Thinking...</p>}
+        <div className="ai-message-footer">
+          <time>{aiTimeLabel(message.timestamp)}</time>
+          <AiThinkingElapsed startedAt={message.thinkingStartedAt || message.timestamp} />
+        </div>
       </div>
     );
   }
@@ -2073,6 +2099,7 @@ function AiAssistantMessage({
         ) : null}
         <div className="ai-message-footer">
           <time>{aiTimeLabel(message.timestamp)}</time>
+          {message.thinkingStartedAt ? <span className="ai-thinking-elapsed">{aiThinkingElapsedLabel(message.thinkingStartedAt, new Date(message.timestamp).getTime())}</span> : null}
           {message.kind === "error" ? (
             <button
               type="button"
@@ -2174,7 +2201,10 @@ function AiAssistantMessage({
           ))}
         </ul>
       ) : null}
-      <time>{aiTimeLabel(message.timestamp)}</time>
+      <div className="ai-message-footer">
+        <time>{aiTimeLabel(message.timestamp)}</time>
+        {message.thinkingStartedAt ? <span className="ai-thinking-elapsed">{aiThinkingElapsedLabel(message.thinkingStartedAt, new Date(message.timestamp).getTime())}</span> : null}
+      </div>
     </div>
   );
 }
@@ -4828,6 +4858,15 @@ export function HomeView() {
       row?.focus();
     }, DETAIL_DRAWER_TRANSITION_MS);
   }, [selectedId]);
+
+  const setMailDetailOpenRef = useRef(actions.setMailDetailOpen);
+  useEffect(() => {
+    setMailDetailOpenRef.current = actions.setMailDetailOpen;
+  }, [actions.setMailDetailOpen]);
+  useEffect(() => {
+    setMailDetailOpenRef.current(drawerOpen);
+    return () => setMailDetailOpenRef.current(false);
+  }, [drawerOpen]);
 
   const openMessageDetail = useCallback(
     (message: InboxMessage) => {

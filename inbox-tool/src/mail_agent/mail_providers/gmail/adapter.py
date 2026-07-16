@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 import hashlib
 import html as html_lib
 from html.parser import HTMLParser
@@ -28,6 +30,27 @@ from ...storage.keys import app_key
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
+_gmail_request_token: ContextVar[str | None] = ContextVar("gmail_request_token", default=None)
+_history_sync_locks: dict[str, threading.Lock] = {}
+_history_sync_locks_guard = threading.Lock()
+
+
+class GmailApiError(ValueError):
+    """保留安全 HTTP 状态码，供增量同步区分游标失效与单封邮件删除。"""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@contextmanager
+def _gmail_request_token_scope(access_token: str | None = None):
+    """仅在当前业务调用链内复用短期 token，退出作用域立即清除。"""
+    marker = _gmail_request_token.set(access_token)
+    try:
+        yield
+    finally:
+        _gmail_request_token.reset(marker)
 
 
 def beijing_now() -> str:
@@ -270,6 +293,10 @@ def _feed_page_path(mailbox: str, page_number: int) -> Path:
     return _feed_pages_dir(mailbox) / f"page-{page_number:04d}.json"
 
 
+def _sync_state_path(mailbox: str) -> Path:
+    return _mailbox_cache_dir(mailbox) / "sync_state.json"
+
+
 def _storage_cache_enabled() -> bool:
     try:
         from ...storage.client import backend, is_ready
@@ -298,11 +325,23 @@ def _storage_feed_page_key(mailbox: str, page_number: int) -> str:
     return f"{_storage_cache_prefix(mailbox)}/feed_pages/page/{page_number:04d}"
 
 
+def _storage_sync_state_key(mailbox: str) -> str:
+    return f"{_storage_cache_prefix(mailbox)}/sync_state"
+
+
 def _storage_get_value_sync(key: str, *, timeout: float = 30.0) -> Any:
     from ...storage.client import get_storage, scope as default_scope
     from ...storage.sync_bridge import run as run_storage_sync
     result = run_storage_sync(get_storage().get(key, scope=default_scope()), timeout=timeout)
     return result.get("value") if result.get("exists") else None
+
+
+def _storage_get_record_sync(key: str, *, timeout: float = 30.0) -> dict[str, Any]:
+    """读取 APS 值及 etag；增量 cursor 写回必须使用同一版本条件提交。"""
+    from ...storage.client import get_storage, scope as default_scope
+    from ...storage.sync_bridge import run as run_storage_sync
+    result = run_storage_sync(get_storage().get(key, scope=default_scope()), timeout=timeout)
+    return result if isinstance(result, dict) else {}
 
 
 def _storage_set_value_sync(key: str, value: Any, *, timeout: float = 30.0) -> None:
@@ -382,6 +421,73 @@ def clear_mailbox_cache(mailbox: str) -> dict[str, Any]:
         "deleted_aps_keys": deleted_aps_keys,
         "deleted_local_cache": deleted_local,
     }
+
+
+def _history_sync_lock(mailbox: str) -> threading.Lock:
+    """同一 Executa 进程内串行化单邮箱增量同步，避免旧快照覆盖新标签。"""
+    normalized = normalize_mailbox(mailbox)
+    with _history_sync_locks_guard:
+        lock = _history_sync_locks.get(normalized)
+        if lock is None:
+            lock = threading.Lock()
+            _history_sync_locks[normalized] = lock
+        return lock
+
+
+def _read_history_sync_state(mailbox: str) -> dict[str, Any]:
+    if _storage_cache_enabled():
+        record = _storage_get_record_sync(_storage_sync_state_key(mailbox))
+        payload = record.get("value") if record.get("exists") else None
+        if not isinstance(payload, dict):
+            return {}
+        return {**payload, "_etag": str(record.get("etag") or "")}
+    path = _sync_state_path(mailbox)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _write_history_sync_state(mailbox: str, state: dict[str, Any], *, if_match: str | None = None) -> None:
+    """同步游标只在 index 成功写入后更新，失败时保留旧 cursor 以便安全重试。"""
+    payload = {
+        "schema_version": 1,
+        "history_id": str(state.get("history_id") or ""),
+        "scope_days": int(state.get("scope_days") or 30),
+        "updated_at": beijing_now(),
+    }
+    if _storage_cache_enabled():
+        from ...storage.client import get_storage, scope as default_scope
+        from ...storage.sync_bridge import run as run_storage_sync
+        run_storage_sync(
+            get_storage().set(
+                _storage_sync_state_key(mailbox),
+                payload,
+                scope=default_scope(),
+                if_match=if_match,
+            ),
+        )
+        return
+    path = _sync_state_path(mailbox)
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def set_cached_mailbox_history_cursor(mailbox: str, history_id: str, *, scope_days: int) -> None:
+    """在 All-mail 全量快照完成后建立 Gmail History cursor。"""
+    if not str(history_id or "").strip():
+        return
+    with _history_sync_lock(mailbox):
+        previous = _read_history_sync_state(mailbox)
+        _write_history_sync_state(
+            mailbox,
+            {"history_id": history_id, "scope_days": scope_days},
+            if_match=str(previous.get("_etag") or "") or None,
+        )
 
 
 # ── Cache read / write ────────────────────────────────────────────
@@ -616,6 +722,9 @@ def _build_feed_page_metadata(mailbox: str, messages: list[dict[str, Any]], upda
     meta = {
         "mailbox": mailbox,
         "updated_at": updated_at,
+        # 分页内容字段变化时递增版本。云端 APS 每次读取都需要一次反向 RPC，
+        # 已确认版本的元数据不应再额外读取第一页进行字段探测。
+        "schema_version": 2,
         "page_size": CACHED_FEED_PAGE_SIZE,
         "message_count": len(compact_messages),
         "page_count": len(page_payloads),
@@ -691,11 +800,10 @@ def _read_cached_feed_page(mailbox: str, page_number: int) -> dict[str, Any] | N
 
 def ensure_cached_feed_index(mailbox: str) -> dict[str, Any]:
     meta = _read_cached_feed_meta(mailbox)
-    if isinstance(meta, dict):
-        first_page = _read_cached_feed_page(mailbox, 0)
-        first_messages = first_page.get("messages") if isinstance(first_page, dict) and isinstance(first_page.get("messages"), list) else []
-        if not first_messages or "latest_subject" in first_messages[0]:
-            return meta
+    if isinstance(meta, dict) and int(meta.get("schema_version") or 0) >= 2:
+        return meta
+    # 旧缓存缺少 schema_version，直接从索引重建一次。不能只返回旧元数据，
+    # 否则每一次云端分页都会继续额外读取第一页做历史字段探测。
     cached = read_cache(mailbox)
     messages = cached.get("messages") if isinstance(cached, dict) and isinstance(cached.get("messages"), list) else []
     updated_at = str(cached.get("updated_at") or beijing_now())
@@ -703,6 +811,7 @@ def ensure_cached_feed_index(mailbox: str) -> dict[str, Any]:
     return _read_cached_feed_meta(mailbox) or {
         "mailbox": mailbox,
         "updated_at": updated_at,
+        "schema_version": 2,
         "page_size": CACHED_FEED_PAGE_SIZE,
         "message_count": 0,
         "page_count": 0,
@@ -1254,8 +1363,21 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
 
 # ── Gmail API request ─────────────────────────────────────────────
 
-def gmail_request(mailbox: str, path: str, query: dict[str, Any] | None = None) -> dict[str, Any]:
-    token = get_access_token(mailbox)
+def gmail_request(
+    mailbox: str,
+    path: str,
+    query: dict[str, Any] | None = None,
+    *,
+    access_token: str | None = None,
+) -> dict[str, Any]:
+    # 调用方可在一个受限业务请求内复用已取得的短期 token，减少平台
+    # credentials/getToken 的反向 RPC 数量；未传入时保留原有按请求解析行为。
+    scoped_token = _gmail_request_token.get()
+    token = access_token or scoped_token or get_access_token(mailbox)
+    # 第一个 Gmail 请求取得 token 后写入当前受限上下文，后续同批请求及复制出的
+    # 摘要 worker 都可复用；外层 scope 退出时会恢复，不会残留在进程全局状态。
+    if not access_token and not scoped_token:
+        _gmail_request_token.set(token)
     url = GMAIL_API_BASE + path
     if query:
         url += "?" + urllib.parse.urlencode(query, doseq=True)
@@ -1273,7 +1395,7 @@ def gmail_request(mailbox: str, path: str, query: dict[str, Any] | None = None) 
             detail_json = json.loads(detail) if detail else {"status_code": exc.code}
         except Exception:
             detail_json = {"status_code": exc.code}
-        raise ValueError(f"Gmail API request failed: {exc.code} {detail_json}") from exc
+        raise GmailApiError(exc.code, f"Gmail API request failed: {exc.code} {detail_json}") from exc
     return json.loads(raw) if raw else {}
 
 
@@ -1726,7 +1848,13 @@ def _normalize_message(mailbox: str, message: dict[str, Any]) -> dict[str, Any]:
 
 # ── Gmail live search ─────────────────────────────────────────────
 
-def search_gmail(mailbox: str, query: str, max_results: int = 100) -> list[str]:
+def search_gmail(
+    mailbox: str,
+    query: str,
+    max_results: int = 100,
+    *,
+    access_token: str | None = None,
+) -> list[str]:
     """Search Gmail with a query string, return list of message IDs."""
     target = max(1, min(int(max_results or 100), 500))
     message_ids: list[str] = []
@@ -1742,7 +1870,7 @@ def search_gmail(mailbox: str, query: str, max_results: int = 100) -> list[str]:
         if page_token:
             params["pageToken"] = page_token
         try:
-            payload = gmail_request(mailbox, "/users/me/messages", params)
+            payload = gmail_request(mailbox, "/users/me/messages", params, access_token=access_token)
         except ValueError as exc:
             logging.getLogger("mail_agent.gmail").warning("search_gmail failed for %s: %s", mailbox, exc)
             return message_ids
@@ -1821,7 +1949,13 @@ def fetch_and_cache_message(mailbox: str, message_id: str) -> dict[str, Any] | N
     return normalized
 
 
-def fetch_message_summary(mailbox: str, message_id: str) -> dict[str, Any] | None:
+def fetch_message_summary(
+    mailbox: str,
+    message_id: str,
+    *,
+    access_token: str | None = None,
+    strict: bool = False,
+) -> dict[str, Any] | None:
     """Fetch headers, labels and attachment metadata without downloading bodies."""
     metadata_headers = [
         "Date",
@@ -1846,8 +1980,17 @@ def fetch_message_summary(mailbox: str, message_id: str) -> dict[str, Any] | Non
                     "payload(headers(name,value),mimeType,filename,body(attachmentId,size),parts(filename,mimeType,body(attachmentId,size)))"
                 ),
             },
+            access_token=access_token,
         )
+    except GmailApiError as exc:
+        if strict:
+            raise
+        if exc.status_code != 404:
+            logging.getLogger("mail_agent.gmail").warning("metadata fetch failed for %s: HTTP %s", message_id, exc.status_code)
+        return None
     except ValueError:
+        if strict:
+            raise
         return None
     headers = _header_map(payload)
     message_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
@@ -1881,43 +2024,199 @@ def fetch_message_summary(mailbox: str, message_id: str) -> dict[str, Any] | Non
     }
 
 
-def live_search_metadata_and_cache(mailbox: str, query: str, max_results: int = 100) -> list[str]:
+def live_search_metadata_and_cache(
+    mailbox: str,
+    query: str,
+    max_results: int = 100,
+    *,
+    access_token: str | None = None,
+) -> list[str]:
     """Search Gmail and cache compact summaries, leaving full bodies on demand."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    msg_ids = search_gmail(mailbox, query, max_results)
-    if not msg_ids:
-        return []
+    # 正式环境的 getToken 是 Host 反向 RPC。首页最多并发拉取数百封摘要，
+    # 若每个 Gmail 请求各自取 token，会把一次刷新放大为数百次跨进程往返。
+    # token 仅保留在当前函数及其 worker 上下文中，函数返回即释放，绝不写入缓存或日志。
+    with _gmail_request_token_scope(access_token):
+        # 使用 ContextVar 而不是给公开 helper 新增必填参数；线程池任务通过 copy_context
+        # 显式继承本次 token，既避免凭据 RPC 风暴，也不影响其他并发 mailbox 请求。
+        msg_ids = search_gmail(mailbox, query, max_results)
+        if not msg_ids:
+            return []
 
-    existing = read_cache(mailbox)
-    existing_by_id = {
-        str(item.get("id")): item
-        for item in existing.get("messages") or []
-        if isinstance(item, dict) and item.get("id")
-    }
-    refresh_before = int(time.time()) - SUMMARY_METADATA_REFRESH_SECONDS
-    missing_ids = [
-        message_id
-        for message_id in msg_ids
-        if message_id not in existing_by_id
-        or (not existing_by_id[message_id].get("from") and not existing_by_id[message_id].get("headers_complete"))
-        or int(existing_by_id[message_id].get("metadata_refreshed_at") or 0) <= refresh_before
-    ]
-    if missing_ids:
-        with ThreadPoolExecutor(max_workers=SUMMARY_FETCH_MAX_WORKERS) as pool:
-            futures = {pool.submit(fetch_message_summary, mailbox, message_id): message_id for message_id in missing_ids}
-            for future in as_completed(futures):
-                try:
-                    summary = future.result()
-                except Exception:
-                    summary = None
-                if summary:
-                    existing_by_id[str(summary.get("id") or futures[future])] = summary
+        existing = read_cache(mailbox)
+        existing_by_id = {
+            str(item.get("id")): item
+            for item in existing.get("messages") or []
+            if isinstance(item, dict) and item.get("id")
+        }
+        refresh_before = int(time.time()) - SUMMARY_METADATA_REFRESH_SECONDS
+        missing_ids = [
+            message_id
+            for message_id in msg_ids
+            if message_id not in existing_by_id
+            or (not existing_by_id[message_id].get("from") and not existing_by_id[message_id].get("headers_complete"))
+            or int(existing_by_id[message_id].get("metadata_refreshed_at") or 0) <= refresh_before
+        ]
+        if missing_ids:
+            worker_context = copy_context()
+            with ThreadPoolExecutor(max_workers=SUMMARY_FETCH_MAX_WORKERS) as pool:
+                futures = {
+                    pool.submit(worker_context.copy().run, fetch_message_summary, mailbox, message_id): message_id
+                    for message_id in missing_ids
+                }
+                for future in as_completed(futures):
+                    try:
+                        summary = future.result()
+                    except Exception:
+                        summary = None
+                    if summary:
+                        existing_by_id[str(summary.get("id") or futures[future])] = summary
 
-    returned_ids = [message_id for message_id in msg_ids if message_id in existing_by_id]
-    merged = sorted(existing_by_id.values(), key=lambda item: int(item.get("internal_date") or 0), reverse=True)
-    write_index(mailbox, merged)
-    return returned_ids
+        returned_ids = [message_id for message_id in msg_ids if message_id in existing_by_id]
+        merged = sorted(existing_by_id.values(), key=lambda item: int(item.get("internal_date") or 0), reverse=True)
+        write_index(mailbox, merged)
+        return returned_ids
+
+
+def _delete_cached_message(mailbox: str, message_id: str) -> None:
+    """删除已永久不存在邮件的正文缓存；索引删除由调用方集中提交。"""
+    if _storage_cache_enabled():
+        _storage_delete_value_sync(_storage_message_key(mailbox, message_id))
+        return
+    path = _message_path(mailbox, message_id)
+    if path.exists():
+        path.unlink()
+
+
+def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
+    """用 Gmail History API 增量合并第三方客户端产生的邮件状态变化。
+
+    此函数只读取 Gmail 并更新本邮箱缓存。任意 History 或 metadata 请求失败时
+    不写新 cursor，下一次会从同一个已确认 cursor 重试，不能把半同步状态标为成功。
+    """
+    normalized = normalize_mailbox(mailbox)
+    with _history_sync_lock(normalized):
+        state = _read_history_sync_state(normalized)
+        start_history_id = str(state.get("history_id") or "")
+        cache = read_cache(normalized)
+        cached_messages = cache.get("messages") if isinstance(cache.get("messages"), list) else []
+        if not start_history_id or not cached_messages:
+            return {
+                "mailbox": normalized,
+                "mode": "baseline_required",
+                "added": 0,
+                "updated": 0,
+                "deleted": 0,
+                "cache_total": len(cached_messages),
+                "resync_required": True,
+                "resync_reason": "cursor_missing",
+                "updated_at": beijing_now(),
+            }
+
+        changed_ids: set[str] = set()
+        deleted_ids: set[str] = set()
+        page_token = ""
+        final_history_id = ""
+        pages = 0
+        try:
+            while True:
+                pages += 1
+                if pages > 100:
+                    raise RuntimeError("Gmail History pagination exceeded the 100-page safety limit")
+                params: dict[str, Any] = {
+                    "startHistoryId": start_history_id,
+                    "historyTypes": ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"],
+                    "fields": "history(id,messagesAdded(message/id),messagesDeleted(message/id),labelsAdded(message/id),labelsRemoved(message/id)),nextPageToken,historyId",
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                payload = gmail_request(normalized, "/users/me/history", params)
+                final_history_id = str(payload.get("historyId") or final_history_id)
+                history_items = payload.get("history") if isinstance(payload.get("history"), list) else []
+                for item in history_items:
+                    if not isinstance(item, dict):
+                        continue
+                    for key in ("messagesAdded", "labelsAdded", "labelsRemoved"):
+                        for entry in item.get(key) or []:
+                            message = entry.get("message") if isinstance(entry, dict) else {}
+                            message_id = str(message.get("id") or "") if isinstance(message, dict) else ""
+                            if message_id:
+                                changed_ids.add(message_id)
+                                deleted_ids.discard(message_id)
+                    for entry in item.get("messagesDeleted") or []:
+                        message = entry.get("message") if isinstance(entry, dict) else {}
+                        message_id = str(message.get("id") or "") if isinstance(message, dict) else ""
+                        if message_id:
+                            deleted_ids.add(message_id)
+                            changed_ids.discard(message_id)
+                page_token = str(payload.get("nextPageToken") or "")
+                if not page_token:
+                    break
+        except GmailApiError as exc:
+            if exc.status_code == 404:
+                return {
+                    "mailbox": normalized,
+                    "mode": "history_expired",
+                    "added": 0,
+                    "updated": 0,
+                    "deleted": 0,
+                    "cache_total": len(cached_messages),
+                    "resync_required": True,
+                    "resync_reason": "history_expired",
+                    "updated_at": beijing_now(),
+                }
+            raise
+
+        by_id = {
+            str(item.get("id") or ""): dict(item)
+            for item in cached_messages
+            if isinstance(item, dict) and item.get("id")
+        }
+        added = 0
+        updated = 0
+        for message_id in sorted(changed_ids):
+            try:
+                summary = fetch_message_summary(normalized, message_id, strict=True)
+            except GmailApiError as exc:
+                if exc.status_code == 404:
+                    deleted_ids.add(message_id)
+                    continue
+                raise
+            if not summary:
+                raise RuntimeError(f"Gmail returned no metadata for changed message {message_id}")
+            if message_id in by_id:
+                # 保留已有摘要中正文缓存、原始主题等本地字段，只覆盖 Gmail 权威 metadata。
+                by_id[message_id] = {**by_id[message_id], **summary}
+                updated += 1
+            else:
+                by_id[message_id] = summary
+                added += 1
+
+        for message_id in deleted_ids:
+            by_id.pop(message_id, None)
+            _delete_cached_message(normalized, message_id)
+
+        merged = sorted(by_id.values(), key=_internal_date_sort_key, reverse=True)
+        cache_error_count = len(_aps_cache_errors)
+        write_index(normalized, merged)
+        if len(_aps_cache_errors) != cache_error_count:
+            raise RuntimeError("Gmail cache index write failed; History cursor was not advanced")
+        _write_history_sync_state(normalized, {
+            "history_id": final_history_id or start_history_id,
+            "scope_days": int(state.get("scope_days") or 30),
+        }, if_match=str(state.get("_etag") or "") or None)
+        return {
+            "mailbox": normalized,
+            "mode": "history",
+            "history_id": final_history_id or start_history_id,
+            "added": added,
+            "updated": updated,
+            "deleted": len(deleted_ids),
+            "cache_total": len(merged),
+            "resync_required": False,
+            "updated_at": beijing_now(),
+        }
 
 
 def refresh_thread_cache(mailbox: str, thread_id: str) -> list[dict[str, Any]]:
