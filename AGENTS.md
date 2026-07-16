@@ -22,9 +22,10 @@
 
 ## 项目基线
 
-- **App（前端）**：`2.0.25` — 位于 `anna-inbox/`
+- **App（前端）**：`2.0.26` — 位于 `anna-inbox/`
 - **Tool（Executa）**：`2.1.6` — 位于 `inbox-tool/`
 
+- AI生成内容过程中，滚动条自动滑动到底部。
 - `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表。
 - `anna-inbox/src/features/mail-detail/`：线程详情、正文、草稿和附件预览。
 - `anna-inbox/src/app/useAppController.ts`：主要状态与工作流控制；AI 侧栏默认 `startAiTurn`。

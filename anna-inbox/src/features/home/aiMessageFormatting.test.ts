@@ -15,6 +15,7 @@ describe("parseAiMessageMarkdown", () => {
       },
       {
         type: "unordered_list",
+        indent: 0,
         items: [
           [{ type: "bold", value: "撰写" }, { type: "text", value: "邮件" }],
           [{ type: "link", label: "**官网**", href: "https://example.com/" }],
@@ -22,6 +23,8 @@ describe("parseAiMessageMarkdown", () => {
       },
       {
         type: "ordered_list",
+        indent: 0,
+        start: 1,
         items: [[{ type: "thread_ref", threadId: "thread-123" }]],
       },
     ]);
@@ -40,6 +43,7 @@ describe("parseAiMessageMarkdown", () => {
     expect(parseAiMessageMarkdown("* Access to Enterprise APIs requires monthly fees. * The Self-Service team cannot assist with migration. * Expect response delays.")).toEqual([
       {
         type: "unordered_list",
+        indent: 0,
         items: [
           [{ type: "text", value: "Access to Enterprise APIs requires monthly fees." }],
           [{ type: "text", value: "The Self-Service team cannot assist with migration." }],
@@ -60,7 +64,7 @@ describe("sliceAiMessageBlocks", () => {
     const total = measureAiMessageBlocks(source);
     expect(total).toBe(42);
 
-    // budget 12 → Title(5) + "First i"(7)
+    // budget 12 �?Title(5) + "First i"(7)
     const mid = sliceAiMessageBlocks(source, 12);
     expect(mid[0]).toEqual({
       type: "heading",
@@ -69,6 +73,8 @@ describe("sliceAiMessageBlocks", () => {
     });
     expect(mid[1]?.type).toBe("ordered_list");
     if (mid[1]?.type === "ordered_list") {
+      expect(mid[1].indent).toBe(0);
+      expect(mid[1].start).toBe(1);
       expect(mid[1].items.length).toBe(1);
       expect(mid[1].items[0]).toEqual([{ type: "text", value: "First i" }]);
     }
@@ -80,14 +86,61 @@ describe("sliceAiMessageBlocks", () => {
   it("does not invent reordered list markers from incomplete markdown", () => {
     // Incomplete raw markdown would re-parse prefixes as new list shapes;
     // slicing the full tree must keep item 1 before item 2.
-    // Alpha(5) + Beta(4) + Gamma(5); budget 8 → Alpha + "Bet"
+    // Alpha(5) + Beta(4) + Gamma(5); budget 8 �?Alpha + "Bet"
     const full = parseAiMessageMarkdown("1. Alpha\n2. Beta\n3. Gamma");
     const partial = sliceAiMessageBlocks(full, 8);
     expect(partial).toEqual([
       {
         type: "ordered_list",
+        indent: 0,
+        start: 1,
         items: [[{ type: "text", value: "Alpha" }], [{ type: "text", value: "Bet" }]],
       },
     ]);
+  });
+});
+
+describe("split inline lists", () => {
+  it("splits inline ordered list items", () => {
+    const full = parseAiMessageMarkdown("1. Alpha 2. Beta 3. Gamma");
+    expect(full).toHaveLength(1);
+    expect(full[0]).toEqual({
+      type: "ordered_list",
+      indent: 0,
+      start: 1,
+      items: [
+        [{ type: "text", value: "Alpha" }],
+        [{ type: "text", value: "Beta" }],
+        [{ type: "text", value: "Gamma" }],
+      ],
+    });
+  });
+
+  it("splits inline unordered list items", () => {
+    const full = parseAiMessageMarkdown("* Alpha * Beta * Gamma");
+    expect(full).toHaveLength(1);
+    expect(full[0]).toEqual({
+      type: "unordered_list",
+      indent: 0,
+      items: [
+        [{ type: "text", value: "Alpha" }],
+        [{ type: "text", value: "Beta" }],
+        [{ type: "text", value: "Gamma" }],
+      ],
+    });
+  });
+
+  it("handles unordered lists with leading spaces", () => {
+    const full = parseAiMessageMarkdown(" * Alpha * Beta * Gamma");
+    expect(full).toHaveLength(1);
+    expect(full[0]).toEqual({
+      type: "unordered_list",
+      indent: 1,
+      items: [
+        [{ type: "text", value: "Alpha" }],
+        [{ type: "text", value: "Beta" }],
+        [{ type: "text", value: "Gamma" }],
+      ],
+    });
   });
 });

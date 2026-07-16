@@ -7,16 +7,20 @@ export type AiMessageInline =
 export type AiMessageBlock =
   | { type: "paragraph"; content: AiMessageInline[] }
   | { type: "heading"; level: 1 | 2 | 3; content: AiMessageInline[] }
-  | { type: "unordered_list"; items: AiMessageInline[][] }
-  | { type: "ordered_list"; items: AiMessageInline[][] };
+  | { type: "unordered_list"; indent: number; items: AiMessageInline[][] }
+  | { type: "ordered_list"; indent: number; start: number; items: AiMessageInline[][] };
 
 const headingPattern = /^(#{1,3})\s+(.+)$/;
-const unorderedListPattern = /^[-*]\s+(.+)$/;
-const orderedListPattern = /^\d+[.)]\s+(.+)$/;
+const unorderedListPattern = /^(\s*)[-*]\s+(.+)$/;
+const orderedListPattern = /^(\s*)(\d+)[.)]\s+(.+)$/;
 const inlinePattern = /\[THREAD_REF_([^\]\s]+)\]|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*/g;
 
 function splitInlineUnorderedListItems(line: string): string[] {
-  return Array.from(line.matchAll(/(?:^|\s+)\*\s+(.+?)(?=\s+\*\s+|$)/g), (match) => match[1].trim());
+  return Array.from(line.matchAll(/(?:^|\s+)[-*]\s+(.+?)(?=\s+[-*]\s+|$)/g), (match) => match[1].trim());
+}
+
+function splitInlineOrderedListItems(line: string): string[] {
+  return Array.from(line.matchAll(/(?:^|\s+)\d+[.)]\s+(.+?)(?=\s+\d+[.)]\s+|$)/g), (match) => match[1].trim());
 }
 
 function isSupportedUrl(value: string) {
@@ -73,29 +77,36 @@ export function parseAiMessageMarkdown(text: string): AiMessageBlock[] {
     }
     const unordered = line.match(unorderedListPattern);
     if (unordered) {
+      const indent = unordered[1].length;
       const items: AiMessageInline[][] = [];
       while (index < lines.length) {
         const item = lines[index].match(unorderedListPattern);
-        if (!item) break;
+        if (!item || item[1].length !== indent) break;
         const inlineItems = splitInlineUnorderedListItems(lines[index]);
-        for (const inlineItem of inlineItems.length ? inlineItems : [item[1]]) {
+        for (const inlineItem of inlineItems.length ? inlineItems : [item[2]]) {
           items.push(parseAiMessageInline(inlineItem));
         }
         index += 1;
       }
-      blocks.push({ type: "unordered_list", items });
+      blocks.push({ type: "unordered_list", indent, items });
       continue;
     }
     const ordered = line.match(orderedListPattern);
     if (ordered) {
+      const indent = ordered[1].length;
       const items: AiMessageInline[][] = [];
+      const start = parseInt(ordered[2], 10);
+      
       while (index < lines.length) {
         const item = lines[index].match(orderedListPattern);
-        if (!item) break;
-        items.push(parseAiMessageInline(item[1]));
+        if (!item || item[1].length !== indent) break;
+        const inlineItems = splitInlineOrderedListItems(lines[index]);
+        for (const inlineItem of inlineItems.length ? inlineItems : [item[3]]) {
+          items.push(parseAiMessageInline(inlineItem));
+        }
         index += 1;
       }
-      blocks.push({ type: "ordered_list", items });
+      blocks.push({ type: "ordered_list", indent, start, items });
       continue;
     }
     const paragraph: string[] = [];
@@ -203,8 +214,8 @@ export function sliceAiMessageBlocks(blocks: AiMessageBlock[], maxChars: number)
     if (items.length) {
       next.push(
         block.type === "ordered_list"
-          ? { type: "ordered_list", items }
-          : { type: "unordered_list", items },
+          ? { type: "ordered_list", indent: block.indent, start: block.start, items }
+          : { type: "unordered_list", indent: block.indent, items },
       );
     }
   }

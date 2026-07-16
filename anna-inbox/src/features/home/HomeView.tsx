@@ -1374,7 +1374,7 @@ function RichAssistantBlocks({
         }
         if (block.type === "unordered_list") {
           return (
-            <ul key={key}>
+            <ul key={key} style={{ marginLeft: block.indent ? `${block.indent * 0.5}rem` : undefined }}>
               {block.items.map((item, itemIndex) => (
                 <li key={itemIndex}>
                   <AiMessageInlineContent
@@ -1388,7 +1388,7 @@ function RichAssistantBlocks({
         }
         if (block.type === "ordered_list") {
           return (
-            <ol key={key}>
+            <ol key={key} start={block.start} style={{ marginLeft: block.indent ? `${block.indent * 0.5}rem` : undefined }}>
               {block.items.map((item, itemIndex) => (
                 <li key={itemIndex}>
                   <AiMessageInlineContent
@@ -1495,6 +1495,7 @@ function AiAssistantMessage({
   onUseComposeArtifact,
   onOpenMail,
   onConfirmSendPlan,
+  onTextComplete,
 }: {
   message: AiChatMessage;
   currentMailContext: AiMailContextRef | null;
@@ -1508,6 +1509,7 @@ function AiAssistantMessage({
   ) => void;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
+  onTextComplete?: () => void;
 }) {
   const { state, actions } = useApp();
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -1691,7 +1693,10 @@ function AiAssistantMessage({
         <AnimatedAssistantText
           text={text}
           animate={animate}
-          onComplete={() => setAssistantTextComplete(true)}
+          onComplete={() => {
+            setAssistantTextComplete(true);
+            onTextComplete?.();
+          }}
           onOpenThread={openThreadReference}
         />
         {clarification && clarification.status === "pending" ? (
@@ -2035,6 +2040,7 @@ function AiAssistantMessage({
             text={message.assistantFollowupText}
             animate={animate}
             onOpenThread={openThreadReference}
+            onComplete={onTextComplete}
           />
         ) : null}
         {assistantTextComplete && message.replyGaps?.needs_user_input ? (
@@ -2101,6 +2107,7 @@ function AiAssistantMessage({
         text={summaryText}
         animate={animate}
         onOpenThread={openThreadReference}
+        onComplete={onTextComplete}
       />
       {result.title || result.plan_title ? (
         <h2>{result.title || result.plan_title}</h2>
@@ -2179,6 +2186,7 @@ function AiMessageBubble({
   onUseComposeArtifact,
   onOpenMail,
   onConfirmSendPlan,
+  onTextComplete,
 }: {
   message: AiChatMessage;
   currentMailContext: AiMailContextRef | null;
@@ -2192,6 +2200,7 @@ function AiMessageBubble({
   ) => void;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
+  onTextComplete?: () => void;
 }) {
   if (message.role === "user") {
     return <div className="ai-message is-user">{message.content}</div>;
@@ -2204,6 +2213,7 @@ function AiMessageBubble({
       onUseComposeArtifact={onUseComposeArtifact}
       onOpenMail={onOpenMail}
       onConfirmSendPlan={onConfirmSendPlan}
+      onTextComplete={onTextComplete}
     />
   );
 }
@@ -2398,6 +2408,7 @@ function AiSidebar({
                 onUseComposeArtifact={onUseComposeArtifact}
                 onOpenMail={onOpenMail}
                 onConfirmSendPlan={onConfirmSendPlan}
+                onTextComplete={scrollConversationToBottom}
               />
             ))}
           </div>
