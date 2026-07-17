@@ -130,7 +130,9 @@ class TestMultiTokenIntegration:
     def run(self):
         self.test_platform_account_id_alias_is_supported()
         self.test_platform_credentials_multi_account_flow()
+        self.test_nondefault_account_never_uses_default_platform_token()
         self.test_platform_credentials_grant_error_is_reported()
+        self.test_platform_credentials_transient_error_keeps_account_map()
         self.test_mailbox_list_includes_credentials_status()
         self.test_single_token_backward_compat()
         self.test_multi_token_only()
@@ -176,6 +178,26 @@ class TestMultiTokenIntegration:
         clear_env()
         clear_adapter_state()
 
+    def test_nondefault_account_never_uses_default_platform_token(self):
+        section("0. Platform credentials reject unsafe default-token fallback")
+        clear_env()
+        clear_adapter_state()
+
+        from mail_agent.mail_providers.gmail import adapter
+
+        os.environ["GMAIL_ACCESS_TOKEN"] = "default-account-token"
+        adapter.configure_platform_accounts(lambda: [], lambda _account_id, _timeout: "unused")
+        with patch.object(adapter, "get_authorized_email", return_value=""):
+            try:
+                adapter.get_access_token("other@example.com")
+            except ValueError as exc:
+                check("nondefault fallback is rejected", "Connected accounts" in str(exc), True)
+            else:
+                raise AssertionError("nondefault mailbox must not receive the default platform token")
+
+        clear_env()
+        clear_adapter_state()
+
         from mail_agent.mail_providers.gmail import adapter
         from anna_inbox_executa.mailbox_tools import _discover_mailboxes
 
@@ -190,6 +212,7 @@ class TestMultiTokenIntegration:
             return f"short-lived-{account_id}"
 
         adapter.configure_platform_accounts(lambda: [], resolve_token)
+        os.environ["GMAIL_ACCESS_TOKEN"] = "default-account-token"
         check("default account first", adapter.get_platform_accounts()[0]["email"], "personal@example.com")
         check("work uses account id", adapter.get_access_token("work@example.com"), "short-lived-account-work")
         check("token request id", requested_ids, ["account-work"])
@@ -227,6 +250,35 @@ class TestMultiTokenIntegration:
         check("grant error is unavailable", status["available"], False)
         status_text = json.dumps(status, ensure_ascii=False)
         check("grant error omits credential token", "credentials_token" in status_text, False)
+        clear_adapter_state()
+
+    def test_platform_credentials_transient_error_keeps_account_map(self):
+        section("0a. Platform credentials transient error keeps account map")
+        clear_env()
+        clear_adapter_state()
+
+        from anna_inbox_executa import common
+        from executa_sdk.credentials import CredentialsError
+        from mail_agent.mail_providers.gmail import adapter
+
+        adapter.set_platform_accounts([
+            {"account_id": "account-other", "email": "other@example.com", "status": "active"},
+        ])
+
+        async def temporarily_unavailable(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise CredentialsError(-32063, "temporarily unavailable")
+
+        with (
+            patch.object(common, "_platform_credentials_ready", True),
+            patch.object(common.platform_credentials, "list_accounts", side_effect=temporarily_unavailable),
+        ):
+            check("transient discovery returns no fresh accounts", common.refresh_platform_google_accounts(), [])
+
+        check(
+            "transient discovery keeps previous account mapping",
+            adapter.get_platform_account("other@example.com").get("account_id"),
+            "account-other",
+        )
         clear_adapter_state()
 
     def test_mailbox_list_includes_credentials_status(self):

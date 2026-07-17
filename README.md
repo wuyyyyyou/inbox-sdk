@@ -13,6 +13,7 @@ Anna Inbox 是运行在 Anna App 中的 Gmail 工作台。2.0 以完整收件箱
 - 多 Gmail 账户发现与切换。
 - LLM 与 Gmail API 的真实连通性和延迟检测：反向 RPC 响应直通、12 秒统一总预算、检测去重，并在扫描或 AI turn 期间暂停轮询。
 - 平台超时安全诊断：AI run 与同步收件箱调用返回 Sampling、Connected accounts、Gmail HTTP 和 Executa 阶段耗时，前端失败消息仅展示经过格式校验的诊断摘要。
+- AI 侧栏 Ask 固定检索当前活动邮箱，不因多账户选择状态扩大 Gmail 搜索范围。
 - 后端保留 Brief 注意力卡片、Ask、自定义扫描和联系人记忆能力。
 
 设置入口在 2.0.1 前端中暂时隐藏；相关后端工具和状态结构仍然保留。
@@ -98,6 +99,7 @@ uv run python tests/test_inbox_thread_storage.py
 uv run python tests/test_attachment_download_host_upload.py
 uv run python tests/test_llm_json_repair.py
 uv run python tests/test_runtime_diagnostics.py
+uv run python tests/test_ai_turn_current_mailbox.py
 uv run python tests/test_storage_integration.py
 ```
 
@@ -115,7 +117,7 @@ App 与 Tool **版本解耦**（当前基线）：
 | 端 | 版本 | 权威文件 |
 | --- | --- | --- |
 | App | `2.0.28` | `anna-inbox/app.json` |
-| Tool | `2.1.8` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
+| Tool | `2.1.9` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
 
 Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Tool 版本后运行：
 

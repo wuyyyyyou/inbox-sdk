@@ -48,6 +48,34 @@ def test_scoped_gmail_requests_resolve_platform_token_once() -> None:
     assert token_calls == ["user@example.com"]
 
 
+def test_ask_full_message_workers_inherit_request_token() -> None:
+    """Ask 的全文缓存 worker 必须复用搜索请求的短期 token。"""
+    from mail_agent.mail_providers.gmail import adapter
+
+    observed_tokens: list[str | None] = []
+
+    def fake_search(_mailbox: str, _query: str, _limit: int) -> list[str]:
+        adapter._gmail_request_token.set("short-lived-token")
+        return ["message-1", "message-2"]
+
+    def fake_fetch(_mailbox: str, message_id: str) -> dict:
+        observed_tokens.append(adapter._gmail_request_token.get())
+        return {"id": message_id, "internal_date": "1"}
+
+    with (
+        patch.object(adapter, "search_gmail", side_effect=fake_search),
+        patch.object(adapter, "read_cache", return_value={"messages": []}),
+        patch.object(adapter, "fetch_and_cache_message", side_effect=fake_fetch),
+        patch.object(adapter, "message_summary", side_effect=lambda item: item),
+        patch.object(adapter, "write_index"),
+    ):
+        returned = adapter.live_search_and_cache("user@example.com", "newer_than:30d", 2)
+
+    assert returned == ["message-1", "message-2"]
+    assert observed_tokens == ["short-lived-token", "short-lived-token"]
+
+
 if __name__ == "__main__":
     test_scoped_gmail_requests_resolve_platform_token_once()
+    test_ask_full_message_workers_inherit_request_token()
     print("Gmail request token reuse: OK")

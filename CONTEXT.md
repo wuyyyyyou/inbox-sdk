@@ -2,7 +2,7 @@
 
 Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；Brief、Attention Card 和 Custom Scan 是仍由后端提供的工作流能力，不再代表 2.0 的整体界面结构。
 
-当前发布基线：App `2.0.28` / Tool `2.1.8`。本版本新增平台调用链安全诊断：同步 invoke 与后台 AI run 返回同一 trace 的安全阶段耗时和错误类型，用于区分宿主、Sampling、Connected accounts 与 Gmail HTTP 超时。
+当前发布基线：App `2.0.28` / Tool `2.1.9`。本版本新增平台调用链安全诊断，并将 AI 侧栏 Ask 固定为当前活动邮箱，避免多账户选择状态扩大搜索和凭据调用。
 
 ## Language
 
@@ -63,7 +63,8 @@ Brief 的扫描窗口、数量和行为偏好。
 - 2.0.1 只支持 Gmail；Outlook 仍是未来方向。
 - 设置页含 AI Personalization（Saved prompts / Memory）与 Connectivity check（LLM / Gmail API 延迟轮询间隔，持久化到 inboxSettings）。
 - AI 侧栏底部展示 LLM 与 Gmail API 连通状态及延迟（ms）；点击各自手动重测，定时轮询并行刷新。检测请求去重，扫描或 AI turn 期间暂停轮询；后端反向 RPC 响应直通，Gmail 的账号、token 与 HTTP 请求共享 12 秒总预算。
-- 调用链诊断只返回随机 trace ID、阶段、耗时、稳定 endpoint 类别、HTTP 状态码和错误类型；禁止包含邮箱地址、邮件内容、查询参数、提示词、模型输出或凭据。
+- 调用链诊断只返回随机 trace ID、阶段、耗时、稳定 endpoint 类别、HTTP 状态码、token 来源枚举和错误类型；禁止包含邮箱地址、邮件内容、查询参数、提示词、模型输出或凭据。
+- AI 侧栏 Ask 只检索 `ui_context.mailbox` 当前活动邮箱；`selected_mailboxes` 仅作界面上下文，不可扩大问答检索范围。
 - AI 侧栏回复先完整解析 Markdown 再按稳定结构揭示；指定联系人检索不得放宽 `from:`/`to:`；Replace draft 直接覆盖编辑栏，Discard 后禁止旧草稿自动回填。
 - 邮件发送、标记已读、标签变更、移至垃圾箱与整理确认必须来自明确用户操作。
 - 凭据不作为工具参数传递，也不得写入日志或持久化状态。

@@ -361,6 +361,7 @@ v1 **不**注册为 Router 可执行 mutation：`send_mail`、`delete_mail`、`a
 | Router 调用 | 计 1 次 Sampling；steps 内生成再计 |
 | Agent Session | 默认关闭；若实验开启须 `granted_tools` 为空，否则拒绝 |
 | 取消 | 前端 abort 应调用 cancel run；停止后续 tool 与 Sampling |
+| Ask 邮箱范围 | 仅使用 `ui_context.mailbox` 当前活动邮箱；`selected_mailboxes` 不参与检索 |
 | 诊断 | 后台 `run_id` 轮询返回同一安全 diagnostics trace；失败 UI 仅展示阶段、耗时和错误类型 |
 
 ---
@@ -370,7 +371,7 @@ v1 **不**注册为 Router 可执行 mutation：`send_mail`、`delete_mail`、`a
 1. **事实边界**：回答中的 message_id / thread_id 必须来自本轮 tool evidence，经 source guard。
 2. **禁止自动 mutation**：Router 不得选择发送/删除/已读等 tool（v1 不存在这些 tool）。
 3. **Draft 引用**：上一版 draft 作为引用内容，防 prompt 注入覆盖系统策略。
-4. **多邮箱**：仅使用 `ui_context` 中已授权且选中的 mailbox 集合。
+4. **多邮箱**：Ask 仅使用 `ui_context.mailbox` 当前活动邮箱；其他邮箱的选择状态不得扩大检索范围。
 5. **日志**：仅 tool 名、阶段、耗时、token、错误类型、fallback 原因码。
 
 ---

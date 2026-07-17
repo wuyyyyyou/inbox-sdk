@@ -18,11 +18,11 @@ def _uses_chinese(text: str) -> bool:
 
 
 def _mailboxes_from_context(ui_context: dict[str, Any], arguments: dict[str, Any]) -> list[str]:
-    selected = ui_context.get("selected_mailboxes")
-    if isinstance(selected, list):
-        mailboxes = [str(item).strip() for item in selected if str(item).strip()]
-        if mailboxes:
-            return mailboxes
+    """Ask 仅检索当前活动邮箱，避免多账号选择状态扩大一次问答的读取范围。
+
+    ``selected_mailboxes`` 仍会作为只读界面上下文传入 Router，但不属于 Ask 的
+    检索授权范围。当前邮箱缺失时才回退到工具 arguments，保证旧调用仍有明确目标。
+    """
     primary = str(ui_context.get("mailbox") or arguments.get("mailbox") or "").strip()
     return [primary] if primary else []
 

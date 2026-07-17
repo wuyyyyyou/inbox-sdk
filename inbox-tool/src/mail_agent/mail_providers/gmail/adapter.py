@@ -992,6 +992,7 @@ def get_access_token(
     refresh_platform_accounts: bool = True,
 ) -> str:
     normalized = str(mailbox or "").strip().lower()
+    started = time.monotonic()
 
     # 延迟探测已在调用方使用受限预算刷新过账号，禁止 adapter 再开启一轮默认 12 秒的发现。
     if refresh_platform_accounts and not get_platform_account(normalized):
@@ -1005,6 +1006,7 @@ def get_access_token(
         # 连通性探测传入剩余预算；正常 Gmail 业务沿用 35 秒的默认凭据预算。
         token = resolver(str(platform_account["account_id"]), platform_token_timeout_seconds)
         if token:
+            _record_diagnostic_span("gmail.token", started, source="platform_credentials")
             return token
         raise ValueError(f"Platform returned no Gmail access token for {mailbox}")
 
@@ -1055,6 +1057,7 @@ def get_access_token(
             token = record.get("access_token")
             if not token:
                 raise ValueError(f"Gmail access token is missing for multi-token mailbox {mailbox}")
+            _record_diagnostic_span("gmail.token", started, source="legacy_multi")
             return str(token)
 
     # Legacy single-account fallback. Platform refreshes this credential for us.
@@ -1063,8 +1066,31 @@ def get_access_token(
         global _discovered_email
         if not _discovered_email or normalized != _discovered_email:
             _discovered_email = get_authorized_email().lower()
-        if normalized == _discovered_email or not _discovered_email:
+        if normalized == _discovered_email:
+            _record_diagnostic_span("gmail.token", started, source="legacy_single")
             return str(platform_token).strip()
+        # 支持 Connected Accounts 的 runtime 必须按目标 account_id 交换 token。
+        # 探测不到目标账户时宁可返回明确错误，也不能把默认账户 token 用于任意邮箱。
+        with _platform_account_lock:
+            has_platform_account_bridge = _platform_account_lister is not None
+        if has_platform_account_bridge:
+            _record_diagnostic_span(
+                "gmail.token",
+                started,
+                outcome="error",
+                source="legacy_single",
+                error_type="MailboxMismatch",
+            )
+            raise ValueError("Selected Gmail mailbox is unavailable through Connected accounts")
+        if not _discovered_email:
+            _record_diagnostic_span(
+                "gmail.token",
+                started,
+                outcome="error",
+                source="legacy_single",
+                error_type="UnverifiedCredential",
+            )
+            raise ValueError("Could not verify the account bound to the platform Gmail credential")
 
     # Local dev — read from JSON token file with refresh support.
     record = _load_token_record(mailbox)
@@ -2403,8 +2429,14 @@ def live_search_and_cache(
     # Fetch uncached messages concurrently
     if uncached_to_fetch:
         fetched: dict[str, dict[str, Any]] = {}
+        # 首次 Gmail 搜索已在当前上下文取得短期 token；复制上下文给全文 worker，
+        # 避免平台环境中每封邮件再次触发 credentials/getToken，并保留同一 trace。
+        worker_context = copy_context()
         with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
-            future_to_mid = {pool.submit(fetch_and_cache_message, mailbox, mid): mid for mid in uncached_to_fetch}
+            future_to_mid = {
+                pool.submit(worker_context.copy().run, fetch_and_cache_message, mailbox, mid): mid
+                for mid in uncached_to_fetch
+            }
             for future in as_completed(future_to_mid):
                 mid = future_to_mid[future]
                 try:

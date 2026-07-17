@@ -1176,10 +1176,9 @@ def refresh_platform_google_accounts(timeout_seconds: float = 12.0) -> list[dict
             error_type=type(exc).__name__,
         )
         from mail_agent.mail_providers.gmail.adapter import set_platform_accounts
-        # 用户未向本 App 授予 Connected accounts 时，不能继续使用
-        # 默认注入 token 冒充完整账户列表；清空旧 metadata 防止断开授权后残留。
-        set_platform_accounts([])
         if exc.code == -32061:
+            # 用户显式撤销授权时才清空旧映射，防止已断开的账户继续被使用。
+            set_platform_accounts([])
             _set_platform_credentials_status(
                 available=False,
                 code="not_granted",
@@ -1202,8 +1201,8 @@ def refresh_platform_google_accounts(timeout_seconds: float = 12.0) -> list[dict
             outcome="error",
             error_type=type(exc).__name__,
         )
-        from mail_agent.mail_providers.gmail.adapter import set_platform_accounts
-        set_platform_accounts([])
+        # 临时 Reverse RPC 故障不能清空上一份有效账户映射；否则切换到非默认
+        # 邮箱会错误退回默认 token，进而向 Gmail 发送不属于目标账户的凭据。
         _set_platform_credentials_status(
             available=False,
             code="unavailable",
