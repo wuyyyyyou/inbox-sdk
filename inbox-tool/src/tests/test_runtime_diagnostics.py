@@ -1,0 +1,72 @@
+"""调用链安全诊断的回归测试。
+
+运行：uv --directory inbox-tool/src run python tests/test_runtime_diagnostics.py
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+
+_SRC = str(Path(__file__).resolve().parents[1])
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+
+def test_span_redacts_unapproved_fields() -> None:
+    """邮箱等未授权字段不能进入前端可见诊断。"""
+    from anna_inbox_executa.diagnostics import activate_trace, create_trace, deactivate_trace, record_span, snapshot
+
+    trace = create_trace(operation="list_gmail_emails", invoke_id="private-host-invoke")
+    token = activate_trace(trace)
+    try:
+        started = time.monotonic()
+        record_span(
+            "gmail.http",
+            started,
+            endpoint="messages",
+            http_status=200,
+            mailbox="secret@example.com",
+            token="never-recorded",
+        )
+        payload = snapshot(trace)
+    finally:
+        deactivate_trace(token)
+
+    assert payload is not None
+    assert payload["operation"] == "list_gmail_emails"
+    assert payload["spans"][0]["endpoint"] == "messages"
+    assert "mailbox" not in payload["spans"][0]
+    assert "secret@example.com" not in str(payload)
+    assert "never-recorded" not in str(payload)
+
+
+def test_invoke_response_includes_diagnostics() -> None:
+    """同步 Gmail/收件箱工具成功时，前端可以获得对应 invoke 的分段摘要。"""
+    from anna_inbox_executa import main
+
+    with patch.object(
+        main,
+        "handle_invoke",
+        return_value={"success": True, "tool": "list_gmail_emails_page", "data": {"messages": []}},
+    ):
+        response = main.handle_request({
+            "jsonrpc": "2.0",
+            "id": "diagnostic-test",
+            "method": "invoke",
+            "params": {"tool": "list_gmail_emails_page", "arguments": {}, "context": {}},
+        })
+
+    diagnostic = response["result"]["data"]["diagnostics"]
+    assert diagnostic["operation"] == "list_gmail_emails_page"
+    assert diagnostic["trace_id"].startswith("rt_")
+    assert diagnostic["spans"][-1]["stage"] == "executa.invoke"
+
+
+if __name__ == "__main__":
+    test_span_redacts_unapproved_fields()
+    test_invoke_response_includes_diagnostics()
+    print("Runtime diagnostics: OK")

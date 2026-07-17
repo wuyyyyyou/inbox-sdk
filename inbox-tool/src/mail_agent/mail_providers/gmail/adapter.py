@@ -27,6 +27,30 @@ from typing import Any, Callable
 from ...domain.types import MessageDetail, MessageLite, ThreadContext
 from ...storage.keys import app_key
 
+
+def _record_diagnostic_span(stage: str, started: float, *, outcome: str = "ok", **fields: Any) -> None:
+    """向 Executa 调用 trace 写入安全时序；独立运行 adapter 时保持兼容。"""
+    try:
+        from anna_inbox_executa.diagnostics import record_span
+        record_span(stage, started, outcome=outcome, **fields)
+    except Exception:
+        # 邮件适配层不能因诊断模块不可用而影响业务请求。
+        return
+
+
+def _gmail_endpoint_kind(path: str) -> str:
+    """将 Gmail 路径归并为稳定类别，避免 message/thread ID 出现在诊断中。"""
+    normalized = str(path or "")
+    if "/history" in normalized:
+        return "history"
+    if "/threads" in normalized:
+        return "threads"
+    if "/messages" in normalized:
+        return "messages"
+    if "/profile" in normalized:
+        return "profile"
+    return "other"
+
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
@@ -1386,16 +1410,23 @@ def gmail_request(
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
         method="GET",
     )
+    started = time.monotonic()
+    endpoint = _gmail_endpoint_kind(path)
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
+        _record_diagnostic_span("gmail.http", started, outcome="error", endpoint=endpoint, http_status=exc.code, error_type=type(exc).__name__)
         try:
             detail = exc.read().decode("utf-8")
             detail_json = json.loads(detail) if detail else {"status_code": exc.code}
         except Exception:
             detail_json = {"status_code": exc.code}
         raise GmailApiError(exc.code, f"Gmail API request failed: {exc.code} {detail_json}") from exc
+    except Exception as exc:
+        _record_diagnostic_span("gmail.http", started, outcome="error", endpoint=endpoint, error_type=type(exc).__name__)
+        raise
+    _record_diagnostic_span("gmail.http", started, endpoint=endpoint)
     return json.loads(raw) if raw else {}
 
 

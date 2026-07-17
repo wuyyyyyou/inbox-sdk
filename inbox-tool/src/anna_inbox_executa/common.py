@@ -52,6 +52,7 @@ from executa_sdk import PROTOCOL_VERSION_V2, SamplingClient, SamplingError
 from executa_sdk.credentials import CredentialsClient, CredentialsError
 from executa_sdk.storage import StorageClient, FilesClient, StorageError, make_response_router
 from executa_sdk.host_upload import HostUploadClient
+from anna_inbox_executa.diagnostics import record_span
 from mail_agent.storage.keys import app_key
 
 JSONRPC_VERSION = "2.0"
@@ -1159,6 +1160,7 @@ def refresh_platform_google_accounts(timeout_seconds: float = 12.0) -> list[dict
             action="upgrade_runtime",
         )
         return []
+    started = time.monotonic()
     try:
         timeout = max(0.1, float(timeout_seconds))
         future = asyncio.run_coroutine_threadsafe(
@@ -1166,6 +1168,13 @@ def refresh_platform_google_accounts(timeout_seconds: float = 12.0) -> list[dict
         )
         payload = future.result(timeout=timeout)
     except CredentialsError as exc:
+        record_span(
+            "credentials.list_accounts",
+            started,
+            outcome="error",
+            code=exc.code,
+            error_type=type(exc).__name__,
+        )
         from mail_agent.mail_providers.gmail.adapter import set_platform_accounts
         # 用户未向本 App 授予 Connected accounts 时，不能继续使用
         # 默认注入 token 冒充完整账户列表；清空旧 metadata 防止断开授权后残留。
@@ -1187,6 +1196,12 @@ def refresh_platform_google_accounts(timeout_seconds: float = 12.0) -> list[dict
         log(f"platform Google account listing unavailable: {exc.code}")
         return []
     except Exception as exc:
+        record_span(
+            "credentials.list_accounts",
+            started,
+            outcome="error",
+            error_type=type(exc).__name__,
+        )
         from mail_agent.mail_providers.gmail.adapter import set_platform_accounts
         set_platform_accounts([])
         _set_platform_credentials_status(
@@ -1199,6 +1214,7 @@ def refresh_platform_google_accounts(timeout_seconds: float = 12.0) -> list[dict
         return []
 
     accounts = payload.get("accounts") if isinstance(payload, dict) else []
+    record_span("credentials.list_accounts", started)
     normalized = [item for item in accounts if isinstance(item, dict)] if isinstance(accounts, list) else []
     from mail_agent.mail_providers.gmail.adapter import set_platform_accounts
     set_platform_accounts(normalized)
@@ -1213,6 +1229,7 @@ def refresh_platform_google_accounts(timeout_seconds: float = 12.0) -> list[dict
 
 def resolve_platform_google_token(account_id: str, timeout_seconds: float = 35.0) -> str:
     """Get one short-lived token without logging, returning, or persisting it."""
+    started = time.monotonic()
     try:
         timeout = max(0.1, float(timeout_seconds))
         future = asyncio.run_coroutine_threadsafe(
@@ -1220,12 +1237,27 @@ def resolve_platform_google_token(account_id: str, timeout_seconds: float = 35.0
         )
         payload = future.result(timeout=timeout)
     except CredentialsError as exc:
+        record_span(
+            "credentials.get_token",
+            started,
+            outcome="error",
+            code=exc.code,
+            error_type=type(exc).__name__,
+        )
         raise ValueError(f"Google authorization is unavailable for this mailbox ({exc.code})") from exc
     except Exception as exc:
+        record_span(
+            "credentials.get_token",
+            started,
+            outcome="error",
+            error_type=type(exc).__name__,
+        )
         raise ValueError("Google authorization token request failed") from exc
     token = str(payload.get("access_token") or "") if isinstance(payload, dict) else ""
     if not token:
+        record_span("credentials.get_token", started, outcome="error", error_type="EmptyToken")
         raise ValueError("Google authorization returned no access token for this mailbox")
+    record_span("credentials.get_token", started)
     return token
 
 

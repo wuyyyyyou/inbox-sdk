@@ -361,6 +361,7 @@ v1 **不**注册为 Router 可执行 mutation：`send_mail`、`delete_mail`、`a
 | Router 调用 | 计 1 次 Sampling；steps 内生成再计 |
 | Agent Session | 默认关闭；若实验开启须 `granted_tools` 为空，否则拒绝 |
 | 取消 | 前端 abort 应调用 cancel run；停止后续 tool 与 Sampling |
+| 诊断 | 后台 `run_id` 轮询返回同一安全 diagnostics trace；失败 UI 仅展示阶段、耗时和错误类型 |
 
 ---
 

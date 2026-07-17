@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from anna_inbox_executa.common import *
+from anna_inbox_executa.diagnostics import record_span
 
 
 # Anna Host 按同一 invoke_id 累计计算 maxTokens；保留余量避免
@@ -85,6 +86,12 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str) -> Any:
         try:
             result = await sampling_fn(**request)
         except Exception as exc:
+            record_span(
+                "sampling.create_message",
+                started,
+                outcome="error",
+                error_type=type(exc).__name__,
+            )
             log(
                 "anna sampling failed: "
                 f"tool={tool_name} requested_tokens={requested_tokens} "
@@ -95,6 +102,7 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str) -> Any:
                 f"error_type={type(exc).__name__}"
             )
             raise
+        record_span("sampling.create_message", started)
         log(
             "anna sampling completed: "
             f"tool={tool_name} requested_tokens={requested_tokens} "

@@ -10,12 +10,27 @@ if _SRC_DIR not in sys.path:
 
 from anna_inbox_executa.common import *
 import anna_inbox_executa.common as common
+from anna_inbox_executa.diagnostics import activate_trace, create_trace, deactivate_trace, record_span, snapshot
 from anna_inbox_executa.dispatcher import handle_invoke
+
+
+def _attach_diagnostics(result: dict[str, Any], trace: dict[str, Any]) -> dict[str, Any]:
+    """仅向工具 data 附加安全时序摘要，不改变既有成功结果的协议形状。"""
+    data = result.get("data")
+    diagnostic = snapshot(trace)
+    if not isinstance(data, dict) or not diagnostic:
+        return result
+    enriched = dict(result)
+    key = "invoke_diagnostics" if "diagnostics" in data else "diagnostics"
+    enriched["data"] = {**data, key: diagnostic}
+    return enriched
+
 
 def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
     request_id = message.get("id")
     method = message.get("method")
     params = message.get("params") or {}
+    trace: dict[str, Any] | None = None
 
     try:
         if method == "initialize":
@@ -33,30 +48,59 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
                 },
             )
         if method == "invoke":
-            return make_response(request_id, result=handle_invoke(params))
+            invoke_params = params if isinstance(params, dict) else {}
+            trace = create_trace(
+                operation=str(invoke_params.get("tool") or "invoke"),
+                invoke_id=str(invoke_params.get("invoke_id") or ""),
+            )
+            started = time.monotonic()
+            trace_token = activate_trace(trace)
+            try:
+                result = handle_invoke(invoke_params)
+                record_span("executa.invoke", started)
+                return make_response(request_id, result=_attach_diagnostics(result, trace))
+            except Exception as exc:
+                record_span("executa.invoke", started, outcome="error", error_type=type(exc).__name__)
+                raise
+            finally:
+                deactivate_trace(trace_token)
         if method == "shutdown":
             return make_response(request_id, result={"ok": True})
         return make_response(request_id, error=make_error(-32601, f"Method not found: {method}"))
     except ValueError as exc:
-        return make_response(request_id, error=make_error(-32601, str(exc)))
+        diagnostic = snapshot(trace)
+        data = {"diagnostics": diagnostic} if diagnostic else None
+        return make_response(request_id, error=make_error(-32601, str(exc), data))
     except RuntimeError as exc:
         try:
             error_data = json.loads(str(exc))
         except json.JSONDecodeError:
             error_data = {"code": -32603, "message": str(exc)}
-        return make_response(request_id, error=make_error(int(error_data.get("code", -32603)), str(error_data.get("message", exc)), error_data.get("data")))
+        data = error_data.get("data") if isinstance(error_data.get("data"), dict) else {}
+        diagnostic = snapshot(trace)
+        if diagnostic:
+            data = {**data, "diagnostics": diagnostic}
+        return make_response(request_id, error=make_error(int(error_data.get("code", -32603)), str(error_data.get("message", exc)), data or None))
     except StorageError as exc:
         log(f"storage error: {exc}")
-        return make_response(request_id, error=make_error(exc.code, exc.message, exc.data))
+        data = dict(exc.data or {})
+        diagnostic = snapshot(trace)
+        if diagnostic:
+            data["diagnostics"] = diagnostic
+        return make_response(request_id, error=make_error(exc.code, exc.message, data or None))
     except Exception as exc:
-        trace = traceback.format_exc()
-        log(f"internal error: {type(exc).__name__}: {exc}\n{trace}")
+        traceback_text = traceback.format_exc()
+        log(f"internal error: {type(exc).__name__}: {exc}\n{traceback_text}")
+        data: dict[str, Any] = {"traceback": traceback_text}
+        diagnostic = snapshot(trace)
+        if diagnostic:
+            data["diagnostics"] = diagnostic
         return make_response(
             request_id,
             error=make_error(
                 -32603,
                 f"{type(exc).__name__}: {exc}",
-                {"traceback": trace},
+                data,
             ),
         )
 

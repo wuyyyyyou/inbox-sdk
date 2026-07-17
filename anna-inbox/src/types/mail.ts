@@ -54,6 +54,26 @@ export interface GmailApiStatus {
   mailbox?: string;
 }
 
+/** 仅包含阶段、耗时和错误类型的调用链摘要；不含邮件或凭据。 */
+export interface RuntimeDiagnosticSpan {
+  stage: string;
+  elapsed_ms: number;
+  outcome: "ok" | "error";
+  cached?: boolean;
+  code?: string | number;
+  endpoint?: string;
+  error_type?: string;
+  http_status?: number;
+  source?: string;
+}
+
+export interface RuntimeDiagnostics {
+  trace_id: string;
+  operation: string;
+  elapsed_ms: number;
+  spans: RuntimeDiagnosticSpan[];
+}
+
 export interface MailboxInfo {
   email: string;
   display_name?: string;
@@ -298,6 +318,7 @@ export interface RunStatus {
   cards_added?: number;
   cards_version?: number;
   error?: string;
+  diagnostics?: RuntimeDiagnostics;
 }
 
 export interface RunWarning {

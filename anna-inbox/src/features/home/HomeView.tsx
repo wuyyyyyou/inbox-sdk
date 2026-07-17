@@ -2678,7 +2678,7 @@ function AiSidebar({
           <button
             type="button"
             className="ai-conn-chip"
-            title="Check LLM connectivity"
+            title={state.llmStatus.message || "Check LLM connectivity"}
             onClick={() => void actions.refreshSamplingStatus()}
           >
             <i className={state.llmStatus.status === "connected" ? "is-live" : ""} />
@@ -2713,7 +2713,7 @@ function AiSidebar({
           <button
             type="button"
             className="ai-conn-chip"
-            title="Check Gmail API connectivity"
+            title={state.gmailApiStatus.message || "Check Gmail API connectivity"}
             onClick={() => void actions.refreshGmailApiStatus()}
           >
             <i className={state.gmailApiStatus.status === "connected" ? "is-live" : ""} />

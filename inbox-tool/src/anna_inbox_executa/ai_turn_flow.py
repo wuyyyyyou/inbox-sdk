@@ -7,6 +7,7 @@ from typing import Any
 
 from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.brief_flow import _merge_partial
+from anna_inbox_executa.diagnostics import activate_trace, current_trace, deactivate_trace, snapshot
 
 
 def _public_ai_turn_state(run_id: str) -> dict[str, Any]:
@@ -23,6 +24,7 @@ def _public_ai_turn_state(run_id: str) -> dict[str, Any]:
         "result": _compact_run_result(state.get("result")),
         "error": state.get("error", ""),
         "needs_continue": bool(state.get("needs_continue")),
+        "diagnostics": snapshot(state.get("diagnostics")),
     }
 
 
@@ -50,6 +52,7 @@ def start_ai_turn(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
         "result": None,
         "error": "",
         "partial": {},
+        "diagnostics": current_trace(),
     }
     _save_run_checkpoint(run_id)
     future = asyncio.run_coroutine_threadsafe(
@@ -73,6 +76,7 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
     """异步执行 Router + 白名单工具。"""
     from mail_agent.ai_turn.runner import run_ai_turn
 
+    trace_token = activate_trace((MAIL_AGENT_RUNS.get(run_id) or {}).get("diagnostics"))
     try:
         MAIL_AGENT_RUNS[run_id]["status"] = "running"
         MAIL_AGENT_RUNS[run_id]["stage"] = "routing"
@@ -172,6 +176,8 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
             "error": str(exc),
         })
         _save_run_checkpoint(run_id)
+    finally:
+        deactivate_trace(trace_token)
 
 
 async def apply_proposed_actions_tool(arguments: dict[str, Any]) -> dict[str, Any]:

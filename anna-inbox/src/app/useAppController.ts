@@ -355,17 +355,47 @@ function isTransientConnectionError(error: unknown) {
   return /unexpected token\s+['"]?<|<!doctype html|text\/html|failed to fetch|network(?:error| request)?|fetch failed|econnreset|enotfound|etimedout|timeout|\b5\d\d\b|\[tool_failed\]|executa process exited/i.test(raw);
 }
 
+function formatRunDiagnostics(status: RunStatus, message: string): string {
+  const diagnostic = status.diagnostics;
+  if (!diagnostic?.trace_id) return message;
+  const spans = diagnostic.spans.slice(-12).map((span) => {
+    const error = span.outcome === "error" && span.error_type ? ` ${span.error_type}` : "";
+    return `${span.stage} ${span.elapsed_ms}ms${error}`;
+  });
+  return [
+    message,
+    `Diagnostic ${diagnostic.trace_id} (${diagnostic.elapsed_ms}ms)`,
+    ...spans,
+  ].join("\n");
+}
+
+function safeDiagnosticsFromError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const lines = raw.split("\n");
+  const start = lines.findIndex((line) => /^Diagnostic rt_[a-f0-9]{12} \(\d+ms\)$/.test(line.trim()));
+  if (start < 0) return "";
+  const safe = [lines[start].trim()];
+  for (const line of lines.slice(start + 1, start + 13)) {
+    const normalized = line.trim();
+    if (!/^[a-z_.]+ \d+ms(?: [A-Za-z][A-Za-z0-9_.-]{0,79})?$/.test(normalized)) break;
+    safe.push(normalized);
+  }
+  return safe.join("\n");
+}
+
 function sanitizeToolError(error: unknown, input: string) {
   const unavailable = prefersChinese(input)
     ? "Anna 暂时无法完成这项邮箱任务，请稍后重试。"
     : "Anna couldn't complete that inbox task right now. Please try again shortly.";
-  if (isTransientConnectionError(error)) {
-    return prefersChinese(input)
+  const message = isTransientConnectionError(error)
+    ? prefersChinese(input)
       ? "连接 Anna 服务时出现问题。我已经自动重试；请稍后再试。"
-      : "There was a problem connecting to Anna. I retried automatically; please try again shortly.";
-  }
-  // 工具和后台任务的错误细节可能含协议、供应商或 HTML 文本，不能直接出现在对话中。
-  return unavailable;
+      : "There was a problem connecting to Anna. I retried automatically; please try again shortly."
+    : unavailable;
+  // 工具和后台任务的原始错误可能含协议、供应商或 HTML 文本，不能直接展示。
+  // 仅保留本地按严格格式生成的时序行，供平台问题复现时复制到报告。
+  const diagnostics = safeDiagnosticsFromError(error);
+  return diagnostics ? `${message}\n\n${diagnostics}` : message;
 }
 
 function persistAskHistory(history: AskHistoryEntry[]) {
@@ -3565,7 +3595,7 @@ export function useAppController() {
           });
         if (!isCurrentGeneration()) return;
         if (started.status === "failed" || started.error) {
-          throw new Error(started.error || "AI turn failed");
+          throw new Error(formatRunDiagnostics(started, started.error || "AI turn failed"));
         }
         if (started.status !== "done") {
           // 后端任务可能仍在运行；先保存 runId，页面刷新后由用户主动继续查询。
@@ -3586,7 +3616,7 @@ export function useAppController() {
           }, generationRun.controller.signal);
         if (!isCurrentGeneration()) return;
         if (completed.status === "failed" || completed.error) {
-          throw new Error(completed.error || "AI turn failed");
+          throw new Error(formatRunDiagnostics(completed, completed.error || "AI turn failed"));
         }
         const payload = (completed.result || {}) as Record<string, unknown>;
         const kind = String(payload.kind || "chat");

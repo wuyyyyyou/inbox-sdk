@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from anna_inbox_executa.common import *
+from anna_inbox_executa.diagnostics import snapshot
 from anna_inbox_executa.sampling_tools import _build_sampling_for_run
 
 def _sync_get_active_cards(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -209,6 +210,7 @@ def get_mail_agent_run(run_id_arg: str) -> dict[str, Any]:
         "result": result,
         "cards": cards,
         "scan_state": scan_state,
+        "diagnostics": snapshot(state.get("diagnostics")),
     }
 
 

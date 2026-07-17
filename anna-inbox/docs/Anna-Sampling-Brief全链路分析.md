@@ -16,6 +16,7 @@ Brief 的 Phase 1、Phase 2、联系人记忆和部分 Ask/草稿任务可通过
 
 - 每次生产 Sampling 记录开始、成功或失败事件，日志只包含工具名、请求与授予 token、剩余 token、超时、UTF-8 `prompt_bytes`、耗时和错误类型。`prompt_bytes` 用于观察反向 JSON-RPC 请求是否接近协议帧上限。
 - 日志不得包含 prompt、响应正文、邮件主题、地址、凭据或完整 metadata。
+- `sampling.create_message` 同时进入前端可回传的安全 diagnostics；该摘要只含 trace ID、阶段耗时和错误类型，不替代 stderr 观测日志，也不包含 prompt、输出或凭据。
 
 ## 数据最小化
 

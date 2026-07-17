@@ -24,6 +24,7 @@ import type {
   RunHistoryEntry,
   RunStatus,
   RuntimeState,
+  RuntimeDiagnostics,
   ScanPlan,
 
 } from "../types/mail";
@@ -70,6 +71,19 @@ export function isRuntimeTransportError(error: unknown) {
 
 function waitForRetry(delayMs: number) {
   return new Promise<void>((resolve) => globalThis.setTimeout(resolve, delayMs));
+}
+
+function formatRuntimeDiagnostics(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const diagnostic = value as Partial<RuntimeDiagnostics>;
+  if (!diagnostic.trace_id || !Array.isArray(diagnostic.spans)) return "";
+  const spans = diagnostic.spans.slice(-12).map((span) => {
+    const outcome = span.outcome === "error" && span.error_type ? ` ${span.error_type}` : "";
+    return `${span.stage} ${span.elapsed_ms}ms${outcome}`;
+  });
+  return spans.length
+    ? `\nDiagnostic ${diagnostic.trace_id} (${diagnostic.elapsed_ms ?? 0}ms)\n${spans.join("\n")}`
+    : `\nDiagnostic ${diagnostic.trace_id} (${diagnostic.elapsed_ms ?? 0}ms)`;
 }
 
 export function unwrapToolResult(result: unknown): unknown {
@@ -124,7 +138,10 @@ export class MailAgentClient {
         const traceback = String(details.traceback || data?.traceback || "");
         const code = err.code !== undefined ? `[${err.code}] ` : "";
         const message = err.message || String(error);
-        const wrapped = new Error(`[tool:${method}] ${code}${message}${traceback ? `\n\n${traceback}` : ""}`);
+        const diagnostics = formatRuntimeDiagnostics(
+          data?.diagnostics || details.diagnostics,
+        );
+        const wrapped = new Error(`[tool:${method}] ${code}${message}${diagnostics}${traceback ? `\n\n${traceback}` : ""}`);
         if (isRuntimeTransportError(wrapped) && this.reconnectRuntime) {
           // 只恢复 transport；非幂等邮件操作仍向调用方报告本次失败，绝不自动重放。
           await this.reconnectRuntime().catch(() => undefined);
