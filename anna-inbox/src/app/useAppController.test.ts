@@ -61,3 +61,23 @@ describe("AI scan invocation", () => {
     expect(homeViewSource).toContain('aria-label="Refresh timed out request"');
   });
 });
+
+describe("mailbox switching", () => {
+  it("renders the first page from the target mailbox cache before background sync", () => {
+    expect(controllerSource).toMatch(
+      /const cached = await client\.listCachedEmails\(primary, rangeDays, 100, "all", 0\)/,
+    );
+    expect(controllerSource).toMatch(
+      /void silentSyncInbox\(rangeDays, primary\)/,
+    );
+    expect(controllerSource).not.toMatch(
+      /await preloadMailboxSnapshot\(primary, rangeDays, true, \{ skipLiveGmail: true \}\)/,
+    );
+  });
+
+  it("invalidates mail and draft requests when switching mailboxes", () => {
+    expect(controllerSource).toMatch(
+      /inboxRequestSequence\.current \+= 1;[\s\S]*draftRequestSequence\.current \+= 1;/,
+    );
+  });
+});

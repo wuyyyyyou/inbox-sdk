@@ -2,7 +2,7 @@
 
 Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；Brief、Attention Card 和 Custom Scan 是仍由后端提供的工作流能力，不再代表 2.0 的整体界面结构。
 
-当前发布基线：App `2.0.28` / Tool `2.1.9`。本版本新增平台调用链安全诊断，并将 AI 侧栏 Ask 固定为当前活动邮箱，避免多账户选择状态扩大搜索和凭据调用。
+当前发布基线：App `2.1.1` / Tool `2.2.1`。本版本重点：外发附件 stage 上传、回复/撰写 Cc·Bcc 与转发、发送前 10 秒可撤销、多邮箱丝滑切换（取消上一扫描 + 本地缓存首屏 + 后台 silent 同步）、Gmail 401 强制换票自愈，以及收件附件元数据/列表回形针可靠性。
 
 ## Language
 

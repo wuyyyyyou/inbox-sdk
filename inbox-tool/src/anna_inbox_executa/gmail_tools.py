@@ -500,17 +500,51 @@ def _thread_original_subjects(messages: list[dict[str, Any]]) -> dict[str, str]:
     return subjects
 
 
-def _compact_inbox_message(item: dict[str, Any], mailbox: str, thread_subjects: dict[str, str] | None = None) -> dict[str, Any]:
-    labels = [str(label)[:80] for label in (item.get("label_ids") or [])][:32]
+def _message_attachment_count(item: dict[str, Any]) -> int:
+    """单封邮件的附件数量：attachments 列表、attachment_count 与 has_attachment 取最大。"""
     attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
     try:
         stored_attachment_count = int(item.get("attachment_count") or 0)
     except (TypeError, ValueError):
         stored_attachment_count = 0
-    attachment_count = max(len(attachments), stored_attachment_count)
-    has_attachment = bool(attachments) or bool(item.get("has_attachment")) or attachment_count > 0
+    count = max(len(attachments), stored_attachment_count)
+    if count > 0:
+        return count
+    if bool(attachments) or bool(item.get("has_attachment")):
+        return 1
+    return 0
+
+
+def _thread_attachment_index(messages: list[dict[str, Any]]) -> dict[str, int]:
+    """按 thread_id 汇总附件数量，列表折叠后仍能显示回形针。"""
+    index: dict[str, int] = {}
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        thread_id = str(item.get("thread_id") or "").strip()
+        if not thread_id:
+            continue
+        count = _message_attachment_count(item)
+        if count <= 0:
+            continue
+        index[thread_id] = max(index.get(thread_id) or 0, count)
+    return index
+
+
+def _compact_inbox_message(
+    item: dict[str, Any],
+    mailbox: str,
+    thread_subjects: dict[str, str] | None = None,
+    thread_attachments: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    labels = [str(label)[:80] for label in (item.get("label_ids") or [])][:32]
+    attachment_count = _message_attachment_count(item)
     latest_subject = str(item.get("subject") or "").strip()
     thread_id = str(item.get("thread_id") or "").strip()
+    # 同线程任一封有附件时，列表行继承线程级标记（与 Gmail 回形针语义一致）
+    if thread_id and thread_attachments:
+        attachment_count = max(attachment_count, int(thread_attachments.get(thread_id) or 0))
+    has_attachment = attachment_count > 0
     subject = str((thread_subjects or {}).get(thread_id) or item.get("original_subject") or latest_subject)
     return {
         "id": str(item.get("id") or "")[:128],
@@ -665,8 +699,8 @@ def list_inbox_emails(
     )
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
-    # 身份校验沿用原有 Gmail 请求入口；后续摘要批次会在 adapter 内只取一次
-    # 短期 token。这样首页刷新最多两次凭据反向 RPC，而非每封摘要各取一次。
+    # 身份校验：gmail_request 在 scope 外不会复用/写入 ContextVar token，
+    # 因此切换邮箱时不会误用上一账户凭据。摘要批在 live_search 内按 mailbox 绑定。
     profile = gmail_request(mailbox, "/users/me/profile", {"fields": "emailAddress,historyId"})
     authorized_email = str(profile.get("emailAddress") or "").strip().lower()
     if authorized_email and authorized_email != mailbox:
@@ -689,14 +723,17 @@ def list_inbox_emails(
         for item in list_messages(mailbox)
         if isinstance(item, dict) and item.get("id")
     }
-    thread_subjects = _thread_original_subjects(list(by_id.values()))
+    cached_messages = list(by_id.values())
+    thread_subjects = _thread_original_subjects(cached_messages)
+    # 用全量缓存汇总线程附件，避免仅最新回信无附件时列表丢回形针
+    thread_attachments = _thread_attachment_index(cached_messages)
 
     all_messages: list[dict[str, Any]] = []
     for message_id in matched_ids:
         item = by_id.get(str(message_id))
         if not item:
             continue
-        all_messages.append(_compact_inbox_message(item, mailbox, thread_subjects))
+        all_messages.append(_compact_inbox_message(item, mailbox, thread_subjects, thread_attachments))
     all_messages.sort(key=_inbox_message_sort_key)
 
     # 按 JSON-RPC 帧预算截断返回条数（与 list_cached_emails 一致），缓存仍保留全量
@@ -966,7 +1003,8 @@ def list_gmail_emails_page(
             params["pageToken"] = request_token
         # 首个 Gmail 请求会在受限上下文中取一次 token；复制该上下文给摘要 worker，
         # 避免“加载更多”因 100 个摘要产生 100 次 credentials/getToken 反向 RPC。
-        with _gmail_request_token_scope():
+        # 绑定 mailbox，防止同 worker 线程切换邮箱时误用上一账户 token。
+        with _gmail_request_token_scope(mailbox=mailbox):
             page = gmail_request(mailbox, "/users/me/messages", params)
             worker_context = copy_context()
         refs = [
@@ -996,14 +1034,17 @@ def list_gmail_emails_page(
                         if isinstance(summary, dict) and summary.get("id"):
                             summaries[position] = summary
 
-            thread_subjects = _thread_original_subjects(list(summaries.values()))
+            # 本页已知摘要 + 历史 page_summaries，尽量还原同线程附件标记
+            known_summaries = [*page_summaries, *summaries.values()]
+            thread_subjects = _thread_original_subjects(known_summaries)
+            thread_attachments = _thread_attachment_index(known_summaries)
             for position in range(index, batch_end):
                 message_id = refs[position]
                 summary = summaries.get(position)
                 if message_id in excluded or not summary:
                     continue
                 page_summaries.append(summary)
-                compact = _compact_inbox_message(summary, mailbox, thread_subjects)
+                compact = _compact_inbox_message(summary, mailbox, thread_subjects, thread_attachments)
                 candidate_messages = [*messages, compact]
                 next_position = position + 1
                 cursor_token = request_token if next_position < len(refs) else api_next_token

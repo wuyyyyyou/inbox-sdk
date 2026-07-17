@@ -635,6 +635,7 @@ export interface InboxThreadDraftPayload {
   exists: boolean;
   etag?: string;
   body: string;
+  attachments?: OutgoingAttachmentMeta[];
   updated_at?: string;
 }
 
@@ -661,12 +662,38 @@ export interface ComposeContact {
   avatar_url?: string;
 }
 
+/** 外发附件元数据（字节在后端 stage，不进 KV / JSON-RPC） */
+export interface OutgoingAttachmentMeta {
+  id: string;
+  filename: string;
+  mime_type: string;
+  size: number;
+  storage_key: string;
+  /** 前端本地预览（blob: 或 loopback），不持久化 */
+  preview_url?: string;
+  status?: "uploading" | "ready" | "error";
+  progress?: number;
+  error?: string;
+}
+
 export interface ComposeDraft {
   id: string;
   mailbox: string;
+  /** forward 草稿回到原邮件详情时使用的路由信息。 */
+  draft_mode?: "compose" | "forward";
+  source_thread_id?: string;
+  source_message_id?: string;
   recipients: string[];
+  /** 抄送地址列表 */
+  cc?: string[];
+  /** 密送地址列表 */
+  bcc?: string[];
   subject: string;
   body: string;
+  /** 可选 HTML 正文（转发保留原格式时使用 multipart/alternative） */
+  body_html?: string;
+  /** 外发附件元数据列表 */
+  attachments?: OutgoingAttachmentMeta[];
   created_at?: string;
   updated_at?: string;
   etag?: string;

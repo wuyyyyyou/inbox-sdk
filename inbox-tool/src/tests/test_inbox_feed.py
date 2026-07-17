@@ -25,6 +25,7 @@ def main() -> None:
         list_inbox_emails,
     )
     from mail_agent.mail_providers.gmail.adapter import (
+        ATTACHMENT_SCAN_VERSION,
         SUMMARY_METADATA_REFRESH_SECONDS,
         clear_mailbox_cache,
         ensure_cached_feed_index,
@@ -32,7 +33,9 @@ def main() -> None:
         get_cached_feed_page,
         live_search_metadata_and_cache,
         search_gmail,
+        sync_cached_message_summaries,
         write_index,
+        write_message,
         update_thread_state,
     )
 
@@ -164,6 +167,68 @@ def main() -> None:
     assert thread_title_feed["messages"][0]["latest_subject"] == "Changed latest title"
     assert thread_title_feed["messages"][0]["has_attachment"] is True
     assert thread_title_feed["messages"][0]["attachment_count"] == 1
+
+    # 同线程旧邮件有附件、最新回信无附件时，列表行仍应显示回形针
+    thread_attachment_messages = [
+        {
+            "id": "thread-att-old",
+            "thread_id": "thread-att",
+            "internal_date": "10",
+            "from": "Sender <sender@example.com>",
+            "subject": "Invoice",
+            "snippet": "See attached",
+            "label_ids": ["INBOX"],
+            "attachments": [{"filename": "invoice.pdf"}],
+        },
+        {
+            "id": "thread-att-new",
+            "thread_id": "thread-att",
+            "internal_date": "20",
+            "from": "User <user@example.com>",
+            "subject": "Re: Invoice",
+            "snippet": "Thanks",
+            "label_ids": ["INBOX", "SENT"],
+            "attachments": [],
+        },
+    ]
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
+        patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"emailAddress": "user@example.com"}),
+        patch("mail_agent.mail_providers.gmail.adapter.live_search_metadata_and_cache", return_value=["thread-att-new"]),
+        patch("mail_agent.mail_providers.gmail.adapter.list_messages", return_value=thread_attachment_messages),
+    ):
+        thread_attachment_feed = list_inbox_emails("USER@example.com", 7, 100)
+    assert thread_attachment_feed["messages"][0]["id"] == "thread-att-new"
+    assert thread_attachment_feed["messages"][0]["has_attachment"] is True
+    assert thread_attachment_feed["messages"][0]["attachment_count"] == 1
+
+    # 详情补全附件后必须同步更新旧的目录摘要与分页缓存。
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cache_root = Path(temp_dir)
+        stale_summary = {
+            "id": "detail-attachment",
+            "thread_id": "thread-detail",
+            "internal_date": "30",
+            "from": "Sender <sender@example.com>",
+            "subject": "Attachment from detail",
+            "label_ids": ["INBOX"],
+            "attachments": [],
+        }
+        detail_message = {
+            **stale_summary,
+            "attachments": [{"filename": "guide.pdf", "mimeType": "application/pdf", "attachmentId": "guide-1"}],
+        }
+        with (
+            patch("mail_agent.mail_providers.gmail.adapter.cache_dir", return_value=cache_root),
+            patch("mail_agent.mail_providers.gmail.adapter._storage_cache_enabled", return_value=False),
+        ):
+            write_index("user@example.com", [stale_summary])
+            write_message("user@example.com", detail_message)
+            assert get_cached_feed_page("user@example.com", 0)["messages"][0]["has_attachment"] is False
+            assert sync_cached_message_summaries("user@example.com", [detail_message]) is True
+            repaired = get_cached_feed_page("user@example.com", 0)["messages"][0]
+        assert repaired["has_attachment"] is True
+        assert repaired["attachment_count"] == 1
 
     with tempfile.TemporaryDirectory() as temp_dir:
         cache_root = Path(temp_dir)
@@ -344,7 +409,13 @@ def main() -> None:
                 {"name": "Date", "value": "Mon, 01 Jul 2024 10:00:00 +0000"},
             ],
             "parts": [
-                {"filename": "brief.pdf", "mimeType": "application/pdf", "body": {"attachmentId": "att-1", "size": 42}},
+                {
+                    "mimeType": "multipart/related",
+                    "parts": [{
+                        "mimeType": "multipart/alternative",
+                        "parts": [{"filename": "brief.pdf", "mimeType": "application/pdf", "body": {"attachmentId": "att-1", "size": 42}}],
+                    }],
+                },
             ],
         },
     }
@@ -355,10 +426,12 @@ def main() -> None:
     assert summary["attachments"][0]["attachmentId"] == "att-1"
     assert summary["body_cached"] is False
     assert summary["headers_complete"] is True
-    assert metadata_request.call_args.args[2]["format"] == "metadata"
-    assert metadata_request.call_args.args[2]["metadataHeaders"] == [
-        "Date", "From", "To", "Cc", "Bcc", "Subject", "Message-Id", "In-Reply-To", "References",
-    ]
+    assert summary["attachment_scan_version"] == ATTACHMENT_SCAN_VERSION
+    request_params = metadata_request.call_args.args[2]
+    assert request_params["format"] == "full"
+    assert "metadataHeaders" not in request_params
+    assert "body(data)" not in request_params["fields"]
+    assert "attachmentId" in request_params["fields"]
 
     stale_age = SUMMARY_METADATA_REFRESH_SECONDS - 60
     existing_summary = {
@@ -366,6 +439,7 @@ def main() -> None:
         "from": "Cached <cached@example.com>",
         "headers_complete": True,
         "metadata_refreshed_at": int(now_ms / 1000) - stale_age,
+        "attachment_scan_version": ATTACHMENT_SCAN_VERSION,
         "internal_date": str(now_ms),
     }
     with (
@@ -378,6 +452,25 @@ def main() -> None:
         ids = live_search_metadata_and_cache("user@example.com", "in:inbox", 10)
     assert ids == ["cached-1"]
     refresh_summary.assert_not_called()
+
+    # 历史摘要没有附件扫描版本时，即使仍在普通刷新窗口内，也必须在首次同步补扫。
+    legacy_summary = {**existing_summary, "id": "legacy-attachment", "attachment_scan_version": 0}
+    refreshed_legacy = {
+        **legacy_summary,
+        "attachments": [{"filename": "legacy.pdf", "mimeType": "application/pdf", "attachmentId": "legacy-1"}],
+        "attachment_scan_version": ATTACHMENT_SCAN_VERSION,
+    }
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.search_gmail", return_value=["legacy-attachment"]),
+        patch("mail_agent.mail_providers.gmail.adapter.read_cache", return_value={"messages": [legacy_summary]}),
+        patch("mail_agent.mail_providers.gmail.adapter.fetch_message_summary", return_value=refreshed_legacy) as refresh_summary,
+        patch("mail_agent.mail_providers.gmail.adapter.write_index") as write_index,
+        patch("mail_agent.mail_providers.gmail.adapter.time.time", return_value=now_ms / 1000),
+    ):
+        ids = live_search_metadata_and_cache("user@example.com", "in:inbox", 10)
+    assert ids == ["legacy-attachment"]
+    refresh_summary.assert_called_once_with("user@example.com", "legacy-attachment")
+    assert write_index.call_args.args[1][0]["attachments"][0]["filename"] == "legacy.pdf"
 
     fetched_summaries = {
         "gmail-2": {

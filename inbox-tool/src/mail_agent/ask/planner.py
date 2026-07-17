@@ -105,13 +105,13 @@ User: "有没有合作相关的邮件"
 → direction: "inbox"
 → timeframe: "7d"
 
-User: "帮我看看最近有什么需要处理的"
-→ concept: "general inbox check"
-→ search_terms: []
-→ relevance_hint: "emails in the inbox that need user attention — not newsletters or automated notifications"
+User: "帮我看看最近有什么需要处理的" / "找找最近需要浏览的邮件"
+→ concept: "emails needing user attention"
+→ search_terms: []  ← abstract “to browse / to handle” cannot be Gmail keywords; leave empty for broad sweep
+→ relevance_hint: "emails that need the user to open, reply, decide, or act — prefer unread/human requests; deprioritize newsletters and automated notifications"
 → direction: "inbox"
-→ timeframe: "7d"
-→ goal: "general_qa"
+→ timeframe: "30d"  ← bare “最近/recent” is NOT an explicit window; code uses the user’s current Scan Plan
+→ goal: "find_emails"
 
 User: "找找 Sarah 最近发的邮件"
 → concept: "emails from Sarah"
@@ -170,23 +170,19 @@ If no specific person is mentioned, return empty array [].
 
 ## timeframe
 
-Choose the most appropriate window. Default is "30d" unless the user specifies otherwise.
+Choose the most appropriate window only when the user gives an **explicit** time unit or number.
+Bare “recent / 最近 / 这几天” is NOT explicit — keep timeframe "30d" as a placeholder; runtime will replace it with the user’s current Scan Plan (display_range_days).
 "today" -> 1d
 "yesterday" / "last 2 days" -> 2d
-"recent" / "this week" / "last few days" / "past week" -> 7d
+"this week" / "last week" / "past week" / "本周" / "上周" -> 7d
+"last N days" / "最近 N 天" -> Nd (use the number the user wrote)
 "two weeks" / "past fortnight" -> 14d
-"this month" -> 30d
+"this month" / "本月" -> 30d
 "last three months" / "past quarter" -> 90d
 "past 6 months" / "last half year" -> 180d
 "this year" / "past year" -> 365d
 "all time" / "everything" -> 365d
-Apply the same logic for non-English requests - map common time words in the user's language to the appropriate duration. → 1d
-"yesterday" / "last 2 days" → 2d
-"recent" / "this week" / "last few days" → 7d
-"this month" → 30d
-"last three months" → 90d
-"this year" → 365d
-"all time" / "everything" → 365d
+Apply the same logic for non-English requests when they name a concrete unit or number.
 Apply the same logic for non-English requests — map common time words in the user's language to the appropriate duration.
 
 ## direction
@@ -257,11 +253,15 @@ def resolve_effective_timeframe(
 
     Planner 的 timeframe 属于模型推断，不能在用户未指定时间时
     覆盖当前 Scan Plan；只有请求文本含明确相对时间时才允许覆盖默认范围。
+
+    注意：单独的「最近 / recent / 这几天」属于模糊时间词，**不**视为明确窗口，
+    必须 defer 到 Scan Plan（display_range_days / scan_window_days）。
     """
     request = str(user_request or "").strip().casefold()
+    original = str(user_request or "")
     explicit_days: int | None = None
 
-    # 优先匹配带数字的天/周/月表达，避免“最近”一词抢占更精确范围。
+    # 优先匹配带数字的天/周/月表达；模糊「最近」不得抢占 Scan Plan。
     day_match = re.search(r"(?:last|past|recent)\s+(\d{1,3})\s+days?|最近\s*(\d{1,3})\s*天", request)
     week_match = re.search(r"(?:last|past|recent)\s+(\d{1,2})\s+weeks?|最近\s*(\d{1,2})\s*周", request)
     month_match = re.search(r"(?:last|past|recent)\s+(\d{1,2})\s+months?|最近\s*(\d{1,2})\s*个?月", request)
@@ -273,13 +273,16 @@ def resolve_effective_timeframe(
         explicit_days = int(month_match.group(1) or month_match.group(2)) * 30
     elif any(token in request for token in ("today", "今天", "今日", "yesterday", "昨天")):
         explicit_days = 1
-    elif any(token in request for token in ("this week", "last week", "past week", "本周", "这周", "上周", "recent", "最近")):
+    # 「本周/上周/this week」是具体单位；不含裸「最近/recent」。
+    elif any(token in request for token in ("this week", "last week", "past week", "本周", "这周", "上周")):
         explicit_days = 7
     elif any(token in request for token in ("this month", "本月", "这个月")):
         explicit_days = 30
     elif any(token in request for token in ("past quarter", "last quarter", "本季度", "上季度")):
         explicit_days = 90
-    elif any(token in request for token in ("past 6 months", "last half year", "半年", "六个月")):
+    elif any(token in original for token in ("半年", "六个月")) or any(
+        token in request for token in ("past 6 months", "last half year")
+    ):
         explicit_days = 180
     elif any(token in request for token in ("this year", "past year", "last year", "今年", "过去一年", "去年")):
         explicit_days = 365
@@ -299,6 +302,154 @@ def resolve_effective_timeframe(
     return f"{min(max(int(matched.group(1)), 1), 365)}d" if matched else "30d"
 
 
+# 「需要浏览/处理」类意图：Gmail 无法用关键词表达，必须 broad sweep + 回答阶段排序。
+_ACTIONABLE_BROWSE_TOKENS = (
+    "需要浏览",
+    "需要处理",
+    "需要看",
+    "需要关注",
+    "值得看",
+    "待处理",
+    "要处理",
+    "有什么需要",
+    "有哪些需要",
+    "need to browse",
+    "need to review",
+    "need to handle",
+    "need to check",
+    "needs attention",
+    "need attention",
+    "to review",
+    "to browse",
+    "actionable",
+)
+
+# 「需要我回复」类意图：必须扫 inbox+sent（direction=all）才能判断谁最后发言。
+_NEEDS_REPLY_TOKENS = (
+    "needs my reply",
+    "need my reply",
+    "needs a reply",
+    "need a reply",
+    "awaiting my reply",
+    "waiting for my reply",
+    "waiting on my reply",
+    "what needs my reply",
+    "emails that need a reply",
+    "mails that need a reply",
+    "require my reply",
+    "requires my reply",
+    "等我回复",
+    "待我回复",
+    "需要我回复",
+    "等我回",
+    "谁在等我",
+    "有没有等我回复",
+)
+
+
+def is_actionable_browse_request(user_request: str) -> bool:
+    """判断是否为「找出需要浏览/处理的邮件」类抽象意图。"""
+    text = str(user_request or "").strip()
+    if not text:
+        return False
+    # 「需要我回复」走更精确的 reply 路径，不与 browse 混用。
+    if is_needs_reply_request(text):
+        return False
+    lowered = text.casefold()
+    return any(token in text or token in lowered for token in _ACTIONABLE_BROWSE_TOKENS)
+
+
+def is_needs_reply_request(user_request: str) -> bool:
+    """判断是否为「找出需要我回复的邮件」意图。"""
+    text = str(user_request or "").strip()
+    if not text:
+        return False
+    lowered = text.casefold()
+    return any(token in text or token in lowered for token in _NEEDS_REPLY_TOKENS)
+
+
+def normalize_actionable_browse_plan(plan: AskPlan) -> AskPlan:
+    """将「需要浏览/处理」或「需要我回复」计划规范为 broad sweep。
+
+    联系人约束保留；话题 search_terms 清空，由 Answer LLM 按 relevance_hint 排序。
+    """
+    if is_needs_reply_request(plan.user_request):
+        return _normalize_needs_reply_plan(plan)
+    if not is_actionable_browse_request(plan.user_request):
+        return plan
+
+    is_chinese = _uses_chinese_text(plan.user_request)
+    relevance_hint = (
+        "Prioritize emails that need the user to open, reply, decide, or act — "
+        "especially unread messages, questions, requests, deadlines, and human senders. "
+        "Deprioritize newsletters, promotions, automated notifications, and bulk marketing."
+    )
+    task_prompt = (
+        "Identify emails the user should browse or handle next. "
+        "Rank by urgency and need for attention. Group by priority. "
+        "Skip newsletters and automated noise. Briefly explain why each item matters."
+    )
+    # 保留联系人约束；仅去掉无法用 Gmail 表达的「浏览/处理」关键词。
+    plan.topics = [
+        {
+            "concept": "emails needing user attention",
+            "search_terms": [],
+            "relevance_hint": relevance_hint,
+        }
+    ]
+    if plan.direction == "sent":
+        plan.direction = "inbox"
+    elif plan.direction not in ("inbox", "all"):
+        plan.direction = "inbox"
+    plan.goal = "find_emails"
+    plan.task_prompt = task_prompt
+    if is_chinese:
+        if not str(plan.title or "").strip():
+            plan.title = "需要浏览的邮件"
+        if not str(plan.description or "").strip():
+            plan.description = "扫描收件箱并标出需要你浏览或处理的邮件。"
+    else:
+        if not str(plan.title or "").strip():
+            plan.title = "Emails to review"
+        if not str(plan.description or "").strip():
+            plan.description = "Scan the inbox and surface emails that need your attention."
+    return plan
+
+
+def _normalize_needs_reply_plan(plan: AskPlan) -> AskPlan:
+    """「需要我回复」：direction=all + 空 search_terms，由回答阶段判断线程末条是否对方发出。"""
+    is_chinese = _uses_chinese_text(plan.user_request)
+    plan.topics = [
+        {
+            "concept": "emails awaiting user reply",
+            "search_terms": [],
+            "relevance_hint": (
+                "Threads where the latest meaningful message is from the other party and they "
+                "asked a question, requested action, or are waiting for the user. "
+                "Skip newsletters, OTP/verification codes, and pure automated notifications."
+            ),
+        }
+    ]
+    plan.direction = "all"
+    plan.goal = "draft_replies"
+    plan.task_prompt = (
+        "Identify threads that need the user's reply. Prefer human senders with questions or "
+        "open requests. Explain briefly why each needs a reply. Offer a draft only when context "
+        "is sufficient; otherwise set reply_gaps.needs_user_input."
+    )
+    if is_chinese:
+        if not str(plan.title or "").strip():
+            plan.title = "需要你回复的邮件"
+        if not str(plan.description or "").strip():
+            plan.description = "找出对方在等你回复的线程。"
+    else:
+        if not str(plan.title or "").strip():
+            plan.title = "Emails that need your reply"
+        if not str(plan.description or "").strip():
+            plan.description = "Find threads where someone is waiting for your reply."
+    return plan
+
+
 def _uses_chinese_text(value: str) -> bool:
     """判断用户侧文案是否包含中文字符。"""
     return bool(re.search(r"[\u3400-\u9fff]", str(value or "")))
@@ -311,20 +462,40 @@ def _fallback_ask_plan(user_request: str, failure_reason: str) -> AskPlan:
     is_chinese = any("\u3400" <= char <= "\u9fff" for char in normalized_request)
     urgent_terms = ("urgent", "asap", "time-sensitive", "紧急", "尽快", "重要")
     is_urgent = any(term in lowered_request for term in urgent_terms)
+    is_browse = is_actionable_browse_request(normalized_request)
     timeframe = "7d" if is_urgent else "30d"
-    title = "紧急邮件" if is_chinese and is_urgent else "收件箱检查" if is_chinese else "Urgent emails" if is_urgent else "Inbox check"
+    if is_chinese and is_urgent:
+        title = "紧急邮件"
+    elif is_chinese and is_browse:
+        title = "需要浏览的邮件"
+    elif is_chinese:
+        title = "收件箱检查"
+    elif is_urgent:
+        title = "Urgent emails"
+    elif is_browse:
+        title = "Emails to review"
+    else:
+        title = "Inbox check"
     description = (
-        "使用保守搜索计划检查近期收件箱。"
+        "扫描收件箱并标出需要你浏览或处理的邮件。"
+        if is_chinese and is_browse
+        else "使用保守搜索计划检查近期收件箱。"
         if is_chinese
+        else "Scan the inbox and surface emails that need your attention."
+        if is_browse
         else "Checking recent inbox messages with a conservative fallback plan."
     )
     task_prompt = (
         "Identify time-sensitive, actionable, or explicitly requested emails. "
         "Use only the provided emails and group findings by priority."
         if is_urgent
+        else "Identify emails the user should browse or handle next. "
+        "Rank by urgency and need for attention. Group by priority. "
+        "Skip newsletters and automated noise."
+        if is_browse
         else "Identify actionable emails using only the provided emails and group findings by priority."
     )
-    return AskPlan(
+    plan = AskPlan(
         plan_id=f"askplan_{uuid.uuid4().hex[:12]}",
         user_request=normalized_request,
         title=title,
@@ -333,7 +504,7 @@ def _fallback_ask_plan(user_request: str, failure_reason: str) -> AskPlan:
         topics=[],
         timeframe=timeframe,
         direction="inbox",
-        goal="general_qa",
+        goal="find_emails" if is_browse else "general_qa",
         task_prompt=task_prompt,
         gmail_flags=[],
         created_at=datetime.now(BEIJING_TZ).isoformat(),
@@ -346,6 +517,7 @@ def _fallback_ask_plan(user_request: str, failure_reason: str) -> AskPlan:
             "fallback_reason": str(failure_reason)[:240],
         },
     )
+    return normalize_actionable_browse_plan(plan)
 
 
 def normalize_user_facing_plan_copy(plan: AskPlan) -> AskPlan:
@@ -466,4 +638,6 @@ async def plan_ask_request(
             "fallback_reason": result.get("fallback_reason", ""),
         },
     )
+    # 「需要浏览/处理」在协议边界统一为 broad sweep，防止模型塞入无效关键词。
+    plan = normalize_actionable_browse_plan(plan)
     return normalize_user_facing_plan_copy(plan)

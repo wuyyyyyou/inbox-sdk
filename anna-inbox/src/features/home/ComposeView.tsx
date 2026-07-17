@@ -1,12 +1,20 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useApp } from "../../app/AppContext";
+import { OutgoingAttachButton, OutgoingAttachmentList } from "../../shared/OutgoingAttachmentBar";
+import {
+  isBlockedOutgoingFilename,
+  isImageOutgoingAttachment,
+  OUTGOING_ATTACHMENT_TOTAL_MAX_BYTES,
+  putFileToUploadUrl,
+  toPersistedOutgoingAttachments,
+  totalOutgoingAttachmentBytes,
+} from "../../shared/outgoingAttachments";
+import { RecipientChipInput } from "../../shared/RecipientChipInput";
 import type {
-  ComposeContact,
   ComposeDraft,
   ComposeDraftArtifact,
+  OutgoingAttachmentMeta,
 } from "../../types/mail";
-
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const ToolbarIcon = ({ children }: { children: ReactNode }) => (
   <svg
@@ -66,7 +74,7 @@ export function ComposeView({
   insertRequest?: { nonce: string; artifact: ComposeDraftArtifact } | null;
   onConsumeInsertRequest?: (nonce: string) => void;
   onOpenAiDraft: (
-    draft: Pick<ComposeDraft, "recipients" | "subject" | "body">,
+    draft: Pick<ComposeDraft, "recipients" | "cc" | "bcc" | "subject" | "body">,
   ) => void;
 }) {
   const { actions } = useApp();
@@ -75,40 +83,84 @@ export function ComposeView({
   const [recipients, setRecipients] = useState<string[]>(
     initialDraft?.recipients || [],
   );
-  const [recipientInput, setRecipientInput] = useState("");
+  const [cc, setCc] = useState<string[]>(initialDraft?.cc || []);
+  const [bcc, setBcc] = useState<string[]>(initialDraft?.bcc || []);
+  // 各自独立：点 Cc 开 Cc 行，再点 Bcc 再开 Bcc 行
+  const [ccOpen, setCcOpen] = useState(Boolean(initialDraft?.cc?.length));
+  const [bccOpen, setBccOpen] = useState(Boolean(initialDraft?.bcc?.length));
+  const [focusField, setFocusField] = useState<"cc" | "bcc" | null>(null);
   const [subject, setSubject] = useState(initialDraft?.subject || "");
   const [body, setBody] = useState(initialDraft?.body || "");
-  const [contacts, setContacts] = useState<ComposeContact[]>([]);
-  const [contactOpen, setContactOpen] = useState(false);
+  const [attachments, setAttachments] = useState<OutgoingAttachmentMeta[]>(
+    () => (initialDraft?.attachments || []).map((item) => ({ ...item, status: "ready" as const })),
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [exitWithoutSavingConfirmation, setExitWithoutSavingConfirmation] =
     useState(false);
-  const recipientInputRef = useRef<HTMLInputElement | null>(null);
 
   const canSend =
     recipients.length > 0 &&
     subject.trim().length > 0 &&
-    body.trim().length > 0;
-  const isEmpty = !recipients.length && !subject.trim() && !body.trim();
-  const candidateEmail = recipientInput.trim().toLowerCase();
-  const canAddRawEmail =
-    EMAIL_RE.test(candidateEmail) && !recipients.includes(candidateEmail);
+    body.trim().length > 0 &&
+    !attachments.some((item) => item.status === "uploading");
+  const isEmpty =
+    !recipients.length &&
+    !cc.length &&
+    !bcc.length &&
+    !subject.trim() &&
+    !body.trim() &&
+    !attachments.length;
 
   useEffect(() => {
     if (!open) return;
     setDraftId(initialDraft?.id || "");
     setEtag(initialDraft?.etag || "");
     setRecipients(initialDraft?.recipients || []);
-    setRecipientInput("");
+    setCc(initialDraft?.cc || []);
+    setBcc(initialDraft?.bcc || []);
+    setCcOpen(Boolean(initialDraft?.cc?.length));
+    setBccOpen(Boolean(initialDraft?.bcc?.length));
+    setFocusField(null);
     setSubject(initialDraft?.subject || "");
     setBody(initialDraft?.body || "");
-    setContacts([]);
-    setContactOpen(false);
+    setAttachments((initialDraft?.attachments || []).map((item) => ({ ...item, status: "ready" as const })));
     setSaving(false);
     setError("");
     setExitWithoutSavingConfirmation(false);
   }, [initialDraft, open]);
+
+  // 恢复草稿图片预览 URL（stage 文件 → loopback）
+  useEffect(() => {
+    if (!open || !mailbox) return;
+    let cancelled = false;
+    const restore = async () => {
+      const next = await Promise.all(
+        attachments.map(async (item) => {
+          if (!isImageOutgoingAttachment(item) || item.preview_url || !item.storage_key) return item;
+          try {
+            const access = await actions.prepareStagedOutgoingAttachmentAccess(
+              mailbox,
+              item.storage_key,
+              item.filename,
+              item.mime_type,
+            );
+            const url = access.preview_url || access.download_url || "";
+            return url ? { ...item, preview_url: url, status: "ready" as const } : item;
+          } catch {
+            return item;
+          }
+        }),
+      );
+      if (!cancelled) setAttachments(next);
+    };
+    void restore();
+    return () => {
+      cancelled = true;
+    };
+    // 仅在打开/草稿切换时恢复预览
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, mailbox, initialDraft?.id]);
 
   useEffect(() => {
     if (!insertRequest || !open) return;
@@ -116,42 +168,108 @@ export function ComposeView({
     onConsumeInsertRequest?.(insertRequest.nonce);
   }, [insertRequest, onConsumeInsertRequest, open]);
 
-  useEffect(() => {
-    if (!recipientInput.trim()) {
-      setContacts([]);
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      void actions
-        .searchComposeContacts(mailbox, recipientInput)
-        .then((result) => {
-          setContacts(result.contacts);
-          setContactOpen(true);
-        })
-        .catch(() => setContacts([]));
-    }, 220);
-    return () => window.clearTimeout(timer);
-  }, [actions, mailbox, recipientInput]);
-
-  const addRecipient = (email: string) => {
-    const normalized = email.trim().toLowerCase();
-    if (!EMAIL_RE.test(normalized) || recipients.includes(normalized)) return;
-    setRecipients((current) => [...current, normalized]);
-    setRecipientInput("");
-    setContacts([]);
-    setContactOpen(false);
-    recipientInputRef.current?.focus();
-  };
-
   const draftInput = useMemo(
     () => ({
       id: draftId || undefined,
       recipients,
+      cc,
+      bcc,
       subject,
       body,
+      attachments: toPersistedOutgoingAttachments(attachments),
     }),
-    [body, draftId, recipients, subject],
+    [attachments, bcc, body, cc, draftId, recipients, subject],
   );
+
+  const stageFiles = async (files: FileList) => {
+    const list = Array.from(files);
+    if (!list.length) return;
+    setError("");
+    let runningTotal = totalOutgoingAttachmentBytes(attachments.filter((item) => item.status !== "error"));
+    for (const file of list) {
+      if (isBlockedOutgoingFilename(file.name)) {
+        setError(`Blocked file type: ${file.name}`);
+        continue;
+      }
+      if (runningTotal + file.size > OUTGOING_ATTACHMENT_TOTAL_MAX_BYTES) {
+        setError("Total attachments must stay within 25 MB.");
+        break;
+      }
+      const tempId = crypto.randomUUID().replace(/-/g, "");
+      const localPreview = isImageOutgoingAttachment({ filename: file.name, mime_type: file.type })
+        ? URL.createObjectURL(file)
+        : "";
+      setAttachments((current) => [
+        ...current,
+        {
+          id: tempId,
+          filename: file.name,
+          mime_type: file.type || "application/octet-stream",
+          size: file.size,
+          storage_key: "",
+          preview_url: localPreview || undefined,
+          status: "uploading",
+          progress: 0,
+        },
+      ]);
+      try {
+        const begun = await actions.beginStageOutgoingAttachment(mailbox, {
+          filename: file.name,
+          mime_type: file.type || "application/octet-stream",
+          size: file.size,
+          existing_total_bytes: runningTotal,
+          draft_scope: "compose",
+          draft_key: draftId || "",
+        });
+        if (!begun.ok || !begun.upload_url || !begun.attachment_id || !begun.storage_key) {
+          throw new Error(begun.error || "Failed to stage attachment");
+        }
+        await putFileToUploadUrl(begun.upload_url, file, (ratio) => {
+          setAttachments((current) =>
+            current.map((item) => (item.id === tempId ? { ...item, progress: ratio } : item)),
+          );
+        });
+        runningTotal += file.size;
+        setAttachments((current) =>
+          current.map((item) =>
+            item.id === tempId
+              ? {
+                  ...item,
+                  id: begun.attachment_id || tempId,
+                  filename: begun.filename || file.name,
+                  mime_type: begun.mime_type || file.type || "application/octet-stream",
+                  size: begun.size || file.size,
+                  storage_key: begun.storage_key || "",
+                  status: "ready",
+                  progress: 1,
+                }
+              : item,
+          ),
+        );
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        setAttachments((current) =>
+          current.map((item) =>
+            item.id === tempId ? { ...item, status: "error", error: message, progress: 0 } : item,
+          ),
+        );
+        setError(message);
+      }
+    }
+  };
+
+  const removeAttachment = async (id: string) => {
+    const target = attachments.find((item) => item.id === id);
+    setAttachments((current) => current.filter((item) => item.id !== id));
+    if (target?.preview_url?.startsWith("blob:")) URL.revokeObjectURL(target.preview_url);
+    if (target?.storage_key) {
+      try {
+        await actions.deleteStagedOutgoingAttachment(mailbox, target.storage_key);
+      } catch {
+        // ignore cleanup failure
+      }
+    }
+  };
 
   const save = async () => {
     if (isEmpty) return null;
@@ -168,6 +286,25 @@ export function ComposeView({
       return saved;
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
+      if (draftId && message.includes("changed elsewhere")) {
+        try {
+          const latestPayload = await actions.listComposeDrafts(mailbox);
+          const latest = latestPayload.drafts.find((item) => item.id === draftId);
+          if (latest) {
+            const saved = await actions.saveComposeDraft(
+              mailbox,
+              draftInput,
+              latest.etag || undefined,
+            );
+            setDraftId(saved.id);
+            setEtag(saved.etag || "");
+            return saved;
+          }
+        } catch (retryReason) {
+          setError(retryReason instanceof Error ? retryReason.message : String(retryReason));
+          return null;
+        }
+      }
       setError(message);
       return null;
     } finally {
@@ -176,7 +313,7 @@ export function ComposeView({
   };
 
   const close = async () => {
-    if (!recipients.length && (subject.trim() || body.trim())) {
+    if (!recipients.length && (subject.trim() || body.trim() || cc.length || bcc.length || attachments.length)) {
       setExitWithoutSavingConfirmation(true);
       return;
     }
@@ -216,6 +353,35 @@ export function ComposeView({
     if (saved) onScheduleSend(saved);
   };
 
+  const ccBccButtons = (
+    <div className="compose-cc-bcc-toggle">
+      {!ccOpen ? (
+        <button
+          type="button"
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => {
+            setCcOpen(true);
+            setFocusField("cc");
+          }}
+        >
+          Cc
+        </button>
+      ) : null}
+      {!bccOpen ? (
+        <button
+          type="button"
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => {
+            setBccOpen(true);
+            setFocusField("bcc");
+          }}
+        >
+          Bcc
+        </button>
+      ) : null}
+    </div>
+  );
+
   return (
     <>
       <aside
@@ -252,71 +418,48 @@ export function ComposeView({
             </p>
           </div>
         </header>
-        <label className="compose-field compose-to">
-          <span>To</span>
-          <div>
-            {recipients.map((email) => (
-              <span className="compose-chip" key={email}>
-                {email}
-                <button
-                  type="button"
-                  aria-label={`Remove ${email}`}
-                  onClick={() =>
-                    setRecipients((items) =>
-                      items.filter((item) => item !== email),
-                    )
-                  }
-                >
-                  ×
-                </button>
-              </span>
-            ))}
-            <input
-              ref={recipientInputRef}
-              aria-label="Recipients"
-              value={recipientInput}
-              onFocus={() => setContactOpen(true)}
-              onBlur={() => window.setTimeout(() => setContactOpen(false), 120)}
-              onChange={(event) => setRecipientInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && canAddRawEmail) {
-                  event.preventDefault();
-                  addRecipient(candidateEmail);
-                }
-              }}
-              placeholder={recipients.length ? undefined : "Name or email"}
-            />
-            {contactOpen && (contacts.length > 0 || canAddRawEmail) ? (
-              <div className="compose-contact-menu">
-                {contacts.map((contact) => (
-                  <button
-                    type="button"
-                    key={contact.email}
-                    onMouseDown={(event) => event.preventDefault()}
-                    onClick={() => addRecipient(contact.email)}
-                  >
-                    {contact.avatar_url ? (
-                      <img src={contact.avatar_url} alt="" />
-                    ) : null}
-                    <span>
-                      {contact.name || contact.email}
-                      <small>{contact.name ? contact.email : ""}</small>
-                    </span>
-                  </button>
-                ))}
-                {canAddRawEmail ? (
-                  <button
-                    type="button"
-                    onMouseDown={(event) => event.preventDefault()}
-                    onClick={() => addRecipient(candidateEmail)}
-                  >
-                    Add <strong>{candidateEmail}</strong>
-                  </button>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-        </label>
+        <RecipientChipInput
+          label="To"
+          emails={recipients}
+          onChange={setRecipients}
+          mailbox={mailbox}
+          searchContacts={actions.searchComposeContacts}
+          placeholder="Name or email"
+          fieldRole="to"
+          trailing={!ccOpen || !bccOpen ? ccBccButtons : null}
+        />
+        {ccOpen ? (
+          <RecipientChipInput
+            label="Cc"
+            emails={cc}
+            onChange={setCc}
+            mailbox={mailbox}
+            searchContacts={actions.searchComposeContacts}
+            fieldRole="cc"
+            autoFocus={focusField === "cc"}
+            onEmptyBlur={() => {
+              setCc([]);
+              setCcOpen(false);
+              setFocusField(null);
+            }}
+          />
+        ) : null}
+        {bccOpen ? (
+          <RecipientChipInput
+            label="Bcc"
+            emails={bcc}
+            onChange={setBcc}
+            mailbox={mailbox}
+            searchContacts={actions.searchComposeContacts}
+            fieldRole="bcc"
+            autoFocus={focusField === "bcc"}
+            onEmptyBlur={() => {
+              setBcc([]);
+              setBccOpen(false);
+              setFocusField(null);
+            }}
+          />
+        ) : null}
         <label className="compose-field">
           <span>Subject</span>
           <input
@@ -333,6 +476,7 @@ export function ComposeView({
             placeholder="Write your message or key points…"
           />
         </label>
+        <OutgoingAttachmentList items={attachments} onRemove={(id) => void removeAttachment(id)} />
         {error ? (
           <p className="compose-error" role="alert">
             {error}
@@ -341,13 +485,16 @@ export function ComposeView({
         <footer className="mail-detail-footer compose-footer">
           <span />
           <div className="mail-detail-composer-actions compose-toolbar-actions">
+            <OutgoingAttachButton disabled={saving} onPick={(files) => void stageFiles(files)} />
             <button
               type="button"
               className="mail-detail-composer-icon-btn"
               aria-label="AI draft"
               data-tooltip="AI draft"
               disabled={saving}
-              onClick={() => onOpenAiDraft({ recipients, subject, body })}
+              onClick={() =>
+                onOpenAiDraft({ recipients, cc, bcc, subject, body })
+              }
             >
               <AiDraftIcon />
             </button>

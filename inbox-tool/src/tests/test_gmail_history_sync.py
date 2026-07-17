@@ -26,13 +26,14 @@ def main() -> None:
     from mail_agent.mail_providers.gmail import adapter
 
     mailbox = "user@example.com"
+    scan_version = adapter.ATTACHMENT_SCAN_VERSION
     existing = [
-        {"id": "changed", "internal_date": "2", "label_ids": ["INBOX", "UNREAD"], "subject": "Old"},
-        {"id": "deleted", "internal_date": "1", "label_ids": ["INBOX"], "subject": "Deleted"},
+        {"id": "changed", "internal_date": "2", "label_ids": ["INBOX", "UNREAD"], "subject": "Old", "attachment_scan_version": scan_version},
+        {"id": "deleted", "internal_date": "1", "label_ids": ["INBOX"], "subject": "Deleted", "attachment_scan_version": scan_version},
     ]
     summaries = {
-        "changed": {"id": "changed", "internal_date": "2", "label_ids": ["INBOX", "STARRED"], "subject": "Updated"},
-        "added": {"id": "added", "internal_date": "3", "label_ids": ["INBOX", "UNREAD"], "subject": "New"},
+        "changed": {"id": "changed", "internal_date": "2", "label_ids": ["INBOX", "STARRED"], "subject": "Updated", "attachment_scan_version": scan_version},
+        "added": {"id": "added", "internal_date": "3", "label_ids": ["INBOX", "UNREAD"], "subject": "New", "attachment_scan_version": scan_version},
     }
     history_page = {
         "historyId": "20",
@@ -63,6 +64,22 @@ def main() -> None:
         check("advances cursor after cache write", state.get("history_id") == "20", str(state))
         params = history_request.call_args.args[2]
         check("uses stored cursor", params["startHistoryId"] == "10", str(params))
+
+    # 旧摘要没有附件扫描版本时，自动同步应要求一次完整基线同步，不能等详情页补全。
+    with tempfile.TemporaryDirectory() as temp_dir:
+        legacy = [{"id": "legacy", "internal_date": "1", "label_ids": ["INBOX"], "attachment_scan_version": 0}]
+        with (
+            patch.object(adapter, "cache_dir", return_value=Path(temp_dir)),
+            patch.object(adapter, "gmail_request") as history_request,
+        ):
+            adapter.write_index(mailbox, legacy)
+            adapter.set_cached_mailbox_history_cursor(mailbox, "10", scope_days=30)
+            result = adapter.sync_cached_mailbox_history(mailbox)
+            state = adapter._read_history_sync_state(mailbox)
+
+        check("attachment upgrade requires resync", result.get("resync_required") is True and result.get("resync_reason") == "attachment_metadata_upgrade", str(result))
+        check("attachment upgrade skips History request", history_request.call_count == 0)
+        check("attachment upgrade keeps old cursor", state.get("history_id") == "10", str(state))
 
     with tempfile.TemporaryDirectory() as temp_dir:
         with (

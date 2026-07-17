@@ -1,6 +1,6 @@
 # AI 侧边栏意图路由
 
-## 状态：已由本地 Router 取代（App 2.0.28 / Tool 2.1.9，阶段 C）
+## 状态：已由本地 Router 取代（App 2.1.1 / Tool 2.2.1，阶段 C）
 
 侧栏**不再**使用前端正则业务路由（原 `decideAiRoute` → `chat | scan | mail_context`）。
 

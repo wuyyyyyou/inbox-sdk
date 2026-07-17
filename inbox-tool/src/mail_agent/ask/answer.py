@@ -11,8 +11,22 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from ..domain.types import MessageLite
-from .planner import AskPlan
+from .planner import AskPlan, is_actionable_browse_request, is_needs_reply_request
 from .sampling_budget import ASK_ANSWER_MAX_TOKENS
+
+# 自动通知 / 验证码噪声：needs-reply 与 browse 排序时降权或剔除。
+_NOISE_SENDER_MARKERS = (
+    "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
+    "notification@", "notifications@", "mailer-daemon", "bounce@",
+    "newsletter", "marketing@", "em@", "em1.", "priority.instagram",
+    "discoursemail.com", "accounts.google.com", "noreply-accounts",
+)
+_NOISE_SUBJECT_MARKERS = (
+    "验证码", "verification code", "otp", "one time code", "one-time code",
+    "is your code", "your code is", "unsubscribe", "newsletter",
+    "错过的精彩", "confirm your new account", "account no longer on hold",
+    "shared some google", "共享了一些", "邮箱验证码",
+)
 
 _logger = logging.getLogger(__name__)
 _BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -27,9 +41,44 @@ _ASK_SYNTHESIS_INSTRUCTION = (
     "Summarize and synthesize the evidence in your own words. "
     "Do not copy email body verbatim, except for a short necessary quote or an exact subject."
 )
-_ASK_ANSWER_SYSTEM_PROMPT = """You are Anna, an executive email assistant. Return one valid JSON object only, with no markdown or analysis.
-Schema: {"title": string, "summary": string, "sections": [{"heading": string, "body": string?, "items": [{"subject": string?, "context": string?, "suggestion": string?, "draft": string?, "mailbox": string?, "message_id": string?, "thread_id": string?, "from": string?, "mail_links": array?, "reply_gaps": object?}]}]}.
-Use only the supplied email evidence. Keep the answer concise, factual, and in the user's language. A reply draft and reply_gaps.needs_user_input cannot both appear for one item."""
+_ASK_ANSWER_SYSTEM_PROMPT = """You are Anna, an executive email assistant. Return ONE valid JSON object only. No markdown fences, no commentary, no TypeScript/schema type names.
+
+Example shape (replace every value with real content from the emails; never copy the words string/array/object or trailing ?):
+{
+  "title": "Emails awaiting your reply",
+  "summary": "Two threads look like they need a response.",
+  "sections": [
+    {
+      "heading": "Needs reply",
+      "body": "Human senders asked a question or requested action.",
+      "items": [
+        {
+          "subject": "exact subject from evidence",
+          "from": "exact from from evidence",
+          "context": "why this needs attention",
+          "suggestion": "what you could do next",
+          "mailbox": "provided mailbox",
+          "message_id": "provided message id",
+          "thread_id": "provided thread id",
+          "mail_links": [
+            {
+              "label": "exact subject",
+              "mailbox": "provided mailbox",
+              "thread_id": "provided thread id",
+              "message_id": "provided message id"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+Rules:
+- Use only the supplied email evidence. Prefer real subjects/IDs from the evidence list.
+- Keep generated copy concise and in the user's language.
+- Never put both a non-empty draft and reply_gaps.needs_user_input=true on the same item.
+- If nothing matches the request, still return valid JSON with an honest summary and empty sections/items."""
 
 
 def _answer_language_instruction(user_request: str) -> str:
@@ -50,22 +99,175 @@ def _uses_chinese(user_request: str) -> bool:
     return bool(re.search(r"[\u3400-\u9fff]", user_request))
 
 
-def _answer_fallback(plan: AskPlan, detail: str = "") -> dict[str, Any]:
-    # 用户侧只展示可行动摘要；解析器/stack 细节只写日志，避免把 excerpt 甩到侧栏。
+def _entry_noise_blob(entry: dict[str, Any] | MessageLite) -> str:
+    """拼接发件人/主题/摘要用于噪声检测。"""
+    if isinstance(entry, dict):
+        return " ".join(
+            str(entry.get(key) or "")
+            for key in ("from", "subject", "snippet", "context")
+        ).casefold()
+    return " ".join(
+        str(getattr(entry, key, "") or "")
+        for key in ("from_addr", "subject", "snippet")
+    ).casefold()
+
+
+def _is_automated_noise_entry(entry: dict[str, Any] | MessageLite) -> bool:
+    """判断是否为验证码/通知类噪声，通常不需要用户回复。"""
+    blob = _entry_noise_blob(entry)
+    if any(marker in blob for marker in _NOISE_SENDER_MARKERS):
+        return True
+    subject = ""
+    if isinstance(entry, dict):
+        subject = str(entry.get("subject") or "").casefold()
+    else:
+        subject = str(getattr(entry, "subject", "") or "").casefold()
+    return any(marker in subject or marker in blob for marker in _NOISE_SUBJECT_MARKERS)
+
+
+def _rank_enriched_for_fallback(enriched: list[dict[str, Any]], plan: AskPlan) -> list[dict[str, Any]]:
+    """Answer 失败时对已读上下文做本地排序，优先真人待回复线程。"""
+    needs_reply = is_needs_reply_request(plan.user_request) or plan.goal == "draft_replies"
+    actionable = is_actionable_browse_request(plan.user_request) or needs_reply
+
+    def score(entry: dict[str, Any]) -> tuple[int, int]:
+        relevance = 0
+        if _is_automated_noise_entry(entry):
+            relevance -= 50 if needs_reply else 20
+        if entry.get("unread"):
+            relevance += 8
+        from_addr = str(entry.get("from") or "").casefold()
+        if from_addr and not any(m in from_addr for m in _NOISE_SENDER_MARKERS):
+            relevance += 12 if needs_reply else 4
+        blob = f"{entry.get('subject', '')} {entry.get('snippet', '')} {entry.get('body', '')}".casefold()
+        if any(token in blob for token in ("?", "？", "please", "could you", "can you", "回复", "确认", "请问")):
+            relevance += 10
+        try:
+            # date 已是可读字符串时退化为 0，仍可按相关性排序。
+            timestamp = int(entry.get("internal_date") or 0)
+        except (TypeError, ValueError):
+            timestamp = 0
+        if not actionable:
+            relevance += 0
+        return (relevance, timestamp)
+
+    ranked = sorted((e for e in enriched if isinstance(e, dict)), key=score, reverse=True)
+    if needs_reply:
+        human = [e for e in ranked if not _is_automated_noise_entry(e)]
+        # 有真人候选时只展示真人；全是噪声则返回空，由上层给“无需回复”结论。
+        return human[:8] if human else []
+    return ranked[:8]
+
+
+def _answer_fallback(
+    plan: AskPlan,
+    detail: str = "",
+    *,
+    enriched: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Answer LLM 失败时的安全降级。
+
+    无候选时只返回错误摘要；已有扫描证据时列出真实邮件引用，
+    不编造分析，也不把解析器 excerpt 甩到侧栏。
+    """
     if detail:
         _logger.warning("ask answer fallback: detail=%s", str(detail)[:300])
-    if _uses_chinese(plan.user_request):
+    is_chinese = _uses_chinese(plan.user_request)
+    needs_reply = is_needs_reply_request(plan.user_request) or plan.goal == "draft_replies"
+    candidates = _rank_enriched_for_fallback(list(enriched or []), plan)
+    if candidates:
+        items: list[dict[str, Any]] = []
+        for entry in candidates:
+            subject = str(entry.get("subject") or "(no subject)")[:120]
+            message_id = str(entry.get("message_id") or "")
+            thread_id = str(entry.get("thread_id") or "")
+            mailbox = str(entry.get("mailbox") or "")
+            item: dict[str, Any] = {
+                "subject": subject,
+                "from": str(entry.get("from") or "")[:240],
+                "context": str(entry.get("snippet") or entry.get("body") or "")[:240],
+                "suggestion": (
+                    "打开线程确认是否需要回复。"
+                    if is_chinese
+                    else "Open this thread and reply if a response is still needed."
+                ),
+                "mailbox": mailbox,
+                "message_id": message_id,
+                "thread_id": thread_id,
+            }
+            if message_id or thread_id:
+                item["mail_links"] = [{
+                    "label": subject,
+                    "mailbox": mailbox,
+                    "thread_id": thread_id,
+                    "message_id": message_id,
+                    "from": str(entry.get("from") or "")[:240],
+                    "date": str(entry.get("date") or "")[:80],
+                    "snippet": str(entry.get("snippet") or "")[:240],
+                }]
+            items.append(item)
+        title = plan.title or (
+            "需要你回复的邮件" if is_chinese and needs_reply
+            else "可能需要关注的邮件" if is_chinese
+            else "Emails that may need your reply" if needs_reply
+            else "Emails to review"
+        )
+        summary = (
+            f"完整分析暂时不可用。已根据发件人与主题筛出 {len(items)} 封更可能需要你处理的邮件。"
+            if is_chinese
+            else f"Full analysis is temporarily unavailable. Showing {len(items)} email(s) most likely to need your attention."
+        )
+        heading = (
+            "更可能需要回复" if is_chinese and needs_reply
+            else "候选邮件" if is_chinese
+            else "Likely needs reply" if needs_reply
+            else "Candidate emails"
+        )
+        return {
+            "title": title,
+            "summary": summary,
+            "sections": [{"heading": heading, "items": items}],
+            "fallback_used": True,
+            "fallback_reason": str(detail)[:240] if detail else "answer_llm_failed",
+        }
+
+    # needs-reply 且全是噪声时，给明确“无需回复”结论，而不是空白错误。
+    if needs_reply and enriched:
+        title = plan.title or ("需要你回复的邮件" if is_chinese else "Emails that need your reply")
+        summary = (
+            "在最近扫描到的邮件里，主要是通知、验证码或自动邮件，没有明显需要你亲自回复的线程。"
+            if is_chinese
+            else "Among the recently scanned messages, most look like notifications, codes, or automated mail — none clearly need your personal reply."
+        )
+        return {
+            "title": title,
+            "summary": summary,
+            "sections": [],
+            "fallback_used": True,
+            "fallback_reason": str(detail)[:240] if detail else "answer_llm_failed_noise_only",
+        }
+
+    if is_chinese:
         summary = "Anna 暂时无法生成可用的回答，请换个说法重试，或打开具体邮件后再问。"
         title = plan.title or "扫描未完成"
     else:
         summary = "Anna could not produce a usable answer. Try rephrasing, or open a specific email first."
         title = plan.title or "Scan incomplete"
-    return {"title": title, "summary": summary, "sections": []}
+    return {
+        "title": title,
+        "summary": summary,
+        "sections": [],
+        "fallback_used": True,
+        "fallback_reason": str(detail)[:240] if detail else "answer_llm_failed",
+    }
 
 
 def _generated_copy_contains_chinese(payload: dict[str, Any]) -> bool:
-    """检查 Ask Answer 的非源邮件文案是否错误混入中文。"""
-    # 邮件主题、发件人和引用原文允许保留源语言，不能参与判断；只检查模型生成的标题、摘要、分组和行动建议。
+    """检查 Ask Answer 的模型生成文案是否错误混入中文。
+
+    context 常引用源邮件原文（中文邮件），不参与判断；
+    只检查 title/summary/heading/body/suggestion/reply_gaps。
+    """
     copy_values = [payload.get("title"), payload.get("summary")]
     sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
     for section in sections:
@@ -76,7 +278,8 @@ def _generated_copy_contains_chinese(payload: dict[str, Any]) -> bool:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            copy_values.extend((item.get("context"), item.get("suggestion")))
+            # context 允许保留源语言摘录；suggestion 必须跟用户请求语言一致。
+            copy_values.append(item.get("suggestion"))
             gaps = item.get("reply_gaps") if isinstance(item.get("reply_gaps"), dict) else {}
             copy_values.append(gaps.get("summary"))
             questions = gaps.get("questions") if isinstance(gaps.get("questions"), list) else []
@@ -84,6 +287,50 @@ def _generated_copy_contains_chinese(payload: dict[str, Any]) -> bool:
                 if isinstance(question, dict):
                     copy_values.extend((question.get("question"), question.get("hint")))
     return any(_uses_chinese(str(value or "")) for value in copy_values)
+
+
+def _scrub_chinese_generated_copy(payload: dict[str, Any], plan: AskPlan) -> dict[str, Any]:
+    """英文请求下，把混入中文的生成字段改成安全英文，尽量保留已解析结构。"""
+    cleaned = dict(payload)
+    if _uses_chinese(str(cleaned.get("title") or "")):
+        cleaned["title"] = plan.title or "Emails that need your reply"
+    if _uses_chinese(str(cleaned.get("summary") or "")):
+        cleaned["summary"] = "Here are the emails that look most relevant to your request."
+    sections = cleaned.get("sections") if isinstance(cleaned.get("sections"), list) else []
+    new_sections: list[dict[str, Any]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        sec = dict(section)
+        if _uses_chinese(str(sec.get("heading") or "")):
+            sec["heading"] = "Needs attention"
+        if _uses_chinese(str(sec.get("body") or "")):
+            sec["body"] = ""
+        items = sec.get("items") if isinstance(sec.get("items"), list) else []
+        new_items: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            if _uses_chinese(str(row.get("suggestion") or "")):
+                row["suggestion"] = "Review this thread and reply if needed."
+            gaps = row.get("reply_gaps") if isinstance(row.get("reply_gaps"), dict) else None
+            if gaps and (
+                _uses_chinese(str(gaps.get("summary") or ""))
+                or any(
+                    _uses_chinese(str((q or {}).get("question") or ""))
+                    or _uses_chinese(str((q or {}).get("hint") or ""))
+                    for q in (gaps.get("questions") or [])
+                    if isinstance(q, dict)
+                )
+            ):
+                row.pop("reply_gaps", None)
+            new_items.append(row)
+        sec["items"] = new_items
+        new_sections.append(sec)
+    cleaned["sections"] = new_sections
+    cleaned["language_scrubbed"] = True
+    return cleaned
 
 
 async def _filter_candidates(
@@ -113,18 +360,32 @@ def _fmt_ts(epoch_ms: str) -> str:
 def _select_candidates_for_context(candidates: list[MessageLite], plan: AskPlan) -> list[MessageLite]:
     """按请求相关度排序并选择有限候选，避免将所有正文交给模型。"""
     # 这里是确定性本地排序，不新增 Sampling 调用；关键词仅用于缩小正文读取集合。
+    needs_reply = is_needs_reply_request(plan.user_request) or plan.goal == "draft_replies"
+    actionable = is_actionable_browse_request(plan.user_request) or needs_reply
     terms = [str(term).casefold().strip() for topic in plan.topics for term in topic.get("search_terms", [])]
-    terms.extend(re.findall(r"[\w\u3400-\u9fff]{2,}", plan.user_request.casefold()))
+    if not actionable:
+        # 「需要浏览/处理」类请求的用户词（浏览/处理）不应作为 Gmail 命中加权，否则噪声偏大。
+        terms.extend(re.findall(r"[\w\u3400-\u9fff]{2,}", plan.user_request.casefold()))
     terms = [term for term in terms if term]
 
     def score(item: tuple[int, MessageLite]) -> tuple[int, int, int]:
         index, message = item
         subject = (message.subject or "").casefold()
         snippet = (message.snippet or "").casefold()
+        from_addr = (getattr(message, "from_addr", None) or "").casefold()
         relevance = sum(8 for term in terms if term in subject)
         relevance += sum(3 for term in terms if term in snippet)
         if getattr(message, "unread", False):
-            relevance += 4
+            # actionable 路径更偏向未读/待处理，提高进入上下文的机会。
+            relevance += 10 if actionable else 4
+        if actionable or needs_reply:
+            if _is_automated_noise_entry(message):
+                relevance -= 40 if needs_reply else 12
+            elif from_addr:
+                relevance += 14 if needs_reply else 4
+            blob = f"{subject} {snippet}"
+            if any(token in blob for token in ("?", "？", "please", "could you", "can you", "回复", "确认", "请问")):
+                relevance += 8
         try:
             timestamp = int(message.internal_date or 0)
         except (TypeError, ValueError):
@@ -132,7 +393,13 @@ def _select_candidates_for_context(candidates: list[MessageLite], plan: AskPlan)
         return (relevance, timestamp, -index)
 
     ranked = sorted(enumerate(candidates), key=score, reverse=True)
-    return [message for _index, message in ranked[:_MAX_CONTEXT_CANDIDATES]]
+    selected = [message for _index, message in ranked[:_MAX_CONTEXT_CANDIDATES]]
+    if needs_reply:
+        human = [message for message in selected if not _is_automated_noise_entry(message)]
+        # 至少给模型 1–2 封真人邮件；若全噪声则仍传原排序前几封以免空上下文。
+        if human:
+            return human[:_MAX_CONTEXT_CANDIDATES]
+    return selected
 
 
 async def _read_candidate_context(
@@ -334,7 +601,8 @@ async def _generate_answer(
             f"## Important\n"
             f"- Base your answer ONLY on the emails provided below.\n"
             f"- {_ASK_SYNTHESIS_INSTRUCTION}\n"
-            f"- If the emails below do not contain what the user is looking for, say so honestly."
+            f"- If the emails below do not contain what the user is looking for, say so honestly.\n"
+            f"- Output real JSON values only. Never emit schema tokens like string, string?, array, object, or boolean."
         )
 
     # Anna invoke 只尝试一次紧凑回答；失败直接返回安全 fallback，不能再消耗多轮 token。
@@ -370,15 +638,22 @@ async def _generate_answer(
                 progress_callback("evaluate", {"variant": variant["name"], "reason": last_error[:200]})
 
     if result is None:
-        # 不再把本地邮件列表伪装成 AI 回答；失败时返回明确错误摘要。
-        return _answer_fallback(plan, last_error or "Anna sampling failed")
+        # 无有效 JSON 时：有证据则列候选邮件，无证据则返回错误摘要（不伪造分析）。
+        return _answer_fallback(plan, last_error or "Anna sampling failed", enriched=enriched)
 
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
     if not payload:
-        return _answer_fallback(plan, "Anna returned empty analysis")
-    # 英文请求的模型输出若混入中文，不能把语言错误暴露到侧栏；保守降级优先于展示不一致的搜索结论。
+        return _answer_fallback(plan, "Anna returned empty analysis", enriched=enriched)
+    # 英文请求若模型生成文案混入中文：优先 scrub 保留结构，避免整份答案被丢弃。
     if not _uses_chinese(plan.user_request) and _generated_copy_contains_chinese(payload):
-        return _answer_fallback(plan, "Anna returned Chinese generated copy for an English request")
+        _logger.warning("ask answer scrubbed Chinese generated copy for English request")
+        payload = _scrub_chinese_generated_copy(payload, plan)
+        if _generated_copy_contains_chinese(payload):
+            return _answer_fallback(
+                plan,
+                "Anna returned Chinese generated copy for an English request",
+                enriched=enriched,
+            )
     payload["llm_meta"] = {
         "provider": result.get("provider"),
         "model": result.get("model"),
@@ -585,7 +860,12 @@ async def run_ask_pipeline(
     If `plan` is provided, skips the Planner LLM and uses the given plan directly
     (for re-running saved plans without re-planning).
     """
-    from .planner import normalize_user_facing_plan_copy, plan_ask_request, resolve_effective_timeframe
+    from .planner import (
+        normalize_actionable_browse_plan,
+        normalize_user_facing_plan_copy,
+        plan_ask_request,
+        resolve_effective_timeframe,
+    )
     from .search import build_queries, execute_search
 
     if not mailboxes:
@@ -600,10 +880,12 @@ async def run_ask_pipeline(
         if progress_callback:
             progress_callback("plan", {"stage": "plan"})
         plan = await plan_ask_request(user_request, primary_mailbox, sampling_create_message=sampling_create_message)
-    # 已保存计划可绕过 Planner；仍须在执行入口执行同一语言边界校验。
+    # 已保存计划可绕过 Planner；仍须在执行入口执行同一语言与 actionable 边界校验。
     plan = normalize_user_facing_plan_copy(plan)
+    plan = normalize_actionable_browse_plan(plan)
 
     # 模型计划只能决定检索意图，默认扫描时间必须服从用户当前 Scan Plan。
+    # 裸「最近/recent」不覆盖 Scan Plan；仅明确数字或具体单位（本周/本月等）才覆盖。
     plan.timeframe = resolve_effective_timeframe(plan.user_request or user_request, scan_window_days, plan.timeframe)
 
     timeframe_match = re.fullmatch(r"(\d{1,3})d", plan.timeframe)
@@ -692,16 +974,32 @@ async def run_ask_pipeline(
                     candidate_mailboxes[c.message_id] = _mbox
 
     if not all_candidates:
+        # 0 命中也要带回扫描计数与计划元数据，避免前端把「扫过」误显示成 0。
+        empty_base = {
+            "plan_id": plan.plan_id,
+            "plan_title": plan.title,
+            "plan_description": plan.description,
+            "plan_timeframe": plan.timeframe,
+            "plan_direction": plan.direction,
+            "plan_goal": plan.goal,
+            "plan_gmail_flags": plan.gmail_flags,
+            "plan_topics": plan.topics,
+            "plan_queries": primary_queries,
+            "planner_llm": plan.llm_meta,
+            "messages_scanned": total_scanned,
+            "candidates_found": 0,
+            "sections": [],
+        }
         if _uses_chinese(plan.user_request):
             return {
+                **empty_base,
                 "title": plan.title or "未找到结果",
                 "summary": f"已扫描 {len(mailboxes)} 个邮箱中的 {total_scanned} 封邮件，但没有找到符合你要求的内容。",
-                "sections": [],
             }
         return {
+            **empty_base,
             "title": plan.title or "No results",
             "summary": f"Scanned {total_scanned} emails across {len(mailboxes)} mailbox(es) but none matched your request.",
-            "sections": [],
         }
 
     if progress_callback:

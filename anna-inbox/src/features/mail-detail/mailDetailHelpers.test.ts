@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  buildForwardDraftBody,
+  buildForwardSendBodies,
+  buildForwardSubject,
   buildQuickReplyPrompt,
   estimateAttachmentPreviewMemory,
-  hasNewerThreadMessage,
   isOutboundMessageForMailbox,
   isPreviewableAttachment,
   materializeAttachmentAccess,
@@ -14,34 +16,11 @@ import {
   resolveAttachmentAccess,
   senderParts,
   splitAddresses,
+  stripForwardedMessageBlock,
   triggerAttachmentDownload,
 } from "./mailDetailHelpers";
 
 describe("mailDetailHelpers", () => {
-  it("only reports a thread update when the known message is actually newer", () => {
-    const page = {
-      mailbox: "owner@example.com",
-      thread_id: "thread-1",
-      subject: "Subject",
-      latest_message_id: "latest",
-      returned_count: 1,
-      has_earlier: false,
-      next_before_index: null,
-      messages: [{
-        id: "latest",
-        thread_id: "thread-1",
-        internal_date: "200",
-        from: "sender@example.com",
-        to: "owner@example.com",
-        subject: "Subject",
-        label_ids: [],
-        attachments: [],
-      }],
-    };
-    expect(hasNewerThreadMessage(page, "old-draft-anchor", "100")).toBe(false);
-    expect(hasNewerThreadMessage(page, "new-feed-message", "300")).toBe(true);
-  });
-
   it("splits address lists without breaking display names", () => {
     expect(splitAddresses('"Anna Team" <team@anna.ai>, Bob <bob@example.com>')).toEqual([
       '"Anna Team" <team@anna.ai>',
@@ -106,6 +85,26 @@ describe("mailDetailHelpers", () => {
       source: "gmail",
       downloadable: true,
     })).toBe(true);
+  });
+
+  it("supports preview for text, audio, and video attachments", () => {
+    expect(normalizeAttachmentKind({ filename: "notes.txt", mime_type: "text/plain" })).toBe("text");
+    expect(normalizeAttachmentKind({ filename: "recording.mp3", mime_type: "audio/mpeg" })).toBe("audio");
+    expect(normalizeAttachmentKind({ filename: "demo.mp4", mime_type: "video/mp4" })).toBe("video");
+  });
+
+  it("does not preview unsupported attachment types", () => {
+    expect(normalizeAttachmentKind({ filename: "archive.zip", mime_type: "application/zip" })).toBe("download");
+    expect(normalizeAttachmentKind({ filename: "archive.pdf", mime_type: "application/zip" })).toBe("download");
+    expect(isPreviewableAttachment({
+      id: "a2",
+      message_id: "m1",
+      filename: "archive.zip",
+      mime_type: "application/zip",
+      size: 1,
+      source: "gmail",
+      downloadable: true,
+    })).toBe(false);
   });
 
   it("estimates bounded preview memory for background rendering", () => {
@@ -263,5 +262,41 @@ describe("mailDetailHelpers", () => {
     expect(appendChild).toHaveBeenCalledOnce();
     expect(click).toHaveBeenCalledOnce();
     expect(remove).toHaveBeenCalledOnce();
+  });
+
+  it("builds forward subjects without duplicating prefixes", () => {
+    expect(buildForwardSubject("Hello")).toMatch(/^(Fwd: |转发：)Hello$/);
+    expect(buildForwardSubject("Fwd: Hello")).toBe("Fwd: Hello");
+    expect(buildForwardSubject("转发：你好")).toBe("转发：你好");
+  });
+
+  it("builds and strips forwarded message blocks", () => {
+    const body = buildForwardDraftBody({
+      from: "Alice <a@example.com>",
+      to: "bob@example.com",
+      subject: "Hello",
+      internal_date: String(Date.UTC(2026, 0, 2, 8, 30)),
+      body_text: "Original body",
+      body_html: "",
+    }, "Please see below.");
+    expect(body).toContain("Please see below.");
+    expect(body).toMatch(/Forwarded message|转发的邮件/);
+    expect(body).toContain("Original body");
+    expect(stripForwardedMessageBlock(body)).toBe("Please see below.");
+  });
+
+  it("preserves original html when building forward send bodies", () => {
+    const result = buildForwardSendBodies({
+      from: "Alice <a@example.com>",
+      to: "bob@example.com",
+      subject: "Hello",
+      internal_date: String(Date.UTC(2026, 0, 2, 8, 30)),
+      body_text: "Original body",
+      body_html: "<p><strong>Original</strong> <em>body</em></p>",
+    }, "Please see below.");
+    expect(result.body).toContain("Please see below.");
+    expect(result.body_html).toContain("<strong>Original</strong>");
+    expect(result.body_html).toContain("Please see below.");
+    expect(result.body_html).toMatch(/Forwarded message|转发的邮件/);
   });
 });

@@ -230,6 +230,11 @@ export class MailAgentClient {
     return this.invoke<RunStatus>("get_mail_agent_run", { run_id: runId }, { retry: "safe" });
   }
 
+  /** 取消 Brief/Ask 后台 run；切换邮箱时立即停止上一邮箱扫描。 */
+  cancelMailAgentRun(runId: string) {
+    return this.invoke<RunStatus & { cancelled?: boolean }>("cancel_mail_agent_run", { run_id: runId }, { timeoutMs: 15_000, retry: "safe" });
+  }
+
   getCardDetail(mailbox: string, cardId: string, storageProvider: string, includeBody = false) {
     return this.invoke<CardDetailPayload>("get_card_detail", { mailbox, card_id: cardId, storage_provider: storageProvider, include_body: includeBody });
   }
@@ -328,11 +333,70 @@ export class MailAgentClient {
     return this.invoke<InboxFeedPayload>("list_inbox_thread_drafts", { mailbox, limit });
   }
 
-  saveInboxThreadDraft(mailbox: string, threadId: string, body: string, ifMatch?: string, message?: Record<string, unknown>) {
+  saveInboxThreadDraft(
+    mailbox: string,
+    threadId: string,
+    body: string,
+    ifMatch?: string,
+    message?: Record<string, unknown>,
+    attachments?: Array<Record<string, unknown>>,
+  ) {
     return this.invoke<{ ok?: boolean; etag?: string; updated?: boolean }>(
       "save_inbox_thread_draft",
-      { mailbox, thread_id: threadId, body, if_match: ifMatch, message: message || {} },
+      {
+        mailbox,
+        thread_id: threadId,
+        body,
+        if_match: ifMatch,
+        message: message || {},
+        ...(attachments ? { attachments } : {}),
+      },
     );
+  }
+
+  beginStageOutgoingAttachment(
+    mailbox: string,
+    args: {
+      filename: string;
+      mime_type?: string;
+      size: number;
+      existing_total_bytes?: number;
+      draft_scope?: string;
+      draft_key?: string;
+    },
+  ) {
+    return this.invoke<{
+      ok?: boolean;
+      error?: string;
+      attachment_id?: string;
+      filename?: string;
+      mime_type?: string;
+      size?: number;
+      storage_key?: string;
+      upload_url?: string;
+      expires_at?: string;
+    }>("begin_stage_outgoing_attachment", { mailbox, ...args }, { timeoutMs: 60_000 });
+  }
+
+  deleteStagedOutgoingAttachment(mailbox: string, storageKey: string) {
+    return this.invoke<{ ok?: boolean; deleted?: boolean }>("delete_staged_outgoing_attachment", {
+      mailbox,
+      storage_key: storageKey,
+    });
+  }
+
+  prepareStagedOutgoingAttachmentAccess(
+    mailbox: string,
+    storageKey: string,
+    filename?: string,
+    mimeType?: string,
+  ) {
+    return this.invoke<AttachmentDownloadPayload>("prepare_staged_outgoing_attachment_access", {
+      mailbox,
+      storage_key: storageKey,
+      filename,
+      mime_type: mimeType,
+    });
   }
 
   deleteInboxThreadDraft(mailbox: string, threadId: string) {

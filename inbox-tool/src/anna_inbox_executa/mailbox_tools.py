@@ -77,14 +77,20 @@ def _discover_mailboxes() -> list[dict[str, Any]]:
         seen.add(email)
         status = str(account.get("status") or "active").lower()
         authorized = status in {"", "active", "connected"}
-        display_name = str(account.get("label") or "").strip()
+        # 平台账号列表通常只提供邮箱和 label，不保证 label 是 Google 账户真实姓名，
+        # 也不会直接携带头像地址。通过当前账号的短期 token 查询 Google profile，
+        # 让平台运行时与本地 OAuth token 的账户展示保持一致；查询失败时保留 label，
+        # 避免 profile scope 或网络问题影响邮箱账号发现本身。
+        platform_label = str(account.get("label") or "").strip()
+        display_name = get_account_display_name(email) or platform_label
+        avatar_url = get_account_avatar_url(email)
         results.append({
             "email": email,
             "provider": "gmail",
             "auth_source": "platform_credentials",
             "authorized": authorized,
             "display_name": display_name,
-            "avatar_url": "",
+            "avatar_url": avatar_url,
             "last_auth_checked_at": beijing_now(),
         })
 

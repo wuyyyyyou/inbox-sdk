@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PlusIcon, accountDisplayName, aiSearchStatus, aiThinkingElapsedLabel, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+import { PlusIcon, accountDisplayName, aiSearchStatus, aiThinkingElapsedLabel, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, inboxLastSyncedLabel, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
 
 describe("nextFeedRangeDays", () => {
   it("steps 7 → 30 → 60 → all time", () => {
@@ -12,6 +12,20 @@ describe("nextFeedRangeDays", () => {
   it("jumps to the next larger step for irregular windows", () => {
     expect(nextFeedRangeDays(14)).toBe(30);
     expect(nextFeedRangeDays(45)).toBe(60);
+  });
+});
+
+describe("inboxLastSyncedLabel", () => {
+  it("formats last synced time down to seconds", () => {
+    const label = inboxLastSyncedLabel("2026-07-17T08:09:10.000Z");
+    expect(label.startsWith("Last synced:")).toBe(true);
+    // 允许本地时区；至少包含秒位分隔
+    expect(label).toMatch(/\d{1,2}:\d{2}:\d{2}/);
+  });
+
+  it("returns empty for invalid timestamps", () => {
+    expect(inboxLastSyncedLabel("")).toBe("");
+    expect(inboxLastSyncedLabel("not-a-date")).toBe("");
   });
 });
 
@@ -380,6 +394,42 @@ describe("resolveSourceMessages", () => {
       "new-reply",
       "other",
     ]);
+  });
+
+  it("propagates attachment flags from older thread messages to the latest row", async () => {
+    const { uniqueLatestInboxThreads } = await import("./HomeView");
+    const mixed = [
+      {
+        id: "old-with-file",
+        thread_id: "thread-1",
+        label_ids: ["INBOX"],
+        internal_date: "1719360000000",
+        subject: "Invoice",
+        has_attachment: true,
+        attachment_count: 2,
+      },
+      {
+        id: "new-reply",
+        thread_id: "thread-1",
+        label_ids: ["INBOX"],
+        internal_date: "1720051200000",
+        subject: "Invoice",
+        has_attachment: false,
+        attachment_count: 0,
+      },
+      {
+        id: "other",
+        thread_id: "thread-2",
+        label_ids: ["INBOX"],
+        internal_date: "1719446400000",
+        subject: "Other",
+      },
+    ];
+    const projected = uniqueLatestInboxThreads(mixed);
+    expect(projected.map((message) => message.id)).toEqual(["new-reply", "other"]);
+    expect(projected[0].has_attachment).toBe(true);
+    expect(projected[0].attachment_count).toBe(2);
+    expect(projected[1].has_attachment).toBeFalsy();
   });
 
   it("treats sent mail as done by default", () => {

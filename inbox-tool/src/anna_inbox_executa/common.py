@@ -247,6 +247,13 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "cancel_mail_agent_run",
+            "description": "Cancel a running Brief/Ask mail-agent run so mailbox switch can free Gmail credentials immediately.",
+            "parameters": [
+                {"name": "run_id", "type": "string", "description": "Run id returned by start_mail_agent_run or custom scan.", "required": True},
+            ],
+        },
+        {
             "name": "get_active_cards",
             "description": "Get all active attention cards for a mailbox from persistent storage.",
             "parameters": [
@@ -401,6 +408,37 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "begin_stage_outgoing_attachment",
+            "description": "Begin staging an outgoing attachment. Returns a loopback upload_url for PUT of file bytes.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "filename", "type": "string", "description": "Original filename.", "required": True},
+                {"name": "mime_type", "type": "string", "description": "MIME type.", "required": False},
+                {"name": "size", "type": "number", "description": "Declared file size in bytes.", "required": True},
+                {"name": "existing_total_bytes", "type": "number", "description": "Total size of already staged attachments.", "required": False},
+                {"name": "draft_scope", "type": "string", "description": "compose or thread.", "required": False},
+                {"name": "draft_key", "type": "string", "description": "Draft id or thread id for association.", "required": False},
+            ],
+        },
+        {
+            "name": "delete_staged_outgoing_attachment",
+            "description": "Delete one staged outgoing attachment file by storage_key.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "storage_key", "type": "string", "description": "Local stage path from begin_stage_outgoing_attachment.", "required": True},
+            ],
+        },
+        {
+            "name": "prepare_staged_outgoing_attachment_access",
+            "description": "Prepare a short-lived preview URL for a staged outgoing attachment (draft restore).",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "storage_key", "type": "string", "description": "Local stage path.", "required": True},
+                {"name": "filename", "type": "string", "description": "Filename for Content-Disposition.", "required": False},
+                {"name": "mime_type", "type": "string", "description": "MIME type.", "required": False},
+            ],
+        },
+        {
             "name": "summarize_thread",
             "description": "Ask Anna to summarize a thread behind a card.",
             "parameters": [
@@ -508,13 +546,14 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "save_inbox_thread_draft",
-            "description": "Persist an Inbox thread draft body to mailbox-scoped storage.",
+            "description": "Persist an Inbox thread draft body and outgoing attachment metadata to mailbox-scoped storage.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
                 {"name": "thread_id", "type": "string", "description": "Gmail thread ID.", "required": True},
                 {"name": "body", "type": "string", "description": "Draft body text.", "required": True},
                 {"name": "if_match", "type": "string", "description": "Optional etag for optimistic concurrency.", "required": False},
                 {"name": "message", "type": "object", "description": "Optional compact source message metadata for the local Drafts folder.", "required": False},
+                {"name": "attachments", "type": "array", "description": "Optional outgoing attachment metadata list (id, filename, mime_type, size, storage_key).", "required": False},
             ],
         },
         {
@@ -641,6 +680,8 @@ DEFAULT_MANIFEST = {
                 {"name": "to_addr", "type": "string", "description": "Recipient email address.", "required": True},
                 {"name": "body", "type": "string", "description": "Reply body text.", "required": True},
                 {"name": "reply_mode", "type": "string", "description": "reply_to_sender | reply_all.", "required": False},
+                {"name": "cc_addr", "type": "string", "description": "Optional Cc addresses (comma-separated).", "required": False},
+                {"name": "bcc_addr", "type": "string", "description": "Optional Bcc addresses (comma-separated).", "required": False},
                 {"name": "dry_run", "type": "boolean", "description": "Default true (mock). Set false to really send.", "required": False},
             ],
         },
@@ -1226,38 +1267,49 @@ def refresh_platform_google_accounts(timeout_seconds: float = 12.0) -> list[dict
     return normalized
 
 
+# 全进程串行化 credentials/getToken：Brief 扫描与切换邮箱并发时，Host 连打多账户
+# 换票易吐缓存废票（401）。业务侧 Gmail 请求已在 scope 内复用 token，串行换票
+# 对首页/扫描吞吐影响有限，但能显著降低“邮箱1扫描中切到邮箱2”的 401。
+_PLATFORM_GET_TOKEN_LOCK = threading.RLock()
+
+
 def resolve_platform_google_token(account_id: str, timeout_seconds: float = 35.0) -> str:
-    """Get one short-lived token without logging, returning, or persisting it."""
+    """按 account_id 向 Host 交换短期 token；全进程串行，避免多邮箱并发换票互相踩踏。
+
+    token 只返回给调用方，不写日志、不进 APS、不进 JSON-RPC result。
+    """
     started = time.monotonic()
-    try:
-        timeout = max(0.1, float(timeout_seconds))
-        future = asyncio.run_coroutine_threadsafe(
-            platform_credentials.get_token(provider="google", account_id=account_id, timeout=timeout), loop,
-        )
-        payload = future.result(timeout=timeout)
-    except CredentialsError as exc:
-        record_span(
-            "credentials.get_token",
-            started,
-            outcome="error",
-            code=exc.code,
-            error_type=type(exc).__name__,
-        )
-        raise ValueError(f"Google authorization is unavailable for this mailbox ({exc.code})") from exc
-    except Exception as exc:
-        record_span(
-            "credentials.get_token",
-            started,
-            outcome="error",
-            error_type=type(exc).__name__,
-        )
-        raise ValueError("Google authorization token request failed") from exc
-    token = str(payload.get("access_token") or "") if isinstance(payload, dict) else ""
-    if not token:
-        record_span("credentials.get_token", started, outcome="error", error_type="EmptyToken")
-        raise ValueError("Google authorization returned no access token for this mailbox")
-    record_span("credentials.get_token", started)
-    return token
+    # 串行窗口包含整个 Reverse RPC 往返，保证同一时刻只有一个 getToken 在飞。
+    with _PLATFORM_GET_TOKEN_LOCK:
+        try:
+            timeout = max(0.1, float(timeout_seconds))
+            future = asyncio.run_coroutine_threadsafe(
+                platform_credentials.get_token(provider="google", account_id=account_id, timeout=timeout), loop,
+            )
+            payload = future.result(timeout=timeout)
+        except CredentialsError as exc:
+            record_span(
+                "credentials.get_token",
+                started,
+                outcome="error",
+                code=exc.code,
+                error_type=type(exc).__name__,
+            )
+            raise ValueError(f"Google authorization is unavailable for this mailbox ({exc.code})") from exc
+        except Exception as exc:
+            record_span(
+                "credentials.get_token",
+                started,
+                outcome="error",
+                error_type=type(exc).__name__,
+            )
+            raise ValueError("Google authorization token request failed") from exc
+        token = str(payload.get("access_token") or "") if isinstance(payload, dict) else ""
+        if not token:
+            record_span("credentials.get_token", started, outcome="error", error_type="EmptyToken")
+            raise ValueError("Google authorization returned no access token for this mailbox")
+        record_span("credentials.get_token", started)
+        return token
 
 
 from mail_agent.mail_providers.gmail.adapter import configure_platform_accounts

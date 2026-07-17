@@ -37,6 +37,7 @@ export function SettingsView({ settings, loading, error, focusSavedPromptsReques
   const [promptBody, setPromptBody] = useState("");
   const [memoryText, setMemoryText] = useState("");
   const [personalizationLoading, setPersonalizationLoading] = useState(false);
+  const [cacheClearing, setCacheClearing] = useState(false);
   const settingsContentRef = useRef<HTMLDivElement | null>(null);
   const savedPromptsSectionRef = useRef<HTMLElement | null>(null);
 
@@ -110,6 +111,27 @@ export function SettingsView({ settings, loading, error, focusSavedPromptsReques
           {AUTO_SYNC_LABELS[seconds]}
         </label>
       ))}
+    </section>
+    <section>
+      <h2>Mailbox cache</h2>
+      <p>Clear the local mail cache for the current mailbox and reload from Gmail. Use only if the list looks wrong after a normal refresh.</p>
+      <button
+        className="settings-action-btn"
+        type="button"
+        disabled={cacheClearing || loading}
+        onClick={() => {
+          void (async () => {
+            setCacheClearing(true);
+            try {
+              await actions.clearInboxCacheAndReload(settings.display_range_days);
+            } finally {
+              setCacheClearing(false);
+            }
+          })();
+        }}
+      >
+        {cacheClearing ? "Clearing cache…" : "Clear cache and reload"}
+      </button>
     </section>
     <section>
       <h2>Connectivity check</h2>

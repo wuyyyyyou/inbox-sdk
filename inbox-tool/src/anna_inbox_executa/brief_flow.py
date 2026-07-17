@@ -179,6 +179,45 @@ async def run_mail_agent_background(run_id: str, arguments: dict[str, Any], invo
         })
     _save_run_checkpoint(run_id)
 
+def cancel_mail_agent_run(run_id_arg: str) -> dict[str, Any]:
+    """取消后台 mail-agent run（Brief / Ask 等共用 MAIL_AGENT_RUNS）。
+
+    切换邮箱时由前端调用，阻止 continue 继续推进，释放 getToken / Gmail 压力。
+    已结束的 run 幂等返回当前视图。
+    """
+    run_id = str(run_id_arg or "").strip()
+    if not run_id:
+        return {"success": False, "run_id": "", "error": "run_id is required", "cancelled": False}
+    state = _get_run_state(run_id)
+    if not state:
+        return {"success": False, "run_id": run_id, "error": "run not found", "cancelled": False}
+    # 已完成/已取消：不重复改写，直接返回。
+    if state.get("cancel_requested") or str(state.get("stage") or "") == "cancelled":
+        view = _public_run_view(state)
+        view["success"] = True
+        view["cancelled"] = True
+        return view
+    if state.get("status") in {"done", "failed"} and not state.get("needs_continue"):
+        view = _public_run_view(state)
+        view["success"] = True
+        view["cancelled"] = False
+        return view
+    state["cancel_requested"] = True
+    state["status"] = "failed"
+    state["stage"] = "cancelled"
+    state["error"] = "cancelled"
+    state["needs_continue"] = False
+    state["updated_at"] = beijing_now()
+    brief = state.get("brief")
+    if isinstance(brief, dict):
+        brief["stage"] = "cancelled"
+    _save_run_checkpoint(run_id)
+    view = _public_run_view(state)
+    view["success"] = True
+    view["cancelled"] = True
+    return view
+
+
 def start_mail_agent_run(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
     # 接收前端预生成的 run_id，便于后续 continue 调用期间轮询同一个运行状态。
     run_id = str(arguments.get("run_id") or "").strip()
@@ -196,6 +235,7 @@ def start_mail_agent_run(arguments: dict[str, Any], invoke_id: str) -> dict[str,
         "error": "",
         "partial": {},
         "needs_continue": True,
+        "cancel_requested": False,
         "cards_added": 0,
         "brief": {
             "stage": "queued",
@@ -1070,6 +1110,15 @@ async def _continue_mail_agent_run_async(arguments: dict[str, Any], invoke_id: s
     state = _get_run_state(run_id)
     if not state:
         return {"success": False, "run_id": run_id, "error": "run not found"}
+    # 切换邮箱等场景已请求取消：不再推进任何阶段，立刻释放 worker。
+    if state.get("cancel_requested") or str(state.get("stage") or "") == "cancelled":
+        state["status"] = "failed"
+        state["stage"] = "cancelled"
+        state["error"] = state.get("error") or "cancelled"
+        state["needs_continue"] = False
+        state["updated_at"] = beijing_now()
+        _save_run_checkpoint(run_id)
+        return _public_run_view(state)
     saved_args = (state.get("partial") or {}).get("_args") or {}
     saved_args.update({key: value for key, value in arguments.items() if key != "run_id" and value not in (None, "")})
     state.setdefault("partial", {})["_args"] = saved_args
@@ -1100,6 +1149,14 @@ async def _continue_mail_agent_run_async(arguments: dict[str, Any], invoke_id: s
             state["needs_continue"] = False
         else:
             brief["stage"] = "phase1"
+        # 阶段执行中可能被 cancel；完成后再次检查，避免写回继续推进标志。
+        if state.get("cancel_requested") or str(state.get("stage") or "") == "cancelled":
+            state["status"] = "failed"
+            state["stage"] = "cancelled"
+            state["error"] = state.get("error") or "cancelled"
+            state["needs_continue"] = False
+            state["updated_at"] = beijing_now()
+            _save_run_checkpoint(run_id)
         return _public_run_view(state)
     except Exception as exc:
         MAIL_AGENT_RUNS[run_id].update({

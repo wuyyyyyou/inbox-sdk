@@ -2,7 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { buildDraftPreferencesInstruction, resolveDraftPreferences } from "../features/handle/draftPreferences";
-import { sortInboxMessagesDesc } from "../features/home/inboxMessageOrder";
+import {
+  mergeInboxMessagesById,
+  pruneInboxMessagesToCacheWindow,
+  sortInboxMessagesDesc,
+} from "../features/home/inboxMessageOrder";
 import { clampInboxSettings } from "../features/settings/inboxSettings";
 import { connectRuntime } from "../runtime/runtimeLoader";
 import { triggerBrowserDownload } from "../shared/browserDownload";
@@ -355,6 +359,23 @@ function isTransientConnectionError(error: unknown) {
   return /unexpected token\s+['"]?<|<!doctype html|text\/html|failed to fetch|network(?:error| request)?|fetch failed|econnreset|enotfound|etimedout|timeout|\b5\d\d\b|\[tool_failed\]|executa process exited/i.test(raw);
 }
 
+function patchInboxThreadAttachmentSummary(
+  messages: InboxFeedPayload["messages"],
+  mailbox: string,
+  threadId: string,
+  attachmentCount: number,
+) {
+  const normalized = normalizedMailbox(mailbox);
+  const count = Math.max(0, Math.floor(Number(attachmentCount) || 0));
+  if (!normalized || !threadId || !count) return messages;
+  return messages.map((message) => {
+    if (normalizedMailbox(message.mailbox || normalized) !== normalized || message.thread_id !== threadId) return message;
+    const nextCount = Math.max(Number(message.attachment_count || 0), count);
+    if (message.has_attachment && Number(message.attachment_count || 0) === nextCount) return message;
+    return { ...message, has_attachment: true, attachment_count: nextCount };
+  });
+}
+
 function formatRunDiagnostics(status: RunStatus, message: string): string {
   const diagnostic = status.diagnostics;
   if (!diagnostic?.trace_id) return message;
@@ -564,6 +585,10 @@ export interface AppActions {
   loadActiveCards(): Promise<void>;
   loadInboxEmails(category?: string, days?: number, force?: boolean): Promise<boolean>;
   refreshInboxEmails(category?: string, days?: number, clearCache?: boolean): Promise<InboxPageResult>;
+  /** 与自动同步相同：History 增量 + 静默合并快照，不整表清空 */
+  silentSyncInbox(days?: number): Promise<boolean>;
+  /** 设置页：清空本地缓存并硬重载当前邮箱 */
+  clearInboxCacheAndReload(days?: number): Promise<boolean>;
   /** 扩大 All mail 时间窗并只追加新邮件，不清空已有快照 */
   expandInboxFeedWindow(days: number): Promise<InboxPageResult>;
   loadCachedInboxEmails(category?: string, days?: number, offset?: number, append?: boolean): Promise<InboxPageResult>;
@@ -581,7 +606,14 @@ export interface AppActions {
   loadInboxThreadAssist(mailbox: string, threadId: string, latestMessageId: string, anchorMessageId?: string): Promise<InboxThreadAssistPayload>;
   getInboxThreadDraft(mailbox: string, threadId: string): Promise<InboxThreadDraftPayload>;
   listInboxThreadDrafts(mailbox: string, limit?: number): Promise<InboxFeedPayload>;
-  saveInboxThreadDraft(mailbox: string, threadId: string, body: string, ifMatch?: string, message?: Record<string, unknown>): Promise<{ ok?: boolean; etag?: string; updated?: boolean }>;
+  saveInboxThreadDraft(
+    mailbox: string,
+    threadId: string,
+    body: string,
+    ifMatch?: string,
+    message?: Record<string, unknown>,
+    attachments?: Array<Record<string, unknown>>,
+  ): Promise<{ ok?: boolean; etag?: string; updated?: boolean }>;
   deleteInboxThreadDraft(mailbox: string, threadId: string): Promise<{ ok?: boolean }>;
   searchComposeContacts(mailbox: string, query: string): Promise<{ contacts: ComposeContact[]; permissionRequired: boolean }>;
   listComposeDrafts(mailbox: string): Promise<ComposeDraftListPayload>;
@@ -589,10 +621,47 @@ export interface AppActions {
   deleteComposeDraft(mailbox: string, draftId: string): Promise<void>;
   sendComposeEmails(mailbox: string, messages: ComposeDraft[]): Promise<Array<{ id: string; ok: boolean; error?: string }>>;
   prepareInboxAttachmentAccess(mailbox: string, messageId: string, attachmentId: string, mode: "preview" | "download"): Promise<AttachmentDownloadPayload>;
+  beginStageOutgoingAttachment(
+    mailbox: string,
+    args: {
+      filename: string;
+      mime_type?: string;
+      size: number;
+      existing_total_bytes?: number;
+      draft_scope?: string;
+      draft_key?: string;
+    },
+  ): Promise<{
+    ok?: boolean;
+    error?: string;
+    attachment_id?: string;
+    filename?: string;
+    mime_type?: string;
+    size?: number;
+    storage_key?: string;
+    upload_url?: string;
+  }>;
+  deleteStagedOutgoingAttachment(mailbox: string, storageKey: string): Promise<void>;
+  prepareStagedOutgoingAttachmentAccess(
+    mailbox: string,
+    storageKey: string,
+    filename?: string,
+    mimeType?: string,
+  ): Promise<AttachmentDownloadPayload>;
   modifyInboxMessageLabels(mailbox: string, messageIds: string[], addLabelIds?: string[], removeLabelIds?: string[]): Promise<void>;
   updateInboxThreadState(mailbox: string, threadId: string, operation: InboxThreadStateOperation): Promise<void>;
   submitMailContextPrompt(request: SubmitMailPromptRequest): Promise<MailPromptRunResult | null>;
-  sendInboxThreadReply(args: { mailbox: string; threadId: string; to: string; body: string; replyMode?: string; dryRun?: boolean }): Promise<{ ok?: boolean; dry_run?: boolean; error?: string }>;
+  sendInboxThreadReply(args: {
+    mailbox: string;
+    threadId: string;
+    to: string;
+    body: string;
+    cc?: string[];
+    bcc?: string[];
+    replyMode?: string;
+    dryRun?: boolean;
+    attachments?: import("../types/mail").OutgoingAttachmentMeta[];
+  }): Promise<{ ok?: boolean; dry_run?: boolean; error?: string }>;
   loadContactAvatars(emails: string[], mailbox?: string): Promise<{
     avatars: Record<string, string>;
     permissionRequired: boolean;
@@ -704,6 +773,14 @@ export function useAppController() {
   const inboxAutoSyncTimer = useRef<number | null>(null);
   const inboxAutoSyncInFlight = useRef(false);
   const inboxAutoSyncPending = useRef<{ mailbox: string; days: number } | null>(null);
+  /** 扫描/Ask 进行中切邮箱时，延后 live Gmail 拉取，避免与扫描抢 Host getToken。 */
+  const gmailBusyRef = useRef(false);
+  const deferredInboxLoadTimer = useRef<number | null>(null);
+  /** Brief 扫描代际号：切换邮箱时 +1，continue 循环立刻退出。 */
+  const briefScanGenerationRef = useRef(0);
+  const briefScanRunIdRef = useRef("");
+  /** Ask/自定义扫描的 run_id，切换邮箱时一并取消。 */
+  const activeBackgroundRunIdRef = useRef("");
 
   const getRuntime = useCallback(async () => {
     if (!runtimePromise.current) {
@@ -754,14 +831,30 @@ export function useAppController() {
   // All mail 混排后 INBOX 占比可能偏低；刷新/预热多拉一些进缓存，投影后 Inbox 才够用
   const ALL_MAIL_CACHE_FETCH_LIMIT = 400;
 
-  const applyInboxSnapshotPayload = useCallback((payload: InboxFeedPayload, options: { error?: string; append?: boolean } = {}) => {
+  const applyInboxSnapshotPayload = useCallback((payload: InboxFeedPayload, options: {
+    error?: string;
+    append?: boolean;
+    /** 静默刷新：按 id 合并并保留未变对象引用，避免整表抖动 */
+    merge?: boolean;
+    /** 合并后按 keepIds 裁剪当前同步窗口内已删除邮件 */
+    keepIds?: Set<string>;
+    pruneDays?: number;
+  } = {}) => {
     const pageMessages = Array.isArray(payload.messages) ? payload.messages : [];
     setState((s) => {
-      const snapshotMessages = options.append
-        ? sortInboxMessagesDesc(
-          [...new Map([...s.inboxSnapshotMessages, ...pageMessages].map((message) => [message.id, message])).values()],
-        )
-        : sortInboxMessagesDesc(pageMessages);
+      let snapshotMessages: InboxMessage[];
+      if (options.append || options.merge) {
+        snapshotMessages = mergeInboxMessagesById(s.inboxSnapshotMessages, pageMessages);
+      } else {
+        snapshotMessages = sortInboxMessagesDesc(pageMessages);
+      }
+      if (options.keepIds) {
+        snapshotMessages = pruneInboxMessagesToCacheWindow(
+          snapshotMessages,
+          options.keepIds,
+          options.pruneDays ?? 0,
+        );
+      }
       return {
         ...s,
         // 标签大小写兼容，避免漏掉 INBOX 导致 Inbox 列表异常偏少
@@ -797,70 +890,150 @@ export function useAppController() {
     return payload;
   }, [client]);
 
-  const preloadMailboxSnapshot = useCallback(async (mailboxOverride?: string, days = 30, force = false) => {
+  /**
+   * 从本地 All mail 缓存（必要时回源 Gmail）加载快照。
+   * soft=true：合并进现有列表并在结束后裁剪窗口内已删除项，不整表清空。
+   */
+  const loadMailboxSnapshotFromCache = useCallback(async (
+    mailbox: string,
+    days: number,
+    requestKey: string,
+    options: { soft?: boolean; skipLiveGmail?: boolean } = {},
+  ) => {
+    const soft = Boolean(options.soft);
+    const skipLiveGmail = Boolean(options.skipLiveGmail);
+    const keepIds = soft ? new Set<string>() : null;
+    const noteIds = (messages: InboxMessage[]) => {
+      if (!keepIds) return;
+      for (const message of messages) {
+        if (message.id) keepIds.add(message.id);
+      }
+    };
+    const applyPage = (payload: InboxFeedPayload, firstPage: boolean) => {
+      if (soft) {
+        noteIds(Array.isArray(payload.messages) ? payload.messages : []);
+        applyInboxSnapshotPayload(payload, { merge: true });
+        return;
+      }
+      applyInboxSnapshotPayload(payload, firstPage ? {} : { append: true });
+    };
+    const finishSoftPrune = () => {
+      if (!keepIds) return;
+      applyInboxSnapshotPayload(
+        { messages: [] },
+        { merge: true, keepIds, pruneDays: days },
+      );
+    };
+
+    const [cached] = await Promise.all([
+      // 启动/刷新快照固定读 All mail 缓存，分类由前端标签投影
+      client.listCachedEmails(mailbox, days, 100, "all", 0),
+      // A draft-index failure must not prevent the Inbox cache from opening.
+      loadInboxThreadDrafts(mailbox).catch(() => undefined),
+    ]);
+    if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0 };
+    const cachedMessages = Array.isArray(cached.messages) ? cached.messages : [];
+    if (cachedMessages.length) {
+      applyPage(cached, true);
+      setState((s) => ({ ...s, inboxSnapshotLoading: false, inboxLoading: false }));
+      let nextOffset = Number(cached.next_offset ?? cachedMessages.length);
+      let hasMore = Boolean(cached.has_more);
+      let pages = 0;
+      while (hasMore && pages < 30) {
+        pages += 1;
+        const more = await client.listCachedEmails(mailbox, days, 100, "all", nextOffset);
+        if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0 };
+        applyPage(more, false);
+        const pageCount = Array.isArray(more.messages) ? more.messages.length : 0;
+        nextOffset = Number(more.next_offset ?? nextOffset + pageCount);
+        hasMore = Boolean(more.has_more) && pageCount > 0;
+        if (!pageCount) break;
+      }
+      finishSoftPrune();
+      return { ok: true, count: nextOffset, source: "cache" as const };
+    }
+
+    // 其他邮箱正在 Brief/Ask 扫描时，先跳过 live Gmail，避免与扫描并发抢 getToken。
+    if (skipLiveGmail) {
+      setState((s) => ({
+        ...s,
+        inboxSnapshotLoading: false,
+        inboxLoading: false,
+        inboxSnapshotComplete: true,
+      }));
+      return { ok: false, count: 0, source: "deferred" as const };
+    }
+
+    // 切换到无本地缓存的邮箱时必打 Gmail；Host 偶发先给废票导致 401，短暂重试一次。
+    let payload: InboxFeedPayload;
+    try {
+      payload = await client.listInboxEmails(mailbox, days, ALL_MAIL_CACHE_FETCH_LIMIT, "all");
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const authFlaky = /401|invalid credentials|unauthenticated|authError/i.test(detail);
+      if (!authFlaky || snapshotRequestMailbox.current !== requestKey) throw error;
+      await sleep(450);
+      if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0 };
+      payload = await client.listInboxEmails(mailbox, days, ALL_MAIL_CACHE_FETCH_LIMIT, "all");
+    }
+    if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0 };
+    applyPage(payload, true);
+    setState((s) => ({ ...s, inboxSnapshotLoading: false, inboxLoading: false }));
+    let nextOffset = Number(payload.next_offset ?? (Array.isArray(payload.messages) ? payload.messages.length : 0));
+    let hasMore = Boolean(payload.has_more);
+    let pages = 0;
+    while (hasMore && pages < 30) {
+      pages += 1;
+      const more = await client.listCachedEmails(mailbox, days, 100, "all", nextOffset);
+      if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0 };
+      applyPage(more, false);
+      const pageCount = Array.isArray(more.messages) ? more.messages.length : 0;
+      nextOffset = Number(more.next_offset ?? nextOffset + pageCount);
+      hasMore = Boolean(more.has_more) && pageCount > 0;
+      if (!pageCount) break;
+    }
+    finishSoftPrune();
+    return { ok: true, count: nextOffset, source: "gmail" as const };
+  }, [applyInboxSnapshotPayload, client, loadInboxThreadDrafts]);
+
+  const preloadMailboxSnapshot = useCallback(async (
+    mailboxOverride?: string,
+    days = 30,
+    force = false,
+    options: { skipLiveGmail?: boolean } = {},
+  ) => {
     const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
     if (!mailbox || mailbox === "all") return false;
     if (!force && snapshotPromise.current && snapshotRequestMailbox.current === mailbox) return snapshotPromise.current;
     snapshotRequestMailbox.current = mailbox;
+    const skipLiveGmail = Boolean(options.skipLiveGmail);
     const run = (async () => {
       const startedAt = performance.now();
-      setState((s) => ({ ...s, inboxSnapshotLoading: true }));
+      // 已有列表时 force 也走 soft，避免自动同步整表替换抖动
+      const soft = force;
+      setState((s) => ({
+        ...s,
+        inboxSnapshotLoading: true,
+        // soft 保留现有列表；冷启动仍可显示 loading
+        inboxLoading: soft ? false : s.inboxLoading || !(s.inboxSnapshotMessages.length || s.inboxMessages.length),
+        inboxError: soft ? "" : s.inboxError,
+      }));
       try {
-        const [cached] = await Promise.all([
-          // 启动快照固定读 All mail 缓存，分类由前端标签投影
-          client.listCachedEmails(mailbox, days, 100, "all", 0),
-          // A draft-index failure must not prevent the Inbox cache from opening.
-          loadInboxThreadDrafts(mailbox).catch(() => undefined),
-        ]);
+        const result = await loadMailboxSnapshotFromCache(mailbox, days, mailbox, { soft, skipLiveGmail });
         if (snapshotRequestMailbox.current !== mailbox) return false;
-        const cachedMessages = Array.isArray(cached.messages) ? cached.messages : [];
-        // 流式：首屏立刻可见，后续页 append 边加载边渲染
-        if (cachedMessages.length) {
-          applyInboxSnapshotPayload(cached);
-          setState((s) => ({ ...s, inboxSnapshotLoading: false, inboxLoading: false }));
-          let nextOffset = Number(cached.next_offset ?? cachedMessages.length);
-          let hasMore = Boolean(cached.has_more);
-          let pages = 0;
-          while (hasMore && pages < 30) {
-            pages += 1;
-            const more = await client.listCachedEmails(mailbox, days, 100, "all", nextOffset);
-            if (snapshotRequestMailbox.current !== mailbox) return false;
-            applyInboxSnapshotPayload(more, { append: true });
-            const pageCount = Array.isArray(more.messages) ? more.messages.length : 0;
-            nextOffset = Number(more.next_offset ?? nextOffset + pageCount);
-            hasMore = Boolean(more.has_more) && pageCount > 0;
-            if (!pageCount) break;
-          }
-          console.info(`[inbox-startup] mailbox=${mailbox} days=${days} source=cache messages=${nextOffset} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
-          return nextOffset > 0;
-        }
-        const payload = await client.listInboxEmails(mailbox, days, ALL_MAIL_CACHE_FETCH_LIMIT, "all");
+        if (!result.ok) return false;
+        console.info(`[inbox-startup] mailbox=${mailbox} days=${days} source=${result.source || "cache"} messages=${result.count} soft=${soft} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
+        return result.count > 0;
+      } catch (error) {
         if (snapshotRequestMailbox.current !== mailbox) return false;
-        applyInboxSnapshotPayload(payload);
-        setState((s) => ({ ...s, inboxSnapshotLoading: false, inboxLoading: false }));
-        let nextOffset = Number(payload.next_offset ?? (Array.isArray(payload.messages) ? payload.messages.length : 0));
-        let hasMore = Boolean(payload.has_more);
-        let pages = 0;
-        while (hasMore && pages < 30) {
-          pages += 1;
-          const more = await client.listCachedEmails(mailbox, days, 100, "all", nextOffset);
-          if (snapshotRequestMailbox.current !== mailbox) return false;
-          applyInboxSnapshotPayload(more, { append: true });
-          const pageCount = Array.isArray(more.messages) ? more.messages.length : 0;
-          nextOffset = Number(more.next_offset ?? nextOffset + pageCount);
-          hasMore = Boolean(more.has_more) && pageCount > 0;
-          if (!pageCount) break;
-        }
-        console.info(`[inbox-startup] mailbox=${mailbox} days=${days} source=gmail messages=${nextOffset} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
-        return nextOffset > 0;
-      } catch {
-        if (snapshotRequestMailbox.current !== mailbox) return false;
+        const detail = error instanceof Error ? error.message : String(error);
         setState((s) => ({
           ...s,
           inboxSnapshotLoading: false,
           inboxLoading: false,
           inboxSnapshotComplete: true,
-          inboxError: "",
+          // 切换邮箱冷启动无列表时也要露出错误，否则 401 被静默吞掉只剩空收件箱
+          inboxError: detail,
         }));
         return false;
       }
@@ -869,7 +1042,58 @@ export function useAppController() {
       if (snapshotRequestMailbox.current === mailbox) snapshotPromise.current = null;
     });
     return snapshotPromise.current;
-  }, [applyInboxSnapshotPayload, client, loadInboxThreadDrafts, state.mailbox, state.selectedMailboxes]);
+  }, [client, loadMailboxSnapshotFromCache, state.mailbox, state.selectedMailboxes]);
+
+  /** History 增量同步 + 静默合并快照（自动同步 / 手动 Refresh / 切换邮箱后台同步共用） */
+  const silentSyncInbox = useCallback(async (days?: number, mailboxOverride?: string) => {
+    const mailbox = normalizedMailbox(mailboxOverride || state.selectedMailboxes[0] || state.mailbox);
+    if (!mailbox || mailbox === "all") return false;
+    const rangeDays = Math.max(0, Number(days ?? state.inboxSettings.display_range_days) || 30);
+    const requestKey = `${mailbox}#silent:${++inboxRequestSequence.current}`;
+    snapshotRequestMailbox.current = requestKey;
+    snapshotPromise.current = null;
+    setState((s) => ({
+      ...s,
+      inboxSnapshotLoading: true,
+      inboxLoading: false,
+      // 切换后的后台同步不清理已展示缓存，失败再写 error
+      inboxError: s.mailbox === mailbox ? s.inboxError : "",
+    }));
+    try {
+      const result = await client.syncInboxCache(mailbox);
+      if (snapshotRequestMailbox.current !== requestKey) return false;
+      if (result.resync_required) {
+        // History 游标失效或附件摘要版本升级时重建缓存；常规增量同步不重新抓取 All-mail。
+        await client.listInboxEmails(mailbox, rangeDays, ALL_MAIL_CACHE_FETCH_LIMIT, "all", true);
+        if (snapshotRequestMailbox.current !== requestKey) return false;
+      }
+      const loaded = await loadMailboxSnapshotFromCache(mailbox, rangeDays, requestKey, { soft: true });
+      if (snapshotRequestMailbox.current !== requestKey) return false;
+      setState((s) => ({
+        ...s,
+        inboxSnapshotLoading: false,
+        inboxLoading: false,
+        inboxError: loaded.ok ? "" : s.inboxError,
+      }));
+      return Boolean(loaded.ok);
+    } catch (error) {
+      if (snapshotRequestMailbox.current !== requestKey) return false;
+      const detail = error instanceof Error ? error.message : String(error);
+      setState((s) => ({
+        ...s,
+        inboxSnapshotLoading: false,
+        inboxLoading: false,
+        inboxSnapshotComplete: true,
+        // 后台同步失败只出横幅，不回滚当前邮箱
+        inboxError: detail,
+      }));
+      return false;
+    } finally {
+      if (snapshotRequestMailbox.current === requestKey) {
+        setState((s) => ({ ...s, inboxSnapshotLoading: false }));
+      }
+    }
+  }, [client, loadMailboxSnapshotFromCache, state.inboxSettings.display_range_days, state.mailbox, state.selectedMailboxes]);
 
   // 第三方 Gmail 客户端变更只在前台、当前邮箱稳定且没有 AI/列表重任务时同步。
   // 使用递归 timeout 而不是 interval，避免平台较慢时堆叠多个 History invoke。
@@ -907,21 +1131,14 @@ export function useAppController() {
       }
       inboxAutoSyncInFlight.current = true;
       try {
-        const result = await client.syncInboxCache(mailbox);
-        if (disposed || document.visibilityState !== "visible") return;
-        if (result.resync_required) {
-          // History cursor 过期时才重建缓存；常规增量同步绝不重新抓取 All-mail。
-          await client.listInboxEmails(mailbox, state.inboxSettings.display_range_days, ALL_MAIL_CACHE_FETCH_LIMIT, "all", true);
-        }
         if (state.mailDetailOpen) {
-          // 详情抽屉依赖当前列表对象和最新线程标识；打开期间替换快照会导致
-          // 正文、滚动位置和附件状态反复重置，因此仅标记关闭后的待刷新。
+          // 详情抽屉打开期间不改快照，避免正文/滚动被重置；关闭后再静默同步。
           inboxAutoSyncPending.current = { mailbox, days: state.inboxSettings.display_range_days };
         } else if (!disposed && document.visibilityState === "visible") {
-          await preloadMailboxSnapshot(mailbox, state.inboxSettings.display_range_days, true);
+          await silentSyncInbox(state.inboxSettings.display_range_days);
         }
       } catch {
-        // 自动同步失败不干扰用户当前阅读；下一轮按同一 cursor 安全重试。
+        // silentSyncInbox 已写入 inboxError；下一轮按同一 cursor 安全重试。
       } finally {
         inboxAutoSyncInFlight.current = false;
         if (!disposed && document.visibilityState === "visible") schedule();
@@ -942,15 +1159,15 @@ export function useAppController() {
       clearTimer();
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [client, preloadMailboxSnapshot, state.aiChatLoading, state.inboxSettings.auto_sync_seconds, state.inboxSettings.display_range_days, state.inboxSnapshotLoading, state.isCustomScanning, state.mailDetailOpen, state.mailbox, state.runtime.connected, state.selectedMailboxes]);
+  }, [silentSyncInbox, state.aiChatLoading, state.inboxSettings.auto_sync_seconds, state.inboxSettings.display_range_days, state.inboxSnapshotLoading, state.isCustomScanning, state.mailDetailOpen, state.mailbox, state.runtime.connected, state.selectedMailboxes]);
 
   useEffect(() => {
     if (state.mailDetailOpen) return;
     const pending = inboxAutoSyncPending.current;
     if (!pending) return;
     inboxAutoSyncPending.current = null;
-    void preloadMailboxSnapshot(pending.mailbox, pending.days, true);
-  }, [preloadMailboxSnapshot, state.mailDetailOpen]);
+    void silentSyncInbox(pending.days);
+  }, [silentSyncInbox, state.mailDetailOpen]);
 
   const upsertAiConversationHistory = useCallback((
     conversationId: string,
@@ -1065,28 +1282,45 @@ export function useAppController() {
       return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
     }
 
+    // 非清缓存刷新与自动同步对齐：History 增量 + 静默合并
+    if (!clearCache) {
+      const ok = await silentSyncInbox(days);
+      const count = 0;
+      // 调用方主要看 ok；count/hasMore 由后续 feed 状态自行推导
+      if (ok) {
+        showToast(days > 7
+          ? `Inbox synced for the last ${days} days.`
+          : "Inbox refreshed.");
+      }
+      return {
+        ok,
+        count,
+        hasMore: false,
+        nextOffset: 0,
+        messages: [],
+      };
+    }
+
     const requestKey = `${mailbox}#refresh:${++inboxRequestSequence.current}`;
     snapshotRequestMailbox.current = requestKey;
     snapshotPromise.current = null;
     for (const key of inboxFeedCache.current.keys()) {
       if (key.startsWith(`${mailbox}|`)) inboxFeedCache.current.delete(key);
     }
-    if (clearCache) {
-      await clearMailboxCacheData(mailbox);
-    }
+    await clearMailboxCacheData(mailbox);
     setState((s) => ({
       ...s,
-      inboxMessages: clearCache ? [] : s.inboxMessages,
-      inboxSnapshotMessages: clearCache ? [] : s.inboxSnapshotMessages,
-      inboxLoading: clearCache || !(s.inboxSnapshotMessages.length || s.inboxMessages.length),
+      inboxMessages: [],
+      inboxSnapshotMessages: [],
+      inboxLoading: true,
       inboxSnapshotLoading: true,
       inboxSnapshotComplete: false,
       inboxError: "",
     }));
 
     try {
-      // 刷新：首屏立刻渲染，后续 list_cached 分页 append（边加载边展示）
-      const payload = await client.listInboxEmails(mailbox, days, ALL_MAIL_CACHE_FETCH_LIMIT, "all", clearCache);
+      // 硬刷新：清空后首屏 replace，后续分页 append
+      const payload = await client.listInboxEmails(mailbox, days, ALL_MAIL_CACHE_FETCH_LIMIT, "all", true);
       if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
       applyInboxSnapshotPayload(payload);
       setState((s) => ({ ...s, inboxSnapshotLoading: false, inboxLoading: false }));
@@ -1127,7 +1361,13 @@ export function useAppController() {
       }
     }
     return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
-  }, [applyInboxSnapshotPayload, client, state.mailbox, state.selectedMailboxes]);
+  }, [applyInboxSnapshotPayload, client, silentSyncInbox, state.mailbox, state.selectedMailboxes]);
+
+  const clearInboxCacheAndReload = useCallback(async (days?: number) => {
+    const rangeDays = Math.max(0, Number(days ?? state.inboxSettings.display_range_days) || 30);
+    const result = await refreshInboxEmails("all", rangeDays, true);
+    return Boolean(result.ok);
+  }, [refreshInboxEmails, state.inboxSettings.display_range_days]);
 
   const expandInboxFeedWindow = useCallback(async (days = 30): Promise<InboxPageResult> => {
     const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
@@ -1489,6 +1729,9 @@ export function useAppController() {
   gmailApiStatusRef.current = state.gmailApiStatus;
   const mailboxForGmailCheckRef = useRef(state.mailbox);
   mailboxForGmailCheckRef.current = state.mailbox;
+  gmailBusyRef.current = Boolean(
+    state.isScanning || state.isPreparingScan || state.isCustomScanning || state.aiChatLoading,
+  );
   // 进行中探测去重：轮询/连点不叠发，避免与扫描争抢
   const llmCheckInFlightRef = useRef(false);
   const gmailCheckInFlightRef = useRef(false);
@@ -1639,8 +1882,51 @@ export function useAppController() {
     };
   }, [ensureSamplingAvailable, showToast, state.isPreparingScan, state.isScanning, state.mailbox, state.runtime.connected, state.selectedMailboxes, state.strategyMode]);
 
+  const stopActiveScans = useCallback((reason = "switched mailbox") => {
+    // 立刻抬升代际号，阻断 Brief continue 循环与后续邮箱扫描。
+    briefScanGenerationRef.current += 1;
+    // 让已经发出的邮件/草稿请求失效；请求本身无法被 stdio 强制撤销时，
+    // 其返回值也不能再写入切换后的邮箱状态。
+    inboxRequestSequence.current += 1;
+    draftRequestSequence.current += 1;
+    snapshotRequestMailbox.current = "";
+    const briefRunId = briefScanRunIdRef.current;
+    briefScanRunIdRef.current = "";
+    const backgroundRunId = activeBackgroundRunIdRef.current;
+    activeBackgroundRunIdRef.current = "";
+    const aiRun = aiGenerationRun.current;
+    if (aiRun) {
+      aiRun.cancelled = true;
+      aiRun.controller.abort();
+      aiGenerationRun.current = null;
+    }
+    if (deferredInboxLoadTimer.current) {
+      window.clearTimeout(deferredInboxLoadTimer.current);
+      deferredInboxLoadTimer.current = null;
+    }
+    gmailBusyRef.current = false;
+    setState((s) => ({
+      ...s,
+      isScanning: false,
+      isPreparingScan: false,
+      isCustomScanning: false,
+      aiChatLoading: false,
+      scanStatus: "",
+      scanStage: "",
+      scanProgress: {},
+      customRunProgress: null,
+    }));
+    // 后端取消：阻止 continue 继续占 worker / getToken（失败忽略）。
+    if (briefRunId) void client.cancelMailAgentRun(briefRunId).catch(() => undefined);
+    if (backgroundRunId && backgroundRunId !== briefRunId) {
+      void client.cancelMailAgentRun(backgroundRunId).catch(() => undefined);
+    }
+    void reason;
+  }, [client]);
+
   const runBriefScan = useCallback(async (scanRequest: { mailboxesToScan: string[]; scanMode: string }, reason = "manual") => {
     const { mailboxesToScan, scanMode } = scanRequest;
+    const scanGeneration = ++briefScanGenerationRef.current;
     setState((s) => ({
       ...s,
       isPreparingScan: false,
@@ -1653,12 +1939,22 @@ export function useAppController() {
       resultFilter: "all",
     }));
     const contactMemoryJobs: Array<Record<string, unknown>> = [];
+    let cancelled = false;
     try {
       const failures: string[] = [];
       for (let index = 0; index < mailboxesToScan.length; index += 1) {
+        if (scanGeneration !== briefScanGenerationRef.current) {
+          cancelled = true;
+          break;
+        }
         const mailbox = mailboxesToScan[index];
         const runScanPlan = await loadScanPlanForRun(mailbox);
+        if (scanGeneration !== briefScanGenerationRef.current) {
+          cancelled = true;
+          break;
+        }
         const runId = `bg_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+        briefScanRunIdRef.current = runId;
         // 先创建可轮询的 run；真实扫描和 LLM 进度由 continue 调用写入。
         const started = await client.startBriefRun({
           user_request: requestForMode(scanMode),
@@ -1672,7 +1968,13 @@ export function useAppController() {
           reason,
           run_id: runId,
         });
+        if (scanGeneration !== briefScanGenerationRef.current) {
+          cancelled = true;
+          void client.cancelMailAgentRun(runId).catch(() => undefined);
+          break;
+        }
         const applyBriefStatus = (status: RunStatus) => {
+          if (scanGeneration !== briefScanGenerationRef.current) return;
           setState((s) => ({
             ...s,
             scanStepIndex: stageToStep(status.stage || ""),
@@ -1708,6 +2010,10 @@ export function useAppController() {
         };
         try {
           for (let step = 0; step < POLL_LIMIT; step += 1) {
+            if (scanGeneration !== briefScanGenerationRef.current) {
+              cancelled = true;
+              break;
+            }
             // 每次 continue 都是短 invoke，只推进 Brief 状态机的一小段。
             result = await client.continueBriefRun({
               run_id: runId,
@@ -1720,6 +2026,10 @@ export function useAppController() {
               ai_provider: state.llmProvider,
               storage_provider: state.storageProvider,
             });
+            if (scanGeneration !== briefScanGenerationRef.current) {
+              cancelled = true;
+              break;
+            }
             applyBriefStatus(result);
             collectWarnings(result);
             const nextCardsVersion = Number(result.cards_version || 0);
@@ -1727,16 +2037,34 @@ export function useAppController() {
               cardsVersion = nextCardsVersion;
               void loadActiveCards(undefined, "all", { timeoutMs: 55_000 });
             }
-            if (result.status === "done" || result.status === "failed" || result.needs_continue === false) {
+            if (
+              result.status === "done"
+              || result.status === "failed"
+              || result.needs_continue === false
+              || result.stage === "cancelled"
+              || /cancelled/i.test(String(result.error || ""))
+            ) {
+              if (result.stage === "cancelled" || /cancelled/i.test(String(result.error || ""))) {
+                cancelled = true;
+              }
               break;
             }
           }
         } finally {
           window.clearInterval(pollTimer);
-          await refreshBriefStatus();
+          if (scanGeneration === briefScanGenerationRef.current) {
+            await refreshBriefStatus();
+          }
+          if (briefScanRunIdRef.current === runId) briefScanRunIdRef.current = "";
+        }
+        if (cancelled || scanGeneration !== briefScanGenerationRef.current) {
+          cancelled = true;
+          break;
         }
         if (result.status === "failed" || result.error) {
-          failures.push(`${mailbox}: ${result.error || "Scan failed"}`);
+          if (!(result.stage === "cancelled" || /cancelled/i.test(String(result.error || "")))) {
+            failures.push(`${mailbox}: ${result.error || "Scan failed"}`);
+          }
           continue;
         }
         if (result.status !== "done") {
@@ -1751,6 +2079,9 @@ export function useAppController() {
           storage_provider: state.storageProvider,
         });
       }
+      if (cancelled || scanGeneration !== briefScanGenerationRef.current) {
+        return;
+      }
       const statusText = failures.length
         ? `Scan complete with ${failures.length} issue${failures.length === 1 ? "" : "s"}.`
         : "Scan complete. Showing persisted attention cards.";
@@ -1764,6 +2095,7 @@ export function useAppController() {
         }
       }, 0);
     } catch (error) {
+      if (scanGeneration !== briefScanGenerationRef.current) return;
       const message = error instanceof Error ? error.message : String(error);
       setState((s) => ({ ...s, scanError: message, scanStatus: "", isPreparingScan: false }));
       // Show popup for Gmail connectivity errors so users know to re-authorize
@@ -1774,7 +2106,9 @@ export function useAppController() {
       }
       showToast(message);
     } finally {
-      setState((s) => ({ ...s, isPreparingScan: false, isScanning: false }));
+      if (scanGeneration === briefScanGenerationRef.current) {
+        setState((s) => ({ ...s, isPreparingScan: false, isScanning: false }));
+      }
     }
   }, [client, loadActiveCards, loadRunHistory, loadScanPlanForRun, showToast, state.llmProvider, state.mailbox, state.storageProvider]);
 
@@ -2143,14 +2477,21 @@ export function useAppController() {
     },
     async switchMailbox(mailbox) {
       const primary = normalizedMailbox(mailbox);
-      const previousMailbox = normalizedMailbox(state.mailbox);
       if (!primary || primary === normalizedMailbox(state.mailbox)) {
         setState((s) => ({ ...s, selectedMailboxes: primary ? [primary] : s.selectedMailboxes, briefMailboxFilter: primary ? [primary] : s.briefMailboxFilter }));
         return;
       }
+      // 立刻停上一邮箱扫描，释放 getToken / Gmail。
+      stopActiveScans("switched mailbox");
+      if (deferredInboxLoadTimer.current) {
+        window.clearTimeout(deferredInboxLoadTimer.current);
+        deferredInboxLoadTimer.current = null;
+      }
       snapshotRequestMailbox.current = primary;
+      snapshotPromise.current = null;
       const target = state.mailboxes.find((item) => normalizedMailbox(item.email) === primary);
       showAccountSwitchNotice(primary, target?.avatar_url);
+      // 瞬间切 UI：列表先换成目标邮箱空壳，随后用本地缓存秒填（无缓存则保持空）。
       setState((s) => {
         const visibleCards = filterCardsByMailboxes(s.allCards, [primary]);
         return {
@@ -2162,7 +2503,8 @@ export function useAppController() {
           configMailbox: s.configMailbox ? primary : "",
           cards: visibleCards,
           actionCount: actionCount(visibleCards),
-          inboxLoading: true,
+          inboxLoading: false,
+          inboxSnapshotLoading: true,
           inboxError: "",
           inboxMessages: [],
           inboxSnapshotMessages: [],
@@ -2170,66 +2512,86 @@ export function useAppController() {
           inboxSnapshotComplete: false,
         };
       });
-      try {
-        for (const item of state.mailboxes) {
-          if (normalizedMailbox(item.email) === primary || item.selected === false) continue;
-          await client.setMailboxSelected(item.email, false, state.storageProvider);
-        }
-      const payload = await client.setMailboxSelected(primary, true, state.storageProvider);
-      const returnedMailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : state.mailboxes;
-      const mailboxes = returnedMailboxes.map((item) => ({ ...item, selected: normalizedMailbox(item.email) === primary }));
-      void cacheMailboxes(mailboxes);
       void setSelectedMailbox(primary);
-      const visibleCards = filterCardsByMailboxes(state.allCards, [primary]);
-        setState((s) => ({
-          ...s,
-          mailboxes,
-          selectedMailboxes: [primary],
-          briefMailboxFilter: [primary],
-          mailbox: primary,
-          configMailbox: s.configMailbox ? primary : "",
-          cards: visibleCards,
-          actionCount: actionCount(visibleCards),
-          inboxLoading: true,
-        }));
-        const switchedSettings = await loadInboxSettings(primary);
-        const rangeDays = switchedSettings?.display_range_days
-          || clampInboxSettings(state.inboxSettings).display_range_days;
-        await preloadMailboxSnapshot(primary, rangeDays, true);
-        await loadScanPlan(primary);
-      } catch (error) {
-        closeAccountSwitchNotice();
-        const message = error instanceof Error ? error.message : String(error);
-        const authFailed = /401|invalid credentials|expired|revoked|unauthenticated/i.test(message);
-        setState((s) => {
-          const rollbackCards = previousMailbox ? filterCardsByMailboxes(s.allCards, [previousMailbox]) : [];
-          return {
+      const rangeDays = clampInboxSettings(state.inboxSettings).display_range_days;
+
+      // 注册表 / 设置 / Scan plan 不挡首屏；失败不回滚邮箱。
+      void (async () => {
+        try {
+          for (const item of state.mailboxes) {
+            if (normalizedMailbox(item.email) === primary || item.selected === false) continue;
+            await client.setMailboxSelected(item.email, false, state.storageProvider);
+          }
+          const payload = await client.setMailboxSelected(primary, true, state.storageProvider);
+          if (snapshotRequestMailbox.current !== primary) return;
+          const returnedMailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : state.mailboxes;
+          const mailboxes = returnedMailboxes.map((item) => ({
+            ...item,
+            selected: normalizedMailbox(item.email) === primary,
+          }));
+          void cacheMailboxes(mailboxes);
+          const visibleCards = filterCardsByMailboxes(state.allCards, [primary]);
+          setState((s) => ({
             ...s,
-            mailbox: previousMailbox || s.mailbox,
-            selectedMailboxes: previousMailbox ? [previousMailbox] : [],
-            briefMailboxFilter: previousMailbox ? [previousMailbox] : [],
-            cards: rollbackCards,
-            actionCount: actionCount(rollbackCards),
+            mailboxes,
+            selectedMailboxes: [primary],
+            briefMailboxFilter: [primary],
+            mailbox: primary,
+            configMailbox: s.configMailbox ? primary : "",
+            cards: visibleCards,
+            actionCount: actionCount(visibleCards),
+          }));
+          await loadInboxSettings(primary);
+          if (snapshotRequestMailbox.current !== primary) return;
+          await loadScanPlan(primary);
+        } catch (error) {
+          if (snapshotRequestMailbox.current !== primary) return;
+          const message = error instanceof Error ? error.message : String(error);
+          const hardAuthFailed = /revoked|reconnect|not granted|unavailable through Connected accounts/i.test(message);
+          setState((s) => ({
+            ...s,
+            mailbox: primary,
+            selectedMailboxes: [primary],
+            briefMailboxFilter: [primary],
             inboxLoading: false,
+            inboxSnapshotLoading: false,
             inboxError: message,
             mailboxes: s.mailboxes.map((item) => ({
               ...item,
-              selected: normalizedMailbox(item.email) === previousMailbox,
-              ...(normalizedMailbox(item.email) === primary && authFailed ? { authorized: false, last_error: "Reconnect Gmail to continue." } : {}),
+              selected: normalizedMailbox(item.email) === primary,
+              ...(normalizedMailbox(item.email) === primary && hardAuthFailed
+                ? { authorized: false, last_error: "Reconnect Gmail to continue." }
+                : {}),
             })),
-          };
-        });
-        if (previousMailbox && previousMailbox !== primary) {
-          try {
-            await client.setMailboxSelected(primary, false, state.storageProvider);
-            await client.setMailboxSelected(previousMailbox, true, state.storageProvider);
-            await loadInboxEmails(previousMailbox);
-          } catch {
-            // Keep the original error visible if rollback also fails.
+          }));
+          if (hardAuthFailed) {
+            showToast("This Gmail authorization expired. Reconnect the account and try again.");
           }
         }
-        showToast(authFailed ? "This Gmail authorization expired. Reconnect the account and try again." : message);
+      })();
+
+      // 首屏只读本地缓存，绝不在切换路径上 list_inbox_emails。
+      // 只等待第一页，避免缓存分页或 APS 延迟拖慢邮箱切换。
+      try {
+        const cached = await client.listCachedEmails(primary, rangeDays, 100, "all", 0);
+        if (snapshotRequestMailbox.current !== primary) return;
+        applyInboxSnapshotPayload(cached);
+        void loadInboxThreadDrafts(primary).catch(() => undefined);
+      } catch {
+        // 缓存读失败也保持目标邮箱；后台 sync 再试。
+        if (snapshotRequestMailbox.current === primary) {
+          setState((s) => ({ ...s, inboxLoading: false, inboxSnapshotLoading: false, inboxSnapshotComplete: true }));
+        }
       }
+      if (snapshotRequestMailbox.current !== primary) return;
+      setState((s) => ({
+        ...s,
+        inboxLoading: false,
+        inboxSnapshotComplete: true,
+      }));
+      // 后台继续读缓存并执行 History 增量同步；resync 时才可能回源 Gmail，且不阻塞切换。
+      void preloadMailboxSnapshot(primary, rangeDays, true, { skipLiveGmail: true }).catch(() => undefined);
+      void silentSyncInbox(rangeDays, primary);
     },
     setBriefMailboxFilter(mailboxes) {
       setState((s) => {
@@ -2255,6 +2617,8 @@ export function useAppController() {
       return loadInboxEmails(undefined, category, days, force);
     },
     refreshInboxEmails,
+    silentSyncInbox,
+    clearInboxCacheAndReload,
     expandInboxFeedWindow,
     async loadCachedInboxEmails(category = "inbox", days = 30, offset = 0, append = false): Promise<InboxPageResult> {
       const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
@@ -2380,7 +2744,30 @@ export function useAppController() {
       return String(payload.message?.body_text || payload.message?.body_preview || payload.message?.snippet || "");
     },
     async loadInboxThreadPage(mailbox, threadId, options = {}) {
-      return client.getInboxThreadPage(normalizedMailbox(mailbox), threadId, options);
+      const normalized = normalizedMailbox(mailbox);
+      const page = await client.getInboxThreadPage(normalized, threadId, options);
+      const attachmentCount = (page.messages || []).reduce(
+        (count, message) => Math.max(count, Array.isArray(message.attachments) ? message.attachments.length : 0),
+        0,
+      );
+      if (attachmentCount > 0) {
+        setState((s) => ({
+          ...s,
+          inboxMessages: patchInboxThreadAttachmentSummary(s.inboxMessages, normalized, threadId, attachmentCount),
+          inboxSnapshotMessages: patchInboxThreadAttachmentSummary(s.inboxSnapshotMessages, normalized, threadId, attachmentCount),
+        }));
+        for (const [key, cached] of inboxFeedCache.current) {
+          if (!key.startsWith(`${normalized}|`)) continue;
+          inboxFeedCache.current.set(key, {
+            ...cached,
+            payload: {
+              ...cached.payload,
+              messages: patchInboxThreadAttachmentSummary(cached.payload.messages || [], normalized, threadId, attachmentCount),
+            },
+          });
+        }
+      }
+      return page;
     },
     async loadInboxMessageDisplayBody(mailbox, messageId) {
       return client.getInboxMessageDisplayBody(normalizedMailbox(mailbox), messageId);
@@ -2412,9 +2799,9 @@ export function useAppController() {
     async listInboxThreadDrafts(mailbox, limit = 100) {
       return loadInboxThreadDrafts(mailbox, limit);
     },
-    async saveInboxThreadDraft(mailbox, threadId, body, ifMatch, message) {
+    async saveInboxThreadDraft(mailbox, threadId, body, ifMatch, message, attachments) {
       const normalized = normalizedMailbox(mailbox);
-      const result = await client.saveInboxThreadDraft(normalized, threadId, body, ifMatch, message);
+      const result = await client.saveInboxThreadDraft(normalized, threadId, body, ifMatch, message, attachments);
       if (body.trim()) {
         setState((s) => ({
           ...s,
@@ -2441,6 +2828,20 @@ export function useAppController() {
     },
     async prepareInboxAttachmentAccess(mailbox, messageId, attachmentId, mode) {
       return client.prepareInboxAttachmentAccess(normalizedMailbox(mailbox), messageId, attachmentId, mode);
+    },
+    async beginStageOutgoingAttachment(mailbox, args) {
+      return client.beginStageOutgoingAttachment(normalizedMailbox(mailbox), args);
+    },
+    async deleteStagedOutgoingAttachment(mailbox, storageKey) {
+      await client.deleteStagedOutgoingAttachment(normalizedMailbox(mailbox), storageKey);
+    },
+    async prepareStagedOutgoingAttachmentAccess(mailbox, storageKey, filename, mimeType) {
+      return client.prepareStagedOutgoingAttachmentAccess(
+        normalizedMailbox(mailbox),
+        storageKey,
+        filename,
+        mimeType,
+      );
     },
     async modifyInboxMessageLabels(mailbox, messageIds, addLabelIds = [], removeLabelIds = []) {
       // Gmail 成功后再改本地 label 样式，避免乐观更新与远端不一致
@@ -2647,14 +3048,27 @@ export function useAppController() {
         }
       }
     },
-    async sendInboxThreadReply({ mailbox, threadId, to, body, replyMode = "reply_to_sender", dryRun = false }) {
+    async sendInboxThreadReply({
+      mailbox,
+      threadId,
+      to,
+      body,
+      cc,
+      bcc,
+      replyMode = "reply_to_sender",
+      dryRun = false,
+      attachments,
+    }) {
       return client.replyFromAsk({
         mailbox: normalizedMailbox(mailbox),
         thread_id: threadId,
         to_addr: to,
         body,
+        cc_addr: (cc || []).filter(Boolean).join(", "),
+        bcc_addr: (bcc || []).filter(Boolean).join(", "),
         reply_mode: replyMode,
         dry_run: dryRun,
+        attachments: attachments || [],
       });
     },
     async searchComposeContacts(mailbox, query) {
@@ -3566,6 +3980,7 @@ export function useAppController() {
         const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
         const scanScope = await loadScanPlanForRun(scanMailbox);
         runId = runId || `at_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+        activeBackgroundRunIdRef.current = runId;
         const uiContext = buildAiTurnUiContext({
           mailbox: state.mailbox,
           selectedMailboxes: state.selectedMailboxes,
@@ -3896,6 +4311,7 @@ export function useAppController() {
         const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
         const scanScope = await loadScanPlanForRun(scanMailbox);
         const runId = `cs_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+        activeBackgroundRunIdRef.current = runId;
         const scanPromise = client.startCustomScan({
           user_request: userRequest,
           mailbox: scanMailbox,
@@ -3962,6 +4378,7 @@ export function useAppController() {
         const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
         const scanScope = await loadScanPlanForRun(scanMailbox);
         const runId = `rr_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+        activeBackgroundRunIdRef.current = runId;
         const scanPromise = client.reRunCustomScan({
           plan_id: planId,
           mailbox: scanMailbox,

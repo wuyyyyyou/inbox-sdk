@@ -146,6 +146,9 @@ class TestMultiTokenIntegration:
         self.test_token_refresh_updates_map()
         self.test_concurrent_refresh_runs_once()
         self.test_unbind_during_refresh_does_not_restore_account()
+        self.test_token_refresh_retries_then_succeeds()
+        self.test_token_refresh_urlerror_falls_back_to_existing_token()
+        self.test_force_refresh_before_expiry()
         self.test_check_gmail_auth_all_sources()
         self.test_discover_mailboxes_merges_all()
         self.test_get_authorized_email_tool()
@@ -694,6 +697,33 @@ class TestMultiTokenIntegration:
         ):
             tok = adapter.get_access_token("fallback_test@gmail.com")
             check("fallback token", tok, "still_usable_token")
+
+    def test_force_refresh_before_expiry(self):
+        section("6e. force_refresh refreshes even when expires_at is still valid")
+        clear_env()
+        clear_adapter_state()
+
+        from mail_agent.mail_providers.gmail import adapter
+
+        adapter.set_multi_tokens([
+            {
+                "email": "force_refresh@gmail.com",
+                "access_token": "clock_says_valid",
+                "refresh_token": "r",
+                "client_id": "c",
+                "client_secret": "s",
+                "expires_at": time.time() + 3600,
+            },
+        ])
+        mock_response = io.BytesIO(json.dumps({"access_token": "FORCED_TOKEN", "expires_in": 3600}).encode())
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            tok = adapter.get_access_token("force_refresh@gmail.com", force_refresh=True)
+            check("forced token", tok, "FORCED_TOKEN")
+            check(
+                "map updated after force refresh",
+                adapter._multi_token_map["force_refresh@gmail.com"]["access_token"],
+                "FORCED_TOKEN",
+            )
 
     # ── 7. _check_gmail_auth all sources ───────────────────────
 

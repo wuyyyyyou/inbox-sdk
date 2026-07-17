@@ -22,6 +22,7 @@ import type {
   CustomRunResult,
   InboxMessage,
   InboxThreadStateOperation,
+  OutgoingAttachmentMeta,
 } from "../../types/mail";
 import { SnoozePicker } from "./SnoozePicker";
 import { ComposeView } from "./ComposeView";
@@ -42,6 +43,7 @@ import {
   splitInboxQueryTokens,
 } from "../search/inboxQuery";
 import { sortInboxMessagesDesc } from "./inboxMessageOrder";
+import { PendingSendScheduler } from "./pendingSend";
 import {
   measureAiMessageBlocks,
   parseAiMessageInline,
@@ -674,14 +676,16 @@ function moreInPeriodButtonLabel(currentDays: number) {
   return `Show more from the last ${currentDays} days`;
 }
 
-function inboxLastSyncedLabel(value?: string) {
+export function inboxLastSyncedLabel(value?: string) {
   if (!value) return "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   const now = new Date();
+  // 精确到秒，便于核对自动同步是否刚跑完
   const time = date.toLocaleTimeString("en-US", {
     hour: "2-digit",
     minute: "2-digit",
+    second: "2-digit",
   });
   const datePrefix =
     date.toDateString() === now.toDateString()
@@ -771,14 +775,51 @@ export function inboxThreadProjectionKey(message: InboxMessage) {
   return `${mailboxKey}:message:${message.id}`;
 }
 
-/** 同一 thread 只保留最新一条，避免同会话多行导致多选/详情错乱。 */
+function hasInboxMessageAttachment(message: InboxMessage) {
+  const attachments = (message as InboxMessage & { attachments?: unknown[] })
+    .attachments;
+  return Boolean(
+    message.has_attachment ||
+    Number(message.attachment_count || 0) > 0 ||
+    (Array.isArray(attachments) && attachments.length > 0),
+  );
+}
+
+function inboxMessageAttachmentCount(message: InboxMessage) {
+  const attachments = (message as InboxMessage & { attachments?: unknown[] })
+    .attachments;
+  const listed = Array.isArray(attachments) ? attachments.length : 0;
+  const stored = Number(message.attachment_count || 0) || 0;
+  const count = Math.max(listed, stored);
+  if (count > 0) return count;
+  return hasInboxMessageAttachment(message) ? 1 : 0;
+}
+
+/** 同一 thread 只保留最新一条，避免同会话多行导致多选/详情错乱。
+ *  附件标记按线程 OR：任一封有附件时最新行显示回形针（与 Gmail 一致）。 */
 export function uniqueLatestInboxThreads<T extends InboxMessage>(messages: T[]) {
+  const threadAttachment = new Map<string, number>();
+  for (const message of messages) {
+    const key = inboxThreadProjectionKey(message);
+    const count = inboxMessageAttachmentCount(message);
+    threadAttachment.set(key, Math.max(threadAttachment.get(key) || 0, count));
+  }
+
   const seen = new Set<string>();
   const unique: T[] = [];
   for (const message of sortInboxMessagesDesc(messages)) {
     const key = inboxThreadProjectionKey(message);
     if (seen.has(key)) continue;
     seen.add(key);
+    const threadCount = threadAttachment.get(key) || 0;
+    if (threadCount > 0 && inboxMessageAttachmentCount(message) < threadCount) {
+      unique.push({
+        ...message,
+        has_attachment: true,
+        attachment_count: threadCount,
+      });
+      continue;
+    }
     unique.push(message);
   }
   return unique;
@@ -949,16 +990,6 @@ export function mergeInboxSearchSourceMessages(
     byId.set(id, message);
   }
   return uniqueLatestInboxThreads([...byId.values()]);
-}
-
-function hasInboxMessageAttachment(message: InboxMessage) {
-  const attachments = (message as InboxMessage & { attachments?: unknown[] })
-    .attachments;
-  return Boolean(
-    message.has_attachment ||
-    Number(message.attachment_count || 0) > 0 ||
-    (Array.isArray(attachments) && attachments.length > 0),
-  );
 }
 
 function InboxRow({
@@ -3034,12 +3065,23 @@ export function HomeView() {
     useState<InboxMessage | null>(null);
   const [drawerMessage, setDrawerMessage] = useState<InboxMessage | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [replyDraftRestore, setReplyDraftRestore] = useState<{
+    nonce: string;
+    threadId: string;
+    body: string;
+    cc?: string[];
+    bcc?: string[];
+    mode?: "reply" | "forward";
+    recipients?: string[];
+    composeDraftId?: string;
+    composeDraftEtag?: string;
+  } | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [authChecking, setAuthChecking] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const [folderOpen, setFolderOpen] = useState(false);
-  const [refreshChoiceOpen, setRefreshChoiceOpen] = useState(false);
+
   const [composeOpen, setComposeOpen] = useState(false);
   const [composeClosing, setComposeClosing] = useState(false);
   const [composeResumeDraft, setComposeResumeDraft] =
@@ -3067,8 +3109,16 @@ export function HomeView() {
   const [batchConfirmDrafts, setBatchConfirmDrafts] = useState<
     ComposeDraft[] | null
   >(null);
-  const pendingComposeTimer = useRef<number | null>(null);
-  const pendingComposeCountdown = useRef<number | null>(null);
+  const pendingSendScheduler = useRef<PendingSendScheduler | null>(null);
+  if (!pendingSendScheduler.current) {
+    pendingSendScheduler.current = new PendingSendScheduler({
+      showToast: actions.showToast,
+      setTimeout: window.setTimeout.bind(window),
+      clearTimeout: window.clearTimeout.bind(window),
+      setInterval: window.setInterval.bind(window),
+      clearInterval: window.clearInterval.bind(window),
+    });
+  }
   const composeCloseTimer = useRef<number | null>(null);
   const [mailboxView, setMailboxView] = useState<MailboxView>("inbox");
   const mailboxViewRef = useRef<MailboxView>("inbox");
@@ -3332,11 +3382,12 @@ export function HomeView() {
         );
     if (mailboxView !== "drafts") return resolved;
     const composeMessages: InboxMessage[] = composeDrafts.map((draft) => ({
-      id: `compose:${draft.id}`,
+      id: draft.draft_mode === "forward" ? `forward:${draft.id}` : `compose:${draft.id}`,
       mailbox,
       date: draft.updated_at || draft.created_at || "",
       from: mailbox,
       to: draft.recipients.join(", "),
+      thread_id: draft.source_thread_id || undefined,
       subject: draft.subject || "(no subject)",
       snippet: draft.body.slice(0, 120),
       body_preview: draft.body.slice(0, 120),
@@ -3990,6 +4041,15 @@ export function HomeView() {
       requestedGmailCursors.current.clear();
       setFeedAction("refresh");
       try {
+        // 静默同步：与自动刷新同一路径，合并快照、不整表清空
+        if (!clearCache) {
+          if (localCategory && mailboxView === "drafts") {
+            await actions.listInboxThreadDrafts(mailbox, 100);
+            return true;
+          }
+          return actions.silentSyncInbox(targetDays);
+        }
+        // 硬刷新：清缓存后整表重载（设置页 / 换邮箱 / 改 display range）
         if (localCategory) {
           if (mailboxView === "drafts") {
             await actions.listInboxThreadDrafts(mailbox, 100);
@@ -3999,12 +4059,7 @@ export function HomeView() {
             }));
             return true;
           }
-          // 本地分类刷新也重建 All mail 缓存，保证标签投影数据完整
-          const result = await actions.refreshInboxEmails(
-            "all",
-            7,
-            clearCache,
-          );
+          const result = await actions.refreshInboxEmails("all", 7, true);
           if (result.ok) {
             setFeedWindow((current) => ({
               ...current,
@@ -4013,14 +4068,11 @@ export function HomeView() {
           }
           return result.ok;
         }
-        if (targetDays > 7 && !clearCache) {
-          return loadRemoteCategory(mailboxView, targetDays);
-        }
         if (mailboxView === "inbox" && targetDays === INBOX_ALL_TIME_DAYS) {
           const result = await actions.refreshInboxEmails(
             "all",
             INBOX_ALL_TIME_DAYS,
-            clearCache,
+            true,
           );
           if (!result.ok) return false;
           const source: InboxFeedWindow["source"] = result.hasMore
@@ -4052,13 +4104,12 @@ export function HomeView() {
         const result = await actions.refreshInboxEmails(
           "all",
           targetDays,
-          clearCache,
+          true,
         );
         if (result.ok) {
           setFeedWindow({
             days: targetDays,
             nextOffset: result.nextOffset,
-            // 与刷新结果对齐，避免切分类后 hasMore 恒为 true 触发假分页
             hasMore: result.hasMore,
             localLimit: INBOX_FEED_PAGE_SIZE,
             source: result.hasMore ? "cache" : "gmail",
@@ -4075,86 +4126,12 @@ export function HomeView() {
       actions,
       feedWindow.days,
       loadRemainingAllTimeInbox,
-      loadRemoteCategory,
       localCategory,
       mailbox,
       mailboxView,
     ],
   );
 
-  const reloadInboxFromEmpty = useCallback(async () => {
-    setRefreshChoiceOpen(false);
-    setSelectedId("");
-    setMessageBodies({});
-    setContactAvatars({});
-    avatarMisses.current.clear();
-    bodyRequests.current.clear();
-    bodyPreheatSeen.current.clear();
-    bodyPreheatSession.current += 1;
-    pageLoadInFlight.current = false;
-    requestedGmailCursors.current.clear();
-    actions.resetInboxFeed();
-    setFeedWindow((current) => ({
-      ...DEFAULT_INBOX_FEED_WINDOW,
-      days: current.days,
-    }));
-    await syncInbox(feedWindow.days, true);
-  }, [actions, feedWindow.days, syncInbox]);
-
-  const continueLoadingInbox = useCallback(async () => {
-    setRefreshChoiceOpen(false);
-    requestedGmailCursors.current.clear();
-    setFeedAction("refresh");
-    try {
-      if (localCategory) {
-        await syncInbox(feedWindow.days);
-        return;
-      }
-      const targetDays = feedWindow.days;
-      // 排除已在 All mail 快照中的 id，避免重复拉取
-      const excludeIds = [
-        ...state.inboxSnapshotMessages,
-        ...state.inboxMessages,
-      ]
-        .map((message) => message.id)
-        .filter(Boolean);
-      // 继续加载固定扩 All mail
-      const result = await loadGmailPage(
-        "all",
-        targetDays,
-        "",
-        0,
-        excludeIds,
-      );
-      if (!result?.ok) {
-        actions.showToast("Failed to load new emails.");
-        return;
-      }
-      setFeedWindow((current) => ({
-        ...current,
-        days: targetDays,
-        hasMore: result.hasMore,
-        source: "gmail",
-        gmailPageToken: result.pageToken,
-        gmailPageOffset: result.pageOffset,
-      }));
-      actions.showToast(
-        result.count
-          ? `${result.count} new email${result.count === 1 ? "" : "s"} loaded.`
-          : "No new emails found.",
-      );
-    } finally {
-      setFeedAction((current) => (current === "refresh" ? null : current));
-    }
-  }, [
-    actions,
-    feedWindow.days,
-    loadGmailPage,
-    localCategory,
-    state.inboxMessages,
-    state.inboxSnapshotMessages,
-    syncInbox,
-  ]);
 
   const gmailAuthorizationRequired = isGmailAuthorizationRequired(
     state.gmailAuthStatus,
@@ -4859,6 +4836,162 @@ export function HomeView() {
     }, DETAIL_DRAWER_TRANSITION_MS);
   }, [selectedId]);
 
+  const scheduleInboxThreadReply = useCallback(
+    (args: {
+      mailbox: string;
+      threadId: string;
+      to: string;
+      body: string;
+      cc?: string[];
+      bcc?: string[];
+      message: InboxMessage;
+      attachments?: OutgoingAttachmentMeta[];
+    }) => {
+      const scheduled = pendingSendScheduler.current?.schedule({
+        countdownMessage: (seconds) =>
+          `Will send in ${seconds} second${seconds === 1 ? "" : "s"}.`,
+        sendingMessage: "Sending…",
+        onUndo: () => {
+          setExternalDetailMessage(args.message);
+          setReplyDraftRestore({
+            nonce: crypto.randomUUID(),
+            threadId: args.threadId,
+            body: args.body,
+            cc: args.cc,
+            bcc: args.bcc,
+            mode: "reply",
+          });
+          setSelectedId(args.message.id);
+        },
+        onSend: async () => {
+          const result = await actions.sendInboxThreadReply({
+            mailbox: args.mailbox,
+            threadId: args.threadId,
+            to: args.to,
+            body: args.body,
+            cc: args.cc,
+            bcc: args.bcc,
+            replyMode: "reply_to_sender",
+            dryRun: false,
+            attachments: args.attachments,
+          });
+          if (!result.ok) {
+            throw new Error(result.error || "Failed to send reply");
+          }
+          void actions.silentSyncInbox();
+          await actions.deleteInboxThreadDraft(args.mailbox, args.threadId);
+          actions.showToast("Email sent.");
+        },
+        onError: (reason) =>
+          actions.showToast(
+            reason instanceof Error ? reason.message : String(reason),
+          ),
+      });
+      if (!scheduled) return false;
+      closeDetailDrawer();
+      return true;
+    },
+    [actions, closeDetailDrawer],
+  );
+
+  const scheduleInboxThreadForward = useCallback(
+    (args: {
+      mailbox: string;
+      recipients: string[];
+      cc?: string[];
+      bcc?: string[];
+      subject: string;
+      body: string;
+      body_html?: string;
+      message: InboxMessage;
+      attachments?: OutgoingAttachmentMeta[];
+    }) => {
+      const draftId = crypto.randomUUID().replace(/-/g, "");
+      const scheduled = pendingSendScheduler.current?.schedule({
+        countdownMessage: (seconds) =>
+          `Will send in ${seconds} second${seconds === 1 ? "" : "s"}.`,
+        sendingMessage: "Sending…",
+        onUndo: () => {
+          setExternalDetailMessage(args.message);
+          setReplyDraftRestore({
+            nonce: crypto.randomUUID(),
+            threadId: args.message.thread_id || args.message.id,
+            body: args.body,
+            cc: args.cc,
+            bcc: args.bcc,
+            mode: "forward",
+            recipients: args.recipients,
+          });
+          setSelectedId(args.message.id);
+        },
+        onSend: async () => {
+          const results = await actions.sendComposeEmails(args.mailbox, [
+            {
+              id: draftId,
+              mailbox: args.mailbox,
+              recipients: args.recipients,
+              cc: args.cc || [],
+              bcc: args.bcc || [],
+              subject: args.subject,
+              body: args.body,
+              body_html: args.body_html,
+              attachments: args.attachments || [],
+            },
+          ]);
+          const result = results[0];
+          if (!result?.ok) {
+            throw new Error(result?.error || "Failed to forward email");
+          }
+          void actions.silentSyncInbox();
+          actions.showToast("Email sent.");
+        },
+        onError: (reason) =>
+          actions.showToast(
+            reason instanceof Error ? reason.message : String(reason),
+          ),
+      });
+      if (!scheduled) return false;
+      closeDetailDrawer();
+      return true;
+    },
+    [actions, closeDetailDrawer],
+  );
+
+  const saveInboxThreadForwardDraft = useCallback(
+    async (args: {
+      id?: string;
+      ifMatch?: string;
+      mailbox: string;
+      recipients: string[];
+      cc?: string[];
+      bcc?: string[];
+      subject: string;
+      body: string;
+      sourceThreadId: string;
+      sourceMessageId: string;
+      attachments?: ComposeDraft["attachments"];
+    }) => {
+      const saved = await actions.saveComposeDraft(args.mailbox, {
+        id: args.id,
+        draft_mode: "forward",
+        source_thread_id: args.sourceThreadId,
+        source_message_id: args.sourceMessageId,
+        recipients: args.recipients,
+        cc: args.cc || [],
+        bcc: args.bcc || [],
+        subject: args.subject,
+        body: args.body,
+        attachments: args.attachments || [],
+      }, args.ifMatch);
+      setComposeDrafts((current) => [
+        saved,
+        ...current.filter((draft) => draft.id !== saved.id),
+      ]);
+      return saved;
+    },
+    [actions],
+  );
+
   const setMailDetailOpenRef = useRef(actions.setMailDetailOpen);
   useEffect(() => {
     setMailDetailOpenRef.current = actions.setMailDetailOpen;
@@ -4870,6 +5003,45 @@ export function HomeView() {
 
   const openMessageDetail = useCallback(
     (message: InboxMessage) => {
+      if (message.id.startsWith("forward:")) {
+        const draft = composeDrafts.find(
+          (item) => item.id === message.id.slice("forward:".length),
+        );
+        if (draft) {
+          const source = [
+            ...inboxMessagesWithDrafts,
+            ...inboxSnapshotMessagesWithDrafts,
+            ...state.inboxMessages,
+          ].find((item) =>
+            (draft.source_message_id && item.id === draft.source_message_id)
+            || (draft.source_thread_id && item.thread_id === draft.source_thread_id),
+          );
+          if (source) {
+            setExternalDetailMessage(null);
+            setSelectedId(source.id);
+            setDrawerMessage(source);
+            setDrawerOpen(true);
+            setReplyDraftRestore({
+              nonce: crypto.randomUUID(),
+              threadId: source.thread_id || draft.source_thread_id || source.id,
+              body: draft.body,
+              cc: draft.cc,
+              bcc: draft.bcc,
+              mode: "forward",
+              recipients: draft.recipients,
+              composeDraftId: draft.id,
+              composeDraftEtag: draft.etag,
+            });
+          } else {
+            if (composeCloseTimer.current)
+              window.clearTimeout(composeCloseTimer.current);
+            setComposeClosing(false);
+            setComposeResumeDraft(draft);
+            setComposeOpen(true);
+          }
+        }
+        return;
+      }
       if (message.id.startsWith("compose:")) {
         const draft = composeDrafts.find(
           (item) => item.id === message.id.slice("compose:".length),
@@ -4921,7 +5093,7 @@ export function HomeView() {
           });
       }
     },
-    [actions, composeDrafts, mailbox, patchSavedMessages],
+    [actions, composeDrafts, inboxMessagesWithDrafts, inboxSnapshotMessagesWithDrafts, mailbox, patchSavedMessages, state.inboxMessages],
   );
 
   const openMailDetailFromAi = useCallback(
@@ -5433,67 +5605,39 @@ export function HomeView() {
 
   const scheduleComposeSend = useCallback(
     (draft: ComposeDraft) => {
-      if (pendingComposeTimer.current)
-        window.clearTimeout(pendingComposeTimer.current);
-      if (pendingComposeCountdown.current)
-        window.clearInterval(pendingComposeCountdown.current);
+      const scheduled = pendingSendScheduler.current?.schedule({
+        countdownMessage: (seconds) =>
+          `Will send in ${seconds} second${seconds === 1 ? "" : "s"}.`,
+        sendingMessage: "Sending…",
+        onUndo: () => {
+          void actions.deleteComposeDraft(mailbox, draft.id).catch(() => undefined);
+          if (composeCloseTimer.current)
+            window.clearTimeout(composeCloseTimer.current);
+          setComposeClosing(false);
+          setComposeResumeDraft(draft);
+          setComposeOpen(true);
+        },
+        onSend: async () => {
+          const results = await actions.sendComposeEmails(mailbox, [draft]);
+          const result = results[0];
+          if (result?.ok) {
+            await actions.deleteComposeDraft(mailbox, draft.id);
+            actions.showToast("Email sent.");
+            return;
+          }
+          actions.showToast(
+            result?.error || "Email could not be sent. The draft was kept.",
+          );
+        },
+        onError: (reason) =>
+          actions.showToast(
+            reason instanceof Error ? reason.message : String(reason),
+          ),
+      });
+      if (!scheduled) return;
       setComposeResumeDraft(null);
       setComposeOpen(false);
       setComposeClosing(true);
-      const undo = () => {
-        if (pendingComposeTimer.current)
-          window.clearTimeout(pendingComposeTimer.current);
-        if (pendingComposeCountdown.current)
-          window.clearInterval(pendingComposeCountdown.current);
-        pendingComposeTimer.current = null;
-        pendingComposeCountdown.current = null;
-        void actions
-          .deleteComposeDraft(mailbox, draft.id)
-          .catch(() => undefined);
-        if (composeCloseTimer.current)
-          window.clearTimeout(composeCloseTimer.current);
-        setComposeClosing(false);
-        setComposeResumeDraft(draft);
-        setComposeOpen(true);
-      };
-      const deadline = Date.now() + 10_000;
-      const updateCountdown = () => {
-        const seconds = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
-        actions.showToast(
-          `Will send in ${seconds} second${seconds === 1 ? "" : "s"}.`,
-          { actionLabel: "Undo", onAction: undo, durationMs: 1_100 },
-        );
-      };
-      updateCountdown();
-      pendingComposeCountdown.current = window.setInterval(
-        updateCountdown,
-        1_000,
-      );
-      pendingComposeTimer.current = window.setTimeout(() => {
-        pendingComposeTimer.current = null;
-        if (pendingComposeCountdown.current)
-          window.clearInterval(pendingComposeCountdown.current);
-        pendingComposeCountdown.current = null;
-        actions.showToast("Sending…", { durationMs: 30_000 });
-        void actions
-          .sendComposeEmails(mailbox, [draft])
-          .then(async (results) => {
-            const result = results[0];
-            if (result?.ok) {
-              await actions.deleteComposeDraft(mailbox, draft.id);
-              actions.showToast("Email sent.");
-            } else {
-              actions.showToast(
-                result?.error || "Email could not be sent. The draft was kept.",
-              );
-            }
-          })
-          .catch((reason) =>
-            actions.showToast(
-              reason instanceof Error ? reason.message : String(reason),
-            ),
-          );
-      }, 10_000);
     },
     [actions, mailbox],
   );
@@ -5538,63 +5682,35 @@ export function HomeView() {
         return;
       }
       setBatchConfirmDrafts(null);
-      if (pendingComposeTimer.current)
-        window.clearTimeout(pendingComposeTimer.current);
-      if (pendingComposeCountdown.current)
-        window.clearInterval(pendingComposeCountdown.current);
-      const deadline = Date.now() + 10_000;
-      const undo = () => {
-        if (pendingComposeTimer.current)
-          window.clearTimeout(pendingComposeTimer.current);
-        if (pendingComposeCountdown.current)
-          window.clearInterval(pendingComposeCountdown.current);
-        pendingComposeTimer.current = null;
-        pendingComposeCountdown.current = null;
-      };
-      const updateCountdown = () => {
-        const seconds = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
-        actions.showToast(
+      pendingSendScheduler.current?.schedule({
+        countdownMessage: (seconds) =>
           `${selected.length} drafts will send in ${seconds} second${seconds === 1 ? "" : "s"}.`,
-          { actionLabel: "Undo", onAction: undo, durationMs: 1_100 },
-        );
-      };
-      updateCountdown();
-      pendingComposeCountdown.current = window.setInterval(
-        updateCountdown,
-        1_000,
-      );
-      pendingComposeTimer.current = window.setTimeout(() => {
-        pendingComposeTimer.current = null;
-        if (pendingComposeCountdown.current)
-          window.clearInterval(pendingComposeCountdown.current);
-        pendingComposeCountdown.current = null;
-        actions.showToast("Sending drafts…", { durationMs: 30_000 });
-        void actions
-          .sendComposeEmails(mailbox, selected)
-          .then(async (results) => {
-            const succeeded = results
-              .filter((result) => result.ok)
-              .map((result) => result.id);
-            await Promise.all(
-              succeeded.map((id) => actions.deleteComposeDraft(mailbox, id)),
-            );
-            setComposeDrafts((drafts) =>
-              drafts.filter((draft) => !succeeded.includes(draft.id)),
-            );
-            setSelectedComposeDraftIds(new Set());
-            const failures = results.filter((result) => !result.ok);
-            actions.showToast(
-              failures.length
-                ? `${succeeded.length} sent; ${failures.length} draft${failures.length === 1 ? "" : "s"} failed and were kept.`
-                : `${succeeded.length} drafts sent.`,
-            );
-          })
-          .catch((reason) =>
-            actions.showToast(
-              reason instanceof Error ? reason.message : String(reason),
-            ),
+        sendingMessage: "Sending drafts…",
+        onUndo: () => undefined,
+        onSend: async () => {
+          const results = await actions.sendComposeEmails(mailbox, selected);
+          const succeeded = results
+            .filter((result) => result.ok)
+            .map((result) => result.id);
+          await Promise.all(
+            succeeded.map((id) => actions.deleteComposeDraft(mailbox, id)),
           );
-      }, 10_000);
+          setComposeDrafts((drafts) =>
+            drafts.filter((draft) => !succeeded.includes(draft.id)),
+          );
+          setSelectedComposeDraftIds(new Set());
+          const failures = results.filter((result) => !result.ok);
+          actions.showToast(
+            failures.length
+              ? `${succeeded.length} sent; ${failures.length} draft${failures.length === 1 ? "" : "s"} failed and were kept.`
+              : `${succeeded.length} drafts sent.`,
+          );
+        },
+        onError: (reason) =>
+          actions.showToast(
+            reason instanceof Error ? reason.message : String(reason),
+          ),
+      });
     },
     [actions, composeDrafts, mailbox, selectedComposeDraftIds],
   );
@@ -5621,10 +5737,7 @@ export function HomeView() {
 
   useEffect(
     () => () => {
-      if (pendingComposeTimer.current)
-        window.clearTimeout(pendingComposeTimer.current);
-      if (pendingComposeCountdown.current)
-        window.clearInterval(pendingComposeCountdown.current);
+      pendingSendScheduler.current?.dispose();
       if (composeCloseTimer.current)
         window.clearTimeout(composeCloseTimer.current);
     },
@@ -5850,7 +5963,7 @@ export function HomeView() {
           <button
             className={`refresh-mail-btn ${isInboxSyncing ? "is-syncing" : ""}`}
             disabled={isInboxSyncing}
-            onClick={() => setRefreshChoiceOpen(true)}
+            onClick={() => void syncInbox(days)}
           >
             <RefreshIcon />
             <span>{isInboxSyncing ? "Syncing" : "Refresh"}</span>
@@ -5870,49 +5983,6 @@ export function HomeView() {
             <span>Compose</span>
           </button>
         </header>
-
-        {refreshChoiceOpen ? (
-          <div
-            className="confirm-overlay refresh-choice-overlay"
-            role="presentation"
-          >
-            <section
-              className="confirm-dialog refresh-choice-dialog"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="refresh-choice-title"
-            >
-              <h3 id="refresh-choice-title">Refresh inbox</h3>
-              <p>
-                Choose how Anna should refresh the current mailbox cache and
-                view.
-              </p>
-              <div className="refresh-choice-actions">
-                <button
-                  className="danger-btn"
-                  type="button"
-                  disabled={isInboxSyncing}
-                  onClick={() => void reloadInboxFromEmpty()}
-                >
-                  Clear cache and reload
-                </button>
-                <button
-                  type="button"
-                  disabled={isInboxSyncing}
-                  onClick={() => void continueLoadingInbox()}
-                >
-                  Continue loading new mail
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setRefreshChoiceOpen(false)}
-                >
-                  Cancel
-                </button>
-              </div>
-            </section>
-          </div>
-        ) : null}
 
         {batchConfirmDrafts ? (
           <div className="confirm-overlay" role="presentation">
@@ -6175,7 +6245,7 @@ export function HomeView() {
           sourceMessages.length > 0 &&
           !cachedInboxBannerDismissed ? (
             <div className="mail-sync-banner">
-              <span>Showing cached inbox.</span>
+              <span>Sync failed. Showing cached emails.</span>
               <div className="mail-sync-banner-actions">
                 <button
                   className="mail-sync-banner-skip"
@@ -6193,7 +6263,7 @@ export function HomeView() {
                 >
                   {cachedInboxRetryAction === "load-more"
                     ? "Retry loading older emails"
-                    : "Retry inbox sync"}
+                    : "Retry sync"}
                 </button>
               </div>
             </div>
@@ -6467,13 +6537,20 @@ export function HomeView() {
             setSidebarCollapsed(false);
             return actions.submitMailContextPrompt(request);
           }}
-          sendInboxThreadReply={actions.sendInboxThreadReply}
+          onScheduleReply={scheduleInboxThreadReply}
+          onScheduleForward={scheduleInboxThreadForward}
+          onSaveForwardDraft={saveInboxThreadForwardDraft}
+          replyDraftRestore={replyDraftRestore}
+          onConsumeReplyDraftRestore={(nonce) =>
+            setReplyDraftRestore((current) =>
+              current?.nonce === nonce ? null : current,
+            )
+          }
           contactAvatars={contactAvatars}
           loadContactAvatars={actions.loadContactAvatars}
+          searchComposeContacts={actions.searchComposeContacts}
           latestThreadMessageId={latestSelectedThreadMessage?.id || ""}
-          latestThreadInternalDate={
-            latestSelectedThreadMessage?.internal_date || ""
-          }
+          autoOpenDraftComposer={mailboxView === "drafts"}
         />
         {composeOpen || composeClosing ? (
           <ComposeView

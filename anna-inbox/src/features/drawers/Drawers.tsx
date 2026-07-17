@@ -1,4 +1,4 @@
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useState, type TransitionEvent } from "react";
 import { modeLabel } from "../../app/constants";
 import { useApp } from "../../app/AppContext";
 import { formatBeijingTimestamp } from "../../shared/format";
@@ -16,11 +16,18 @@ function RestoreIcon() {
 
 export function Drawers() {
   const { state, actions } = useApp();
+  const [settingsMounted, setSettingsMounted] = useState(state.settingsOpen);
   const overlayOpen = state.settingsOpen || state.sourcesOpen || state.historyOpen || state.memoryOpen || state.scanPlanOpen;
+  useEffect(() => {
+    if (state.settingsOpen) setSettingsMounted(true);
+  }, [state.settingsOpen]);
+  const handleSettingsTransitionEnd = (event: TransitionEvent<HTMLElement>) => {
+    if (event.propertyName === "transform" && !state.settingsOpen) setSettingsMounted(false);
+  };
   return (
     <>
       <div className={`drawer-overlay ${overlayOpen ? "is-open" : ""}`} onClick={() => { actions.closeDrawers(); actions.closeSettings(); }} />
-      <aside className={`drawer ${state.settingsOpen ? "is-open" : ""}`} aria-label="Settings drawer"><SettingsView settings={state.inboxSettings} loading={state.inboxSettingsLoading} error={state.inboxSettingsError} focusSavedPromptsRequest={state.settingsFocusRequest} onChange={actions.saveInboxSettings} onBack={actions.closeSettings} /></aside>
+      <aside className={`drawer ${state.settingsOpen ? "is-open" : ""}`} aria-label="Settings drawer" onTransitionEnd={handleSettingsTransitionEnd}>{settingsMounted ? <SettingsView settings={state.inboxSettings} loading={state.inboxSettingsLoading} error={state.inboxSettingsError} focusSavedPromptsRequest={state.settingsFocusRequest} onChange={actions.saveInboxSettings} onBack={actions.closeSettings} /> : null}</aside>
       <SourcesDrawer />
       <MemoryDrawer />
       <HistoryDrawer />

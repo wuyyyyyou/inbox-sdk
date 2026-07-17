@@ -391,8 +391,8 @@ def _ensure_loopback_download_server() -> str:
 
             def _send_cors_headers(self) -> None:
                 self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Content-Length")
                 self.send_header("Access-Control-Expose-Headers", "Content-Disposition, Content-Type, Content-Length")
 
             def do_OPTIONS(self) -> None:
@@ -400,6 +400,40 @@ def _ensure_loopback_download_server() -> str:
                 self._send_cors_headers()
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
+
+            def do_PUT(self) -> None:
+                """接收前端外发附件 stage 上传，字节不经过 JSON-RPC。"""
+                path = urllib.parse.urlsplit(self.path).path
+                if not path.startswith("/upload/"):
+                    self.send_error(404)
+                    return
+                token = path[len("/upload/"):].split("/", 1)[0].strip()
+                try:
+                    from mail_agent.mail_providers.gmail.outgoing_attachments import (
+                        commit_stage_upload,
+                        get_stage_upload_slot,
+                    )
+                    slot = get_stage_upload_slot(token)
+                    if not slot:
+                        self.send_error(404)
+                        return
+                    length = int(self.headers.get("Content-Length") or "0")
+                    if length < 0 or length > 25 * 1024 * 1024:
+                        self.send_error(413)
+                        return
+                    content = self.rfile.read(length) if length else b""
+                    commit_stage_upload(token, content)
+                except Exception:
+                    self.send_error(400)
+                    return
+                self.send_response(200)
+                self._send_cors_headers()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                body = b'{"ok":true}'
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
             def do_GET(self) -> None:
                 _cleanup_expired_download_tokens()
@@ -585,7 +619,11 @@ def _attachment_preview_kind(attachment: dict[str, Any]) -> str:
     mime_type = _normalized_attachment_mime_type(attachment)
     filename = str(attachment.get("filename") or "").strip().lower()
     guessed, _ = mimetypes.guess_type(filename)
-    effective_mime = str(guessed or mime_type).lower()
+    # Gmail 明确返回的 MIME 类型优先；只有通用二进制类型时，才用文件名推断，
+    # 避免异常文件名覆盖服务端已经确认的真实类型。
+    effective_mime = str(
+        guessed if mime_type == "application/octet-stream" and guessed else mime_type
+    ).lower()
     if effective_mime == "application/pdf":
         return "pdf"
     if effective_mime.startswith("image/"):
@@ -1068,7 +1106,12 @@ def _read_cached_thread_messages(mailbox: str, thread_id: str) -> list[dict[str,
 
 
 def _load_thread_messages(mailbox: str, thread_id: str, *, force_refresh: bool = False) -> list[dict[str, Any]]:
-    from mail_agent.mail_providers.gmail.adapter import list_messages, normalize_mailbox, refresh_thread_cache
+    from mail_agent.mail_providers.gmail.adapter import (
+        list_messages,
+        normalize_mailbox,
+        refresh_thread_cache,
+        sync_cached_message_summaries,
+    )
 
     cached_messages = _read_cached_thread_messages(mailbox, thread_id)
     normalized_mailbox = normalize_mailbox(mailbox)
@@ -1080,6 +1123,13 @@ def _load_thread_messages(mailbox: str, thread_id: str, *, force_refresh: bool =
     # 仅当该线程所有 index 消息都有完整缓存时才跳过 Gmail；长线程在只缓存
     # 部分正文时必须刷新，否则“加载更早邮件”会被错误地截断。
     if cached_messages and len(cached_messages) == expected_count and not force_refresh:
+        try:
+            # 完整详情可能在更早一次按需读取中补齐附件；回填目录摘要后，
+            # 当前线程关闭或下次加载列表时即可正确显示附件图标。
+            sync_cached_message_summaries(normalized_mailbox, cached_messages)
+        except Exception as exc:
+            # 摘要缓存更新失败不能影响用户打开邮件详情。
+            log(f"thread summary cache sync failed for {thread_id}: {type(exc).__name__}: {exc}")
         return cached_messages
     try:
         messages = refresh_thread_cache(mailbox, thread_id)
@@ -2040,14 +2090,30 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             return {"error": f"Card {card_id} not found"}
         try:
             from mail_agent.mail_providers.gmail.adapter import (
+                fetch_and_cache_message,
                 fetch_attachment_bytes,
                 find_attachment_for_token,
                 normalize_mailbox,
                 read_message,
             )
             normalized_mailbox = normalize_mailbox(mailbox)
-            msg = read_message(normalized_mailbox, card.message_id)
-            attachment = find_attachment_for_token(msg, attachment_id)
+            # 缓存 miss 或 token 对不上时回源 full 消息，避免缓存后附件不可用。
+            try:
+                msg = read_message(normalized_mailbox, card.message_id)
+            except Exception:
+                msg = None
+            if not isinstance(msg, dict):
+                msg = await asyncio.to_thread(fetch_and_cache_message, normalized_mailbox, card.message_id)
+            if not isinstance(msg, dict):
+                return {"ok": False, "error": f"Message {card.message_id} not found"}
+            try:
+                attachment = find_attachment_for_token(msg, attachment_id)
+            except Exception:
+                refreshed = await asyncio.to_thread(fetch_and_cache_message, normalized_mailbox, card.message_id)
+                if not isinstance(refreshed, dict):
+                    raise
+                msg = refreshed
+                attachment = find_attachment_for_token(msg, attachment_id)
             content = await asyncio.to_thread(
                 fetch_attachment_bytes,
                 normalized_mailbox,
@@ -2099,14 +2165,41 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             return {"error": "mode must be preview or download"}
         try:
             from mail_agent.mail_providers.gmail.adapter import (
+                fetch_and_cache_message,
                 fetch_attachment_bytes,
                 find_attachment_for_token,
                 normalize_mailbox,
                 read_message,
             )
             normalized_mailbox = normalize_mailbox(mailbox)
-            message = read_message(normalized_mailbox, message_id)
-            attachment = find_attachment_for_token(message, attachment_id)
+            # 列表/History 可能只有摘要缓存；访问附件时必须能回源 full 消息。
+            try:
+                message = read_message(normalized_mailbox, message_id)
+            except Exception:
+                message = None
+            if not isinstance(message, dict):
+                message = await asyncio.to_thread(fetch_and_cache_message, normalized_mailbox, message_id)
+            if not isinstance(message, dict):
+                return {"ok": False, "error": f"Message {message_id} not found"}
+            try:
+                attachment = find_attachment_for_token(message, attachment_id)
+            except Exception:
+                refreshed = await asyncio.to_thread(fetch_and_cache_message, normalized_mailbox, message_id)
+                if not isinstance(refreshed, dict):
+                    raise
+                message = refreshed
+                attachment = find_attachment_for_token(message, attachment_id)
+            if mode == "preview" and _attachment_preview_kind(attachment) == "download":
+                # 预览能力必须在后端协议层再次校验，防止绕过前端直接请求任意附件的预览资源。
+                return {
+                    "ok": False,
+                    "mode": mode,
+                    "message_id": message_id,
+                    "attachment_id": attachment_id,
+                    "filename": str(attachment.get("filename") or "attachment"),
+                    "mime_type": _normalized_attachment_mime_type(attachment),
+                    "error": "This attachment type does not support preview. Download the file instead.",
+                }
             content = await asyncio.to_thread(
                 fetch_attachment_bytes,
                 normalized_mailbox,
@@ -2648,15 +2741,43 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if not thread_id or not to_addr or not body:
             return {"error": "thread_id, to_addr, and body are required"}
         reply_mode = str(arguments.get("reply_mode", "reply_to_sender")).strip() or "reply_to_sender"
+        # 前端显式传入的抄送 / 密送（字符串或列表均可）
+        cc_raw = arguments.get("cc_addr") if arguments.get("cc_addr") is not None else arguments.get("cc")
+        bcc_raw = arguments.get("bcc_addr") if arguments.get("bcc_addr") is not None else arguments.get("bcc")
+        if isinstance(cc_raw, list):
+            cc_addr = ", ".join(str(item).strip() for item in cc_raw if str(item).strip())
+        else:
+            cc_addr = str(cc_raw or "").strip()
+        if isinstance(bcc_raw, list):
+            bcc_addr = ", ".join(str(item).strip() for item in bcc_raw if str(item).strip())
+        else:
+            bcc_addr = str(bcc_raw or "").strip()
         dry_run = arguments.get("dry_run", True)
         if not isinstance(dry_run, bool):
             dry_run = True
         from mail_agent.mail_providers.gmail.adapter import send_reply
+        from mail_agent.mail_providers.gmail.outgoing_attachments import (
+            delete_staged_attachments,
+            load_outgoing_attachments_for_send,
+        )
         import asyncio as _asyncio
+        attachment_meta = arguments.get("attachments") if isinstance(arguments.get("attachments"), list) else []
         if dry_run:
             return {"ok": True, "dry_run": True, "message": "Mock: reply was NOT sent."}
         try:
-            result = await _asyncio.to_thread(send_reply, mailbox, thread_id, to_addr, body, reply_mode=reply_mode)
+            loaded_attachments = load_outgoing_attachments_for_send(mailbox, attachment_meta)
+            result = await _asyncio.to_thread(
+                send_reply,
+                mailbox,
+                thread_id,
+                to_addr,
+                body,
+                reply_mode=reply_mode,
+                cc_addr=cc_addr,
+                bcc_addr=bcc_addr,
+                attachments=loaded_attachments,
+            )
+            delete_staged_attachments(mailbox, attachment_meta)
             from mail_agent.storage.ops import append_card_action
             await append_card_action(mailbox, "", thread_id, "reply_from_ask", body[:80])
             return {"ok": True, "dry_run": False, "result": result}
@@ -2666,11 +2787,84 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
     if tool == "search_compose_contacts":
         query = str(arguments.get("query", "")).strip()
         if not mailbox or not query:
-            return {"error": "mailbox and query are required"}
+            return {"error": "mailbox and query is required"}
         from mail_agent.mail_providers.gmail.adapter import search_contacts
         import asyncio as _asyncio
         try:
             return await _asyncio.to_thread(search_contacts, mailbox, query, limit=int(arguments.get("limit") or 10))
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    if tool == "begin_stage_outgoing_attachment":
+        # 创建本地 stage 槽位，前端再 PUT 字节到 loopback，避免大文件走 JSON-RPC。
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        filename = str(arguments.get("filename") or "attachment")
+        mime_type = str(arguments.get("mime_type") or "application/octet-stream")
+        try:
+            size = int(arguments.get("size") or 0)
+        except (TypeError, ValueError):
+            return {"error": "size is required"}
+        try:
+            existing_total = int(arguments.get("existing_total_bytes") or 0)
+        except (TypeError, ValueError):
+            existing_total = 0
+        draft_scope = str(arguments.get("draft_scope") or "compose").strip().lower() or "compose"
+        draft_key = str(arguments.get("draft_key") or "").strip()
+        try:
+            from mail_agent.mail_providers.gmail.outgoing_attachments import create_stage_upload_slot
+            slot = create_stage_upload_slot(
+                mailbox,
+                filename=filename,
+                mime_type=mime_type,
+                size=size,
+                existing_total_bytes=existing_total,
+                draft_scope=draft_scope,
+                draft_key=draft_key,
+            )
+            base_url = _ensure_loopback_download_server()
+            return {
+                "ok": True,
+                "attachment_id": slot["attachment_id"],
+                "filename": slot["filename"],
+                "mime_type": slot["mime_type"],
+                "size": slot["size"],
+                "storage_key": slot["storage_key"],
+                "upload_url": f"{base_url}/upload/{slot['upload_token']}",
+                "expires_at": datetime.fromtimestamp(float(slot["expires_at_ts"]), tz=timezone.utc).isoformat(),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    if tool == "delete_staged_outgoing_attachment":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        storage_key = str(arguments.get("storage_key") or "").strip()
+        if not storage_key:
+            return {"error": "storage_key is required"}
+        from mail_agent.mail_providers.gmail.outgoing_attachments import delete_staged_attachment
+        deleted = delete_staged_attachment(mailbox, storage_key)
+        return {"ok": True, "deleted": deleted}
+
+    if tool == "prepare_staged_outgoing_attachment_access":
+        # 草稿恢复后给图片预览用的短期 loopback URL。
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        storage_key = str(arguments.get("storage_key") or "").strip()
+        filename = str(arguments.get("filename") or "attachment")
+        mime_type = str(arguments.get("mime_type") or "application/octet-stream")
+        if not storage_key:
+            return {"error": "storage_key is required"}
+        try:
+            from mail_agent.mail_providers.gmail.outgoing_attachments import read_staged_attachment
+            content = read_staged_attachment(mailbox, storage_key)
+            payload = _loopback_attachment_download_payload(
+                {"filename": filename, "mime_type": mime_type},
+                content,
+                disposition="inline",
+            )
+            payload["preview_url"] = payload.get("download_url") or ""
+            return payload
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -2685,6 +2879,14 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if tool == "delete_compose_draft":
             if not mailbox or not draft_id:
                 return {"error": "mailbox and draft_id are required"}
+            # 删除草稿时同步清理已 stage 的外发附件文件。
+            try:
+                existing = await get_compose_draft(mailbox, draft_id)
+                draft_value = existing.get("draft") if isinstance(existing.get("draft"), dict) else {}
+                from mail_agent.mail_providers.gmail.outgoing_attachments import delete_staged_attachments
+                delete_staged_attachments(mailbox, draft_value.get("attachments") if isinstance(draft_value, dict) else [])
+            except Exception:
+                pass
             await delete_compose_draft(mailbox, draft_id)
             return {"ok": True, "mailbox": mailbox, "draft_id": draft_id}
         if tool == "list_compose_drafts":
@@ -2704,19 +2906,30 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if not raw_messages:
             return {"error": "messages is required"}
         from mail_agent.mail_providers.gmail.adapter import send_compose_email
+        from mail_agent.mail_providers.gmail.outgoing_attachments import (
+            delete_staged_attachments,
+            load_outgoing_attachments_for_send,
+        )
         import asyncio as _asyncio
         results: list[dict[str, Any]] = []
         for item in raw_messages[:100]:
             draft = item if isinstance(item, dict) else {}
             draft_id = str(draft.get("id") or "")
             try:
+                attachment_meta = draft.get("attachments") if isinstance(draft.get("attachments"), list) else []
+                loaded_attachments = load_outgoing_attachments_for_send(mailbox, attachment_meta)
                 sent = await _asyncio.to_thread(
                     send_compose_email,
                     mailbox,
                     draft.get("recipients") if isinstance(draft.get("recipients"), list) else [],
                     str(draft.get("subject") or ""),
                     str(draft.get("body") or ""),
+                    cc=draft.get("cc") if isinstance(draft.get("cc"), list) else draft.get("cc"),
+                    bcc=draft.get("bcc") if isinstance(draft.get("bcc"), list) else draft.get("bcc"),
+                    body_html=str(draft.get("body_html") or "") or None,
+                    attachments=loaded_attachments,
                 )
+                delete_staged_attachments(mailbox, attachment_meta)
                 results.append({"id": draft_id, "ok": True, "result": sent})
             except Exception as exc:
                 results.append({"id": draft_id, "ok": False, "error": str(exc)})
@@ -2822,12 +3035,14 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         from mail_agent.storage.ops import get_inbox_thread_draft
         draft = await get_inbox_thread_draft(mailbox, thread_id)
         value = draft.get("value") if isinstance(draft.get("value"), dict) else {}
+        attachments = value.get("attachments") if isinstance(value.get("attachments"), list) else []
         return {
             "mailbox": mailbox,
             "thread_id": thread_id,
             "exists": bool(draft.get("exists")),
             "etag": str(draft.get("etag") or ""),
             "body": str(value.get("body") or ""),
+            "attachments": attachments,
             "updated_at": str(value.get("updated_at") or ""),
         }
 
@@ -2925,6 +3140,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if not mailbox or not thread_id:
             return {"error": "mailbox and thread_id are required"}
         message = arguments.get("message") if isinstance(arguments.get("message"), dict) else {}
+        attachments = arguments.get("attachments") if isinstance(arguments.get("attachments"), list) else None
         from mail_agent.storage.ops import set_inbox_thread_draft
         result = await set_inbox_thread_draft(
             mailbox,
@@ -2932,6 +3148,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             body,
             if_match=if_match,
             message=message,
+            attachments=attachments,
         )
         return {
             "ok": True,
@@ -2945,7 +3162,14 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         thread_id = str(arguments.get("thread_id", "")).strip()
         if not mailbox or not thread_id:
             return {"error": "mailbox and thread_id are required"}
-        from mail_agent.storage.ops import delete_inbox_thread_draft
+        from mail_agent.storage.ops import delete_inbox_thread_draft, get_inbox_thread_draft
+        try:
+            existing = await get_inbox_thread_draft(mailbox, thread_id)
+            value = existing.get("value") if isinstance(existing.get("value"), dict) else {}
+            from mail_agent.mail_providers.gmail.outgoing_attachments import delete_staged_attachments
+            delete_staged_attachments(mailbox, value.get("attachments") if isinstance(value, dict) else [])
+        except Exception:
+            pass
         result = await delete_inbox_thread_draft(mailbox, thread_id)
         return {"ok": True, "mailbox": mailbox, "thread_id": thread_id, "result": result}
 

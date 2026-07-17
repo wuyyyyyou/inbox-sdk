@@ -1,7 +1,10 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useApp } from "../../app/AppContext";
 import type {
   AiMailContextRef,
   AttachmentDownloadPayload,
+  ComposeContact,
+  ComposeDraft,
   DraftReplyArtifact,
   InboxMessage,
   InboxMessageDisplayBodyPayload,
@@ -10,8 +13,10 @@ import type {
   InboxThreadPagePayload,
   InboxThreadStateOperation,
   MailAttachmentMeta,
+  OutgoingAttachmentMeta,
   SubmitMailPromptRequest,
 } from "../../types/mail";
+import { RecipientChipInput } from "../../shared/RecipientChipInput";
 import { SafeEmailHtml, SafeEmailText } from "../../shared/SafeEmailHtml";
 import {
   getCachedMessageBody,
@@ -20,14 +25,25 @@ import {
   setCachedThreadPage,
 } from "../../shared/browserStorage";
 import { mailAvatarFallback } from "../../shared/mailIdentity";
+import { OutgoingAttachButton, OutgoingAttachmentList } from "../../shared/OutgoingAttachmentBar";
+import {
+  isBlockedOutgoingFilename,
+  isImageOutgoingAttachment,
+  OUTGOING_ATTACHMENT_TOTAL_MAX_BYTES,
+  putFileToUploadUrl,
+  toPersistedOutgoingAttachments,
+  totalOutgoingAttachmentBytes,
+} from "../../shared/outgoingAttachments";
 import { PdfAttachmentPreview } from "./PdfAttachmentPreview";
 import {
+  buildForwardDraftBody,
+  buildForwardSendBodies,
+  buildForwardSubject,
   buildQuickReplyPrompt,
   deriveReplyToAddress,
   estimateAttachmentPreviewMemory,
   formatAbsoluteDateTime,
   formatAttachmentSize,
-  hasNewerThreadMessage,
   isOutboundMessageForMailbox,
   isPreviewableAttachment,
   materializeAttachmentAccess,
@@ -38,9 +54,50 @@ import {
   resolveMessageThreadId,
   senderParts,
   splitAddresses,
+  stripForwardedMessageBlock,
   triggerAttachmentDownload,
   type ResolvedAttachmentAccess,
 } from "./mailDetailHelpers";
+
+type ComposerMode = "reply" | "forward";
+
+type ComposerDraftState = {
+  id: string;
+  body: string;
+  dirty: boolean;
+  etag: string;
+  recipients: string[];
+  cc: string[];
+  bcc: string[];
+  ccInput: string;
+  bccInput: string;
+  ccOpen: boolean;
+  bccOpen: boolean;
+  focusField: "cc" | "bcc" | null;
+  attachments: OutgoingAttachmentMeta[];
+};
+
+type ComposerDraftPatch =
+  | Partial<ComposerDraftState>
+  | ((current: ComposerDraftState) => ComposerDraftState);
+
+function emptyComposerDraft(): ComposerDraftState {
+  return {
+    id: "",
+    body: "",
+    dirty: false,
+    etag: "",
+    recipients: [],
+    cc: [],
+    bcc: [],
+    ccInput: "",
+    bccInput: "",
+    ccOpen: false,
+    bccOpen: false,
+    focusField: null,
+    attachments: [],
+  };
+}
 
 type MailUiFlags = {
   todos: string[];
@@ -293,10 +350,6 @@ function normalizeComparableSubject(value: unknown) {
     .replace(/^(?:(?:re|fw|fwd):\s*)+/i, "")
     .replace(/\s+/g, " ")
     .toLowerCase();
-}
-
-function isLocalDraftMessage(message: Pick<InboxMessage, "draft_body" | "draft_local"> | null | undefined) {
-  return Boolean(message?.draft_local || message?.draft_body);
 }
 
 function HeaderContactRow({
@@ -597,6 +650,9 @@ const DoneIcon = () => <ToolbarIcon><path d="m4 12 5 5L20 6" /></ToolbarIcon>;
 const ExpandInlineIcon = () => <ToolbarIcon><path d="M9 4H4v5" /><path d="M4 4l6 6" /><path d="M15 20h5v-5" /><path d="m20 20-6-6" /></ToolbarIcon>;
 const CollapseInlineIcon = () => <ToolbarIcon><path d="M10 4v6H4" /><path d="m4 10 6-6" /><path d="M14 20v-6h6" /><path d="m20 14-6 6" /></ToolbarIcon>;
 const AiDraftIcon = () => <ToolbarIcon><path d="M14.5 4.5 19.5 9.5" /><path d="M5 15.5 15.5 5a2.1 2.1 0 0 1 3 3L8 18.5 4 20l1-4.5Z" /><path d="M19 16v4" /><path d="M17 18h4" /></ToolbarIcon>;
+const ReplyModeIcon = () => <ToolbarIcon><path d="M9 14 4 9l5-5" /><path d="M20 20v-7a4 4 0 0 0-4-4H4" /></ToolbarIcon>;
+const ForwardModeIcon = () => <ToolbarIcon><path d="m15 14 5-5-5-5" /><path d="M4 20v-7a4 4 0 0 1 4-4h12" /></ToolbarIcon>;
+const ModeChevronIcon = () => <ToolbarIcon><path d="m6 9 6 6 6-6" /></ToolbarIcon>;
 
 export function MailDetailDrawer({
   open,
@@ -621,11 +677,16 @@ export function MailDetailDrawer({
   deleteInboxThreadDraft,
   prepareInboxAttachmentAccess,
   submitMailContextPrompt,
-  sendInboxThreadReply,
+  onScheduleReply,
+  onScheduleForward,
+  onSaveForwardDraft,
+  replyDraftRestore,
+  onConsumeReplyDraftRestore,
   contactAvatars,
   loadContactAvatars,
+  searchComposeContacts,
   latestThreadMessageId = "",
-  latestThreadInternalDate = "",
+  autoOpenDraftComposer = false,
 }: {
   open: boolean;
   mailbox: string;
@@ -650,16 +711,78 @@ export function MailDetailDrawer({
   }) => Promise<InboxThreadPagePayload>;
   loadInboxMessageDisplayBody: (mailbox: string, messageId: string) => Promise<InboxMessageDisplayBodyPayload>;
   loadInboxThreadAssist: (mailbox: string, threadId: string, latestMessageId: string, anchorMessageId?: string) => Promise<InboxThreadAssistPayload>;
-  getInboxThreadDraft: (mailbox: string, threadId: string) => Promise<{ exists: boolean; body: string; etag?: string }>;
-  saveInboxThreadDraft: (mailbox: string, threadId: string, body: string, ifMatch?: string, message?: Record<string, unknown>) => Promise<{ etag?: string }>;
+  getInboxThreadDraft: (mailbox: string, threadId: string) => Promise<{
+    exists: boolean;
+    body: string;
+    etag?: string;
+    attachments?: OutgoingAttachmentMeta[];
+  }>;
+  saveInboxThreadDraft: (
+    mailbox: string,
+    threadId: string,
+    body: string,
+    ifMatch?: string,
+    message?: Record<string, unknown>,
+    attachments?: Array<Record<string, unknown>>,
+  ) => Promise<{ etag?: string }>;
   deleteInboxThreadDraft: (mailbox: string, threadId: string) => Promise<{ ok?: boolean }>;
   prepareInboxAttachmentAccess: (mailbox: string, messageId: string, attachmentId: string, mode: "preview" | "download") => Promise<AttachmentDownloadPayload>;
   submitMailContextPrompt: (request: SubmitMailPromptRequest) => Promise<unknown>;
-  sendInboxThreadReply: (args: { mailbox: string; threadId: string; to: string; body: string; replyMode?: string; dryRun?: boolean }) => Promise<{ ok?: boolean; error?: string }>;
+  onScheduleReply: (args: {
+    mailbox: string;
+    threadId: string;
+    to: string;
+    body: string;
+    cc?: string[];
+    bcc?: string[];
+    message: InboxMessage;
+    attachments?: OutgoingAttachmentMeta[];
+  }) => boolean;
+  onScheduleForward: (args: {
+    mailbox: string;
+    recipients: string[];
+    cc?: string[];
+    bcc?: string[];
+    subject: string;
+    body: string;
+    body_html?: string;
+    message: InboxMessage;
+    attachments?: OutgoingAttachmentMeta[];
+  }) => boolean;
+  onSaveForwardDraft: (args: {
+    id?: string;
+    ifMatch?: string;
+    mailbox: string;
+    recipients: string[];
+    cc?: string[];
+    bcc?: string[];
+    subject: string;
+    body: string;
+    sourceThreadId: string;
+    sourceMessageId: string;
+    attachments?: OutgoingAttachmentMeta[];
+  }) => Promise<ComposeDraft>;
+  replyDraftRestore: {
+    nonce: string;
+    threadId: string;
+    body: string;
+    cc?: string[];
+    bcc?: string[];
+    mode?: ComposerMode;
+    recipients?: string[];
+    composeDraftId?: string;
+    composeDraftEtag?: string;
+  } | null;
+  onConsumeReplyDraftRestore: (nonce: string) => void;
   contactAvatars?: Record<string, string>;
   loadContactAvatars: (emails: string[], mailbox?: string) => Promise<{ avatars: Record<string, string>; permissionRequired: boolean }>;
+  searchComposeContacts: (
+    mailbox: string,
+    query: string,
+  ) => Promise<{ contacts: ComposeContact[] }>;
   latestThreadMessageId?: string;
-  latestThreadInternalDate?: string;
+  /** 仅从 Drafts 分类进入详情时为 true：默认展开编辑区并加载已存草稿 */
+  autoOpenDraftComposer?: boolean;
 }) {
   const [page, setPage] = useState<InboxThreadPagePayload | null>(null);
   const [loading, setLoading] = useState(false);
@@ -670,10 +793,15 @@ export function MailDetailDrawer({
   const [composerOpen, setComposerOpen] = useState(false);
   const [composerClosing, setComposerClosing] = useState(false);
   const [composerExpanded, setComposerExpanded] = useState(false);
-  const [draft, setDraft] = useState("");
-  const [draftDirty, setDraftDirty] = useState(false);
-  const [draftEtag, setDraftEtag] = useState("");
+  const [composerMode, setComposerMode] = useState<ComposerMode>("reply");
+  const { actions } = useApp();
+  const [modeMenuOpen, setModeMenuOpen] = useState(false);
+  const [composerDrafts, setComposerDrafts] = useState<Record<ComposerMode, ComposerDraftState>>(() => ({
+    reply: emptyComposerDraft(),
+    forward: emptyComposerDraft(),
+  }));
   const [sending, setSending] = useState(false);
+  const modeMenuRef = useRef<HTMLDivElement | null>(null);
   const [toolbarPending, setToolbarPending] = useState(false);
   const [displayBodyLoading, setDisplayBodyLoading] = useState<Set<string>>(() => new Set());
   const [displayBodyLoaded, setDisplayBodyLoaded] = useState<Set<string>>(() => new Set());
@@ -713,11 +841,61 @@ export function MailDetailDrawer({
   const previewRenderWaitersRef = useRef<Map<string, () => void>>(new Map());
   const attachmentDownloadsRef = useRef<Set<string>>(new Set());
   const pendingThreadScrollTargetRef = useRef("");
+  const draftLoadKeyRef = useRef("");
+  const composerContextHeightRef = useRef<number | null>(null);
   const draftLoadSequenceRef = useRef(0);
   const suppressDraftLoadForRef = useRef("");
   const draftEditSequenceRef = useRef(0);
   const pendingDraftSavesRef = useRef(new Set<Promise<void>>());
   const composerCloseTimerRef = useRef<number | null>(null);
+  const closeComposerRef = useRef<() => Promise<void>>(async () => undefined);
+  const aiDraftModeRef = useRef<ComposerMode>("reply");
+
+  const updateComposerDraft = (mode: ComposerMode, patch: ComposerDraftPatch) => {
+    setComposerDrafts((current) => {
+      const previous = current[mode];
+      const next = typeof patch === "function" ? patch(previous) : { ...previous, ...patch };
+      return { ...current, [mode]: next };
+    });
+  };
+
+  const updateActiveComposerDraft = (patch: ComposerDraftPatch) => updateComposerDraft(composerMode, patch);
+  const activeComposerDraft = composerDrafts[composerMode];
+  const draft = activeComposerDraft.body;
+  const draftDirty = activeComposerDraft.dirty;
+  const draftEtag = activeComposerDraft.etag;
+  const forwardTo = activeComposerDraft.recipients;
+  const replyCc = activeComposerDraft.cc;
+  const replyBcc = activeComposerDraft.bcc;
+  const replyCcInput = activeComposerDraft.ccInput;
+  const replyBccInput = activeComposerDraft.bccInput;
+  const replyCcOpen = activeComposerDraft.ccOpen;
+  const replyBccOpen = activeComposerDraft.bccOpen;
+  const replyFocusField = activeComposerDraft.focusField;
+  const composerAttachments = activeComposerDraft.attachments;
+  const setComposerAttachments = (attachments: OutgoingAttachmentMeta[] | ((current: OutgoingAttachmentMeta[]) => OutgoingAttachmentMeta[])) => {
+    updateActiveComposerDraft((current) => ({
+      ...current,
+      attachments: typeof attachments === "function" ? attachments(current.attachments) : attachments,
+      dirty: true,
+    }));
+  };
+  const setDraft = (body: string | ((current: string) => string)) => {
+    updateActiveComposerDraft((current) => ({
+      ...current,
+      body: typeof body === "function" ? body(current.body) : body,
+    }));
+  };
+  const setDraftDirty = (dirty: boolean) => updateActiveComposerDraft({ dirty });
+  const setDraftEtag = (etag: string) => updateActiveComposerDraft({ etag });
+  const setForwardTo = (recipients: string[]) => updateActiveComposerDraft({ recipients, dirty: true });
+  const setReplyCc = (cc: string[]) => updateActiveComposerDraft({ cc, dirty: true });
+  const setReplyBcc = (bcc: string[]) => updateActiveComposerDraft({ bcc, dirty: true });
+  const setReplyCcInput = (ccInput: string) => updateActiveComposerDraft({ ccInput });
+  const setReplyBccInput = (bccInput: string) => updateActiveComposerDraft({ bccInput });
+  const setReplyCcOpen = (ccOpen: boolean) => updateActiveComposerDraft({ ccOpen });
+  const setReplyBccOpen = (bccOpen: boolean) => updateActiveComposerDraft({ bccOpen });
+  const setReplyFocusField = (focusField: "cc" | "bcc" | null) => updateActiveComposerDraft({ focusField });
 
   const clearPreviewAccess = () => {
     previewAccessRef.current = null;
@@ -743,8 +921,47 @@ export function MailDetailDrawer({
     pendingThreadScrollTargetRef.current = scrollTargetForPage(nextPage, fallbackMessageId);
   };
 
-  const closeComposer = () => {
+  const clearEmptyForwardDraft = () => {
+    if (stripForwardedMessageBlock(composerDrafts.forward.body).trim()) return;
+    setComposerDrafts((current) => ({ ...current, forward: emptyComposerDraft() }));
+  };
+
+  const saveForwardDraftIfNeeded = async () => {
+    const forwardDraft = composerDrafts.forward;
+    const forwardNote = stripForwardedMessageBlock(forwardDraft.body).trim();
+    if ((!forwardNote && !forwardDraft.attachments.length) || !threadId || !message?.id) return;
+    return onSaveForwardDraft({
+      id: forwardDraft.id || undefined,
+      ifMatch: forwardDraft.etag || undefined,
+      mailbox,
+      recipients: forwardDraft.recipients,
+      cc: forwardDraft.cc,
+      bcc: forwardDraft.bcc,
+      subject: buildForwardSubject(latestMessage?.subject || message.subject || page?.subject),
+      body: forwardDraft.body,
+      sourceThreadId: threadId,
+      sourceMessageId: message.id,
+      attachments: toPersistedOutgoingAttachments(forwardDraft.attachments),
+    });
+  };
+
+  const closeComposer = async () => {
     if (!composerOpen) return;
+    if (composerMode === "forward") {
+      try {
+        await saveForwardDraftIfNeeded();
+      } catch (reason) {
+        showToast(reason instanceof Error ? reason.message : String(reason));
+        return;
+      }
+    }
+    clearEmptyForwardDraft();
+    setComposerDrafts((current) => ({
+      reply: { ...current.reply, ccOpen: false, bccOpen: false, ccInput: "", bccInput: "", focusField: null },
+      forward: { ...current.forward, ccOpen: false, bccOpen: false, ccInput: "", bccInput: "", focusField: null },
+    }));
+    setComposerExpanded(false);
+    setModeMenuOpen(false);
     setComposerOpen(false);
     setComposerClosing(true);
     if (composerCloseTimerRef.current) window.clearTimeout(composerCloseTimerRef.current);
@@ -753,6 +970,7 @@ export function MailDetailDrawer({
       composerCloseTimerRef.current = null;
     }, COMPOSER_TRANSITION_MS);
   };
+  closeComposerRef.current = closeComposer;
 
   const threadId = resolveMessageThreadId(message);
   const messageId = message?.id || "";
@@ -763,8 +981,7 @@ export function MailDetailDrawer({
     [page?.messages],
   );
   const latestMessage = visibleThreadMessages[visibleThreadMessages.length - 1] || page?.messages[page.messages.length - 1];
-  const selectedIsDraft = isLocalDraftMessage(message);
-  const hasThreadUpdate = hasNewerThreadMessage(page, latestThreadMessageId, latestThreadInternalDate);
+  const replyToAddress = deriveReplyToAddress(latestMessage, mailbox);
   const important = Boolean(latestMessage?.label_ids?.includes("IMPORTANT") || message?.important);
   const starred = Boolean(latestMessage?.label_ids?.includes("STARRED") || message?.starred);
   const trashed = Boolean(latestMessage?.label_ids?.includes("TRASH") || message?.label_ids?.includes("TRASH"));
@@ -832,23 +1049,25 @@ export function MailDetailDrawer({
     scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
   }, [assistLoading, open, quickReplyRenderKey, showQuickReplies]);
 
-  useLayoutEffect(() => {
-    if (!composerOpen) return;
+  // footer 展开/收缩会改变 context 高度；在动画帧内持续补偿 scrollTop，让正文随 footer 上下移
+  useEffect(() => {
     const scroller = scrollRef.current;
-    const footer = footerRef.current;
-    if (!scroller || !footer) return;
-    // The composer reduces the context viewport. Keep the latest thread content
-    // (including delayed AI prompts) above it throughout the transition.
-    scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
-    const ResizeObserverCtor = window.ResizeObserver;
-    const observer = ResizeObserverCtor
-      ? new ResizeObserver(() => {
-        scroller.scrollTop = scroller.scrollHeight;
-      })
-      : null;
-    observer?.observe(footer);
-    return () => observer?.disconnect();
-  }, [composerExpanded, composerOpen]);
+    if (!scroller || !open) {
+      composerContextHeightRef.current = null;
+      return;
+    }
+    let previousHeight = scroller.clientHeight;
+    composerContextHeightRef.current = previousHeight;
+    const observer = new ResizeObserver(() => {
+      const currentHeight = scroller.clientHeight;
+      const heightDelta = previousHeight - currentHeight;
+      if (heightDelta) scroller.scrollTop += heightDelta;
+      previousHeight = currentHeight;
+      composerContextHeightRef.current = currentHeight;
+    });
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [messageId, open, threadId]);
 
   useEffect(() => {
     loadInboxEmailBodyRef.current = loadInboxEmailBody;
@@ -885,12 +1104,15 @@ export function MailDetailDrawer({
     assistRequestKeyRef.current = "";
     if (composerCloseTimerRef.current) window.clearTimeout(composerCloseTimerRef.current);
     composerCloseTimerRef.current = null;
-    setComposerOpen(false);
+    // 默认收起编辑区；仅 Drafts 分类进入时默认展开
+    setComposerOpen(Boolean(autoOpenDraftComposer));
     setComposerClosing(false);
     setComposerExpanded(false);
-    setDraft("");
-    setDraftDirty(false);
-    setDraftEtag("");
+    setComposerMode("reply");
+    setModeMenuOpen(false);
+    setComposerDrafts({ reply: emptyComposerDraft(), forward: emptyComposerDraft() });
+    draftLoadKeyRef.current = "";
+    composerContextHeightRef.current = null;
     suppressDraftLoadForRef.current = "";
     setPreviewAttachment(null);
     invalidatePreviewCache();
@@ -935,6 +1157,8 @@ export function MailDetailDrawer({
             queueThreadScroll(visibleCachedPage, messageId);
             setPage(visibleCachedPage);
             requestAssist(visibleCachedPage.latest_message_id || messageId);
+            // 先展示缓存；若缺附件元数据/线程上下文，或需要刷新，继续走网络。
+            // 不能因列表 has_attachment=false 就永久跳过网络（缓存回归后常见）。
             if (
               !pageMayBeMissingAnchorAttachments(visibleCachedPage, anchorMessage)
               && !pageMayBeMissingThreadContext(visibleCachedPage, anchorMessage)
@@ -951,7 +1175,7 @@ export function MailDetailDrawer({
                 .catch(() => {
                   if (!cancelled) loadFullAnchorMessage(visibleCachedPage);
                 });
-              return;
+              // stale-while-revalidate：后台刷新线程页，补齐附件元数据
             }
           }
           const nextPage = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: messageId, limit: 5, includeDisplayBody: true });
@@ -1015,7 +1239,7 @@ export function MailDetailDrawer({
   // A saved local draft overlays the selected inbox message with a new object. That
   // is not a navigation event, so avoid using the whole message as a dependency:
   // doing so would reload the thread and reset the composer after an AI insertion.
-  }, [latestThreadMessageId, mailbox, messageId, open, threadId]);
+  }, [autoOpenDraftComposer, latestThreadMessageId, mailbox, messageId, open, threadId]);
 
   useEffect(() => {
     setResolvedAvatars(contactAvatars || {});
@@ -1045,7 +1269,11 @@ export function MailDetailDrawer({
   }, [contactAvatars, mailbox, message?.from, message?.to, open, page, resolvedAvatars]);
 
   useEffect(() => {
-    if ((!composerOpen && !selectedIsDraft) || !threadId || !mailbox) return;
+    // 默认不加载/展开；仅 Drafts 进入时自动展开，或用户手动打开编辑区后回填草稿。
+    if ((!composerOpen && !autoOpenDraftComposer) || !threadId || !mailbox) return;
+    const loadKey = `${draftStorageKey}:${autoOpenDraftComposer ? "auto" : "manual"}`;
+    if (autoOpenDraftComposer && draftLoadKeyRef.current === loadKey) return;
+    if (autoOpenDraftComposer) draftLoadKeyRef.current = loadKey;
     // 用户已明确替换或丢弃当前草稿时，不能再用持久化草稿自动回填编辑栏。
     if (suppressDraftLoadForRef.current === draftStorageKey) return;
     const requestId = ++draftLoadSequenceRef.current;
@@ -1056,17 +1284,57 @@ export function MailDetailDrawer({
         const storedBody = stored.body || "";
         const fallbackBody = message?.draft_body || "";
         const nextDraft = storedBody || fallbackBody;
-        if (nextDraft) {
-          setComposerOpen(true);
-          setDraft(nextDraft);
-          setDraftEtag(stored.etag || "");
+        const storedAttachments = (stored.attachments || []).map((item) => ({
+          ...item,
+          status: "ready" as const,
+        }));
+        if (nextDraft || storedAttachments.length) {
+          if (autoOpenDraftComposer) setComposerOpen(true);
+          updateComposerDraft("reply", {
+            body: nextDraft,
+            etag: stored.etag || "",
+            attachments: storedAttachments,
+          });
         }
       })
       .catch(() => undefined);
     return () => {
       cancelled = true;
     };
-  }, [composerOpen, draftStorageKey, mailbox, message?.draft_body, selectedIsDraft, threadId]);
+  }, [autoOpenDraftComposer, composerOpen, draftStorageKey, mailbox, message?.draft_body, threadId]);
+
+  useEffect(() => {
+    if (!open || !replyDraftRestore || replyDraftRestore.threadId !== threadId) return;
+    draftLoadSequenceRef.current += 1;
+    draftEditSequenceRef.current += 1;
+    setComposerClosing(false);
+    setComposerOpen(true);
+    const restoreMode = replyDraftRestore.mode || "reply";
+    setComposerMode(restoreMode);
+    updateComposerDraft(restoreMode, (current) => ({
+      ...current,
+      body: replyDraftRestore.body,
+      id: restoreMode === "forward" ? (replyDraftRestore.composeDraftId || "") : current.id,
+      etag: restoreMode === "forward" ? (replyDraftRestore.composeDraftEtag || "") : current.etag,
+      dirty: true,
+      recipients: restoreMode === "forward" ? (replyDraftRestore.recipients || []) : current.recipients,
+      cc: replyDraftRestore.cc || [],
+      bcc: replyDraftRestore.bcc || [],
+      ccOpen: Boolean(replyDraftRestore.cc?.length),
+      bccOpen: Boolean(replyDraftRestore.bcc?.length),
+    }));
+    onConsumeReplyDraftRestore(replyDraftRestore.nonce);
+  }, [onConsumeReplyDraftRestore, open, replyDraftRestore, threadId]);
+
+  useEffect(() => {
+    if (!modeMenuOpen) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (modeMenuRef.current?.contains(event.target as Node)) return;
+      setModeMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [modeMenuOpen]);
 
   useEffect(() => {
     if (!composerOpen || !threadId || !mailbox || !draftDirty) return;
@@ -1074,21 +1342,39 @@ export function MailDetailDrawer({
     const timer = window.setTimeout(() => {
       const persistDraft = async () => {
         try {
-          const result = await saveInboxThreadDraftRef.current(mailbox, threadId, draft, draftEtag || undefined, {
-            id: latestMessage?.id || message?.id || "",
-            thread_id: threadId,
+          if (composerMode === "forward") {
+            const saved = await saveForwardDraftIfNeeded();
+            if (!saved || editSequence !== draftEditSequenceRef.current) return;
+            updateComposerDraft("forward", (current) => ({
+              ...current,
+              id: saved.id,
+              etag: saved.etag || current.etag,
+              dirty: false,
+            }));
+            return;
+          }
+          const result = await saveInboxThreadDraftRef.current(
             mailbox,
-            internal_date: latestMessage?.internal_date || message?.internal_date || "",
-            date: message?.date || "",
-            from: latestMessage?.from || message?.from || "",
-            to: latestMessage?.to || message?.to || "",
-            subject: latestMessage?.subject || message?.subject || "",
-            label_ids: (latestMessage?.label_ids || message?.label_ids || []).filter((label) => label.toUpperCase() !== "DRAFT"),
-            important: Boolean(message?.important || latestMessage?.label_ids?.includes("IMPORTANT")),
-            starred: Boolean(message?.starred || latestMessage?.label_ids?.includes("STARRED")),
-            has_attachment: Boolean(message?.has_attachment),
-            attachment_count: Number(message?.attachment_count || 0),
-          });
+            threadId,
+            draft,
+            draftEtag || undefined,
+            {
+              id: latestMessage?.id || message?.id || "",
+              thread_id: threadId,
+              mailbox,
+              internal_date: latestMessage?.internal_date || message?.internal_date || "",
+              date: message?.date || "",
+              from: latestMessage?.from || message?.from || "",
+              to: latestMessage?.to || message?.to || "",
+              subject: latestMessage?.subject || message?.subject || "",
+              label_ids: (latestMessage?.label_ids || message?.label_ids || []).filter((label) => label.toUpperCase() !== "DRAFT"),
+              important: Boolean(message?.important || latestMessage?.label_ids?.includes("IMPORTANT")),
+              starred: Boolean(message?.starred || latestMessage?.label_ids?.includes("STARRED")),
+              has_attachment: Boolean(message?.has_attachment),
+              attachment_count: Number(message?.attachment_count || 0),
+            },
+            toPersistedOutgoingAttachments(composerAttachments),
+          );
           if (editSequence !== draftEditSequenceRef.current) return;
           setDraftDirty(false);
           if (result.etag) setDraftEtag(result.etag);
@@ -1101,18 +1387,52 @@ export function MailDetailDrawer({
       void pendingSave.finally(() => pendingDraftSavesRef.current.delete(pendingSave));
     }, 500);
     return () => window.clearTimeout(timer);
-  }, [composerOpen, draft, draftDirty, draftEtag, latestMessage, mailbox, message, threadId]);
+  }, [composerAttachments, composerMode, composerOpen, draft, draftDirty, draftEtag, latestMessage, mailbox, message, threadId]);
 
   useEffect(() => {
     if (!composerOpen) return;
-    const handlePointerDown = (event: MouseEvent) => {
-      if (!composerRef.current?.contains(event.target as Node) && !draft.trim() && !sending && !aiBusy) {
-        closeComposer();
+    const collapseEmptyRecipientFields = () => {
+      const ccEmpty = replyCcOpen && !replyCc.length && !replyCcInput.trim();
+      const bccEmpty = replyBccOpen && !replyBcc.length && !replyBccInput.trim();
+      if (ccEmpty) {
+        setReplyCcOpen(false);
+        setReplyCcInput("");
       }
+      if (bccEmpty) {
+        setReplyBccOpen(false);
+        setReplyBccInput("");
+      }
+      if (ccEmpty || bccEmpty) setReplyFocusField(null);
+    };
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Element | null;
+      if (!composerRef.current?.contains(target)) return;
+      if (
+        target?.closest('[data-recipient-role="cc"], [data-recipient-role="bcc"]')
+        || target?.closest(".compose-contact-menu")
+        || target?.closest(".compose-cc-bcc-toggle")
+      ) return;
+      collapseEmptyRecipientFields();
     };
     document.addEventListener("mousedown", handlePointerDown);
     return () => document.removeEventListener("mousedown", handlePointerDown);
-  }, [aiBusy, composerOpen, draft, sending]);
+  }, [composerOpen, replyBcc, replyBccInput, replyBccOpen, replyCc, replyCcInput, replyCcOpen]);
+
+  // 编辑区展开时，点击编辑区外内容则收起
+  useEffect(() => {
+    if (!composerOpen) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Element | null;
+      if (!target) return;
+      if (footerRef.current?.contains(target)) return;
+      if (target.closest(".compose-contact-menu")) return;
+      // 附件预览层内操作不收起编辑区
+      if (target.closest(".attachment-preview-modal")) return;
+      void closeComposerRef.current();
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [composerOpen]);
 
   useEffect(() => {
     if (!insertRequest || !message || !threadId) return;
@@ -1123,14 +1443,22 @@ export function MailDetailDrawer({
       return;
     }
     onConsumeInsertRequest(nonce);
+    const targetMode = aiDraftModeRef.current;
+    setComposerMode(targetMode);
+    setModeMenuOpen(false);
     if (mode === "replace") {
       // Replace 是用户明确操作：直接覆盖编辑栏，不走 discard 或持久化草稿回填路径。
-      suppressDraftLoadForRef.current = draftStorageKey;
+      if (targetMode === "reply") suppressDraftLoadForRef.current = draftStorageKey;
       draftLoadSequenceRef.current += 1;
       setComposerOpen(true);
       draftEditSequenceRef.current += 1;
-      setDraft(artifact.body);
-      setDraftDirty(true);
+      updateComposerDraft(targetMode, (current) => ({
+        ...current,
+        body: targetMode === "forward"
+          ? buildForwardDraftBody(latestMessage || undefined, artifact.body)
+          : artifact.body,
+        dirty: true,
+      }));
       requestAnimationFrame(() => bodyRef.current?.focus());
       return;
     }
@@ -1138,10 +1466,18 @@ export function MailDetailDrawer({
     draftLoadSequenceRef.current += 1;
     setComposerOpen(true);
     draftEditSequenceRef.current += 1;
-    setDraft((current) => mergeDraftArtifactBody(current, artifact.body, mode));
-    setDraftDirty(true);
+    updateComposerDraft(targetMode, (current) => ({
+      ...current,
+      body: targetMode === "forward"
+        ? buildForwardDraftBody(
+            latestMessage || undefined,
+            mergeDraftArtifactBody(stripForwardedMessageBlock(current.body), artifact.body, mode),
+          )
+        : mergeDraftArtifactBody(current.body, artifact.body, mode),
+      dirty: true,
+    }));
     requestAnimationFrame(() => bodyRef.current?.focus());
-  }, [draft, draftStorageKey, insertRequest, mailbox, message, onConsumeInsertRequest, showToast, threadId]);
+  }, [composerDrafts.reply.body, draftStorageKey, insertRequest, mailbox, message, onConsumeInsertRequest, showToast, threadId]);
 
   const refreshThread = async () => {
     if (!threadId || !messageId) return;
@@ -1508,6 +1844,17 @@ export function MailDetailDrawer({
     });
   };
 
+  const requestAiDraft = () => {
+    aiDraftModeRef.current = composerMode;
+    void submitPrompt(
+      composerMode === "forward"
+        ? "Write a concise note to accompany forwarding the current thread"
+        : "Write a first draft reply to the current thread",
+      "draft_reply",
+      true,
+    );
+  };
+
   const expandOverview = () => {
     void submitPrompt("Summarize this thread", "summary", true);
   };
@@ -1522,8 +1869,180 @@ export function MailDetailDrawer({
       .finally(() => setAssistLoading(false));
   };
 
+  const openComposer = (mode: ComposerMode = "reply") => {
+    setComposerClosing(false);
+    setComposerOpen(true);
+    setModeMenuOpen(false);
+    if (mode === "forward") {
+      setComposerMode("forward");
+      // 转发：用户说明区为空 + 自动附加引用块（不含附件）
+      updateComposerDraft("forward", (current) => ({
+        ...current,
+        body: current.body || buildForwardDraftBody(latestMessage || undefined, ""),
+        dirty: false,
+      }));
+      requestAnimationFrame(() => bodyRef.current?.focus());
+      return;
+    }
+    setComposerMode("reply");
+    requestAnimationFrame(() => bodyRef.current?.focus());
+  };
+
+  const switchComposerMode = (mode: ComposerMode) => {
+    setModeMenuOpen(false);
+    if (mode === composerMode) return;
+    if (mode === "forward") {
+      setComposerMode("forward");
+      updateComposerDraft("forward", (current) => ({
+        ...current,
+        body: current.body || buildForwardDraftBody(latestMessage || undefined, ""),
+        dirty: false,
+      }));
+      return;
+    }
+    clearEmptyForwardDraft();
+    setComposerMode("reply");
+  };
+
+  const stageComposerFiles = async (files: FileList) => {
+    const list = Array.from(files);
+    if (!list.length) return;
+    let runningTotal = totalOutgoingAttachmentBytes(composerAttachments.filter((item) => item.status !== "error"));
+    for (const file of list) {
+      if (isBlockedOutgoingFilename(file.name)) {
+        showToast(`Blocked file type: ${file.name}`);
+        continue;
+      }
+      if (runningTotal + file.size > OUTGOING_ATTACHMENT_TOTAL_MAX_BYTES) {
+        showToast("Total attachments must stay within 25 MB.");
+        break;
+      }
+      const tempId = crypto.randomUUID().replace(/-/g, "");
+      const localPreview = isImageOutgoingAttachment({ filename: file.name, mime_type: file.type })
+        ? URL.createObjectURL(file)
+        : "";
+      setComposerAttachments((current) => [
+        ...current,
+        {
+          id: tempId,
+          filename: file.name,
+          mime_type: file.type || "application/octet-stream",
+          size: file.size,
+          storage_key: "",
+          preview_url: localPreview || undefined,
+          status: "uploading",
+          progress: 0,
+        },
+      ]);
+      try {
+        const begun = await actions.beginStageOutgoingAttachment(mailbox, {
+          filename: file.name,
+          mime_type: file.type || "application/octet-stream",
+          size: file.size,
+          existing_total_bytes: runningTotal,
+          draft_scope: composerMode === "forward" ? "compose" : "thread",
+          draft_key: composerMode === "forward" ? activeComposerDraft.id || "" : threadId,
+        });
+        if (!begun.ok || !begun.upload_url || !begun.attachment_id || !begun.storage_key) {
+          throw new Error(begun.error || "Failed to stage attachment");
+        }
+        await putFileToUploadUrl(begun.upload_url, file, (ratio) => {
+          setComposerAttachments((current) =>
+            current.map((item) => (item.id === tempId ? { ...item, progress: ratio } : item)),
+          );
+        });
+        runningTotal += file.size;
+        setComposerAttachments((current) =>
+          current.map((item) =>
+            item.id === tempId
+              ? {
+                  ...item,
+                  id: begun.attachment_id || tempId,
+                  filename: begun.filename || file.name,
+                  mime_type: begun.mime_type || file.type || "application/octet-stream",
+                  size: begun.size || file.size,
+                  storage_key: begun.storage_key || "",
+                  status: "ready",
+                  progress: 1,
+                }
+              : item,
+          ),
+        );
+      } catch (reason) {
+        const messageText = reason instanceof Error ? reason.message : String(reason);
+        setComposerAttachments((current) =>
+          current.map((item) =>
+            item.id === tempId ? { ...item, status: "error", error: messageText, progress: 0 } : item,
+          ),
+        );
+        showToast(messageText);
+      }
+    }
+  };
+
+  const removeComposerAttachment = async (id: string) => {
+    const target = composerAttachments.find((item) => item.id === id);
+    setComposerAttachments((current) => current.filter((item) => item.id !== id));
+    if (target?.preview_url?.startsWith("blob:")) URL.revokeObjectURL(target.preview_url);
+    if (target?.storage_key) {
+      try {
+        await actions.deleteStagedOutgoingAttachment(mailbox, target.storage_key);
+      } catch {
+        // ignore cleanup failure
+      }
+    }
+  };
+
   const sendReply = async () => {
-    if (!threadId || !draft.trim() || !latestMessage) return;
+    if (!message || !threadId || !draft.trim() || !latestMessage) return;
+    if (composerAttachments.some((item) => item.status === "uploading")) {
+      showToast("Wait for attachments to finish uploading.");
+      return;
+    }
+    const readyAttachments = toPersistedOutgoingAttachments(composerAttachments);
+    if (composerMode === "forward") {
+      if (!forwardTo.length) {
+        showToast("Add at least one recipient to forward.");
+        return;
+      }
+      setSending(true);
+      try {
+        // 发送时用原信 HTML 组装 multipart，保留排版；编辑栏仍是纯文本预览
+        let source = latestMessage;
+        if (source.body_truncated || (!source.body_html && source.id)) {
+          try {
+            const display = await resolveDisplayBodyPayload(
+              await loadInboxMessageDisplayBody(mailbox, source.id),
+            );
+            source = {
+              ...source,
+              body_html: display.body_html || source.body_html,
+              body_text: display.body_text || source.body_text,
+              body_truncated: Boolean(display.body_truncated),
+            };
+          } catch {
+            // 拉全文失败时仍按当前正文转发
+          }
+        }
+        const sendBodies = buildForwardSendBodies(source, draft);
+        if (onScheduleForward({
+          mailbox,
+          recipients: forwardTo,
+          cc: replyCc,
+          bcc: replyBcc,
+          subject: buildForwardSubject(source.subject || message.subject || page?.subject),
+          body: sendBodies.body,
+          body_html: sendBodies.body_html,
+          message,
+          attachments: readyAttachments,
+        })) return;
+        setSending(false);
+      } catch (reason) {
+        showToast(reason instanceof Error ? reason.message : String(reason));
+        setSending(false);
+      }
+      return;
+    }
     const to = deriveReplyToAddress(latestMessage, mailbox);
     if (!to) {
       showToast("Reply recipient is unavailable.");
@@ -1531,39 +2050,89 @@ export function MailDetailDrawer({
     }
     setSending(true);
     try {
-      const result = await sendInboxThreadReply({ mailbox, threadId, to, body: draft, replyMode: "reply_to_sender", dryRun: false });
-      if (!result.ok) throw new Error(result.error || "Failed to send reply");
-      if (threadId) await deleteInboxThreadDraft(mailbox, threadId);
-      setDraft("");
+      const result = await saveInboxThreadDraft(
+        mailbox,
+        threadId,
+        draft,
+        draftEtag || undefined,
+        {
+          id: latestMessage.id || message.id,
+          thread_id: threadId,
+          mailbox,
+          internal_date: latestMessage.internal_date || message.internal_date || "",
+          date: message.date || "",
+          from: latestMessage.from || message.from || "",
+          to: latestMessage.to || message.to || "",
+          subject: latestMessage.subject || message.subject || "",
+          label_ids: (latestMessage.label_ids || message.label_ids || []).filter((label) => label.toUpperCase() !== "DRAFT"),
+          important: Boolean(message.important || latestMessage.label_ids?.includes("IMPORTANT")),
+          starred: Boolean(message.starred || latestMessage.label_ids?.includes("STARRED")),
+          has_attachment: Boolean(message.has_attachment),
+          attachment_count: Number(message.attachment_count || 0),
+        },
+        readyAttachments,
+      );
+      if (result.etag) setDraftEtag(result.etag);
       setDraftDirty(false);
-      showToast("Reply sent.");
-      const refreshed = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: message?.id, limit: 5, includeDisplayBody: true, forceRefresh: true });
-      const visiblePage = withoutGmailDraftThreadMessages(refreshed);
-      queueThreadScroll(visiblePage, message?.id || "");
-      setPage(visiblePage);
+      if (onScheduleReply({
+        mailbox,
+        threadId,
+        to,
+        body: draft,
+        cc: replyCc,
+        bcc: replyBcc,
+        message,
+        attachments: readyAttachments,
+      })) return;
+      setSending(false);
     } catch (reason) {
       showToast(reason instanceof Error ? reason.message : String(reason));
-    } finally {
       setSending(false);
     }
   };
 
   const discardDraft = async () => {
-    // Discard 是显式清空：阻止当前线程的持久化草稿在关闭后重新打开编辑栏。
-    suppressDraftLoadForRef.current = draftStorageKey;
-    draftLoadSequenceRef.current += 1;
-    draftEditSequenceRef.current += 1;
-    setDraft("");
-    setDraftDirty(false);
-    setDraftEtag("");
-    closeComposer();
+    const discardMode = composerMode;
+    // Discard 是显式清空：阻止当前线程的持久化回复草稿在关闭后重新打开编辑栏。
+    if (discardMode === "reply") {
+      suppressDraftLoadForRef.current = draftStorageKey;
+      draftLoadSequenceRef.current += 1;
+      draftEditSequenceRef.current += 1;
+    }
+    updateComposerDraft(discardMode, emptyComposerDraft());
+    setComposerMode("reply");
+    setModeMenuOpen(false);
+    await closeComposer();
     setComposerExpanded(false);
     await Promise.allSettled([...pendingDraftSavesRef.current]);
-    if (threadId) await deleteInboxThreadDraft(mailbox, threadId);
+    if (discardMode === "reply" && threadId) await deleteInboxThreadDraft(mailbox, threadId);
   };
 
-  const closeThread = () => {
-    if (draftDirty && draft.trim()) showToast("Draft saved to Drafts.");
+  const closeThread = async () => {
+    const forwardDraft = composerDrafts.forward;
+    const forwardNote = stripForwardedMessageBlock(forwardDraft.body).trim();
+    if (forwardNote) {
+      try {
+        await onSaveForwardDraft({
+          id: forwardDraft.id || undefined,
+          ifMatch: forwardDraft.etag || undefined,
+          mailbox,
+          recipients: forwardDraft.recipients,
+          cc: forwardDraft.cc,
+          bcc: forwardDraft.bcc,
+          subject: buildForwardSubject(latestMessage?.subject || message?.subject || page?.subject),
+          body: forwardDraft.body,
+          sourceThreadId: threadId,
+          sourceMessageId: message?.id || "",
+        });
+      } catch (reason) {
+        showToast(reason instanceof Error ? reason.message : String(reason));
+        return;
+      }
+    } else {
+      clearEmptyForwardDraft();
+    }
+    if (composerMode === "reply" && draftDirty && draft.trim()) showToast("Draft saved to Drafts.");
     onClose();
   };
 
@@ -1577,6 +2146,16 @@ export function MailDetailDrawer({
     }
   };
 
+  const forwardNote = stripForwardedMessageBlock(draft);
+  const forwardQuote = composerMode === "forward"
+    ? buildForwardDraftBody(latestMessage || undefined, "").trimStart()
+    : "";
+  const updateForwardNote = (value: string) => {
+    draftEditSequenceRef.current += 1;
+    setDraft(buildForwardDraftBody(latestMessage || undefined, value));
+    setDraftDirty(true);
+  };
+
   if (!message) return null;
 
   const composerVisible = composerOpen || composerClosing;
@@ -1586,7 +2165,7 @@ export function MailDetailDrawer({
       <aside className={`mail-detail-drawer ${open ? "is-open" : ""}`} aria-hidden={!open}>
         <header className="mail-detail-header">
           <div className="mail-detail-toolbar">
-            <button aria-label="Close thread" data-tooltip="Close thread" onClick={closeThread}><CloseThreadIcon /></button>
+            <button aria-label="Close thread" data-tooltip="Close thread" onClick={() => void closeThread()}><CloseThreadIcon /></button>
             {trashed ? (
               <button className="is-active is-trashed" aria-label="Remove from trash" data-tooltip="Remove from trash" disabled={toolbarPending} onClick={() => void runThreadAction("untrash")}><TrashOffIcon /></button>
             ) : (
@@ -1611,12 +2190,6 @@ export function MailDetailDrawer({
             <h2>{displaySubject}</h2>
             {subjectWasModified ? (
               <p className="mail-detail-subject-note">Latest message subject: {latestSubject}</p>
-            ) : null}
-            {hasThreadUpdate ? (
-              <div className="mail-detail-update-banner" role="status">
-                <span>Newer mail is available in this thread.</span>
-                <button onClick={() => void refreshThread()}>Update thread</button>
-              </div>
             ) : null}
             <div className="mail-detail-overview">
               {assistLoading ? <p className="mail-detail-overview-loading">Generating overview...</p> : assist?.overview ? <MailOverviewAction text={assist.overview} onClick={expandOverview} /> : assistError ? <p>AI is unavailable. <button onClick={retryOverview}>Retry</button></p> : null}
@@ -1705,18 +2278,120 @@ export function MailDetailDrawer({
         <footer ref={footerRef} className={`mail-detail-footer ${composerVisible ? "is-composer-open" : ""} ${composerClosing ? "is-composer-closing" : ""} ${composerExpanded ? "is-expanded" : ""}`}>
           <div className="mail-detail-reply">
             {!composerVisible ? (
-              <button className="mail-detail-reply-toggle" onClick={() => {
-                setComposerOpen(true);
-                requestAnimationFrame(() => bodyRef.current?.focus());
-              }}>
-                <span>Reply to {deriveReplyToAddress(latestMessage, mailbox) || "thread"}</span>
-                <strong>Reply</strong>
-              </button>
+              <div className="mail-detail-reply-bar">
+                <button
+                  type="button"
+                  className="mail-detail-reply-action"
+                  aria-label="Reply"
+                  data-tooltip="Reply"
+                  onClick={() => openComposer("reply")}
+                >
+                  <ReplyModeIcon />
+                </button>
+                <button
+                  type="button"
+                  className="mail-detail-reply-action"
+                  aria-label="Forward"
+                  data-tooltip="Forward"
+                  onClick={() => openComposer("forward")}
+                >
+                  <ForwardModeIcon />
+                </button>
+              </div>
             ) : (
               <div className="mail-detail-composer" ref={composerRef}>
                 <div className="mail-detail-composer-head">
-                  <span>To {deriveReplyToAddress(latestMessage, mailbox) || "thread"}</span>
+                  <div className="mail-detail-composer-to-row">
+                    <div className="mail-detail-mode-switch" ref={modeMenuRef}>
+                      <button
+                        type="button"
+                        className="mail-detail-mode-btn"
+                        aria-label={composerMode === "forward" ? "Forward mode" : "Reply mode"}
+                        aria-expanded={modeMenuOpen}
+                        onClick={() => setModeMenuOpen((value) => !value)}
+                      >
+                        {composerMode === "forward" ? <ForwardModeIcon /> : <ReplyModeIcon />}
+                        <ModeChevronIcon />
+                      </button>
+                      {modeMenuOpen ? (
+                        <div className="mail-detail-mode-menu" role="menu">
+                          <button
+                            type="button"
+                            role="menuitem"
+                            className={composerMode === "reply" ? "is-active" : ""}
+                            onClick={() => switchComposerMode("reply")}
+                          >
+                            <ReplyModeIcon />
+                            <span>Reply</span>
+                          </button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            className={composerMode === "forward" ? "is-active" : ""}
+                            onClick={() => switchComposerMode("forward")}
+                          >
+                            <ForwardModeIcon />
+                            <span>Forward</span>
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                    {composerMode === "forward" ? (
+                      <div className="mail-detail-forward-to">
+                        <RecipientChipInput
+                          label="To"
+                          emails={forwardTo}
+                          onChange={setForwardTo}
+                          mailbox={mailbox}
+                          searchContacts={searchComposeContacts}
+                          fieldRole="to"
+                          placeholder="Enter a name or email"
+                        />
+                      </div>
+                    ) : (
+                      <div className="mail-detail-forward-to">
+                        <RecipientChipInput
+                          label="To"
+                          emails={replyToAddress ? [replyToAddress] : []}
+                          onChange={() => undefined}
+                          mailbox={mailbox}
+                          searchContacts={searchComposeContacts}
+                          fieldRole="to"
+                          placeholder="thread"
+                          readOnly
+                        />
+                      </div>
+                    )}
+                  </div>
                   <div>
+                    {!replyCcOpen || !replyBccOpen ? (
+                      <div className="compose-cc-bcc-toggle">
+                        {!replyCcOpen ? (
+                          <button
+                            type="button"
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => {
+                              setReplyCcOpen(true);
+                              setReplyFocusField("cc");
+                            }}
+                          >
+                            Cc
+                          </button>
+                        ) : null}
+                        {!replyBccOpen ? (
+                          <button
+                            type="button"
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => {
+                              setReplyBccOpen(true);
+                              setReplyFocusField("bcc");
+                            }}
+                          >
+                            Bcc
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
                     <button
                       className="mail-detail-composer-icon-btn"
                       aria-label={composerExpanded ? "Collapse inline" : "Expand inline"}
@@ -1725,12 +2400,13 @@ export function MailDetailDrawer({
                     >
                       {composerExpanded ? <CollapseInlineIcon /> : <ExpandInlineIcon />}
                     </button>
+                    <OutgoingAttachButton disabled={sending} onPick={(files) => void stageComposerFiles(files)} />
                     <button
                       className="mail-detail-composer-icon-btn"
-                      aria-label="AI draft"
-                      data-tooltip="AI draft"
+                      aria-label={composerMode === "forward" ? "AI forward note" : "AI draft"}
+                      data-tooltip={composerMode === "forward" ? "AI forward note" : "AI draft"}
                       disabled={aiBusy || !context}
-                      onClick={() => void submitPrompt("Write a first draft reply to the current thread", "draft_reply", true)}
+                      onClick={requestAiDraft}
                     >
                       <AiDraftIcon />
                     </button>
@@ -1744,18 +2420,82 @@ export function MailDetailDrawer({
                     </button>
                   </div>
                 </div>
-                <textarea
-                  ref={bodyRef}
-                  value={draft}
-                  onChange={(event) => {
-                    draftEditSequenceRef.current += 1;
-                    setDraft(event.target.value);
-                    setDraftDirty(true);
-                  }}
-                  placeholder="Write your reply…"
-                />
+                {replyCcOpen ? (
+                  <RecipientChipInput
+                    label="Cc"
+                    emails={replyCc}
+                    onChange={setReplyCc}
+                    onInputValueChange={setReplyCcInput}
+                    mailbox={mailbox}
+                    searchContacts={searchComposeContacts}
+                    fieldRole="cc"
+                    autoFocus={replyFocusField === "cc"}
+                    onEmptyBlur={() => {
+                      setReplyCc([]);
+                      setReplyCcOpen(false);
+                      setReplyFocusField(null);
+                    }}
+                  />
+                ) : null}
+                {replyBccOpen ? (
+                  <RecipientChipInput
+                    label="Bcc"
+                    emails={replyBcc}
+                    onChange={setReplyBcc}
+                    onInputValueChange={setReplyBccInput}
+                    mailbox={mailbox}
+                    searchContacts={searchComposeContacts}
+                    fieldRole="bcc"
+                    autoFocus={replyFocusField === "bcc"}
+                    onEmptyBlur={() => {
+                      setReplyBcc([]);
+                      setReplyBccOpen(false);
+                      setReplyFocusField(null);
+                    }}
+                  />
+                ) : null}
+                <div className={`mail-detail-composer-body${composerMode === "forward" && forwardQuote ? " is-forward" : ""}`}>
+                  {composerMode === "forward" ? (
+                    <>
+                      <textarea
+                        ref={bodyRef}
+                        value={forwardNote}
+                        onChange={(event) => updateForwardNote(event.target.value)}
+                        placeholder="Add a message…"
+                      />
+                      {forwardQuote ? (
+                        <div className="mail-detail-forward-quote" aria-label="Forwarded email content">
+                          <pre>{forwardQuote}</pre>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <textarea
+                      ref={bodyRef}
+                      value={draft}
+                      onChange={(event) => {
+                        draftEditSequenceRef.current += 1;
+                        setDraft(event.target.value);
+                        setDraftDirty(true);
+                      }}
+                      placeholder="Write your reply…"
+                    />
+                  )}
+                </div>
+                <OutgoingAttachmentList items={composerAttachments} onRemove={(id) => void removeComposerAttachment(id)} />
                 <div className="mail-detail-composer-actions">
-                  <button className="is-primary" disabled={!draft.trim() || sending} onClick={() => void sendReply()}>{sending ? "Sending…" : "Send"}</button>
+                  <button
+                    className="is-primary"
+                    disabled={
+                      sending
+                      || !draft.trim()
+                      || (composerMode === "forward" && !forwardTo.length)
+                      || composerAttachments.some((item) => item.status === "uploading")
+                    }
+                    onClick={() => void sendReply()}
+                  >
+                    {sending ? "Sending…" : "Send"}
+                  </button>
                 </div>
               </div>
             )}

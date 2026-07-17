@@ -435,12 +435,24 @@ async def set_inbox_thread_draft(
     if_match: str | None = None,
     message: dict[str, Any] | None = None,
     updated_at: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """持久化线程草稿正文与外发附件元数据（不含文件字节）。"""
+    from mail_agent.mail_providers.gmail.outgoing_attachments import normalize_draft_attachment_meta
+
     key = _inbox_thread_draft_key(mailbox, thread_id)
+    # 未传 attachments 时保留已有附件列表，避免只改正文时丢失附件引用。
+    if attachments is None:
+        existing = await get_storage().get(key, scope=default_scope())
+        existing_value = existing.get("value") if existing.get("exists") and isinstance(existing.get("value"), dict) else {}
+        attachment_meta = normalize_draft_attachment_meta(existing_value.get("attachments"))
+    else:
+        attachment_meta = normalize_draft_attachment_meta(attachments)
     payload = {
         "thread_id": str(thread_id or ""),
         "body": str(body or ""),
         "message": message if isinstance(message, dict) else {},
+        "attachments": attachment_meta,
         "updated_at": str(updated_at or _now()),
     }
     return await get_storage().set(key, payload, scope=default_scope(), if_match=if_match)
@@ -498,12 +510,50 @@ async def set_compose_draft(
     existing = await get_storage().get(key, scope=default_scope())
     if if_match and existing.get("exists") and str(existing.get("etag") or "") != if_match:
         raise ValueError("Compose draft was changed elsewhere. Refresh and try again.")
+    def _addr_list(key: str) -> list[str]:
+        # 统一清洗 To / Cc / Bcc，最多各保留 100 个地址
+        raw = draft.get(key) or []
+        if isinstance(raw, str):
+            items = [part.strip() for part in raw.replace(";", ",").split(",") if part.strip()]
+        elif isinstance(raw, list):
+            items = [str(item).strip() for item in raw if str(item).strip()]
+        else:
+            items = []
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in items:
+            email = item.lower()
+            if email in seen:
+                continue
+            seen.add(email)
+            result.append(email)
+            if len(result) >= 100:
+                break
+        return result
+
+    # Compose Draft 既支持普通新邮件，也支持从线程详情保存的 Forward 草稿；
+    # 路由元数据必须和正文一起持久化，前端才能在 Drafts 中回到原线程。
+    # 外发附件只存元数据 + storage_key，字节在本地 stage 目录。
+    from mail_agent.mail_providers.gmail.outgoing_attachments import normalize_draft_attachment_meta
+
+    if "attachments" in draft:
+        attachment_meta = normalize_draft_attachment_meta(draft.get("attachments"))
+    else:
+        existing_value = existing.get("value") if existing.get("exists") and isinstance(existing.get("value"), dict) else {}
+        attachment_meta = normalize_draft_attachment_meta(existing_value.get("attachments"))
     payload = {
         "id": draft_id,
         "mailbox": str(mailbox or "").strip().lower(),
-        "recipients": [str(item).strip() for item in (draft.get("recipients") or []) if str(item).strip()][:100],
+        "draft_mode": "forward" if str(draft.get("draft_mode") or "").strip().lower() == "forward" else "compose",
+        "source_thread_id": str(draft.get("source_thread_id") or "").strip(),
+        "source_message_id": str(draft.get("source_message_id") or "").strip(),
+        "recipients": _addr_list("recipients"),
+        "cc": _addr_list("cc"),
+        "bcc": _addr_list("bcc"),
         "subject": str(draft.get("subject") or "")[:998],
         "body": str(draft.get("body") or ""),
+        "body_html": str(draft.get("body_html") or ""),
+        "attachments": attachment_meta,
         "created_at": str(draft.get("created_at") or (existing.get("value") or {}).get("created_at") or _now()),
         "updated_at": _now(),
     }

@@ -302,6 +302,36 @@ async def main_async() -> None:
         check("preview tool uses dedicated preview route", "/preview/" in str(preview_result["preview_url"]))
         check("preview tool does not expose a download route", "/download/" not in str(preview_result["preview_url"]))
 
+        gmail_adapter.find_attachment_for_token = lambda message, token: {
+            "id": token,
+            "message_id": str(message.get("id") or ""),
+            "filename": "archive.zip",
+            "mime_type": "application/zip",
+            "size": len(b"archive-bytes"),
+            "gmail_attachment_id": "gmail-att-unsupported",
+        }
+        unsupported_preview = await v2_tools._handle_v2_tool(
+            "prepare_inbox_attachment_access",
+            {
+                "mailbox": "User@Example.com",
+                "message_id": "msg-unsupported",
+                "attachment_id": "token-unsupported",
+                "mode": "preview",
+            },
+            "invoke-unsupported",
+        )
+        check("unsupported preview is rejected by backend", unsupported_preview["ok"] is False)
+        check("unsupported preview explains download fallback", "Download" in unsupported_preview["error"])
+
+        gmail_adapter.find_attachment_for_token = lambda message, token: {
+            "id": token,
+            "message_id": str(message.get("id") or ""),
+            "filename": "report.pdf",
+            "mime_type": "application/octet-stream",
+            "size": len(b"preview-bytes"),
+            "gmail_attachment_id": "gmail-att-1",
+        }
+
         async def _raise_upload(*args: Any, **kwargs: Any) -> dict[str, Any]:
             raise RuntimeError("host upload unavailable")
 

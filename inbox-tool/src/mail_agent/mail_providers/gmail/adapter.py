@@ -17,6 +17,7 @@ import ssl
 import sys
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -54,7 +55,10 @@ def _gmail_endpoint_kind(path: str) -> str:
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
-_gmail_request_token: ContextVar[str | None] = ContextVar("gmail_request_token", default=None)
+# 短期 token 仅在 _gmail_request_token_scope 内复用，值为 (mailbox, access_token)。
+# 绑定邮箱可防止 worker 线程复用上一邮箱的凭据；scope 外既不读也不写，避免跨 invoke 泄漏。
+_gmail_request_token: ContextVar[tuple[str, str] | None] = ContextVar("gmail_request_token", default=None)
+_gmail_request_token_scope_active: ContextVar[bool] = ContextVar("gmail_request_token_scope_active", default=False)
 _history_sync_locks: dict[str, threading.Lock] = {}
 _history_sync_locks_guard = threading.Lock()
 
@@ -68,13 +72,23 @@ class GmailApiError(ValueError):
 
 
 @contextmanager
-def _gmail_request_token_scope(access_token: str | None = None):
-    """仅在当前业务调用链内复用短期 token，退出作用域立即清除。"""
-    marker = _gmail_request_token.set(access_token)
+def _gmail_request_token_scope(access_token: str | None = None, *, mailbox: str = ""):
+    """仅在当前业务调用链内复用短期 token，退出作用域立即清除。
+
+    access_token 可预置；mailbox 用于绑定，缺省时由首个 gmail_request 写入实际邮箱。
+    """
+    normalized_mailbox = str(mailbox or "").strip().lower()
+    initial: tuple[str, str] | None = None
+    if access_token:
+        # 允许先注入 token、后由首个请求补全 mailbox 绑定。
+        initial = (normalized_mailbox, str(access_token))
+    token_marker = _gmail_request_token.set(initial)
+    active_marker = _gmail_request_token_scope_active.set(True)
     try:
         yield
     finally:
-        _gmail_request_token.reset(marker)
+        _gmail_request_token.reset(token_marker)
+        _gmail_request_token_scope_active.reset(active_marker)
 
 
 def beijing_now() -> str:
@@ -654,12 +668,20 @@ def message_summary(message: dict[str, Any]) -> dict[str, Any]:
         "date", "from", "to", "cc", "bcc", "subject", "message_id",
         "in_reply_to", "references", "label_ids", "snippet",
         "size_estimate", "mime_type", "attachments", "fetched_at",
+        "headers_complete", "metadata_refreshed_at", "attachment_scan_version",
     ]
     summary = {key: message.get(key) for key in summary_keys}
     summary["body_preview"] = body_text[:500]
     summary["body_length"] = len(body_text)
     summary["raw_header_count"] = len(headers)
     summary["body_cached"] = bool(message.get("_body_cached", True))
+    # 完整邮件已包含完整 MIME 树，因此即使它来自详情按需读取，写回摘要时也可
+    # 视为完成了当前版本的附件扫描，避免下一轮同步把旧摘要误判为未扫描。
+    if isinstance(message.get("payload"), dict):
+        summary["attachment_scan_version"] = max(
+            int(summary.get("attachment_scan_version") or 0),
+            ATTACHMENT_SCAN_VERSION,
+        )
     mailbox = str(message.get("mailbox") or "")
     message_id = str(message.get("id") or "")
     if summary["body_cached"]:
@@ -668,6 +690,46 @@ def message_summary(message: dict[str, Any]) -> dict[str, Any]:
         else:
             summary["json_file"] = str(_message_path(mailbox, message_id))
     return summary
+
+
+def sync_cached_message_summaries(mailbox: str, messages: list[dict[str, Any]]) -> bool:
+    """将已加载详情中的附件元数据回填到首页索引和分页缓存。
+
+    首页只读取 index/feed_pages 的轻量摘要，而线程详情会读取单封邮件的完整
+    MIME 缓存。若详情先补全了附件、摘要仍是旧版本，目录就会继续漏掉回形针。
+    本函数只更新索引中已经存在的邮件，并通过 write_index 一次性重建分页缓存，
+    避免把不属于当前首页快照的邮件意外加入目录。
+    """
+    normalized_mailbox = normalize_mailbox(mailbox)
+    detail_by_id = {
+        str(message.get("id") or ""): message
+        for message in messages
+        if isinstance(message, dict) and str(message.get("id") or "")
+    }
+    if not detail_by_id:
+        return False
+
+    cache = read_cache(normalized_mailbox)
+    cached_messages = cache.get("messages") if isinstance(cache.get("messages"), list) else []
+    changed = False
+    merged_messages: list[dict[str, Any]] = []
+    for summary in cached_messages:
+        if not isinstance(summary, dict):
+            continue
+        message_id = str(summary.get("id") or "")
+        detail = detail_by_id.get(message_id)
+        if not detail:
+            merged_messages.append(summary)
+            continue
+        # 保留 history 游标、原始主题等仅存在于摘要中的字段；完整 MIME 中的附件
+        # 元数据优先覆盖旧摘要，随后 write_index 会同步更新 feed_pages。
+        merged = {**summary, **message_summary(detail)}
+        merged_messages.append(merged)
+        changed = changed or merged != summary
+
+    if changed:
+        write_index(normalized_mailbox, merged_messages)
+    return changed
 
 
 def _internal_date_sort_key(item: dict[str, Any]) -> int:
@@ -687,17 +749,51 @@ def _thread_original_subjects(messages: list[dict[str, Any]]) -> dict[str, str]:
     return subjects
 
 
-def _compact_feed_message(message: dict[str, Any], mailbox: str, thread_subjects: dict[str, str] | None = None) -> dict[str, Any]:
-    labels = [str(label)[:80] for label in (message.get("label_ids") or [])][:32]
+def _message_attachment_count(message: dict[str, Any]) -> int:
+    """单封邮件的附件数量：attachments 列表、attachment_count 与 has_attachment 取最大。"""
     attachments = message.get("attachments") if isinstance(message.get("attachments"), list) else []
     try:
         stored_attachment_count = int(message.get("attachment_count") or 0)
     except (TypeError, ValueError):
         stored_attachment_count = 0
-    attachment_count = max(len(attachments), stored_attachment_count)
-    has_attachment = bool(attachments) or bool(message.get("has_attachment")) or attachment_count > 0
+    count = max(len(attachments), stored_attachment_count)
+    if count > 0:
+        return count
+    if bool(attachments) or bool(message.get("has_attachment")):
+        return 1
+    return 0
+
+
+def _thread_attachment_index(messages: list[dict[str, Any]]) -> dict[str, int]:
+    """按 thread_id 汇总附件数量，供首页缓存页折叠后仍显示回形针。"""
+    index: dict[str, int] = {}
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        thread_id = str(item.get("thread_id") or "").strip()
+        if not thread_id:
+            continue
+        count = _message_attachment_count(item)
+        if count <= 0:
+            continue
+        index[thread_id] = max(index.get(thread_id) or 0, count)
+    return index
+
+
+def _compact_feed_message(
+    message: dict[str, Any],
+    mailbox: str,
+    thread_subjects: dict[str, str] | None = None,
+    thread_attachments: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    labels = [str(label)[:80] for label in (message.get("label_ids") or [])][:32]
+    attachment_count = _message_attachment_count(message)
     latest_subject = str(message.get("subject") or "").strip()
     thread_id = str(message.get("thread_id") or "").strip()
+    # 同线程任一封有附件时继承线程级标记，避免仅最新回信无附件时列表丢图标
+    if thread_id and thread_attachments:
+        attachment_count = max(attachment_count, int(thread_attachments.get(thread_id) or 0))
+    has_attachment = attachment_count > 0
     subject = str((thread_subjects or {}).get(thread_id) or message.get("original_subject") or latest_subject)
     return {
         "id": str(message.get("id") or "")[:128],
@@ -724,7 +820,11 @@ def _compact_feed_message(message: dict[str, Any], mailbox: str, thread_subjects
 def _build_feed_page_metadata(mailbox: str, messages: list[dict[str, Any]], updated_at: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     ordered = sorted(messages, key=_internal_date_sort_key, reverse=True)
     thread_subjects = _thread_original_subjects(messages)
-    compact_messages = [_compact_feed_message(message, mailbox, thread_subjects) for message in ordered]
+    thread_attachments = _thread_attachment_index(messages)
+    compact_messages = [
+        _compact_feed_message(message, mailbox, thread_subjects, thread_attachments)
+        for message in ordered
+    ]
     pages: list[dict[str, Any]] = []
     page_payloads: list[dict[str, Any]] = []
     for page_number, start in enumerate(range(0, len(compact_messages), CACHED_FEED_PAGE_SIZE)):
@@ -851,6 +951,8 @@ def get_cached_feed_page(mailbox: str, page_number: int) -> dict[str, Any]:
 
 
 SUMMARY_METADATA_REFRESH_SECONDS = 30 * 60
+# 变更附件扫描字段或 MIME 遍历策略时递增；旧缓存会在下一次同步自动补扫。
+ATTACHMENT_SCAN_VERSION = 1
 SUMMARY_FETCH_MAX_WORKERS = 20
 GMAIL_PAGE_SUMMARY_FETCH_MAX_WORKERS = 20
 CACHED_FEED_PAGE_SIZE = 100
@@ -990,7 +1092,15 @@ def get_access_token(
     platform_token_timeout_seconds: float = 35.0,
     token_refresh_timeout_seconds: float | None = None,
     refresh_platform_accounts: bool = True,
+    force_refresh: bool = False,
 ) -> str:
+    """解析目标邮箱的 access token。
+
+    force_refresh=True 时：
+    - 平台 Connected accounts：再次 credentials/getToken（刷新由 Host 负责）
+    - multi-token / 本地 token 文件：忽略 expires_at，在有 refresh_token 时强制换票
+    用于 Gmail HTTP 401 后的一次性自愈，避免 expires_at 未到期但 token 已失效的情况。
+    """
     normalized = str(mailbox or "").strip().lower()
     started = time.monotonic()
 
@@ -1004,9 +1114,26 @@ def get_access_token(
         if resolver is None:
             raise ValueError("Platform account is available but credentials/getToken is unavailable")
         # 连通性探测传入剩余预算；正常 Gmail 业务沿用 35 秒的默认凭据预算。
-        token = resolver(str(platform_account["account_id"]), platform_token_timeout_seconds)
+        # force_refresh 时重新向 Host 要票，不在本地缓存平台 token。
+        # 切换非默认邮箱时 Host 偶发先吐出缓存废票；401 自愈路径下短暂等待再换票，
+        # 给上游 OAuth 刷新留窗口（不是“切换太慢”，而是废票窗口）。
+        account_id = str(platform_account["account_id"])
+        if force_refresh:
+            time.sleep(0.4)
+        token = resolver(account_id, platform_token_timeout_seconds)
+        if force_refresh and token:
+            # 同一次 force 再要一次：Host 有时第一次仍返回刚被 Gmail 拒绝的缓存票。
+            time.sleep(0.25)
+            second = resolver(account_id, platform_token_timeout_seconds)
+            if second:
+                token = second
         if token:
-            _record_diagnostic_span("gmail.token", started, source="platform_credentials")
+            _record_diagnostic_span(
+                "gmail.token",
+                started,
+                source="platform_credentials",
+                force_refresh=bool(force_refresh),
+            )
             return token
         raise ValueError(f"Platform returned no Gmail access token for {mailbox}")
 
@@ -1021,7 +1148,11 @@ def get_access_token(
                 if current is None:
                     raise ValueError(f"Gmail mailbox was unbound while resolving its token: {mailbox}")
                 record = dict(current)
-            if _should_refresh_token(record):
+            # 有 refresh_token 时，到期刷新或 401 强制换票共用同一条路径。
+            should_refresh = bool(record.get("refresh_token")) and (
+                force_refresh or _should_refresh_token(record)
+            )
+            if should_refresh:
                 try:
                     _refresh_access_token(record, timeout_seconds=token_refresh_timeout_seconds)
                 except (urllib.error.HTTPError, urllib.error.URLError, ssl.SSLError, TimeoutError) as exc:
@@ -1057,7 +1188,12 @@ def get_access_token(
             token = record.get("access_token")
             if not token:
                 raise ValueError(f"Gmail access token is missing for multi-token mailbox {mailbox}")
-            _record_diagnostic_span("gmail.token", started, source="legacy_multi")
+            _record_diagnostic_span(
+                "gmail.token",
+                started,
+                source="legacy_multi",
+                force_refresh=bool(force_refresh),
+            )
             return str(token)
 
     # Legacy single-account fallback. Platform refreshes this credential for us.
@@ -1094,7 +1230,10 @@ def get_access_token(
 
     # Local dev — read from JSON token file with refresh support.
     record = _load_token_record(mailbox)
-    if _should_refresh_token(record):
+    should_refresh_local = bool(record.get("refresh_token")) and (
+        force_refresh or _should_refresh_token(record)
+    )
+    if should_refresh_local:
         try:
             _refresh_access_token(record, timeout_seconds=token_refresh_timeout_seconds)
         except (urllib.error.HTTPError, urllib.error.URLError, ssl.SSLError, TimeoutError) as exc:
@@ -1413,6 +1552,21 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
 
 # ── Gmail API request ─────────────────────────────────────────────
 
+def _scoped_gmail_token_for_mailbox(mailbox: str) -> str | None:
+    """读取当前 scope 内绑定到目标邮箱的短期 token；scope 外或不匹配时返回 None。"""
+    if not _gmail_request_token_scope_active.get():
+        return None
+    scoped = _gmail_request_token.get()
+    if not scoped:
+        return None
+    scoped_mailbox, scoped_token = scoped
+    normalized = str(mailbox or "").strip().lower()
+    # 空 mailbox 占位表示 scope 预置了 token 但尚未绑定邮箱，允许首个请求认领。
+    if scoped_mailbox and scoped_mailbox != normalized:
+        return None
+    return str(scoped_token) if scoped_token else None
+
+
 def gmail_request(
     mailbox: str,
     path: str,
@@ -1420,40 +1574,87 @@ def gmail_request(
     *,
     access_token: str | None = None,
 ) -> dict[str, Any]:
+    """向 Gmail REST API 发起 GET。
+
+    未显式传入 access_token 时，若收到 HTTP 401，会清空当前 ContextVar 中的短期
+    token、force_refresh 换票后仅重试一次；调用方显式传入 token 时不自动换票。
+    短期 token 仅在 _gmail_request_token_scope 内按 mailbox 复用，禁止跨邮箱/跨 invoke 泄漏。
+    """
     # 调用方可在一个受限业务请求内复用已取得的短期 token，减少平台
     # credentials/getToken 的反向 RPC 数量；未传入时保留原有按请求解析行为。
-    scoped_token = _gmail_request_token.get()
-    token = access_token or scoped_token or get_access_token(mailbox)
-    # 第一个 Gmail 请求取得 token 后写入当前受限上下文，后续同批请求及复制出的
-    # 摘要 worker 都可复用；外层 scope 退出时会恢复，不会残留在进程全局状态。
-    if not access_token and not scoped_token:
-        _gmail_request_token.set(token)
-    url = GMAIL_API_BASE + path
-    if query:
-        url += "?" + urllib.parse.urlencode(query, doseq=True)
-    req = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-        method="GET",
-    )
-    started = time.monotonic()
+    retried_auth = False
     endpoint = _gmail_endpoint_kind(path)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            raw = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        _record_diagnostic_span("gmail.http", started, outcome="error", endpoint=endpoint, http_status=exc.code, error_type=type(exc).__name__)
+    normalized_mailbox = str(mailbox or "").strip().lower()
+    while True:
+        # 仅在活跃 scope 且邮箱匹配时复用；401 重试时强制换票。
+        scoped_token = None if retried_auth else _scoped_gmail_token_for_mailbox(normalized_mailbox)
+        token = access_token or scoped_token or get_access_token(mailbox, force_refresh=retried_auth)
+        # 第一个 Gmail 请求取得 token 后写入当前受限上下文，后续同批请求及复制出的
+        # 摘要 worker 都可复用；外层 scope 退出时会恢复，不会残留在进程全局状态。
+        # 401 自愈成功后也要写回，避免同批后续请求继续使用失效票。
+        # scope 外绝不写入，防止 ThreadPool worker 线程把上一 invoke 的 token 留给下一邮箱。
+        if not access_token and _gmail_request_token_scope_active.get() and (retried_auth or not scoped_token):
+            _gmail_request_token.set((normalized_mailbox, str(token)))
+        url = GMAIL_API_BASE + path
+        if query:
+            url += "?" + urllib.parse.urlencode(query, doseq=True)
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            method="GET",
+        )
+        started = time.monotonic()
         try:
-            detail = exc.read().decode("utf-8")
-            detail_json = json.loads(detail) if detail else {"status_code": exc.code}
-        except Exception:
-            detail_json = {"status_code": exc.code}
-        raise GmailApiError(exc.code, f"Gmail API request failed: {exc.code} {detail_json}") from exc
-    except Exception as exc:
-        _record_diagnostic_span("gmail.http", started, outcome="error", endpoint=endpoint, error_type=type(exc).__name__)
-        raise
-    _record_diagnostic_span("gmail.http", started, endpoint=endpoint)
-    return json.loads(raw) if raw else {}
+            with urllib.request.urlopen(req, timeout=60) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8")
+                detail_json = json.loads(detail) if detail else {"status_code": exc.code}
+            except Exception:
+                detail_json = {"status_code": exc.code}
+            # 仅在未由调用方固定 token 时自愈；显式 access_token 由上层决定生命周期。
+            if exc.code == 401 and not retried_auth and not access_token:
+                logging.getLogger("mail_agent.gmail").warning(
+                    "Gmail HTTP 401 on %s; clearing scoped token and forcing refresh once",
+                    endpoint,
+                )
+                _record_diagnostic_span(
+                    "gmail.http",
+                    started,
+                    outcome="error",
+                    endpoint=endpoint,
+                    http_status=401,
+                    error_type=type(exc).__name__,
+                    auth_retry="scheduled",
+                )
+                # 丢弃同批复用的失效票，下一轮 get_access_token(force_refresh=True)
+                if _gmail_request_token_scope_active.get():
+                    _gmail_request_token.set(None)
+                # 平台 Connected accounts 换票需要极短冷却，立即连打两次 getToken 常仍是废票。
+                time.sleep(0.25)
+                retried_auth = True
+                continue
+            _record_diagnostic_span(
+                "gmail.http",
+                started,
+                outcome="error",
+                endpoint=endpoint,
+                http_status=exc.code,
+                error_type=type(exc).__name__,
+                auth_retry="exhausted" if retried_auth else "none",
+            )
+            raise GmailApiError(exc.code, f"Gmail API request failed: {exc.code} {detail_json}") from exc
+        except Exception as exc:
+            _record_diagnostic_span("gmail.http", started, outcome="error", endpoint=endpoint, error_type=type(exc).__name__)
+            raise
+        _record_diagnostic_span(
+            "gmail.http",
+            started,
+            endpoint=endpoint,
+            auth_retry="recovered" if retried_auth else "none",
+        )
+        return json.loads(raw) if raw else {}
 
 
 # ── Gmail message parsing ─────────────────────────────────────────
@@ -2006,6 +2207,20 @@ def fetch_and_cache_message(mailbox: str, message_id: str) -> dict[str, Any] | N
     return normalized
 
 
+def _summary_mime_fields() -> str:
+    """构造首次扫描使用的有限层 MIME 字段选择，明确排除 body.data。
+
+    Gmail 的 metadata 格式只保证返回信头，附件通常位于 payload.parts 中。这里使用
+    full 格式读取 MIME 结构，但 partial response 只保留文件名、附件 ID 和大小，
+    不会把正文或附件字节放进同步响应。六层可覆盖常见的 mixed/alternative/related
+    嵌套；真正的字节仍仅在用户预览或下载时按需获取。
+    """
+    part_fields = "mimeType,filename,body(attachmentId,size)"
+    for _ in range(6):
+        part_fields = f"mimeType,filename,body(attachmentId,size),parts({part_fields})"
+    return f"payload(headers(name,value),{part_fields})"
+
+
 def fetch_message_summary(
     mailbox: str,
     message_id: str,
@@ -2013,28 +2228,18 @@ def fetch_message_summary(
     access_token: str | None = None,
     strict: bool = False,
 ) -> dict[str, Any] | None:
-    """Fetch headers, labels and attachment metadata without downloading bodies."""
-    metadata_headers = [
-        "Date",
-        "From",
-        "To",
-        "Cc",
-        "Bcc",
-        "Subject",
-        "Message-Id",
-        "In-Reply-To",
-        "References",
-    ]
+    """首次同步时读取信头与附件元数据，不下载正文或附件字节。"""
     try:
         payload = gmail_request(
             mailbox,
             f"/users/me/messages/{urllib.parse.quote(message_id, safe='')}",
             {
-                "format": "metadata",
-                "metadataHeaders": metadata_headers,
+                # metadata 格式不保证返回 payload.parts；首次目录同步必须从完整
+                # MIME 结构提取附件。fields 明确省略 body.data，不传输邮件正文。
+                "format": "full",
                 "fields": (
                     "id,threadId,historyId,labelIds,internalDate,snippet,sizeEstimate,"
-                    "payload(headers(name,value),mimeType,filename,body(attachmentId,size),parts(filename,mimeType,body(attachmentId,size)))"
+                    f"{_summary_mime_fields()}"
                 ),
             },
             access_token=access_token,
@@ -2078,6 +2283,7 @@ def fetch_message_summary(
         "body_cached": False,
         "headers_complete": True,
         "metadata_refreshed_at": int(time.time()),
+        "attachment_scan_version": ATTACHMENT_SCAN_VERSION,
     }
 
 
@@ -2094,7 +2300,8 @@ def live_search_metadata_and_cache(
     # 正式环境的 getToken 是 Host 反向 RPC。首页最多并发拉取数百封摘要，
     # 若每个 Gmail 请求各自取 token，会把一次刷新放大为数百次跨进程往返。
     # token 仅保留在当前函数及其 worker 上下文中，函数返回即释放，绝不写入缓存或日志。
-    with _gmail_request_token_scope(access_token):
+    # mailbox 绑定防止同线程切换邮箱时误复用上一账户凭据。
+    with _gmail_request_token_scope(access_token, mailbox=mailbox):
         # 使用 ContextVar 而不是给公开 helper 新增必填参数；线程池任务通过 copy_context
         # 显式继承本次 token，既避免凭据 RPC 风暴，也不影响其他并发 mailbox 请求。
         msg_ids = search_gmail(mailbox, query, max_results)
@@ -2113,6 +2320,7 @@ def live_search_metadata_and_cache(
             for message_id in msg_ids
             if message_id not in existing_by_id
             or (not existing_by_id[message_id].get("from") and not existing_by_id[message_id].get("headers_complete"))
+            or int(existing_by_id[message_id].get("attachment_scan_version") or 0) < ATTACHMENT_SCAN_VERSION
             or int(existing_by_id[message_id].get("metadata_refreshed_at") or 0) <= refresh_before
         ]
         if missing_ids:
@@ -2168,6 +2376,25 @@ def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
                 "cache_total": len(cached_messages),
                 "resync_required": True,
                 "resync_reason": "cursor_missing",
+                "updated_at": beijing_now(),
+            }
+        # History 只返回发生变化的邮件，无法主动补齐历史摘要中的附件字段。
+        # 检测到旧扫描版本时交给上层执行一次完整 All-mail 基线同步，确保首次
+        # 目录展示已经拥有附件标记，而不是等用户打开详情再发现附件。
+        if any(
+            int(item.get("attachment_scan_version") or 0) < ATTACHMENT_SCAN_VERSION
+            for item in cached_messages
+            if isinstance(item, dict)
+        ):
+            return {
+                "mailbox": normalized,
+                "mode": "attachment_metadata_upgrade",
+                "added": 0,
+                "updated": 0,
+                "deleted": 0,
+                "cache_total": len(cached_messages),
+                "resync_required": True,
+                "resync_reason": "attachment_metadata_upgrade",
                 "updated_at": beijing_now(),
             }
 
@@ -2243,8 +2470,19 @@ def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
             if not summary:
                 raise RuntimeError(f"Gmail returned no metadata for changed message {message_id}")
             if message_id in by_id:
-                # 保留已有摘要中正文缓存、原始主题等本地字段，只覆盖 Gmail 权威 metadata。
-                by_id[message_id] = {**by_id[message_id], **summary}
+                # 合并 Gmail 权威 metadata，但不得用更浅的附件列表覆盖更完整缓存，
+                # 也不得把已有 body_cached 误标成 False（正文可能仍在 message cache 中）。
+                existing = by_id[message_id]
+                merged = {**existing, **summary}
+                existing_atts = existing.get("attachments") if isinstance(existing.get("attachments"), list) else []
+                summary_atts = summary.get("attachments") if isinstance(summary.get("attachments"), list) else []
+                if existing_atts and (not summary_atts or len(existing_atts) > len(summary_atts)):
+                    merged["attachments"] = existing_atts
+                if existing.get("body_cached") and not summary.get("body_cached"):
+                    merged["body_cached"] = True
+                if existing.get("original_subject") and not summary.get("original_subject"):
+                    merged["original_subject"] = existing.get("original_subject")
+                by_id[message_id] = merged
                 updated += 1
             else:
                 by_id[message_id] = summary
@@ -2406,70 +2644,72 @@ def live_search_and_cache(
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    msg_ids = search_gmail(mailbox, query, max_results)
-    if not msg_ids:
-        return []
+    # 全文拉取与搜索共用同一 scope，确保 worker 仅复用本邮箱 token，退出即清除。
+    with _gmail_request_token_scope(mailbox=mailbox):
+        msg_ids = search_gmail(mailbox, query, max_results)
+        if not msg_ids:
+            return []
 
-    existing = read_cache(mailbox)
-    existing_by_id: dict[str, dict[str, Any]] = {
-        str(item.get("id")): item for item in existing["messages"] if item.get("id")
-    }
-    cached_ids = set(existing_by_id.keys())
+        existing = read_cache(mailbox)
+        existing_by_id: dict[str, dict[str, Any]] = {
+            str(item.get("id")): item for item in existing["messages"] if item.get("id")
+        }
+        cached_ids = set(existing_by_id.keys())
 
-    # Split into cached (process in order) and uncached (fetch concurrently)
-    uncached_to_fetch: list[str] = []
-    ordered: list[dict[str, Any]] = []
-    for msg_id in msg_ids:
-        if msg_id in cached_ids:
-            ordered.append(existing_by_id[msg_id])
-        else:
-            uncached_to_fetch.append(msg_id)
-            ordered.append({})  # placeholder, filled after concurrent fetch
+        # Split into cached (process in order) and uncached (fetch concurrently)
+        uncached_to_fetch: list[str] = []
+        ordered: list[dict[str, Any]] = []
+        for msg_id in msg_ids:
+            if msg_id in cached_ids:
+                ordered.append(existing_by_id[msg_id])
+            else:
+                uncached_to_fetch.append(msg_id)
+                ordered.append({})  # placeholder, filled after concurrent fetch
 
-    # Fetch uncached messages concurrently
-    if uncached_to_fetch:
-        fetched: dict[str, dict[str, Any]] = {}
-        # 首次 Gmail 搜索已在当前上下文取得短期 token；复制上下文给全文 worker，
-        # 避免平台环境中每封邮件再次触发 credentials/getToken，并保留同一 trace。
-        worker_context = copy_context()
-        with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
-            future_to_mid = {
-                pool.submit(worker_context.copy().run, fetch_and_cache_message, mailbox, mid): mid
-                for mid in uncached_to_fetch
-            }
-            for future in as_completed(future_to_mid):
-                mid = future_to_mid[future]
-                try:
-                    result = future.result()
-                    if result:
-                        fetched[mid] = message_summary(result)
-                except Exception:
-                    pass
+        # Fetch uncached messages concurrently
+        if uncached_to_fetch:
+            fetched: dict[str, dict[str, Any]] = {}
+            # 首次 Gmail 搜索已在当前上下文取得短期 token；复制上下文给全文 worker，
+            # 避免平台环境中每封邮件再次触发 credentials/getToken，并保留同一 trace。
+            worker_context = copy_context()
+            with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
+                future_to_mid = {
+                    pool.submit(worker_context.copy().run, fetch_and_cache_message, mailbox, mid): mid
+                    for mid in uncached_to_fetch
+                }
+                for future in as_completed(future_to_mid):
+                    mid = future_to_mid[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            fetched[mid] = message_summary(result)
+                    except Exception:
+                        pass
 
-        # Fill placeholders with fetched results
-        for i, entry in enumerate(ordered):
-            if isinstance(entry, dict) and not entry:
-                mid = msg_ids[i]
-                if mid in fetched:
-                    ordered[i] = fetched[mid]
+            # Fill placeholders with fetched results
+            for i, entry in enumerate(ordered):
+                if isinstance(entry, dict) and not entry:
+                    mid = msg_ids[i]
+                    if mid in fetched:
+                        ordered[i] = fetched[mid]
 
-    # Build returned IDs respecting stop time boundary
-    returned_ids: list[str] = []
-    for mid, msg in zip(msg_ids, ordered):
-        if isinstance(msg, dict) and msg:
-            if _is_at_or_before_stop_time(msg, stop_at_internal_date):
-                break
-            returned_ids.append(mid)
+        # Build returned IDs respecting stop time boundary
+        returned_ids: list[str] = []
+        for mid, msg in zip(msg_ids, ordered):
+            if isinstance(msg, dict) and msg:
+                if _is_at_or_before_stop_time(msg, stop_at_internal_date):
+                    break
+                returned_ids.append(mid)
 
-    # Update index
-    all_cached = dict(existing_by_id)
-    for msg in ordered:
-        if isinstance(msg, dict) and msg:
-            all_cached[str(msg.get("id"))] = msg
+        # Update index
+        all_cached = dict(existing_by_id)
+        for msg in ordered:
+            if isinstance(msg, dict) and msg:
+                all_cached[str(msg.get("id"))] = msg
 
-    merged = sorted(all_cached.values(), key=lambda item: int(item.get("internal_date") or 0), reverse=True)
-    write_index(mailbox, merged)
-    return returned_ids
+        merged = sorted(all_cached.values(), key=lambda item: int(item.get("internal_date") or 0), reverse=True)
+        write_index(mailbox, merged)
+        return returned_ids
 
 
 # ── MessageLite / MessageDetail / ThreadContext ────────────────────
@@ -2615,32 +2855,165 @@ async def get_thread_context_async(mailbox: str, thread_id: str, max_messages: i
 
 # ── Send reply via Gmail API ────────────────────────────────────────
 
-def send_compose_email(mailbox: str, recipients: list[str], subject: str, body: str) -> dict[str, Any]:
-    """Send a plain-text compose message after an explicit frontend confirmation."""
-    from email.mime.text import MIMEText
+def _normalize_email_list(values: list[str] | tuple[str, ...] | str | None) -> list[str]:
+    """将收件人字段规范为去重后的邮箱列表（小写、去空白）。"""
+    if values is None:
+        return []
+    if isinstance(values, str):
+        raw_items = [part.strip() for part in re.split(r"[,;]", values) if part.strip()]
+    else:
+        raw_items = [str(item).strip() for item in values if str(item).strip()]
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        email = item.lower()
+        if email in seen:
+            continue
+        seen.add(email)
+        result.append(email)
+    return result
+
+
+def _attach_file_parts(container: Any, attachments: list[dict[str, Any]] | None) -> None:
+    """把已 stage 的外发附件挂到 MIME 容器上。"""
+    from email import encoders
+    from email.mime.base import MIMEBase
+
+    for item in attachments or []:
+        if not isinstance(item, dict):
+            continue
+        filename = str(item.get("filename") or "attachment").strip() or "attachment"
+        mime_type = str(item.get("mime_type") or "application/octet-stream").strip() or "application/octet-stream"
+        content = item.get("content")
+        if not isinstance(content, (bytes, bytearray)):
+            continue
+        maintype, _, subtype = mime_type.partition("/")
+        part = MIMEBase(maintype or "application", subtype or "octet-stream")
+        part.set_payload(bytes(content))
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+        container.attach(part)
+
+
+def _send_raw_mime(mailbox: str, raw_bytes: bytes, *, thread_id: str = "") -> dict[str, Any]:
+    """发送原始 RFC822 字节；大邮件走 media upload，避免 JSON body 膨胀。"""
     import base64 as b64
 
-    normalized_recipients = [str(item).strip() for item in recipients if str(item).strip()]
+    token = get_access_token(mailbox)
+    # 约 3MB 以上 raw 使用 media upload；含附件时通常超过此阈值。
+    use_media = len(raw_bytes) > 3 * 1024 * 1024
+    if use_media:
+        url = f"https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=media"
+        if thread_id:
+            # media 模式下 threadId 通过 query 无法直接传；改用 multipart metadata + raw。
+            boundary = f"anna_inbox_{uuid.uuid4().hex}"
+            metadata = json.dumps({"threadId": thread_id}, separators=(",", ":")).encode("utf-8")
+            body = b"".join([
+                f"--{boundary}\r\n".encode("ascii"),
+                b"Content-Type: application/json; charset=UTF-8\r\n\r\n",
+                metadata,
+                b"\r\n",
+                f"--{boundary}\r\n".encode("ascii"),
+                b"Content-Type: message/rfc822\r\n\r\n",
+                raw_bytes,
+                b"\r\n",
+                f"--{boundary}--\r\n".encode("ascii"),
+            ])
+            url = "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=multipart"
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": f"multipart/related; boundary={boundary}",
+                    "Content-Length": str(len(body)),
+                },
+                method="POST",
+            )
+        else:
+            req = urllib.request.Request(
+                url,
+                data=raw_bytes,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "message/rfc822",
+                    "Content-Length": str(len(raw_bytes)),
+                },
+                method="POST",
+            )
+    else:
+        payload: dict[str, Any] = {"raw": b64.urlsafe_b64encode(raw_bytes).decode("ascii")}
+        if thread_id:
+            payload["threadId"] = thread_id
+        req = urllib.request.Request(
+            f"{GMAIL_API_BASE}/users/me/messages/send",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            return json.loads(response.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8")
+        except Exception:
+            detail = ""
+        raise ValueError(f"Gmail send failed: HTTP {exc.code} {detail[:300]}") from exc
+
+
+def send_compose_email(
+    mailbox: str,
+    recipients: list[str],
+    subject: str,
+    body: str,
+    *,
+    cc: list[str] | str | None = None,
+    bcc: list[str] | str | None = None,
+    body_html: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """在用户明确确认后发送新邮件；支持 To / Cc / Bcc 与外发附件。
+
+    若提供 body_html，则发送 multipart/alternative（plain + html），用于转发保留原格式。
+    有附件时使用 multipart/mixed 包裹正文与附件。
+    """
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    normalized_recipients = _normalize_email_list(recipients)
+    normalized_cc = _normalize_email_list(cc)
+    normalized_bcc = _normalize_email_list(bcc)
     if not normalized_recipients:
         raise ValueError("At least one recipient is required")
-    if not str(subject).strip() or not str(body).strip():
+    plain_body = str(body or "")
+    html_body = str(body_html or "").strip()
+    if not str(subject).strip() or (not plain_body.strip() and not html_body):
         raise ValueError("Subject and content are required")
 
-    msg = MIMEText(str(body), "plain", "utf-8")
+    attachment_items = [item for item in (attachments or []) if isinstance(item, dict) and isinstance(item.get("content"), (bytes, bytearray))]
+    if html_body:
+        # multipart/alternative：客户端优先展示 HTML，纯文本作回退
+        text_root: Any = MIMEMultipart("alternative")
+        text_root.attach(MIMEText(plain_body or _html_to_text(html_body), "plain", "utf-8"))
+        text_root.attach(MIMEText(html_body, "html", "utf-8"))
+    else:
+        text_root = MIMEText(plain_body, "plain", "utf-8")
+
+    if attachment_items:
+        msg: Any = MIMEMultipart("mixed")
+        msg.attach(text_root)
+        _attach_file_parts(msg, attachment_items)
+    else:
+        msg = text_root
+
     msg["To"] = ", ".join(normalized_recipients)
+    if normalized_cc:
+        msg["Cc"] = ", ".join(normalized_cc)
+    if normalized_bcc:
+        msg["Bcc"] = ", ".join(normalized_bcc)
     msg["Subject"] = str(subject)
-    raw_b64 = b64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
-    request = urllib.request.Request(
-        f"{GMAIL_API_BASE}/users/me/messages/send",
-        data=json.dumps({"raw": raw_b64}).encode("utf-8"),
-        headers={"Authorization": f"Bearer {get_access_token(mailbox)}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8") or "{}")
-    except urllib.error.HTTPError as exc:
-        raise ValueError(f"Gmail compose send failed: HTTP {exc.code}") from exc
+    result = _send_raw_mime(mailbox, msg.as_bytes())
     return {"id": str(result.get("id") or ""), "thread_id": str(result.get("threadId") or "")}
 
 
@@ -2714,16 +3087,19 @@ def send_reply(
     *,
     reply_mode: str = "reply_to_sender",
     cc_addr: str = "",
+    bcc_addr: str = "",
+    attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Send a reply email via Gmail API.
+    """通过 Gmail API 发送回复。
 
-    WARNING: This performs a real send. Callers should default to dry_run=True
-    and only call this function after explicit user confirmation.
+    警告：会真实发信。调用方默认应 dry_run，仅在用户明确确认后关闭 dry_run。
+    cc_addr / bcc_addr 由前端显式传入；reply_all 不再单独推断抄送列表。
+    attachments 为已加载字节的附件列表（filename/mime_type/content）。
     """
+    from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
-    import base64 as b64
 
-    # Fetch the original message to get Message-ID and subject for threading
+    # 拉取原信 Message-ID / 主题，保证回复落在同一 thread
     thread_ctx = get_thread_context(mailbox, thread_id, max_messages=1)
     original_msg_id = ""
     original_subject = "Re: "
@@ -2732,7 +3108,6 @@ def send_reply(
         original_subject = latest.subject or ""
         if not original_subject.lower().startswith("re:"):
             original_subject = f"Re: {original_subject}"
-        # Try to get Message-ID from headers
         try:
             raw_msg = get_message_detail(mailbox, latest.message_id)
             if raw_msg and raw_msg.headers:
@@ -2743,46 +3118,35 @@ def send_reply(
         except Exception:
             pass
 
-    msg = MIMEText(body, "plain", "utf-8")
+    normalized_cc = _normalize_email_list(cc_addr)
+    normalized_bcc = _normalize_email_list(bcc_addr)
+    # reply_mode 保留给上层兼容；真正写入 MIME 的抄送以显式列表为准
+    _ = reply_mode
+
+    attachment_items = [item for item in (attachments or []) if isinstance(item, dict) and isinstance(item.get("content"), (bytes, bytearray))]
+    if attachment_items:
+        msg: Any = MIMEMultipart("mixed")
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        _attach_file_parts(msg, attachment_items)
+    else:
+        msg = MIMEText(body, "plain", "utf-8")
     msg["To"] = to_addr
-    if reply_mode == "reply_all" and cc_addr:
-        msg["Cc"] = cc_addr
+    if normalized_cc:
+        msg["Cc"] = ", ".join(normalized_cc)
+    if normalized_bcc:
+        msg["Bcc"] = ", ".join(normalized_bcc)
     msg["Subject"] = original_subject
     if original_msg_id:
         msg["In-Reply-To"] = original_msg_id
         msg["References"] = original_msg_id
 
-    raw_bytes = msg.as_bytes()
-    raw_b64 = b64.urlsafe_b64encode(raw_bytes).decode("ascii")
-
-    token = get_access_token(mailbox)
-    url = f"{GMAIL_API_BASE}/users/me/messages/send"
-    payload = json.dumps({"raw": raw_b64, "threadId": thread_id}).encode("utf-8")
-
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            raw = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8")
-            detail_json = json.loads(detail) if detail else {"status_code": exc.code}
-        except Exception:
-            detail_json = {"status_code": exc.code}
+        result = _send_raw_mime(mailbox, msg.as_bytes(), thread_id=thread_id)
+    except ValueError as exc:
         import sys as _sys
-        print(f"[send_reply] Gmail API error: {exc.code} {detail_json}", file=_sys.stderr)
-        raise ValueError(f"Gmail API send failed: {exc.code} {detail_json}") from exc
-
+        print(f"[send_reply] Gmail API error: {exc}", file=_sys.stderr)
+        raise
     import sys as _sys
-    result = json.loads(raw) if raw else {}
     print(f"[send_reply] Gmail API success: id={result.get('id', '?')[:20]} threadId={result.get('threadId', '?')}", file=_sys.stderr)
     return result
 

@@ -21,6 +21,13 @@ describe("mail feed overflow", () => {
 
     expect(feedRule).toContain("overflow-x: clip;");
     expect(feedRule).toContain("overflow-y: auto;");
+    expect(feedRule).toContain("scrollbar-gutter: stable;");
+  });
+
+  it("keeps webkit scrollbar chrome stable for the mail feed", () => {
+    expect(styles).toContain(".mail-feed::-webkit-scrollbar {");
+    expect(styles).toContain(".mail-feed::-webkit-scrollbar-thumb {");
+    expect(styles).toContain(".mail-feed::-webkit-scrollbar-track {");
   });
 });
 
@@ -35,5 +42,22 @@ describe("inbox selection toolbar", () => {
     expect(clearRule).toContain("height: 32px;");
     expect(tooltipRule).toContain("content: attr(data-tooltip);");
     expect(tooltipRule).toContain("top: calc(100% + 8px);");
+  });
+});
+
+describe("mail detail composer controls", () => {
+  it("uses icon reply and forward actions with visible tooltips", () => {
+    expect(styles).toContain(".mail-detail-reply-action {");
+    expect(styles).toContain(".mail-detail-reply-action::after {");
+    expect(styles).toContain(".mail-detail-footer {");
+    expect(styles).toContain("  height: 51px;");
+    expect(styles).toContain("  overflow: visible;");
+    expect(styles).toContain("bottom: calc(100% + 8px);");
+  });
+
+  it("keeps forward recipients aligned and gives the contact menu enough width", () => {
+    expect(styles).toContain(".mail-detail-forward-to .compose-field {\n  align-items: center;");
+    expect(styles).toContain(".mail-detail-forward-to .compose-contact-menu {");
+    expect(styles).toContain("width: min(420px, max(260px, calc(100vw - 48px)));");
   });
 });

@@ -13,6 +13,9 @@ async def run_custom_scan_background(run_id: str, plan: Any, arguments: dict[str
     _save_run_checkpoint(run_id)
 
     def _update_progress(stage: str, progress: dict[str, Any]) -> None:
+        # 切换邮箱等场景会 cancel_mail_agent_run；进度回调中立刻中断扫描。
+        if MAIL_AGENT_RUNS.get(run_id, {}).get("cancel_requested"):
+            raise RuntimeError("cancelled")
         partial_update = progress.pop("partial", None)
         if isinstance(partial_update, dict):
             _merge_partial(run_id, partial_update)
@@ -95,11 +98,13 @@ async def run_custom_scan_background(run_id: str, plan: Any, arguments: dict[str
         )
         await append_run_history(history_entry)
     except Exception as exc:
+        cancelled = MAIL_AGENT_RUNS.get(run_id, {}).get("cancel_requested") or str(exc) == "cancelled"
         MAIL_AGENT_RUNS[run_id].update({
             "status": "failed",
-            "stage": "failed",
+            "stage": "cancelled" if cancelled else "failed",
             "updated_at": beijing_now(),
-            "error": str(exc),
+            "error": "cancelled" if cancelled else str(exc),
+            "needs_continue": False,
         })
         _save_run_checkpoint(run_id)
 

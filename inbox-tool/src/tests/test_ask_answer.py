@@ -376,7 +376,7 @@ def test_answer_language_instruction():
 
 
 def test_english_generated_copy_rejects_chinese():
-    """源邮件字段以外的英文回答文案不得混入中文。"""
+    """源邮件字段以外的英文回答文案不得混入中文；context 允许源语言摘录。"""
     from mail_agent.ask.answer import _generated_copy_contains_chinese
 
     assert _generated_copy_contains_chinese({"title": "查找紧急邮件", "summary": "Found one urgent email."})
@@ -385,7 +385,48 @@ def test_english_generated_copy_rejects_chinese():
         "summary": "Found one urgent email.",
         "sections": [{"heading": "Immediate action", "items": [{"subject": "紧急通知", "suggestion": "Reply today."}]}],
     })
+    # 中文邮件的 context 摘录不得触发整份答案丢弃。
+    assert not _generated_copy_contains_chinese({
+        "title": "Emails that need your reply",
+        "summary": "One human thread looks open.",
+        "sections": [{
+            "heading": "Needs reply",
+            "items": [{
+                "subject": "问候一下",
+                "context": "你好，最近方便通话吗？",
+                "suggestion": "Reply with your availability.",
+            }],
+        }],
+    })
     print("[PASS] test_english_generated_copy_rejects_chinese")
+
+
+def test_scrub_chinese_generated_copy_keeps_structure():
+    """英文请求混入中文生成字段时，scrub 后应仍可用。"""
+    from mail_agent.ask.answer import _generated_copy_contains_chinese, _scrub_chinese_generated_copy
+    from mail_agent.ask.planner import AskPlan
+
+    payload = {
+        "title": "需要回复的邮件",
+        "summary": "有一封需要你回复。",
+        "sections": [{
+            "heading": "待回复",
+            "items": [{
+                "subject": "hello",
+                "context": "你好",
+                "suggestion": "请尽快回复",
+                "message_id": "m1",
+            }],
+        }],
+    }
+    cleaned = _scrub_chinese_generated_copy(
+        payload,
+        AskPlan(user_request="What needs my reply?", title="Emails that need your reply"),
+    )
+    assert not _generated_copy_contains_chinese(cleaned)
+    assert cleaned["sections"][0]["items"][0]["message_id"] == "m1"
+    assert cleaned["sections"][0]["items"][0]["context"] == "你好"
+    print("[PASS] test_scrub_chinese_generated_copy_keeps_structure")
 
 
 def test_answer_requires_synthesis_instead_of_copying_email_body():
@@ -412,7 +453,7 @@ def test_answer_fallback_uses_request_language():
 
 
 def test_empty_sampling_uses_error_fallback_not_local_mail_list():
-    """Anna 空响应时返回错误摘要，不再回退为本地邮件列表。"""
+    """无扫描证据时返回错误摘要，不编造邮件列表。"""
     from mail_agent.ask.answer import _answer_fallback
     from mail_agent.ask.planner import AskPlan
 
@@ -426,6 +467,57 @@ def test_empty_sampling_uses_error_fallback_not_local_mail_list():
     assert "matching emails" not in result["summary"].lower()
     assert "相关邮件" not in result["summary"]
     print("[PASS] test_empty_sampling_uses_error_fallback_not_local_mail_list")
+
+
+def test_answer_fallback_lists_enriched_candidates_when_llm_fails():
+    """已有扫描证据时，Answer 失败应列出真实候选而非空白错误页。"""
+    from mail_agent.ask.answer import _answer_fallback
+    from mail_agent.ask.planner import AskPlan
+
+    result = _answer_fallback(
+        AskPlan(user_request="What needs my reply?", title="Emails that need your reply", goal="draft_replies"),
+        "Expecting value: schema echo",
+        enriched=[
+            {
+                "subject": "BH68B7 is your Gravatar code",
+                "from": "Gravatar <donotreply@gravatar.com>",
+                "snippet": "Verify your email",
+                "mailbox": "owner@example.com",
+                "message_id": "noise1",
+                "thread_id": "noise1",
+            },
+            {
+                "subject": "问候一下",
+                "from": "KateQ Zhou <kateq@anna.partners>",
+                "snippet": "hello",
+                "mailbox": "owner@example.com",
+                "message_id": "m1",
+                "thread_id": "t1",
+                "date": "Jul 10, 2026",
+            },
+        ],
+    )
+
+    assert result["fallback_used"] is True
+    assert result["sections"]
+    items = result["sections"][0]["items"]
+    assert len(items) == 1
+    item = items[0]
+    assert item["subject"] == "问候一下"
+    assert item["message_id"] == "m1"
+    assert item["mail_links"][0]["thread_id"] == "t1"
+    assert "unavailable" in result["summary"].lower() or "候选" in result["summary"] or "likely" in result["summary"].lower()
+    print("[PASS] test_answer_fallback_lists_enriched_candidates_when_llm_fails")
+
+
+def test_answer_system_prompt_avoids_typescript_schema_tokens():
+    """System prompt 不得用 string/string? 类型注解，否则模型会原样回显导致 JSON 失败。"""
+    from mail_agent.ask.answer import _ASK_ANSWER_SYSTEM_PROMPT
+
+    assert "string?" not in _ASK_ANSWER_SYSTEM_PROMPT
+    assert '"title": string' not in _ASK_ANSWER_SYSTEM_PROMPT
+    assert "valid JSON" in _ASK_ANSWER_SYSTEM_PROMPT
+    print("[PASS] test_answer_system_prompt_avoids_typescript_schema_tokens")
 
 
 def test_answer_sampling_token_limit_stays_below_host_cap():
@@ -472,9 +564,12 @@ def main():
     asyncio.run(test_filter_candidates_does_not_make_a_second_sampling_call())
     test_answer_language_instruction()
     test_english_generated_copy_rejects_chinese()
+    test_scrub_chinese_generated_copy_keeps_structure()
     test_answer_requires_synthesis_instead_of_copying_email_body()
     test_answer_fallback_uses_request_language()
     test_empty_sampling_uses_error_fallback_not_local_mail_list()
+    test_answer_fallback_lists_enriched_candidates_when_llm_fails()
+    test_answer_system_prompt_avoids_typescript_schema_tokens()
     test_answer_sampling_token_limit_stays_below_host_cap()
 
     print(f"\n[ALL TESTS PASSED]")

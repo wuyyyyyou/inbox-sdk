@@ -2,7 +2,6 @@ import type {
   AttachmentDownloadPayload,
   DraftReplyArtifact,
   InboxThreadMessage,
-  InboxThreadPagePayload,
   MailAttachmentMeta,
   QuickReplySuggestion,
 } from "../../types/mail";
@@ -32,18 +31,6 @@ export interface SnoozePreset {
   id: string;
   label: string;
   at: Date;
-}
-
-export function hasNewerThreadMessage(
-  page: InboxThreadPagePayload | null,
-  latestThreadMessageId: string,
-  latestThreadInternalDate: string,
-) {
-  if (!page?.latest_message_id || !latestThreadMessageId || page.latest_message_id === latestThreadMessageId) return false;
-  const loadedLatest = page.messages.find((item) => item.id === page.latest_message_id) || page.messages[page.messages.length - 1];
-  const loadedTime = Number(loadedLatest?.internal_date || 0);
-  const knownTime = Number(latestThreadInternalDate || 0);
-  return Number.isFinite(loadedTime) && Number.isFinite(knownTime) && knownTime > loadedTime;
 }
 
 export function parseMessageDate(value?: string) {
@@ -81,24 +68,25 @@ function attachmentExtension(filename: string) {
 export function normalizeAttachmentKind(attachment: Pick<MailAttachmentMeta, "filename" | "mime_type">): AttachmentKind {
   const mime = String(attachment.mime_type || "").trim().toLowerCase();
   const extension = attachmentExtension(attachment.filename);
-  if (mime === "application/pdf" || extension === "pdf") return "pdf";
+  const useExtensionFallback = !mime || mime === "application/octet-stream";
+  if (mime === "application/pdf" || (useExtensionFallback && extension === "pdf")) return "pdf";
   if (
     mime.startsWith("image/")
-    || ["png", "jpg", "jpeg", "gif", "webp"].includes(extension)
+    || (useExtensionFallback && ["png", "jpg", "jpeg", "gif", "webp"].includes(extension))
   ) return "image";
   if (
     mime.startsWith("text/")
     || mime === "application/json"
     || mime === "text/csv"
-    || ["txt", "json", "csv", "log", "md"].includes(extension)
+    || (useExtensionFallback && ["txt", "json", "csv", "log", "md"].includes(extension))
   ) return "text";
   if (
     mime.startsWith("audio/")
-    || ["mp3", "wav"].includes(extension)
+    || (useExtensionFallback && ["mp3", "wav"].includes(extension))
   ) return "audio";
   if (
     mime.startsWith("video/")
-    || ["mp4", "webm"].includes(extension)
+    || (useExtensionFallback && ["mp4", "webm"].includes(extension))
   ) return "video";
   return "download";
 }
@@ -202,6 +190,140 @@ export function deriveReplyToAddress(message: InboxThreadMessage | undefined, ma
   if (from.email && from.email.toLowerCase() !== normalizedMailbox) return from.email;
   const recipients = splitAddresses(message.to).map(senderParts);
   return recipients.find((item) => item.email.toLowerCase() !== normalizedMailbox)?.email || from.email || "";
+}
+
+/** 界面语言：后期接中英文切换；当前先跟浏览器语言。 */
+export function uiPrefersChinese() {
+  if (typeof navigator === "undefined") return false;
+  const lang = String(navigator.language || "").toLowerCase();
+  return lang.startsWith("zh");
+}
+
+/** 生成转发主题：已有 Fwd:/转发：前缀则不重复添加。 */
+export function buildForwardSubject(subject?: string) {
+  const raw = String(subject || "").trim() || "(no subject)";
+  if (/^(fwd|fw)\s*:/i.test(raw) || /^转发\s*[:：]/.test(raw)) return raw;
+  return uiPrefersChinese() ? `转发：${raw}` : `Fwd: ${raw}`;
+}
+
+const FORWARD_BLOCK_RE =
+  /(?:^|\n)(?:-{2,}\s*(?:Forwarded message|转发的邮件)\s*-{2,})[\s\S]*$/i;
+
+/** 去掉正文中的自动转发引用块，保留用户写的说明。 */
+export function stripForwardedMessageBlock(body: string) {
+  return String(body || "").replace(FORWARD_BLOCK_RE, "").replace(/\s+$/u, "");
+}
+
+function forwardHeaderMeta(
+  message: Pick<InboxThreadMessage, "from" | "to" | "cc" | "subject" | "internal_date">,
+) {
+  const zh = uiPrefersChinese();
+  const header = zh ? "---------- 转发的邮件 ---------" : "---------- Forwarded message ---------";
+  const labels = zh
+    ? { from: "发件人", date: "日期", subject: "主题", to: "收件人", cc: "抄送" }
+    : { from: "From", date: "Date", subject: "Subject", to: "To", cc: "Cc" };
+  const date = formatAbsoluteDateTime(message.internal_date) || "";
+  return {
+    header,
+    lines: [
+      `${labels.from}: ${message.from || ""}`,
+      date ? `${labels.date}: ${date}` : "",
+      `${labels.subject}: ${message.subject || "(no subject)"}`,
+      `${labels.to}: ${message.to || ""}`,
+      message.cc ? `${labels.cc}: ${message.cc}` : "",
+    ].filter(Boolean),
+  };
+}
+
+function htmlToPlainFallback(html: string) {
+  return String(html || "")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&amp;/gi, "&")
+    .replace(/\s+\n/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function escapeHtml(value: string) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function plainNoteToHtml(note: string) {
+  const escaped = escapeHtml(note).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!escaped.trim()) return "";
+  return escaped
+    .split("\n")
+    .map((line) => (line ? `<div>${line}</div>` : "<div><br></div>"))
+    .join("");
+}
+
+/** 构造标准转发引用块（纯文本，不含用户说明；供编辑栏预览）。 */
+export function buildForwardedMessageBlock(
+  message: Pick<InboxThreadMessage, "from" | "to" | "cc" | "subject" | "internal_date" | "body_text" | "body_html"> | undefined,
+) {
+  if (!message) return "";
+  const { header, lines } = forwardHeaderMeta(message);
+  const bodyText = String(message.body_text || "").trim()
+    || htmlToPlainFallback(String(message.body_html || ""));
+  return [header, ...lines, "", bodyText].join("\n");
+}
+
+/** 用户说明 + 转发引用块（纯文本编辑栏用）。 */
+export function buildForwardDraftBody(
+  message: Pick<InboxThreadMessage, "from" | "to" | "cc" | "subject" | "internal_date" | "body_text" | "body_html"> | undefined,
+  userNote = "",
+) {
+  const note = stripForwardedMessageBlock(userNote).trimEnd();
+  const block = buildForwardedMessageBlock(message);
+  if (!block) return note;
+  if (!note) return `\n\n${block}`;
+  return `${note}\n\n${block}`;
+}
+
+/**
+ * 发送用正文：优先保留原信 HTML 格式。
+ * - body: multipart 的 text/plain 回退
+ * - body_html: text/html，内嵌原信 HTML
+ */
+export function buildForwardSendBodies(
+  message: Pick<InboxThreadMessage, "from" | "to" | "cc" | "subject" | "internal_date" | "body_text" | "body_html"> | undefined,
+  userNote = "",
+): { body: string; body_html?: string } {
+  const note = stripForwardedMessageBlock(userNote).trimEnd();
+  const plain = buildForwardDraftBody(message, note);
+  if (!message) return { body: plain };
+
+  const originalHtml = String(message.body_html || "").trim();
+  if (!originalHtml) return { body: plain };
+
+  const { header, lines } = forwardHeaderMeta(message);
+  const metaHtml = [header, ...lines]
+    .map((line) => `<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222;">${escapeHtml(line)}</div>`)
+    .join("");
+  const noteHtml = plainNoteToHtml(note);
+  const body_html = [
+    noteHtml,
+    noteHtml ? "<br>" : "",
+    `<div class="gmail_quote">`,
+    metaHtml,
+    `<br>`,
+    originalHtml,
+    `</div>`,
+  ].filter(Boolean).join("\n");
+
+  return { body: plain, body_html };
 }
 
 export function isOutboundMessageForMailbox(from: string | undefined, mailbox: string) {
