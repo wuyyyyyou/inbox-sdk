@@ -82,9 +82,16 @@ def _resolve_connectivity_future(future: Any, *, tool: str, started: float) -> d
 
 def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     tool = params.get("tool")
-    arguments = params.get("arguments") or {}
+    arguments = dict(params.get("arguments") or {})
     context = params.get("context") or {}
     invoke_id = str(params.get("invoke_id") or "")
+    # 预算授权只能来自 Host 的 invoke context，不能相信前端工具参数。
+    grant = context.get("sampling_grant") if isinstance(context, dict) else None
+    if isinstance(grant, dict):
+        arguments["_sampling_grant"] = {
+            "maxCalls": grant.get("maxCalls"),
+            "maxTokensTotal": grant.get("maxTokensTotal"),
+        }
     _apply_storage_provider(arguments)
     apply_runtime_credentials(context)
 

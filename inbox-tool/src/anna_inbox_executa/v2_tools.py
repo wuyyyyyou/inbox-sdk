@@ -684,8 +684,10 @@ INBOX_PAGE_BODY_LIMIT = INBOX_FULL_BODY_LIMIT
 # 子进程，因此这里使用 48 KiB 的业务预算，提前切换到正文 loopback URL。
 INBOX_THREAD_RESPONSE_MAX_BYTES = 48 * 1024
 INBOX_PAGE_BODY_LIMIT_STEPS = (200000, 120000, 80000, 48000, 24000, 12000, 6000, 3000, 1500, 750, 320)
-INBOX_PROMPT_MESSAGE_LIMIT = 8
-INBOX_PROMPT_BODY_LIMIT = 1200
+# 线程问答只保留最近消息的去重正文。旧值会将约 9600 字符正文连同提示词
+# 一次送入 Sampling，容易挤占模型完成 JSON / Markdown 回答所需的上下文。
+INBOX_PROMPT_MESSAGE_LIMIT = 4
+INBOX_PROMPT_BODY_LIMIT = 600
 THREAD_ASSIST_CACHE_VERSION = 2
 
 
@@ -819,24 +821,10 @@ Rules:
 - Keep a sign-off and sender name on consecutive lines with no blank line between them.
 """
 
-MAIL_SUMMARY_SYSTEM = """You are Anna, an executive email assistant summarizing a Gmail thread.
-
-Return JSON only:
-{
-  "assistant_text": "concise factual summary of the thread"
-}
-
-Rules:
-- Follow the Response language instruction in the user message exactly.
-- Summarize the email conversation only.
-- Do not write or offer a draft reply.
-- Do not mention drafting, draft buttons, or reply artifacts.
-- Include concrete participants, asks, decisions, deadlines, and current status when available.
-- Use only Markdown headings, bold text, ordered or unordered lists, and HTTP/HTTPS links in the form [label](https://example.com). Do not use HTML, tables, images, code blocks, or block quotes. If the user requests an unsupported format, say so and offer an equivalent using the supported formats.
-- When referring to this Gmail thread, replace <Thread ID> with the Thread ID from the prompt and use the exact token [THREAD_REF_<Thread ID>] so the sidebar can open it.
-- Do not invent dates, commitments, prices, or factual claims.
-- Never include HTML.
-"""
+MAIL_SUMMARY_SYSTEM = """Summarize the provided Gmail thread using only its evidence.
+Return one JSON object with exactly one field: {"markdown": string}.
+markdown must be a complete concise Markdown summary with factual full sentences.
+Do not draft, send, or suggest state changes. Follow the requested response language."""
 
 
 _DRAFT_SIGNOFF_BLANK_LINE_RE = re.compile(
@@ -1268,22 +1256,6 @@ def _one_line_overview(value: Any, *, max_chars: int = 220) -> str:
     return clipped or text[:max_chars].strip()
 
 
-def _fallback_thread_overview(messages: list[dict[str, Any]], anchor_message_id: str = "") -> str:
-    if not messages:
-        return ""
-    anchor_message = _find_thread_message(messages, anchor_message_id) if anchor_message_id else None
-    target = anchor_message or messages[-1]
-    subject = str(target.get("subject") or messages[-1].get("subject") or "").strip()
-    snippet = str(target.get("snippet") or messages[-1].get("snippet") or "").strip()
-    if not snippet:
-        display = _display_body_payload(target, limit=260, prefer_html=False)
-        snippet = str(display.get("body_text") or "").strip()
-    candidate = snippet or subject
-    if subject and candidate and subject.lower() not in candidate.lower():
-        candidate = f"{subject}: {candidate}"
-    return _one_line_overview(candidate)
-
-
 async def _load_contact_context_for_thread(
     *,
     mailbox: str,
@@ -1396,7 +1368,6 @@ async def _generate_thread_assist_result(
     messages = _visible_thread_messages(_load_thread_messages(mailbox, thread_id))
     if not messages:
         raise ValueError(f"Thread {thread_id} not found")
-    fallback_overview = _fallback_thread_overview(messages, anchor_message_id)
     overview_result = await call_llm_json_safe(
         sampling_create_message,
         system_prompt=THREAD_ASSIST_SYSTEM,
@@ -1406,16 +1377,21 @@ async def _generate_thread_assist_result(
             f"Participants: {'; '.join(_thread_participants(messages))}\n"
             f"Thread messages:\n{_thread_prompt_excerpt(messages)}\n"
         ),
-        fallback={"overview": fallback_overview, "quick_replies": []},
+        # 概览必须是完整的模型总结；不可用时让后台 run 失败并由详情页显示
+        # Retry，不能把主题、snippet 或正文片段伪装成 AI 概览。
+        fallback={},
         temperature=0.2,
         max_tokens=320,
         timeout=45.0,
         metadata={"tool": "inbox_thread_assist", "thread_id": thread_id},
+        allow_fallback=False,
         max_attempts=1,
     )
     payload = overview_result.get("payload") if isinstance(overview_result.get("payload"), dict) else {}
-    overview = _one_line_overview(payload.get("overview") or fallback_overview)
-    quick_replies = [] if overview_result.get("fallback_used") else _normalize_quick_replies(payload.get("quick_replies"))
+    overview = _one_line_overview(payload.get("overview"))
+    if not overview:
+        raise RuntimeError("analysis_unavailable")
+    quick_replies = _normalize_quick_replies(payload.get("quick_replies"))
 
     return {
         "format_version": THREAD_ASSIST_CACHE_VERSION,
@@ -1425,7 +1401,7 @@ async def _generate_thread_assist_result(
         "quick_replies": quick_replies,
         "summary": {},
         "related_context": [],
-        "fallback_used": bool(overview_result.get("fallback_used")),
+        "fallback_used": False,
     }
 
 
@@ -1459,7 +1435,6 @@ async def _generate_mail_prompt_result(
         sampling_create_message=sampling_create_message,
     )
     if expected_artifact == "summary":
-        fallback_assistant = _sidebar_fallback_text(visible_prompt, "summary")
         result = await call_llm_json_safe(
             sampling_create_message,
             system_prompt=MAIL_SUMMARY_SYSTEM,
@@ -1473,13 +1448,20 @@ async def _generate_mail_prompt_result(
                 f"Contact context: {contact_context_text}\n"
                 f"Thread messages:\n{_thread_prompt_excerpt(messages)}\n"
             ),
-            fallback={"assistant_text": fallback_assistant},
+            # 展开后的线程总结与顶部概览使用同一语义：模型不可用时直接失败，
+            # 前端保留可重试状态，不能展示“已查看线程”的伪总结。
+            fallback={},
             temperature=0.2,
-            max_tokens=1200,
+            max_tokens=1600,
             timeout=90.0,
             metadata={"tool": "inbox_mail_summary", "thread_id": thread_id},
+            allow_fallback=False,
+            max_attempts=2,
         )
         payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+        assistant_text = str(payload.get("markdown") or "").strip()
+        if not assistant_text:
+            raise RuntimeError("analysis_unavailable")
         return {
             "mailbox": mailbox,
             "thread_id": thread_id,
@@ -1487,11 +1469,11 @@ async def _generate_mail_prompt_result(
             "latest_message_id": latest_message_id,
             "visible_prompt": visible_prompt,
             "thread_title": thread_title,
-            "assistant_text": str(payload.get("assistant_text") or fallback_assistant).strip(),
+            "assistant_text": assistant_text,
             "assistant_followup_text": "",
             "artifact": None,
             "reply_gaps": {"needs_user_input": False, "summary": "", "questions": []},
-            "fallback_used": bool(result.get("fallback_used")),
+            "fallback_used": False,
         }
 
     answers_text = "\n".join(
@@ -1752,6 +1734,8 @@ async def _handle_inbox_thread_assist_background(run_id: str, arguments: dict[st
             cached.get("exists")
             and cached_value
             and cached_value.get("format_version") == THREAD_ASSIST_CACHE_VERSION
+            and not cached_value.get("fallback_used")
+            and str(cached_value.get("overview") or "").strip()
             and isinstance(cached_quick_replies, list)
             and len(cached_quick_replies) > 0
         ):
@@ -2738,6 +2722,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         thread_id = str(arguments.get("thread_id", "")).strip()
         to_addr = str(arguments.get("to_addr", "")).strip()
         body = str(arguments.get("body", "")).strip()
+        body_html = str(arguments.get("body_html", "")).strip()
         if not thread_id or not to_addr or not body:
             return {"error": "thread_id, to_addr, and body are required"}
         reply_mode = str(arguments.get("reply_mode", "reply_to_sender")).strip() or "reply_to_sender"
@@ -2772,6 +2757,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 thread_id,
                 to_addr,
                 body,
+                body_html=body_html or None,
                 reply_mode=reply_mode,
                 cc_addr=cc_addr,
                 bcc_addr=bcc_addr,
@@ -3042,6 +3028,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             "exists": bool(draft.get("exists")),
             "etag": str(draft.get("etag") or ""),
             "body": str(value.get("body") or ""),
+            "body_html": str(value.get("body_html") or ""),
             "attachments": attachments,
             "updated_at": str(value.get("updated_at") or ""),
         }
@@ -3093,6 +3080,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                                 mailbox,
                                 thread_id,
                                 body,
+                                body_html=str(draft.get("body_html") or "") or None,
                                 if_match=str(draft.get("etag") or "") or None,
                                 message=meta,
                                 updated_at=str(draft.get("updated_at") or "") or None,
@@ -3136,6 +3124,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
     if tool == "save_inbox_thread_draft":
         thread_id = str(arguments.get("thread_id", "")).strip()
         body = str(arguments.get("body", ""))
+        body_html = str(arguments.get("body_html", ""))
         if_match = str(arguments.get("if_match", "")).strip() or None
         if not mailbox or not thread_id:
             return {"error": "mailbox and thread_id are required"}
@@ -3146,6 +3135,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             mailbox,
             thread_id,
             body,
+            body_html=body_html or None,
             if_match=if_match,
             message=message,
             attachments=attachments,

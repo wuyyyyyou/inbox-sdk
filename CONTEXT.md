@@ -2,7 +2,7 @@
 
 Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；Brief、Attention Card 和 Custom Scan 是仍由后端提供的工作流能力，不再代表 2.0 的整体界面结构。
 
-当前发布基线：App `2.1.1` / Tool `2.2.1`。本版本重点：外发附件 stage 上传、回复/撰写 Cc·Bcc 与转发、发送前 10 秒可撤销、多邮箱丝滑切换（取消上一扫描 + 本地缓存首屏 + 后台 silent 同步）、Gmail 401 强制换票自愈，以及收件附件元数据/列表回形针可靠性。
+当前发布基线：App `2.1.2` / Tool `2.2.2`。本版本重点：回复/转发/Compose 富文本（`body_html` + 后端白名单净化）、AI Router 澄清弹层与 `routing_intent`、Ask/线程回答预算与失败语义收紧、Sampling grant 预算快照，以及 `start_ai_turn` 短 wait 建 run。
 
 ## Language
 
@@ -24,7 +24,7 @@ Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 或 All 
 
 **Anna AI Sidebar**
 
-主界面左侧的对话入口。默认调用 Executa `start_ai_turn`：由本地 Router 在白名单工具中选型（对话、搜索、总结、写/改稿、整理建议、记忆等），并透传只读屏上上下文。整理类仅产出确认卡片，须用户确认后 mutation。旧前端 `aiRoute` 三分支可作为旁路保留。
+主界面左侧的对话入口。默认调用 Executa `start_ai_turn`：由本地 Router 在白名单工具中选型（对话、搜索、总结、写/改稿、整理建议、记忆等），并透传只读屏上上下文；意图不清时返回澄清选项，用户选定 `routing_intent` 后直达范围级计划。整理类仅产出确认卡片，须用户确认后 mutation。
 
 **Saved prompts / AI Memory**
 
@@ -32,7 +32,7 @@ AI Personalization：可复用提示词与长期偏好短句（无邮件正文�
 
 **Local Draft**
 
-按 mailbox 和 thread 持久化、尚未发送到 Gmail 的用户草稿。发送成功或用户丢弃后删除。
+按 mailbox 和 thread 持久化、尚未发送到 Gmail 的用户草稿。可同时保存 `body`（纯文本）与 `body_html`（白名单净化后的富文本）。发送成功或用户丢弃后删除。
 
 **Brief**
 

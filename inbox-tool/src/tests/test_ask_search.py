@@ -327,6 +327,7 @@ async def test_execute_search_does_not_broaden_named_person_query():
     fake_adapter = types.SimpleNamespace(
         live_search_and_cache=fake_live_search,
         get_messages_lite_async=fake_get_messages,
+        list_cached_messages_lite=lambda *_args, **_kwargs: [],
     )
     with patch.dict(sys.modules, {"mail_agent.mail_providers.gmail.adapter": fake_adapter}):
         messages = await execute_search(
@@ -339,6 +340,56 @@ async def test_execute_search_does_not_broaden_named_person_query():
     assert messages == []
     assert calls == ["from:alice in:inbox newer_than:7d"]
     print("[PASS] test_execute_search_does_not_broaden_named_person_query")
+
+
+async def test_execute_search_falls_back_to_cache_only_on_gmail_error():
+    """Gmail 401/超时等异常时读取缓存；正常零结果不得混入缓存。"""
+    from mail_agent.domain.types import MessageLite
+    from mail_agent.ask.search import execute_search
+
+    cached = [MessageLite(
+        message_id="cached-1", thread_id="thread-1", from_addr="alice@example.com",
+        to_addr="owner@example.com", subject="Cached project update", snippet="Please reply",
+    )]
+
+    def failing_live_search(*_args: object, **_kwargs: object) -> list[str]:
+        raise RuntimeError("401")
+
+    fake_adapter = types.SimpleNamespace(
+        live_search_and_cache=failing_live_search,
+        get_messages_lite_async=lambda *_args, **_kwargs: [],
+        list_cached_messages_lite=lambda *_args, **_kwargs: cached,
+    )
+    meta: dict[str, str] = {}
+    with patch.dict(sys.modules, {"mail_agent.mail_providers.gmail.adapter": fake_adapter}):
+        messages = await execute_search(
+            "owner@example.com",
+            [{"query": "in:inbox", "max_results": 10}],
+            max_broaden_attempts=0,
+            search_meta=meta,
+        )
+
+    assert [message.message_id for message in messages] == ["cached-1"]
+    assert meta == {"source": "cache_fallback", "error_type": "RuntimeError"}
+    print("[PASS] test_execute_search_falls_back_to_cache_only_on_gmail_error")
+
+
+def test_live_search_surfaces_all_detail_fetch_failures():
+    """搜索命中但每封实时详情均失败时，必须触发上层缓存回退。"""
+    from mail_agent.mail_providers.gmail import adapter
+
+    with (
+        patch.object(adapter, "search_gmail", return_value=["m1", "m2"]),
+        patch.object(adapter, "read_cache", return_value={"messages": []}),
+        patch.object(adapter, "fetch_and_cache_message", return_value=None),
+    ):
+        try:
+            adapter.live_search_and_cache("owner@example.com", "in:inbox", 2)
+        except RuntimeError as exc:
+            assert "detail fetch failed" in str(exc)
+        else:
+            raise AssertionError("all failed live details must not look like an empty Gmail search")
+    print("[PASS] test_live_search_surfaces_all_detail_fetch_failures")
 
 
 # ── Main ────────────────────────────────────────────────────────────────
@@ -375,6 +426,8 @@ async def main_async():
     print("\n--- execute_search ---\n")
     await test_execute_search_uses_gmail_query()
     await test_execute_search_does_not_broaden_named_person_query()
+    await test_execute_search_falls_back_to_cache_only_on_gmail_error()
+    test_live_search_surfaces_all_detail_fetch_failures()
 
     print(f"\n[ALL TESTS PASSED]")
 

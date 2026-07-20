@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from urllib.request import urlopen
 from unittest.mock import patch
@@ -21,6 +22,29 @@ def _message(index: int, **overrides: object) -> dict[str, object]:
     }
     message.update(overrides)
     return message
+
+
+async def test_thread_assist_refuses_raw_mail_fallback() -> None:
+    """线程概览缺少模型总结时必须失败，不能用主题或正文片段代替。"""
+    import anna_inbox_executa.v2_tools as tools
+
+    async def empty_summary_sampling(**_kwargs: object) -> dict[str, object]:
+        return {"content": {"type": "text", "text": "{}"}}
+
+    with patch.object(tools, "_load_thread_messages", return_value=[_message(1, snippet="Raw mail snippet")]):
+        try:
+            await tools._generate_thread_assist_result(
+                "user@example.com",
+                "thread-1",
+                "m1",
+                "m1",
+                empty_summary_sampling,
+            )
+        except RuntimeError as exc:
+            assert str(exc) == "analysis_unavailable"
+        else:
+            raise AssertionError("模型空总结不能退化为原邮件内容")
+    print("[PASS] test_thread_assist_refuses_raw_mail_fallback")
 
 
 def main() -> None:
@@ -244,6 +268,8 @@ def main() -> None:
     fitted = common._limit_inbox_thread_response_frame(frame)
     assert common._encoded_frame_size(fitted) <= common.MAX_INBOX_THREAD_RESPONSE_BYTES
     assert all(not item.get("body_html") for item in fitted["result"]["data"]["messages"])
+
+    asyncio.run(test_thread_assist_refuses_raw_mail_fallback())
 
     print("PASS inbox thread response budget tests")
 

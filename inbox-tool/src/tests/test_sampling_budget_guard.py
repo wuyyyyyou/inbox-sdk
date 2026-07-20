@@ -41,9 +41,13 @@ async def test_budget_guard_caps_requests_and_stops_before_host() -> None:
     stub = SamplingStub()
     logs: list[str] = []
     with patch("anna_inbox_executa.sampling_tools.log", logs.append):
-        sampling = build_budgeted_sampling(stub, invoke_id="run-unit-test")
+        sampling = build_budgeted_sampling(
+            stub,
+            invoke_id="run-unit-test",
+            sampling_grant={"maxCalls": 3, "maxTokensTotal": 6000},
+        )
         await sampling(
-            max_tokens=8000,
+            max_tokens=4096,
             timeout=180.0,
             metadata={"tool": "ask_answer", "mailbox": "secret@example.com"},
             system_prompt="Never log this private prompt.",
@@ -64,13 +68,17 @@ async def test_budget_guard_caps_requests_and_stops_before_host() -> None:
     assert [call["max_tokens"] for call in stub.calls] == [4096, 1904]
     assert all(call["timeout"] == 60.0 for call in stub.calls)
     joined_logs = "\n".join(logs)
-    assert "requested_tokens=8000" in joined_logs
+    assert "requested_tokens=4096" in joined_logs
     assert "granted_tokens=4096" in joined_logs
     assert "remaining_tokens=1904" in joined_logs
     assert "prompt_bytes=" in joined_logs
     assert "private email body" not in joined_logs
     assert "Never log this private prompt" not in joined_logs
     assert "secret@example.com" not in joined_logs
+    snapshot = sampling.budget_snapshot()
+    assert snapshot["grant"]["max_tokens_total"] == 6000
+    assert snapshot["reserved"] == {"calls": 2, "tokens": 6000}
+    assert snapshot["remaining_reservation_tokens"] == 0
     print("[PASS] test_budget_guard_caps_requests_and_stops_before_host")
 
 
@@ -95,12 +103,35 @@ async def test_budget_guard_logs_safe_failure_metrics() -> None:
     assert "elapsed_ms=" in joined_logs
     assert "error_type=TimeoutError" in joined_logs
     assert "secret@example.com" not in joined_logs
+    snapshot = sampling.budget_snapshot()
+    assert snapshot["failed_calls"] == 1
+    assert snapshot["last_error"] == "TimeoutError"
     print("[PASS] test_budget_guard_logs_safe_failure_metrics")
+
+
+async def test_budget_guard_allocates_stage_weights_from_host_grant() -> None:
+    """阶段比例必须服从本次 Host grant，并为后续 Ask 阶段保留额度。"""
+    from anna_inbox_executa.sampling_tools import build_budgeted_sampling
+
+    stub = SamplingStub()
+    sampling = build_budgeted_sampling(
+        stub,
+        invoke_id="run-unit-test",
+        sampling_grant={"maxCalls": 8, "maxTokensTotal": 6000},
+    )
+    allocate = sampling.allocate_tokens
+    assert allocate(weight=0.10, reserve_weights=(0.60, 0.25, 0.05)) == 600
+    await sampling(max_tokens=600, metadata={"tool": "ask_planner"})
+    assert allocate(weight=0.60, reserve_weights=(0.25, 0.05)) == 3600
+    assert allocate(weight=0.25, reserve_weights=(0.05,)) == 1500
+    assert allocate(weight=0.05) == 300
+    print("[PASS] test_budget_guard_allocates_stage_weights_from_host_grant")
 
 
 async def main() -> None:
     await test_budget_guard_caps_requests_and_stops_before_host()
     await test_budget_guard_logs_safe_failure_metrics()
+    await test_budget_guard_allocates_stage_weights_from_host_grant()
     print("[ALL TESTS PASSED]")
 
 

@@ -10,6 +10,7 @@ import {
   totalOutgoingAttachmentBytes,
 } from "../../shared/outgoingAttachments";
 import { RecipientChipInput } from "../../shared/RecipientChipInput";
+import { RichTextEditor, plainTextToEditorHtml } from "../mail-detail/RichTextEditor";
 import type {
   ComposeDraft,
   ComposeDraftArtifact,
@@ -91,6 +92,7 @@ export function ComposeView({
   const [focusField, setFocusField] = useState<"cc" | "bcc" | null>(null);
   const [subject, setSubject] = useState(initialDraft?.subject || "");
   const [body, setBody] = useState(initialDraft?.body || "");
+  const [bodyHtml, setBodyHtml] = useState(initialDraft?.body_html || plainTextToEditorHtml(initialDraft?.body || ""));
   const [attachments, setAttachments] = useState<OutgoingAttachmentMeta[]>(
     () => (initialDraft?.attachments || []).map((item) => ({ ...item, status: "ready" as const })),
   );
@@ -124,6 +126,7 @@ export function ComposeView({
     setFocusField(null);
     setSubject(initialDraft?.subject || "");
     setBody(initialDraft?.body || "");
+    setBodyHtml(initialDraft?.body_html || plainTextToEditorHtml(initialDraft?.body || ""));
     setAttachments((initialDraft?.attachments || []).map((item) => ({ ...item, status: "ready" as const })));
     setSaving(false);
     setError("");
@@ -165,6 +168,7 @@ export function ComposeView({
   useEffect(() => {
     if (!insertRequest || !open) return;
     setBody(insertRequest.artifact.body);
+    setBodyHtml(plainTextToEditorHtml(insertRequest.artifact.body));
     onConsumeInsertRequest?.(insertRequest.nonce);
   }, [insertRequest, onConsumeInsertRequest, open]);
 
@@ -176,9 +180,10 @@ export function ComposeView({
       bcc,
       subject,
       body,
+      body_html: bodyHtml,
       attachments: toPersistedOutgoingAttachments(attachments),
     }),
-    [attachments, bcc, body, cc, draftId, recipients, subject],
+    [attachments, bcc, body, bodyHtml, cc, draftId, recipients, subject],
   );
 
   const stageFiles = async (files: FileList) => {
@@ -468,14 +473,17 @@ export function ComposeView({
             placeholder="Add a subject"
           />
         </label>
-        <label className="compose-body">
+        <div className="compose-body">
           <span>Content</span>
-          <textarea
-            value={body}
-            onChange={(event) => setBody(event.target.value)}
+          <RichTextEditor
+            value={bodyHtml}
+            onChange={(value) => {
+              setBody(value.text);
+              setBodyHtml(value.html);
+            }}
             placeholder="Write your message or key points…"
           />
-        </label>
+        </div>
         <OutgoingAttachmentList items={attachments} onRemove={(id) => void removeAttachment(id)} />
         {error ? (
           <p className="compose-error" role="alert">

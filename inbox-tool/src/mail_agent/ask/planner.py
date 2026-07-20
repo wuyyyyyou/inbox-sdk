@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .sampling_budget import ASK_PLANNER_MAX_TOKENS
+from .sampling_budget import ask_sampling_tokens
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
@@ -564,9 +564,17 @@ async def plan_ask_request(
             user_message=user_message,
             fallback={},
             temperature=0.1,
-            max_tokens=ASK_PLANNER_MAX_TOKENS,
-            timeout=90.0,
+            # Planner 只占本次授权的一小部分，并为回答、截断重试和 JSON
+            # 修复保留比例预算；不再假定所有 Host 都有固定 800 token 额度。
+            max_tokens=ask_sampling_tokens(
+                sampling_create_message,
+                "planner",
+                reserve_for=("answer", "answer_retry", "json_repair"),
+            ),
+            timeout=30.0,
             metadata={"tool": "ask_planner"},
+            response_format={"type": "json_object"},
+            on_unsupported="text",
             allow_fallback=False,
             allow_sampling_provider_fallback=True,
             max_attempts=1 if strict_anna_sampling else None,

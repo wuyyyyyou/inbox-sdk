@@ -9,12 +9,35 @@ from anna_inbox_executa.diagnostics import record_span
 # Anna Host 按同一 invoke_id 累计计算 maxTokens；保留余量避免
 # 重试或 JSON repair 让后续小请求触发 -32007 MAX_TOKENS_EXCEEDED。
 ANNA_SAMPLING_TIMEOUT_SECONDS = 60.0
-ANNA_SAMPLING_TOTAL_TOKENS = 6000
-ANNA_SAMPLING_MAX_TOKENS_PER_CALL = 4096
+ANNA_SAMPLING_MIN_TIMEOUT_SECONDS = 30.0
+ANNA_SAMPLING_TOTAL_TOKENS = 32000
+ANNA_SAMPLING_MAX_TOKENS_PER_CALL = 8192
+ANNA_SAMPLING_MAX_CALLS = 8
 
 
 class SamplingBudgetExceeded(RuntimeError):
     """本地累计 Sampling 预算耗尽，调用方应使用既有 fallback。"""
+
+
+class SamplingCallLimitExceeded(RuntimeError):
+    """本地 Sampling 调用次数已达 Host 单轮上限。"""
+
+
+def _sampling_grant_limits(grant: Any) -> tuple[int, int]:
+    """解析 Host 下发的 Sampling 授权，并始终收敛到官方 v1 上限。"""
+    raw = grant if isinstance(grant, dict) else {}
+    try:
+        max_calls = int(raw.get("maxCalls") or ANNA_SAMPLING_MAX_CALLS)
+    except (TypeError, ValueError):
+        max_calls = ANNA_SAMPLING_MAX_CALLS
+    try:
+        max_tokens = int(raw.get("maxTokensTotal") or ANNA_SAMPLING_TOTAL_TOKENS)
+    except (TypeError, ValueError):
+        max_tokens = ANNA_SAMPLING_TOTAL_TOKENS
+    return (
+        max(1, min(max_calls, ANNA_SAMPLING_MAX_CALLS)),
+        max(1, min(max_tokens, ANNA_SAMPLING_TOTAL_TOKENS)),
+    )
 
 
 def _sampling_prompt_bytes(request: dict[str, Any]) -> int:
@@ -33,14 +56,54 @@ def _sampling_prompt_bytes(request: dict[str, Any]) -> int:
     return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
 
 
-def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str) -> Any:
+def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str, sampling_grant: Any = None) -> Any:
     """为一个 Executa invoke 创建带累计预算、统一超时和安全日志的 sampler。"""
-    remaining_tokens = ANNA_SAMPLING_TOTAL_TOKENS
+    max_calls, total_tokens = _sampling_grant_limits(sampling_grant)
+    remaining_tokens = total_tokens
+    call_count = 0
+    reserved_tokens = 0
+    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    failed_calls = 0
+    last_error = ""
     budget_lock = asyncio.Lock()
+
+    def _snapshot() -> dict[str, Any]:
+        """返回可公开给终端用户的脱敏预算快照。"""
+        return {
+            "grant": {"max_calls": max_calls, "max_tokens_total": total_tokens, "max_tokens_per_call": ANNA_SAMPLING_MAX_TOKENS_PER_CALL},
+            "reserved": {"calls": call_count, "tokens": reserved_tokens},
+            "usage": dict(usage),
+            "remaining_reservation_tokens": remaining_tokens,
+            "remaining_calls": max(0, max_calls - call_count),
+            "failed_calls": failed_calls,
+            "last_error": last_error,
+        }
+
+    def _allocate_tokens(*, weight: float, reserve_weights: tuple[float, ...] = ()) -> int:
+        """按累计授权和剩余额度计算一个阶段可申请的输出 token。
+
+        该方法只计算本次请求的上限，不提前修改 ``remaining_tokens``；真正的
+        原子预留仍在下方 sampler 调用时完成。这样 Ask 可以为截断重试预留
+        比例，同时并发调用也仍由 ``budget_lock`` 和 Host 上限兜底。
+        """
+        try:
+            normalized_weight = max(0.0, float(weight))
+        except (TypeError, ValueError):
+            normalized_weight = 0.0
+        reserve_total = 0.0
+        for reserve_weight in reserve_weights:
+            try:
+                reserve_total += max(0.0, float(reserve_weight))
+            except (TypeError, ValueError):
+                continue
+        target = max(1, int(total_tokens * normalized_weight))
+        reserved_for_later = int(total_tokens * min(1.0, reserve_total))
+        available_now = max(1, remaining_tokens - reserved_for_later)
+        return min(target, ANNA_SAMPLING_MAX_TOKENS_PER_CALL, available_now)
 
     async def _budgeted_sampling(**kwargs: Any) -> dict[str, Any]:
         """在调用 Host 前原子预留 token，避免发送必然超额的请求。"""
-        nonlocal remaining_tokens
+        nonlocal remaining_tokens, call_count, reserved_tokens, failed_calls, last_error
         requested_tokens = kwargs.get("max_tokens")
         if not isinstance(requested_tokens, int) or requested_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
@@ -54,12 +117,16 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str) -> Any:
         metadata["executa_invoke_id"] = invoke_id
 
         async with budget_lock:
+            if call_count >= max_calls:
+                last_error = "max_calls_exceeded"
+                raise SamplingCallLimitExceeded("Anna sampling call budget exhausted")
             granted_tokens = min(
                 requested_tokens,
                 ANNA_SAMPLING_MAX_TOKENS_PER_CALL,
                 remaining_tokens,
             )
             if granted_tokens <= 0:
+                last_error = "max_tokens_exceeded"
                 log(
                     "anna sampling rejected: "
                     f"tool={tool_name} requested_tokens={requested_tokens} "
@@ -69,11 +136,22 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str) -> Any:
                 )
                 raise SamplingBudgetExceeded("Anna sampling token budget exhausted")
             remaining_tokens -= granted_tokens
+            call_count += 1
+            reserved_tokens += granted_tokens
             remaining_after_reservation = remaining_tokens
 
         request = dict(kwargs)
         request["max_tokens"] = granted_tokens
-        request["timeout"] = ANNA_SAMPLING_TIMEOUT_SECONDS
+        # Anna Host 对模型截止时间的有效下限为 30 秒。尊重阶段调用方给出的
+        # 较短预算，同时把上限限制在 60 秒，防止单次 Sampling 独占后台 run。
+        try:
+            requested_timeout = float(request.get("timeout") or ANNA_SAMPLING_TIMEOUT_SECONDS)
+        except (TypeError, ValueError):
+            requested_timeout = ANNA_SAMPLING_TIMEOUT_SECONDS
+        request["timeout"] = max(
+            ANNA_SAMPLING_MIN_TIMEOUT_SECONDS,
+            min(requested_timeout, ANNA_SAMPLING_TIMEOUT_SECONDS),
+        )
         request["metadata"] = metadata
         prompt_bytes = _sampling_prompt_bytes(request)
         started = time.monotonic()
@@ -81,11 +159,13 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str) -> Any:
             "anna sampling started: "
             f"tool={tool_name} requested_tokens={requested_tokens} "
             f"granted_tokens={granted_tokens} remaining_tokens={remaining_after_reservation} "
-            f"timeout_s={ANNA_SAMPLING_TIMEOUT_SECONDS} prompt_bytes={prompt_bytes}"
+            f"timeout_s={request['timeout']} prompt_bytes={prompt_bytes}"
         )
         try:
             result = await sampling_fn(**request)
         except Exception as exc:
+            failed_calls += 1
+            last_error = type(exc).__name__
             record_span(
                 "sampling.create_message",
                 started,
@@ -96,23 +176,35 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str) -> Any:
                 "anna sampling failed: "
                 f"tool={tool_name} requested_tokens={requested_tokens} "
                 f"granted_tokens={granted_tokens} remaining_tokens={remaining_after_reservation} "
-                f"timeout_s={ANNA_SAMPLING_TIMEOUT_SECONDS} "
+                f"timeout_s={request['timeout']} "
                 f"prompt_bytes={prompt_bytes} "
                 f"elapsed_ms={int((time.monotonic() - started) * 1000)} "
                 f"error_type={type(exc).__name__}"
             )
             raise
+        raw_usage = result.get("usage") if isinstance(result, dict) else {}
+        if isinstance(raw_usage, dict):
+            for source, target in (("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"), ("totalTokens", "total_tokens")):
+                try:
+                    usage[target] += max(0, int(raw_usage.get(source) or 0))
+                except (TypeError, ValueError):
+                    pass
         record_span("sampling.create_message", started)
         log(
             "anna sampling completed: "
             f"tool={tool_name} requested_tokens={requested_tokens} "
             f"granted_tokens={granted_tokens} remaining_tokens={remaining_after_reservation} "
-            f"timeout_s={ANNA_SAMPLING_TIMEOUT_SECONDS} "
+            f"timeout_s={request['timeout']} "
             f"prompt_bytes={prompt_bytes} "
             f"elapsed_ms={int((time.monotonic() - started) * 1000)}"
         )
         return result
 
+    # 调用方通过属性读取快照，不把闭包或邮件内容写入 run checkpoint。
+    _budgeted_sampling.budget_snapshot = _snapshot
+    # 调用方只传阶段比例，不接触凭据或原始 Host grant；实际扣减仍集中在
+    # _budgeted_sampling 中，避免各业务管线各自维护一套累计预算。
+    _budgeted_sampling.allocate_tokens = _allocate_tokens
     return _budgeted_sampling
 
 
@@ -123,7 +215,11 @@ def _build_sampling_for_run(arguments: dict[str, Any], invoke_id: str) -> Any:
     """
     provider = str(arguments.get("ai_provider", "anna-llm")).strip()
     if provider == "anna-llm":
-        return build_budgeted_sampling(sampling.create_message, invoke_id=invoke_id)
+        return build_budgeted_sampling(
+            sampling.create_message,
+            invoke_id=invoke_id,
+            sampling_grant=arguments.get("_sampling_grant"),
+        )
     return None
 
 

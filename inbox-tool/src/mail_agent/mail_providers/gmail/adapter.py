@@ -2669,6 +2669,7 @@ def live_search_and_cache(
         # Fetch uncached messages concurrently
         if uncached_to_fetch:
             fetched: dict[str, dict[str, Any]] = {}
+            failed_fetches = 0
             # 首次 Gmail 搜索已在当前上下文取得短期 token；复制上下文给全文 worker，
             # 避免平台环境中每封邮件再次触发 credentials/getToken，并保留同一 trace。
             worker_context = copy_context()
@@ -2683,8 +2684,10 @@ def live_search_and_cache(
                         result = future.result()
                         if result:
                             fetched[mid] = message_summary(result)
+                        else:
+                            failed_fetches += 1
                     except Exception:
-                        pass
+                        failed_fetches += 1
 
             # Fill placeholders with fetched results
             for i, entry in enumerate(ordered):
@@ -2692,6 +2695,14 @@ def live_search_and_cache(
                     mid = msg_ids[i]
                     if mid in fetched:
                         ordered[i] = fetched[mid]
+
+            # fetch_and_cache_message 会把认证/网络错误转换为 None。若本批次
+            # 所有实时详情都失败且没有任何缓存命中，必须通知上层走缓存回退，
+            # 不能伪装成 Gmail 正常返回的零结果。
+            if failed_fetches == len(uncached_to_fetch) and not any(
+                isinstance(item, dict) and item for item in ordered
+            ):
+                raise RuntimeError("Gmail message detail fetch failed for all search matches")
 
         # Build returned IDs respecting stop time boundary
         returned_ids: list[str] = []
@@ -2750,6 +2761,17 @@ def get_messages_lite(mailbox: str, message_ids: list[str]) -> list[MessageLite]
         if isinstance(msg, dict):
             results.append(_to_message_lite(msg))
     return results
+
+
+def list_cached_messages_lite(mailbox: str, limit: int = 200) -> list[MessageLite]:
+    """从本地或 APS 消息索引读取摘要，不触发 Gmail API。"""
+    try:
+        bounded_limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        bounded_limit = 200
+    messages = list_messages(mailbox)
+    messages.sort(key=lambda item: int(item.get("internal_date") or 0), reverse=True)
+    return [_to_message_lite(message) for message in messages[:bounded_limit] if isinstance(message, dict)]
 
 
 async def get_messages_lite_async(mailbox: str, message_ids: list[str]) -> list[MessageLite]:
@@ -2987,7 +3009,9 @@ def send_compose_email(
     if not normalized_recipients:
         raise ValueError("At least one recipient is required")
     plain_body = str(body or "")
-    html_body = str(body_html or "").strip()
+    from mail_agent.mail_providers.gmail.outgoing_html import sanitize_outgoing_html
+
+    html_body = sanitize_outgoing_html(body_html)
     if not str(subject).strip() or (not plain_body.strip() and not html_body):
         raise ValueError("Subject and content are required")
 
@@ -3085,6 +3109,7 @@ def send_reply(
     to_addr: str,
     body: str,
     *,
+    body_html: str | None = None,
     reply_mode: str = "reply_to_sender",
     cc_addr: str = "",
     bcc_addr: str = "",
@@ -3095,6 +3120,7 @@ def send_reply(
     警告：会真实发信。调用方默认应 dry_run，仅在用户明确确认后关闭 dry_run。
     cc_addr / bcc_addr 由前端显式传入；reply_all 不再单独推断抄送列表。
     attachments 为已加载字节的附件列表（filename/mime_type/content）。
+    body_html 经过后端白名单净化后，作为 multipart/alternative 的 HTML 部分发送。
     """
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
@@ -3123,13 +3149,24 @@ def send_reply(
     # reply_mode 保留给上层兼容；真正写入 MIME 的抄送以显式列表为准
     _ = reply_mode
 
+    from mail_agent.mail_providers.gmail.outgoing_html import sanitize_outgoing_html
+
+    plain_body = str(body or "")
+    html_body = sanitize_outgoing_html(body_html)
     attachment_items = [item for item in (attachments or []) if isinstance(item, dict) and isinstance(item.get("content"), (bytes, bytearray))]
+    if html_body:
+        # 带附件时先创建 alternative，再由 mixed 包裹，保证 Gmail 客户端优先使用 HTML。
+        text_root: Any = MIMEMultipart("alternative")
+        text_root.attach(MIMEText(plain_body or _html_to_text(html_body), "plain", "utf-8"))
+        text_root.attach(MIMEText(html_body, "html", "utf-8"))
+    else:
+        text_root = MIMEText(plain_body, "plain", "utf-8")
     if attachment_items:
         msg: Any = MIMEMultipart("mixed")
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        msg.attach(text_root)
         _attach_file_parts(msg, attachment_items)
     else:
-        msg = MIMEText(body, "plain", "utf-8")
+        msg = text_root
     msg["To"] = to_addr
     if normalized_cc:
         msg["Cc"] = ", ".join(normalized_cc)

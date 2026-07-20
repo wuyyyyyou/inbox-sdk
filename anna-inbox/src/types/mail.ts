@@ -442,6 +442,17 @@ export interface CustomRunResultSection {
   items?: CustomRunResultItem[];
 }
 
+/** 终端用户可见的 Sampling 预算与消耗摘要；不含邮件、提示词或凭据。 */
+export interface SamplingUsageSummary {
+  grant?: { max_calls?: number; max_tokens_total?: number; max_tokens_per_call?: number };
+  reserved?: { calls?: number; tokens?: number };
+  usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number };
+  remaining_reservation_tokens?: number;
+  remaining_calls?: number;
+  failed_calls?: number;
+  last_error?: string;
+}
+
 export interface CustomRunResult {
   runId?: string;
   planId?: string;
@@ -452,6 +463,7 @@ export interface CustomRunResult {
   title?: string;
   summary?: string;
   sections?: CustomRunResultSection[];
+  sampling?: SamplingUsageSummary;
   trace?: Record<string, unknown>;
   planner_fallback?: boolean;
 }
@@ -635,6 +647,8 @@ export interface InboxThreadDraftPayload {
   exists: boolean;
   etag?: string;
   body: string;
+  /** 富文本草稿的安全 HTML；缺失时由 body 按纯文本恢复。 */
+  body_html?: string;
   attachments?: OutgoingAttachmentMeta[];
   updated_at?: string;
 }
@@ -984,6 +998,9 @@ export interface AiClarificationPayload {
   resolved_action?: string;
 }
 
+/** 用户在 Router 澄清弹层中选择的任务范围。 */
+export type AiRoutingIntent = "inbox" | "current_thread" | "compose" | "chat";
+
 /** 收件箱多选线程，写入 ui_context.selected_threads */
 export interface AiSelectedThreadRef {
   mailbox: string;
@@ -1004,5 +1021,7 @@ export interface SendAiMessageOptions {
   resumeRunId?: string;
   /** 收件箱勾选线程（批量 draft / outreach） */
   selectedThreads?: AiSelectedThreadRef[];
+  /** Router 无法判断时由用户明确选择的范围。 */
+  routingIntent?: AiRoutingIntent;
 }
 

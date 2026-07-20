@@ -36,8 +36,8 @@ describe("Manage Splits tooltip", () => {
 });
 
 describe("AI scan invocation", () => {
-  it("uses the current Scan Plan and a 60-second initial wait in every entry point", () => {
-    expect(controllerSource.match(/wait_timeout_seconds: 60/g)?.length || 0).toBeGreaterThanOrEqual(3);
+  it("uses the current Scan Plan and returns AI turns before the platform timeout boundary", () => {
+    expect(controllerSource.match(/wait_timeout_seconds: 45/g)?.length || 0).toBeGreaterThanOrEqual(2);
     expect(controllerSource.match(/scan_window_days: scanScope\.scan_window_days/g)?.length || 0).toBeGreaterThanOrEqual(3);
     expect(controllerSource.match(/max_messages: scanScope\.max_messages/g)?.length || 0).toBeGreaterThanOrEqual(3);
   });
@@ -52,6 +52,13 @@ describe("AI scan invocation", () => {
     expect(controllerSource).toMatch(/selected_threads:/);
     expect(controllerSource).not.toMatch(/decideAiRoute\(/);
     expect(controllerSource).not.toMatch(/isAiTurnEnabled\(/);
+  });
+
+  it("routes thread detail prompts through the same unified AI turn", () => {
+    const detailPromptHandler = controllerSource.match(/async submitMailContextPrompt\(request\)[\s\S]*?async sendInboxThreadReply/)?.[0] || "";
+    expect(detailPromptHandler).toContain("client.startAiTurn(");
+    expect(detailPromptHandler).not.toContain("client.startInboxMailPrompt(");
+    expect(detailPromptHandler).toContain("requested_artifact: requestedArtifact");
   });
 
   it("resumes a timed-out sidebar turn by polling its existing run", () => {

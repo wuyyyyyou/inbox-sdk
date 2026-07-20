@@ -300,6 +300,7 @@ export function buildForwardDraftBody(
 export function buildForwardSendBodies(
   message: Pick<InboxThreadMessage, "from" | "to" | "cc" | "subject" | "internal_date" | "body_text" | "body_html"> | undefined,
   userNote = "",
+  userNoteHtml = "",
 ): { body: string; body_html?: string } {
   const note = stripForwardedMessageBlock(userNote).trimEnd();
   const plain = buildForwardDraftBody(message, note);
@@ -312,7 +313,7 @@ export function buildForwardSendBodies(
   const metaHtml = [header, ...lines]
     .map((line) => `<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222;">${escapeHtml(line)}</div>`)
     .join("");
-  const noteHtml = plainNoteToHtml(note);
+  const noteHtml = userNoteHtml.trim() || plainNoteToHtml(note);
   const body_html = [
     noteHtml,
     noteHtml ? "<br>" : "",
@@ -324,6 +325,13 @@ export function buildForwardSendBodies(
   ].filter(Boolean).join("\n");
 
   return { body: plain, body_html };
+}
+
+/** 已保存转发 HTML 含原信引用块；恢复编辑器时只取用户可编辑的说明部分。 */
+export function extractForwardNoteHtml(value: string | undefined) {
+  const html = String(value || "");
+  const quoteStart = html.indexOf('<div class="gmail_quote">');
+  return quoteStart >= 0 ? html.slice(0, quoteStart).trim() : html.trim();
 }
 
 export function isOutboundMessageForMailbox(from: string | undefined, mailbox: string) {

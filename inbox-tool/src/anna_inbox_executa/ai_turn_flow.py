@@ -10,12 +10,36 @@ from anna_inbox_executa.brief_flow import _merge_partial
 from anna_inbox_executa.diagnostics import activate_trace, current_trace, deactivate_trace, snapshot
 
 
+def _gmail_access_failed_without_results(trace: dict[str, Any] | None, candidates_found: int) -> bool:
+    """判断 AI 检索是否因 Gmail 授权失败而没有得到任何可用邮件。"""
+    if candidates_found > 0:
+        return False
+    diagnostic = snapshot(trace)
+    spans = diagnostic.get("spans") if isinstance(diagnostic, dict) else []
+    return any(
+        isinstance(span, dict)
+        and span.get("stage") == "gmail.http"
+        and str(span.get("http_status") or "") in {"401", "403"}
+        for span in spans
+    )
+
+
+def _gmail_access_unavailable_message(user_text: str) -> str:
+    """生成授权失效时的可执行用户提示，不把认证错误伪装成零搜索结果。"""
+    if any("\u3400" <= char <= "\u9fff" for char in str(user_text or "")):
+        return "AI 暂时无法读取邮箱。Google 账号授权已失效或权限不足，请在设置中重新连接 Google 账号，刷新收件箱后再重试。"
+    return "AI is temporarily unavailable because Google account access has expired or lacks permission. Reconnect your Google account in Settings, refresh the inbox, then try again."
+
+
 def _public_ai_turn_state(run_id: str) -> dict[str, Any]:
     state = MAIL_AGENT_RUNS.get(run_id) or {}
+    status = str(state.get("status") or "queued")
     return {
-        "success": state.get("status") == "done",
+        # JSON-RPC facade 将 success:false 解释为本次工具调用失败并直接抛错。
+        # running/queued 是已成功建立、等待前端轮询的异步状态，不能误报失败。
+        "success": status != "failed",
         "run_id": run_id,
-        "status": state.get("status", "queued"),
+        "status": status,
         "stage": state.get("stage", ""),
         "progress": state.get("progress", {}),
         "partial": state.get("partial", {}),
@@ -52,6 +76,7 @@ def start_ai_turn(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
         "result": None,
         "error": "",
         "partial": {},
+        "sampling": {},
         "diagnostics": current_trace(),
     }
     _save_run_checkpoint(run_id)
@@ -59,7 +84,13 @@ def start_ai_turn(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
         _start_ai_turn_async(run_id, arguments, invoke_id),
         loop,
     )
-    wait_timeout = int(arguments.get("wait_timeout_seconds", 60))
+    # 首个 invoke 只负责快速建立后台 run；完整邮件分析由前端轮询 run_id。
+    # 等待过久不会加快最终回答，反而会占用平台 60 秒工具窗口。
+    try:
+        requested_wait_timeout = int(arguments.get("wait_timeout_seconds", 5))
+    except (TypeError, ValueError):
+        requested_wait_timeout = 5
+    wait_timeout = max(1, min(requested_wait_timeout, 5))
     try:
         future.result(timeout=wait_timeout)
     except FutureTimeoutError:
@@ -84,6 +115,9 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
         _save_run_checkpoint(run_id)
 
         sampling = _build_sampling_for_run(arguments, invoke_id)
+        sampling_snapshot = getattr(sampling, "budget_snapshot", None) if sampling else None
+        if callable(sampling_snapshot):
+            MAIL_AGENT_RUNS[run_id]["sampling"] = sampling_snapshot()
         user_text = str(arguments.get("user_text") or arguments.get("user_request") or "").strip()
         ui_context = arguments.get("ui_context") if isinstance(arguments.get("ui_context"), dict) else {}
 
@@ -94,6 +128,8 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
                 _merge_partial(run_id, partial_update)
             MAIL_AGENT_RUNS[run_id]["stage"] = stage
             MAIL_AGENT_RUNS[run_id]["progress"] = progress
+            if callable(sampling_snapshot):
+                MAIL_AGENT_RUNS[run_id]["sampling"] = sampling_snapshot()
             MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
             _save_run_checkpoint(run_id)
 
@@ -106,17 +142,37 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
         )
 
         kind = str(outcome.get("kind") or "chat")
+        scan_result = outcome.get("scan_result") if isinstance(outcome.get("scan_result"), dict) else None
+        candidates_found = int(scan_result.get("candidates_found") or 0) if scan_result else 0
+        if kind == "scan" and scan_result and _gmail_access_failed_without_results(
+            MAIL_AGENT_RUNS[run_id].get("diagnostics"), candidates_found,
+        ):
+            # 底层兼容路径可能把 401 转成空结果；最终出口必须恢复真实错误语义。
+            unavailable = _gmail_access_unavailable_message(user_text)
+            scan_result = {
+                **scan_result,
+                "title": "",
+                "summary": unavailable,
+                "sections": [],
+                "availability_error": "gmail_authorization",
+            }
+            outcome = {**outcome, "scan_result": scan_result, "assistant_text": unavailable, "fallback_used": True}
         result_data: dict[str, Any] = {
             "success": kind != "error",
             "kind": kind,
             "assistant_text": str(outcome.get("assistant_text") or ""),
-            "route": outcome.get("route") if isinstance(outcome.get("route"), dict) else {},
             "fallback_used": bool(outcome.get("fallback_used")),
         }
+        if callable(sampling_snapshot):
+            # 仅公开预算与用量聚合，不包含 prompt、邮件内容、模型输出或凭据。
+            result_data["sampling"] = sampling_snapshot()
         if kind == "error":
             result_data["error"] = str(outcome.get("error") or "error")
         if kind == "clarify":
             result_data["clarify"] = str(outcome.get("clarify") or outcome.get("assistant_text") or "")
+            # 澄清选项只包含路由范围和用户原始输入，不携带邮件内容或凭据。
+            if isinstance(outcome.get("clarification"), dict):
+                result_data["clarification"] = outcome["clarification"]
         if kind in {"mail_context", "draft"} and isinstance(outcome.get("mail_context"), dict):
             result_data["mail_context"] = outcome["mail_context"]
         if isinstance(outcome.get("artifact"), dict):
@@ -138,23 +194,21 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
         if kind == "scan" and isinstance(outcome.get("scan_result"), dict):
             # 展开 Ask 结果字段，便于前端复用 buildCustomRunResult。
             scan = outcome["scan_result"]
+            candidates_found = int(scan.get("candidates_found") or 0)
             result_data.update({
                 "plan_id": scan.get("plan_id", ""),
-                "plan_title": scan.get("plan_title", ""),
-                "plan_description": scan.get("plan_description", ""),
                 "summary": scan.get("summary", result_data["assistant_text"]),
                 "sections": scan.get("sections", []),
-                "plan_topics": scan.get("plan_topics", []),
-                "plan_timeframe": scan.get("plan_timeframe", ""),
-                "plan_direction": scan.get("plan_direction", ""),
-                "plan_goal": scan.get("plan_goal", ""),
-                "plan_queries": scan.get("plan_queries", []),
                 "messages_scanned": scan.get("messages_scanned", 0),
-                "candidates_found": scan.get("candidates_found", 0),
-                "llm_meta": scan.get("llm_meta", {}),
+                "candidates_found": candidates_found,
             })
+            if candidates_found:
+                result_data["plan_title"] = scan.get("plan_title", "")
+                result_data["plan_description"] = scan.get("plan_description", "")
             if not result_data["assistant_text"]:
                 result_data["assistant_text"] = str(scan.get("summary") or "")
+            # scan 的 summary 已是侧栏唯一文本来源，避免与 assistant_text 重复传输。
+            result_data.pop("assistant_text", None)
         # compose 路径也可能附带 scan_result
         if kind == "draft" and isinstance(outcome.get("scan_result"), dict) and "summary" not in result_data:
             scan = outcome["scan_result"]

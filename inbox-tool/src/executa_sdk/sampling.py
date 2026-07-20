@@ -157,6 +157,8 @@ class SamplingClient:
         model_preferences: Optional[dict] = None,
         include_context: str = "none",
         metadata: Optional[dict] = None,
+        response_format: Optional[dict] = None,
+        on_unsupported: Optional[str] = None,
         timeout: float = 90.0,
     ) -> dict:
         """Ask the host to run an LLM completion. Returns the host result dict.
@@ -223,6 +225,10 @@ class SamplingClient:
             params["modelPreferences"] = model_preferences
         if metadata:
             params["metadata"] = metadata
+        if response_format:
+            params["responseFormat"] = response_format
+        if on_unsupported:
+            params["onUnsupported"] = on_unsupported
 
         future: asyncio.Future[dict] = loop.create_future()
         with self._lock:

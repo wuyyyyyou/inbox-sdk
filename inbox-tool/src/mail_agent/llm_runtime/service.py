@@ -55,6 +55,14 @@ JSON_REPAIR_SYSTEM_PROMPT = (
     "Do not add facts, do not change field meanings, and do not include markdown or explanations."
 )
 
+
+class TruncatedJsonResponse(ValueError):
+    """模型在 JSON 对象完成前停止输出。
+
+    这类响应缺少事实内容，不能通过补引号或补括号伪装为成功结果；调用方
+    应重试原始任务，或回退到基于真实邮件证据的本地结果。
+    """
+
 # Surrogate range: U+D800–U+DFFF
 _SURROGATE_START = 0xD800
 _SURROGATE_END = 0xE000
@@ -143,50 +151,50 @@ def _repair_json(text: str) -> str:
     return text
 
 
-def _balance_json_brackets(text: str) -> str:
-    """在字符串外补齐未闭合的 } / ]，用于模型截断输出的本地抢救。"""
-    in_string = False
-    escape = False
-    stack: list[str] = []
-    for ch in text:
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-            continue
-        if ch in "{[":
-            stack.append("}" if ch == "{" else "]")
-        elif ch in "}]":
-            if stack and stack[-1] == ch:
-                stack.pop()
-    if in_string:
-        text += '"'
-    # 截断若落在值后，先去掉尾部悬挂逗号再补括号。
-    text = re.sub(r",\s*$", "", text.rstrip())
-    while stack:
-        text += stack.pop()
-    return text
+def _normalize_json_delimiters(text: str) -> str:
+    """把全角括号等常见 Unicode 分隔符归一成标准 JSON 分隔符。"""
+    return (
+        text.replace("\uff5b", "{")
+        .replace("\uff5d", "}")
+        .replace("\uff3b", "[")
+        .replace("\uff3d", "]")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
+
+
+def _strip_markdown_json_fence(text: str) -> str:
+    """提取 markdown fence 中的 JSON，兼容前后夹杂说明文字。"""
+    stripped = text.strip()
+    whole = re.match(r"^```(?:json)?\s*\n?(.*)\n?```\s*$", stripped, re.DOTALL)
+    if whole:
+        return whole.group(1).strip()
+    embedded = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", stripped, re.DOTALL)
+    if embedded:
+        return embedded.group(1).strip()
+    return stripped
 
 
 def parse_json_response(text: str) -> dict[str, Any]:
     """Extract JSON object from LLM response text (handles markdown fences and common LLM errors)."""
-    text = text.strip()
-    fence = re.match(r"^```(?:json)?\s*\n?(.*)\n?```\s*$", text, re.DOTALL)
-    if fence:
-        text = fence.group(1).strip()
+    text = _normalize_json_delimiters(_strip_markdown_json_fence(text))
     start = text.find("{")
     end = text.rfind("}")
     if start < 0:
-        raise ValueError("LLM response did not contain a JSON object")
-    # 优先截到最后一个 }；若模型截断未闭合，仍从首个 { 起做修复。
-    candidate = text[start : end + 1] if end > start else text[start:]
-    attempts = [candidate, _repair_json(candidate), _balance_json_brackets(_repair_json(candidate))]
+        # 预览仅用于诊断模型是否输出了散文/推理而非 JSON；不记录完整邮件内容。
+        preview = text[:160].replace("\n", "\\n")
+        raise ValueError(
+            f"LLM response did not contain a JSON object; preview={preview!r}"
+        )
+    # 缺少对象结束符意味着生成在字段中途停止。此前会补齐字符串和括号，
+    # 导致半句邮件回答被错误展示给用户。
+    if end <= start:
+        raise TruncatedJsonResponse("LLM response ended before its JSON object was complete")
+    candidate = text[start : end + 1]
+    # 仅修复缺逗号等局部语法问题；绝不推测或补齐缺失的业务内容。
+    attempts = [candidate, _repair_json(candidate)]
     last_error: json.JSONDecodeError | None = None
     for attempt in attempts:
         try:
@@ -206,9 +214,13 @@ def parse_json_response(text: str) -> dict[str, Any]:
 
 
 def _build_sampling_json_user_message(system_prompt: str, user_message: str, retry_note: str = "") -> str:
+    # system_prompt 由 Host 的 systemPrompt 字段单独下发；此处只强化 user 侧输出约束。
+    _ = system_prompt
     prompt = (
         f"{user_message.strip()}\n\n"
-        "Return ONLY one valid JSON object. Do not include markdown fences, prose, analysis, or code comments."
+        "Return ONLY one valid JSON object. "
+        "The first non-whitespace character MUST be '{'. "
+        "Do not include markdown fences, prose, analysis, reasoning, or code comments."
     )
     if retry_note:
         prompt = f"{prompt}\n\n{retry_note}"
@@ -321,7 +333,9 @@ async def repair_json_with_sampling(
         "metadata": {str(key): _ascii_escape_for_host_transport(str(value)) for key, value in metadata_payload.items()},
         "timeout": timeout,
     }
-    request["max_tokens"] = 512
+    # 修复调用也必须使用调用方已分配的预算，不能继续把 512 写死，
+    # 否则比例预算虽然计算成功，实际 Host 请求仍会偏离分配策略。
+    request["max_tokens"] = max(1, int(max_tokens))
     result = await sampling_create_message(**request)
     repaired_text = extract_sampling_text(result)
     if not isinstance(repaired_text, str) or not repaired_text.strip():
@@ -329,26 +343,61 @@ async def repair_json_with_sampling(
     return _sanitize_str(repaired_text)
 
 
+def _coerce_sampling_text_value(value: Any) -> str:
+    """把 Host 可能返回的 text/dict/list 统一成可解析字符串。"""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        # JSON mode 偶发直接回传对象；序列化后交给 parse_json_response。
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return ""
+    if isinstance(value, list):
+        parts = [_coerce_sampling_text_value(item) for item in value]
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
 def extract_sampling_text(result: Any) -> str:
     # 不同 host 版本可能返回 content.text、content 字符串、content 数组或 OpenAI 风格 message.content。
+    # thinking/reasoning 块优先忽略：它们常耗尽 max_tokens 且不含最终 JSON。
     if not isinstance(result, dict):
         return ""
     content = result.get("content")
     if isinstance(content, str):
         return content
     if isinstance(content, dict):
-        text = content.get("text") or content.get("content")
-        if isinstance(text, str):
-            return text
+        text = content.get("text")
+        if text is None:
+            text = content.get("content")
+        if text is None and content.get("type") in {"json", "object"}:
+            text = content.get("json") or content.get("data") or content.get("value")
+        coerced = _coerce_sampling_text_value(text)
+        if coerced:
+            return coerced
     if isinstance(content, list):
-        parts: list[str] = []
+        preferred: list[str] = []
+        fallback: list[str] = []
         for item in content:
             if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text") or item.get("content")
-                if isinstance(text, str):
-                    parts.append(text)
+                preferred.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").casefold()
+            text = item.get("text")
+            if text is None:
+                text = item.get("content")
+            coerced = _coerce_sampling_text_value(text)
+            if not coerced:
+                continue
+            # 最终回答块优先；thinking/reasoning 仅作兜底。
+            if item_type in {"thinking", "reasoning", "thought"}:
+                fallback.append(coerced)
+            else:
+                preferred.append(coerced)
+        parts = preferred or fallback
         if parts:
             return "\n".join(parts)
     message = result.get("message")
@@ -365,6 +414,15 @@ def extract_sampling_text(result: Any) -> str:
         nested = extract_sampling_text(first.get("message") if isinstance(first.get("message"), dict) else {})
         if nested:
             return nested
+    # 少数 Host 在 json_object 模式下把业务 JSON 摊到 result 顶层。
+    if any(key in result for key in ("title", "summary", "sections", "markdown", "assistant_text")):
+        try:
+            return json.dumps(
+                {key: value for key, value in result.items() if key not in {"model", "usage", "stopReason", "role", "content", "message", "choices"}},
+                ensure_ascii=False,
+            )
+        except (TypeError, ValueError):
+            pass
     return ""
 
 
@@ -522,7 +580,11 @@ async def call_llm_json(
     metadata: dict[str, str] | None = None,
     allow_sampling_provider_fallback: bool = False,
     stop_sequences: list[str] | None = None,
+    response_format: dict[str, Any] | None = None,
+    on_unsupported: str | None = None,
     max_attempts: int | None = None,
+    retry_max_tokens: int | None = None,
+    json_repair_max_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Call the selected LLM and return parsed JSON payload.
 
@@ -535,16 +597,25 @@ async def call_llm_json(
                        {"system_prompt": _sanitize_str(system_prompt)[:800], "max_tokens": str(max_tokens)})
         last_error: Exception | None = None
         last_text = ""
+        last_response_was_truncated = False
         attempts = max(1, max_attempts or (MAX_RETRIES + 1))
         for attempt in range(attempts):
             try:
+                # 截断重试可使用调用方为该分支单独预留的额度，避免首次输出
+                # 很短时重试仍沿用同一个上限；未传入时保持旧调用的兼容行为。
+                request_max_tokens = max_tokens if attempt == 0 else (retry_max_tokens or max_tokens)
                 retry_note = ""
                 if last_text:
                     retry_note = (
-                        "Your previous response was not parseable as a JSON object. "
-                        f"Parser error: {last_error}. "
-                        f"Previous response excerpt: {last_text[:800]}. "
-                        "Return the corrected JSON object only."
+                        "Your previous response was truncated before its JSON object was complete. "
+                        "Return a shorter, complete JSON object only."
+                        if last_response_was_truncated
+                        else (
+                            "Your previous response was not parseable as a JSON object. "
+                            f"Parser error: {last_error}. "
+                            f"Previous response excerpt: {last_text[:800]}. "
+                            "Return the corrected JSON object only."
+                        )
                     )
                 metadata_payload = {
                     str(key): _ascii_escape_for_host_transport(str(value))
@@ -568,7 +639,9 @@ async def call_llm_json(
                     "metadata": metadata_payload,
                     "timeout": timeout,
                     "stop_sequences": stop_sequences,
-                    "max_tokens": max_tokens,
+                    "response_format": response_format,
+                    "on_unsupported": on_unsupported,
+                    "max_tokens": request_max_tokens,
                 }
                 result = await sampling_create_message(**request)
                 text = extract_sampling_text(result)
@@ -579,13 +652,46 @@ async def call_llm_json(
                 try:
                     payload = parse_json_response(text)
                     repaired_text = ""
+                except TruncatedJsonResponse:
+                    # 截断不是格式瑕疵，JSON repair 无法恢复被省略的邮件事实。
+                    _write_llm_log(
+                        tool_name,
+                        "output_error",
+                        text[:4000],
+                        {
+                            "model": str(result.get("model") or ""),
+                            "error": "truncated_json",
+                            "shape": _sampling_result_shape(result),
+                        },
+                    )
+                    raise
                 except Exception as parse_exc:
+                    # 纯散文/推理文本没有 JSON 骨架时，格式修复只会浪费 call 预算；
+                    # 交给外层任务重试，并要求模型直接输出完整 JSON。
+                    if "{" not in text and "\uff5b" not in text:
+                        _write_llm_log(
+                            tool_name,
+                            "output_error",
+                            text[:4000],
+                            {
+                                "model": str(result.get("model") or ""),
+                                "error": "no_json_object",
+                                "shape": _sampling_result_shape(result),
+                            },
+                        )
+                        raise
                     repaired_text = await repair_json_with_sampling(
                         sampling_create_message,
                         bad_text=text,
                         parse_error=str(parse_exc),
                         expected_shape=_build_json_repair_expected_shape(system_prompt, user_message),
-                        max_tokens=max_tokens,
+                        # 完整但语法无效的 JSON 只需格式修复额度，不能占用
+                        # 回答或截断重试的输出预算。
+                        max_tokens=(
+                            json_repair_max_tokens
+                            if json_repair_max_tokens is not None
+                            else 512
+                        ),
                         timeout=timeout,
                         metadata=metadata_payload,
                     )
@@ -604,6 +710,13 @@ async def call_llm_json(
                 return result_obj
             except Exception as exc:
                 last_error = exc
+                last_response_was_truncated = isinstance(exc, TruncatedJsonResponse)
+                # Host 明确标记的预算/授权错误在同一 invoke 内不可恢复，禁止盲目重试。
+                if (
+                    getattr(exc, "code", None) in {-32006, -32007, -32009}
+                    or type(exc).__name__ in {"SamplingBudgetExceeded", "SamplingCallLimitExceeded"}
+                ):
+                    break
                 if attempt >= attempts - 1:
                     break
                 await asyncio.sleep(min(BASE_DELAY ** (attempt + 1), 6.0))
@@ -646,7 +759,11 @@ async def call_llm_json_safe(
     allow_fallback: bool = True,
     allow_sampling_provider_fallback: bool = False,
     stop_sequences: list[str] | None = None,
+    response_format: dict[str, Any] | None = None,
+    on_unsupported: str | None = None,
     max_attempts: int | None = None,
+    retry_max_tokens: int | None = None,
+    json_repair_max_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Call LLM with fallback on failure."""
     try:
@@ -660,7 +777,11 @@ async def call_llm_json_safe(
             metadata=metadata,
             allow_sampling_provider_fallback=allow_sampling_provider_fallback,
             stop_sequences=stop_sequences,
+            response_format=response_format,
+            on_unsupported=on_unsupported,
             max_attempts=max_attempts,
+            retry_max_tokens=retry_max_tokens,
+            json_repair_max_tokens=json_repair_max_tokens,
         )
         result["fallback_used"] = False
         return result

@@ -50,13 +50,16 @@ describe("mail detail composer controls", () => {
     expect(styles).toContain(".mail-detail-reply-action {");
     expect(styles).toContain(".mail-detail-reply-action::after {");
     expect(styles).toContain(".mail-detail-footer {");
-    expect(styles).toContain("  height: 51px;");
+    expect(styles).toContain("--mail-detail-footer-size: 51px;");
+    expect(styles).toContain("height: var(--mail-detail-footer-size);");
     expect(styles).toContain("  overflow: visible;");
     expect(styles).toContain("bottom: calc(100% + 8px);");
   });
 
   it("keeps forward recipients aligned and gives the contact menu enough width", () => {
-    expect(styles).toContain(".mail-detail-forward-to .compose-field {\n  align-items: center;");
+    expect(styles).toMatch(
+      /\.mail-detail-forward-to \.compose-field \{\r?\n\s*align-items: center;/,
+    );
     expect(styles).toContain(".mail-detail-forward-to .compose-contact-menu {");
     expect(styles).toContain("width: min(420px, max(260px, calc(100vw - 48px)));");
   });

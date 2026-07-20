@@ -35,12 +35,14 @@ import {
   totalOutgoingAttachmentBytes,
 } from "../../shared/outgoingAttachments";
 import { PdfAttachmentPreview } from "./PdfAttachmentPreview";
+import { RichTextEditor, plainTextToEditorHtml, type RichTextValue } from "./RichTextEditor";
 import {
   buildForwardDraftBody,
   buildForwardSendBodies,
   buildForwardSubject,
   buildQuickReplyPrompt,
   deriveReplyToAddress,
+  extractForwardNoteHtml,
   estimateAttachmentPreviewMemory,
   formatAbsoluteDateTime,
   formatAttachmentSize,
@@ -64,6 +66,7 @@ type ComposerMode = "reply" | "forward";
 type ComposerDraftState = {
   id: string;
   body: string;
+  bodyHtml: string;
   dirty: boolean;
   etag: string;
   recipients: string[];
@@ -85,6 +88,7 @@ function emptyComposerDraft(): ComposerDraftState {
   return {
     id: "",
     body: "",
+    bodyHtml: "",
     dirty: false,
     etag: "",
     recipients: [],
@@ -714,6 +718,7 @@ export function MailDetailDrawer({
   getInboxThreadDraft: (mailbox: string, threadId: string) => Promise<{
     exists: boolean;
     body: string;
+    body_html?: string;
     etag?: string;
     attachments?: OutgoingAttachmentMeta[];
   }>;
@@ -721,6 +726,7 @@ export function MailDetailDrawer({
     mailbox: string,
     threadId: string,
     body: string,
+    bodyHtml?: string,
     ifMatch?: string,
     message?: Record<string, unknown>,
     attachments?: Array<Record<string, unknown>>,
@@ -733,6 +739,7 @@ export function MailDetailDrawer({
     threadId: string;
     to: string;
     body: string;
+    bodyHtml?: string;
     cc?: string[];
     bcc?: string[];
     message: InboxMessage;
@@ -758,6 +765,7 @@ export function MailDetailDrawer({
     bcc?: string[];
     subject: string;
     body: string;
+    bodyHtml?: string;
     sourceThreadId: string;
     sourceMessageId: string;
     attachments?: OutgoingAttachmentMeta[];
@@ -766,6 +774,7 @@ export function MailDetailDrawer({
     nonce: string;
     threadId: string;
     body: string;
+    bodyHtml?: string;
     cc?: string[];
     bcc?: string[];
     mode?: ComposerMode;
@@ -822,7 +831,7 @@ export function MailDetailDrawer({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const footerRef = useRef<HTMLElement | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
-  const bodyRef = useRef<HTMLTextAreaElement | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
   const loadInboxEmailBodyRef = useRef(loadInboxEmailBody);
   const loadInboxThreadPageRef = useRef(loadInboxThreadPage);
   const loadInboxMessageDisplayBodyRef = useRef(loadInboxMessageDisplayBody);
@@ -862,6 +871,7 @@ export function MailDetailDrawer({
   const updateActiveComposerDraft = (patch: ComposerDraftPatch) => updateComposerDraft(composerMode, patch);
   const activeComposerDraft = composerDrafts[composerMode];
   const draft = activeComposerDraft.body;
+  const draftHtml = activeComposerDraft.bodyHtml;
   const draftDirty = activeComposerDraft.dirty;
   const draftEtag = activeComposerDraft.etag;
   const forwardTo = activeComposerDraft.recipients;
@@ -885,6 +895,9 @@ export function MailDetailDrawer({
       ...current,
       body: typeof body === "function" ? body(current.body) : body,
     }));
+  };
+  const setDraftContent = ({ html, text }: RichTextValue) => {
+    updateActiveComposerDraft((current) => ({ ...current, body: text, bodyHtml: html }));
   };
   const setDraftDirty = (dirty: boolean) => updateActiveComposerDraft({ dirty });
   const setDraftEtag = (etag: string) => updateActiveComposerDraft({ etag });
@@ -939,6 +952,7 @@ export function MailDetailDrawer({
       bcc: forwardDraft.bcc,
       subject: buildForwardSubject(latestMessage?.subject || message.subject || page?.subject),
       body: forwardDraft.body,
+      bodyHtml: buildForwardSendBodies(latestMessage, forwardDraft.body, forwardDraft.bodyHtml).body_html,
       sourceThreadId: threadId,
       sourceMessageId: message.id,
       attachments: toPersistedOutgoingAttachments(forwardDraft.attachments),
@@ -1292,6 +1306,7 @@ export function MailDetailDrawer({
           if (autoOpenDraftComposer) setComposerOpen(true);
           updateComposerDraft("reply", {
             body: nextDraft,
+            bodyHtml: stored.body_html || plainTextToEditorHtml(nextDraft),
             etag: stored.etag || "",
             attachments: storedAttachments,
           });
@@ -1314,6 +1329,9 @@ export function MailDetailDrawer({
     updateComposerDraft(restoreMode, (current) => ({
       ...current,
       body: replyDraftRestore.body,
+      bodyHtml: restoreMode === "forward"
+        ? (extractForwardNoteHtml(replyDraftRestore.bodyHtml) || plainTextToEditorHtml(stripForwardedMessageBlock(replyDraftRestore.body)))
+        : (replyDraftRestore.bodyHtml || plainTextToEditorHtml(replyDraftRestore.body)),
       id: restoreMode === "forward" ? (replyDraftRestore.composeDraftId || "") : current.id,
       etag: restoreMode === "forward" ? (replyDraftRestore.composeDraftEtag || "") : current.etag,
       dirty: true,
@@ -1357,6 +1375,7 @@ export function MailDetailDrawer({
             mailbox,
             threadId,
             draft,
+            draftHtml,
             draftEtag || undefined,
             {
               id: latestMessage?.id || message?.id || "",
@@ -1387,7 +1406,7 @@ export function MailDetailDrawer({
       void pendingSave.finally(() => pendingDraftSavesRef.current.delete(pendingSave));
     }, 500);
     return () => window.clearTimeout(timer);
-  }, [composerAttachments, composerMode, composerOpen, draft, draftDirty, draftEtag, latestMessage, mailbox, message, threadId]);
+  }, [composerAttachments, composerMode, composerOpen, draft, draftDirty, draftEtag, draftHtml, latestMessage, mailbox, message, threadId]);
 
   useEffect(() => {
     if (!composerOpen) return;
@@ -1457,6 +1476,7 @@ export function MailDetailDrawer({
         body: targetMode === "forward"
           ? buildForwardDraftBody(latestMessage || undefined, artifact.body)
           : artifact.body,
+        bodyHtml: plainTextToEditorHtml(artifact.body),
         dirty: true,
       }));
       requestAnimationFrame(() => bodyRef.current?.focus());
@@ -1468,12 +1488,15 @@ export function MailDetailDrawer({
     draftEditSequenceRef.current += 1;
     updateComposerDraft(targetMode, (current) => ({
       ...current,
-      body: targetMode === "forward"
+        body: targetMode === "forward"
         ? buildForwardDraftBody(
             latestMessage || undefined,
             mergeDraftArtifactBody(stripForwardedMessageBlock(current.body), artifact.body, mode),
           )
-        : mergeDraftArtifactBody(current.body, artifact.body, mode),
+          : mergeDraftArtifactBody(current.body, artifact.body, mode),
+        bodyHtml: plainTextToEditorHtml(targetMode === "forward"
+          ? mergeDraftArtifactBody(stripForwardedMessageBlock(current.body), artifact.body, mode)
+          : mergeDraftArtifactBody(current.body, artifact.body, mode)),
       dirty: true,
     }));
     requestAnimationFrame(() => bodyRef.current?.focus());
@@ -2024,7 +2047,7 @@ export function MailDetailDrawer({
             // 拉全文失败时仍按当前正文转发
           }
         }
-        const sendBodies = buildForwardSendBodies(source, draft);
+        const sendBodies = buildForwardSendBodies(source, draft, draftHtml);
         if (onScheduleForward({
           mailbox,
           recipients: forwardTo,
@@ -2054,6 +2077,7 @@ export function MailDetailDrawer({
         mailbox,
         threadId,
         draft,
+        draftHtml,
         draftEtag || undefined,
         {
           id: latestMessage.id || message.id,
@@ -2079,6 +2103,7 @@ export function MailDetailDrawer({
         threadId,
         to,
         body: draft,
+        bodyHtml: draftHtml || undefined,
         cc: replyCc,
         bcc: replyBcc,
         message,
@@ -2122,6 +2147,7 @@ export function MailDetailDrawer({
           bcc: forwardDraft.bcc,
           subject: buildForwardSubject(latestMessage?.subject || message?.subject || page?.subject),
           body: forwardDraft.body,
+          bodyHtml: buildForwardSendBodies(latestMessage, forwardDraft.body, forwardDraft.bodyHtml).body_html,
           sourceThreadId: threadId,
           sourceMessageId: message?.id || "",
         });
@@ -2150,9 +2176,10 @@ export function MailDetailDrawer({
   const forwardQuote = composerMode === "forward"
     ? buildForwardDraftBody(latestMessage || undefined, "").trimStart()
     : "";
-  const updateForwardNote = (value: string) => {
+  const updateForwardNote = ({ html, text }: RichTextValue) => {
     draftEditSequenceRef.current += 1;
-    setDraft(buildForwardDraftBody(latestMessage || undefined, value));
+    setDraft(buildForwardDraftBody(latestMessage || undefined, text));
+    updateActiveComposerDraft({ bodyHtml: html });
     setDraftDirty(true);
   };
 
@@ -2457,10 +2484,10 @@ export function MailDetailDrawer({
                 <div className={`mail-detail-composer-body${composerMode === "forward" && forwardQuote ? " is-forward" : ""}`}>
                   {composerMode === "forward" ? (
                     <>
-                      <textarea
+                      <RichTextEditor
                         ref={bodyRef}
-                        value={forwardNote}
-                        onChange={(event) => updateForwardNote(event.target.value)}
+                        value={draftHtml || plainTextToEditorHtml(forwardNote)}
+                        onChange={updateForwardNote}
                         placeholder="Add a message…"
                       />
                       {forwardQuote ? (
@@ -2470,12 +2497,12 @@ export function MailDetailDrawer({
                       ) : null}
                     </>
                   ) : (
-                    <textarea
+                    <RichTextEditor
                       ref={bodyRef}
-                      value={draft}
-                      onChange={(event) => {
+                      value={draftHtml || plainTextToEditorHtml(draft)}
+                      onChange={(value) => {
                         draftEditSequenceRef.current += 1;
-                        setDraft(event.target.value);
+                        setDraftContent(value);
                         setDraftDirty(true);
                       }}
                       placeholder="Write your reply…"

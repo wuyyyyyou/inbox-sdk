@@ -6,12 +6,16 @@ import logging
 import re
 from typing import Any
 
+from mail_agent.ai_turn.prompts import chat_general_system_prompt, thread_answer_system_prompt
 from mail_agent.ai_turn.registry import format_summary_for_router, record_turn_summary
 from mail_agent.ai_turn.router import route_ai_turn
-from mail_agent.llm_runtime.service import extract_sampling_text
+from mail_agent.llm_runtime.service import (
+    _ascii_escape_for_host_transport,
+    call_llm_json_safe,
+    extract_sampling_text,
+)
 
 _logger = logging.getLogger(__name__)
-
 
 def _uses_chinese(text: str) -> bool:
     return bool(re.search(r"[\u3400-\u9fff]", text or ""))
@@ -35,15 +39,7 @@ async def _tool_chat_general(
     memory_summary: str = "",
 ) -> dict[str, Any]:
     """普通闲聊：走 budgeted Sampling，不访问邮箱。"""
-    system = (
-        "You are Anna, a concise inbox assistant (AI 助理). "
-        "Answer naturally. Do not claim you scanned email unless tools did. "
-        "You can help organize (suggest only), search, draft/revise, and analyze email. "
-        "No calendar auto-scheduling, no silent Gmail mutations. "
-        f"Respond in {'Chinese' if language == 'zh' else 'English'}."
-    )
-    if memory_summary:
-        system += f"\n{memory_summary}"
+    system = chat_general_system_prompt(language, memory_summary)
     if sampling_create_message is None:
         text = (
             "你好，我是 AI 助理。你可以让我搜索、总结、起草回复或建议整理收件箱（整理须你确认）。"
@@ -52,10 +48,18 @@ async def _tool_chat_general(
         )
         return {"kind": "chat", "assistant_text": text, "fallback_used": True}
     try:
+        # 纯聊天只进行一次最终回答生成。非 ASCII 文本仍需在直连 Sampling 前转义，
+        # 防止 Windows Anna bridge 通过 GBK stdout 写反向 RPC 时发生编码崩溃。
         result = await sampling_create_message(
-            messages=[{"role": "user", "content": {"type": "text", "text": user_text}}],
+            messages=[{
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": _ascii_escape_for_host_transport(user_text),
+                },
+            }],
             max_tokens=500,
-            system_prompt=system,
+            system_prompt=_ascii_escape_for_host_transport(system),
             temperature=0.4,
             include_context="none",
             metadata={"tool": "ai_turn_chat"},
@@ -65,14 +69,12 @@ async def _tool_chat_general(
     except Exception as exc:
         _logger.warning("ai_turn chat_general failed: error_type=%s", type(exc).__name__)
         text = ""
-    if not text:
-        text = (
-            "你好，我在。聊天模型暂时不可用，你仍可让我搜索或总结邮件。"
-            if language == "zh"
-            else "Hi, I'm here. Chat is temporarily limited; you can still ask me to search or summarize email."
-        )
-        return {"kind": "chat", "assistant_text": text, "fallback_used": True}
-    return {"kind": "chat", "assistant_text": text, "fallback_used": False}
+
+    if text:
+        return {"kind": "chat", "assistant_text": text, "fallback_used": False}
+
+    unavailable = "AI 聊天暂时不可用，请稍后重试。" if language == "zh" else "AI chat is temporarily unavailable. Please try again."
+    return {"kind": "error", "assistant_text": unavailable, "error": "chat_unavailable", "fallback_used": False}
 
 
 async def _tool_summarize_thread(
@@ -83,7 +85,11 @@ async def _tool_summarize_thread(
     sampling_create_message: Any,
     memory_summary: str = "",
 ) -> dict[str, Any]:
-    """总结当前打开的邮件线程。"""
+    """基于当前线程回答邮件问题，并把自然语言主体限制为 Markdown。
+
+    线程问题不再先经过关键词 Router。当前线程本身就是稳定的执行边界；模型
+    只负责根据证据回答问题，状态变更和发送仍由独立的确认工具处理。
+    """
     from mail_agent.llm_runtime.service import call_llm_json_safe
     from mail_agent.mail_providers.gmail.adapter import get_message_detail, normalize_mailbox
 
@@ -103,61 +109,81 @@ async def _tool_summarize_thread(
     subject = str(current.get("subject") or "")
     snippet = str(current.get("snippet") or "")
     try:
-        detail = get_message_detail(mailbox, message_id)
-        if detail:
-            body = (getattr(detail, "body_text", "") or "")[:2000]
-            subject = subject or (getattr(detail, "subject", "") or "")
-            snippet = snippet or (getattr(detail, "snippet", "") or "")
+        # 仅保留最近 4 封、每封 600 字符，避免长引用链挤占模型输出空间。
+        from mail_agent.mail_providers.gmail.adapter import get_thread_context, refresh_thread_cache
+
+        # 当前线程优先取 Gmail 最新内容；失败时仍可由下方缓存读取继续回答。
+        try:
+            refresh_thread_cache(mailbox, thread_id)
+        except Exception:
+            pass
+        thread = get_thread_context(mailbox, thread_id, max_messages=4)
+        excerpts: list[str] = []
+        for index, item in enumerate(getattr(thread, "messages", [])[-4:], start=1):
+            item_body = str(getattr(item, "body_text", "") or "").strip()[:600]
+            item_subject = str(getattr(item, "subject", "") or "").strip()
+            item_from = str(getattr(item, "from_addr", "") or "").strip()
+            if item_body or item_subject:
+                excerpts.append(
+                    f"Message {index}\nFrom: {item_from}\nSubject: {item_subject}\nBody: {item_body}"
+                )
+        body = "\n\n---\n\n".join(excerpts)
+        if not body:
+            detail = get_message_detail(mailbox, message_id)
+            if detail:
+                body = (getattr(detail, "body_text", "") or "")[:1200]
+                subject = subject or (getattr(detail, "subject", "") or "")
+                snippet = snippet or (getattr(detail, "snippet", "") or "")
     except Exception:
         pass
 
-    fallback = (
-        f"这是关于「{subject or '当前邮件'}」的摘要。正文未能完整读取时，请打开邮件查看详情。"
-        if language == "zh"
-        else f"Summary for “{subject or 'this email'}”. Open the message if the body could not be fully read."
-    )
     if sampling_create_message is None:
-        text = f"{fallback}\n\n{snippet}".strip()
         return {
-            "kind": "mail_context",
-            "assistant_text": text,
-            "mail_context": {
-                "kind": "thread",
-                "mailbox": mailbox,
-                "message_id": message_id,
-                "thread_id": thread_id,
-                "subject": subject,
-            },
-            "fallback_used": True,
+            "kind": "error",
+            "assistant_text": "AI 总结暂时不可用，请稍后重试。" if language == "zh" else "AI summary is temporarily unavailable. Please try again.",
+            "error": "analysis_unavailable",
+            "fallback_used": False,
         }
 
-    system_prompt = (
-        "You are Anna. Summarize the email for the user. Return JSON only: "
-        '{"assistant_text": string}. Use only the provided evidence. '
-        "Structure as purpose / key facts / user actions when helpful. "
-        f"Language: {'Chinese' if language == 'zh' else 'English'}."
-    )
-    if memory_summary:
-        system_prompt += f"\n{memory_summary}"
+    system_prompt = thread_answer_system_prompt(language, memory_summary)
 
-    result = await call_llm_json_safe(
-        sampling_create_message,
-        system_prompt=system_prompt,
-        user_message=(
-            f"User request: {user_text}\n"
-            f"Subject: {subject}\nSnippet: {snippet}\nBody excerpt:\n{body or '(empty)'}\n"
-        ),
-        fallback={"assistant_text": fallback},
-        temperature=0.2,
-        max_tokens=900,
-        timeout=60.0,
-        metadata={"tool": "ai_turn_summarize_thread"},
-        allow_fallback=True,
-        allow_sampling_provider_fallback=True,
-        max_attempts=1,
-    )
+    try:
+        result = await call_llm_json_safe(
+            sampling_create_message,
+            system_prompt=system_prompt,
+            user_message=(
+                f"Question: {user_text}\n"
+                f"Subject: {subject}\n"
+                f"Thread evidence:\n{body or snippet or '(empty)'}\n"
+            ),
+            fallback={},
+            temperature=0.2,
+            max_tokens=1600,
+            timeout=45.0,
+            metadata={"tool": "ai_turn_thread_answer"},
+            response_format={"type": "json_object"},
+            on_unsupported="text",
+            allow_fallback=False,
+            allow_sampling_provider_fallback=True,
+            max_attempts=2,
+        )
+    except Exception as exc:
+        _logger.warning("ai_turn thread summary failed: error_type=%s", type(exc).__name__)
+        return {
+            "kind": "error",
+            "assistant_text": "AI 总结暂时不可用，请稍后重试。" if language == "zh" else "AI summary is temporarily unavailable. Please try again.",
+            "error": "analysis_unavailable",
+            "fallback_used": False,
+        }
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
-    text = str(payload.get("assistant_text") or fallback).strip()
+    text = str(payload.get("markdown") or "").strip()
+    if not text:
+        return {
+            "kind": "error",
+            "assistant_text": "AI 总结暂时不可用，请稍后重试。" if language == "zh" else "AI summary is temporarily unavailable. Please try again.",
+            "error": "analysis_unavailable",
+            "fallback_used": False,
+        }
     return {
         "kind": "mail_context",
         "assistant_text": text,
@@ -203,6 +229,15 @@ async def _tool_search_and_answer(
         progress_callback=_progress,
     )
     summary = str(result.get("summary") or result.get("plan_title") or "").strip()
+    if result.get("analysis_error"):
+        # Ask 已确认检索完成但分析模型未返回有效 JSON。该情况必须进入失败态，
+        # 让侧栏显示重试入口，不能将候选邮件或计划信息当作最终分析输出。
+        return {
+            "kind": "error",
+            "assistant_text": summary,
+            "error": "analysis_unavailable",
+            "fallback_used": False,
+        }
     # 失败时不伪装本地邮件列表成功回答
     if result.get("error") or (result.get("success") is False):
         language = "zh" if _uses_chinese(user_text) else "en"
@@ -225,7 +260,9 @@ async def _tool_search_and_answer(
         "kind": "scan",
         "assistant_text": summary,
         "scan_result": result,
-        "fallback_used": bool((result.get("llm_meta") or {}).get("fallback_used")),
+        "fallback_used": bool(
+            result.get("fallback_used") or (result.get("llm_meta") or {}).get("fallback_used")
+        ),
     }
 
 
@@ -319,6 +356,41 @@ async def run_ai_turn(
     except Exception as exc:
         _logger.warning("ai_turn memory summary failed: error_type=%s", type(exc).__name__)
 
+    # 邮箱上下文只是页面状态而非读取授权。除显式 UI artifact 外，本轮由
+    # Router 模型判断聊天、搜索或线程操作，不能在后端用关键词硬编码分流。
+    language = "zh" if _uses_chinese(text) else "en"
+    current = context.get("current_thread") if isinstance(context.get("current_thread"), dict) else {}
+    requested_artifact = str(
+        context.get("requested_artifact") or arguments.get("requested_artifact") or ""
+    ).strip()
+
+    if requested_artifact in {"draft_reply", "send_plan"}:
+        if progress_callback:
+            progress_callback("draft", {"stage": "thread_draft"})
+        outcome = await tool_draft_reply(
+            text,
+            context,
+            language=language,
+            sampling_create_message=sampling_create_message,
+            memory_summary=memory_summary,
+            mode="draft_reply",
+        )
+        outcome["route"] = {"execution": "thread_draft"}
+        return outcome
+
+    if requested_artifact == "revise_draft":
+        if progress_callback:
+            progress_callback("draft", {"stage": "revise_draft"})
+        outcome = await tool_revise_draft(
+            text,
+            context,
+            language=language,
+            sampling_create_message=sampling_create_message,
+            memory_summary=memory_summary,
+        )
+        outcome["route"] = {"execution": "revise_draft"}
+        return outcome
+
     conversation_summary = format_summary_for_router(conversation_id)
 
     if progress_callback:
@@ -376,6 +448,8 @@ async def run_ai_turn(
             "clarify": str(route.get("clarify")),
             "route": route,
         }
+        if isinstance(route.get("clarification"), dict):
+            outcome["clarification"] = route["clarification"]
         return _record("clarify", outcome)
 
     steps = route.get("steps") if isinstance(route.get("steps"), list) else []
@@ -395,6 +469,8 @@ async def run_ai_turn(
             "能再具体一点吗？" if language == "zh" else "Could you be more specific?"
         ))
         outcome = {"kind": "clarify", "assistant_text": clarify, "clarify": clarify, "route": route}
+        if isinstance(route.get("clarification"), dict):
+            outcome["clarification"] = route["clarification"]
         return _record("clarify", outcome)
 
     if primary == "remember_preference":

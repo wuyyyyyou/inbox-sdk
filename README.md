@@ -7,10 +7,10 @@ Anna Inbox 是运行在 Anna App 中的 Gmail 工作台。2.0 以完整收件箱
 - Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 和 All mail 视图；Trash 邮件仅在 Trash 中展示且排除草稿，恢复时仅移除 Gmail 的 `TRASH` 标签。
 - Important / Other 分类、本地缓存、增量加载和 Gmail 刷新。
 - 星标、重要、Todo、Snooze、已读、完成和移至垃圾箱操作。
-- 线程详情、清洗后的文本或安全 HTML、AI overview、回复/转发草稿、Cc·Bcc 与发送（10 秒可撤销）。
+- 线程详情、清洗后的文本或安全 HTML、AI overview、回复/转发/Compose 富文本草稿（`body_html`）、Cc·Bcc 与发送（10 秒可撤销）。
 - 收件附件预览/下载；回复与 Compose 外发附件（loopback stage，合计 ≤25MB）。
 - 多邮箱切换：立刻取消上一邮箱扫描，首屏读本地缓存，后台 History 静默同步。
-- 可折叠、可调宽的 Anna AI 侧栏：默认经后端 `start_ai_turn` 本地 Router 选型（聊天 / 收件箱搜索 / 当前邮件总结），并支持当前邮件上下文协助与可审阅 Compose 草稿。
+- 可折叠、可调宽的 Anna AI 侧栏：默认经后端 `start_ai_turn` 本地 Router 选型；意图不清时可澄清范围；支持当前邮件上下文协助与可审阅 Compose 草稿。
 - 多 Gmail 账户发现与切换。
 - LLM 与 Gmail API 的真实连通性和延迟检测：反向 RPC 响应直通、12 秒统一总预算、检测去重，并在扫描或 AI turn 期间暂停轮询。
 - 平台超时安全诊断：AI run 与同步收件箱调用返回 Sampling、Connected accounts、Gmail HTTP 和 Executa 阶段耗时，前端失败消息仅展示经过格式校验的诊断摘要。
@@ -117,8 +117,8 @@ App 与 Tool **版本解耦**（当前基线）：
 
 | 端 | 版本 | 权威文件 |
 | --- | --- | --- |
-| App | `2.1.1` | `anna-inbox/app.json` |
-| Tool | `2.2.1` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
+| App | `2.1.2` | `anna-inbox/app.json` |
+| Tool | `2.2.2` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
 
 Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Tool 版本后运行：
 

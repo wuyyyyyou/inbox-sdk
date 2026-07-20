@@ -101,23 +101,27 @@ async def main() -> None:
         mailbox,
         thread_id,
         "Draft reply body",
+        body_html='<p><strong>Draft</strong> <a href="https://example.com">reply</a><script>alert(1)</script></p>',
         message={"id": "msg-123", "thread_id": thread_id, "subject": "Hello"},
     )
     assert saved_draft.get("etag")
     loaded_draft = await get_inbox_thread_draft(mailbox, thread_id)
     assert loaded_draft["exists"] is True
     assert loaded_draft["value"]["body"] == "Draft reply body"
+    assert loaded_draft["value"]["body_html"] == '<p><strong>Draft</strong> <a href="https://example.com">reply</a></p>'
     assert loaded_draft["value"]["message"]["subject"] == "Hello"
 
     listed = await list_inbox_thread_drafts(mailbox)
     assert listed["count"] == 1
     assert listed["drafts"][0]["body"] == "Draft reply body"
+    assert listed["drafts"][0]["body_html"] == '<p><strong>Draft</strong> <a href="https://example.com">reply</a></p>'
     assert listed["drafts"][0]["message"]["id"] == "msg-123"
 
     repaired = await set_inbox_thread_draft(
         mailbox,
         thread_id,
         "Draft reply body",
+        body_html=listed["drafts"][0]["body_html"],
         if_match=listed["drafts"][0]["etag"],
         message={"id": "msg-999", "thread_id": thread_id, "subject": "Latest subject"},
         updated_at=listed["drafts"][0]["updated_at"],
@@ -126,6 +130,7 @@ async def main() -> None:
     repaired_draft = await get_inbox_thread_draft(mailbox, thread_id)
     assert repaired_draft["value"]["updated_at"] == listed["drafts"][0]["updated_at"]
     assert repaired_draft["value"]["message"]["subject"] == "Latest subject"
+    assert repaired_draft["value"]["body_html"] == '<p><strong>Draft</strong> <a href="https://example.com">reply</a></p>'
 
     deleted = await delete_inbox_thread_draft(mailbox, thread_id)
     assert deleted["deleted"] is True

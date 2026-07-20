@@ -14,6 +14,7 @@ import type {
   AiChatMessage,
   AiComposeContextRef,
   AiMailContextRef,
+  AiRoutingIntent,
   AskMailLink,
   ComposeDraftArtifact,
   ComposeDraft,
@@ -1570,6 +1571,8 @@ function AiAssistantMessage({
   const [assistantTextComplete, setAssistantTextComplete] = useState(
     () => !shouldAnimateAssistantText(message.timestamp),
   );
+  const [clarificationInput, setClarificationInput] = useState("");
+  const [clarificationSubmitting, setClarificationSubmitting] = useState(false);
   // 整理确认卡片：勾选状态与主动作
   const proposed = message.proposedActions;
   const [selectedProposeKeys, setSelectedProposeKeys] = useState<Set<string>>(() => {
@@ -1689,6 +1692,25 @@ function AiAssistantMessage({
         : null;
     const summaryLink = message.mailSummaryLink;
     const clarification = message.clarification;
+    const submitClarification = async (actionId?: string) => {
+      if (!clarification || clarificationSubmitting) return;
+      const customInput = clarificationInput.trim();
+      const routingIntent = actionId && ["inbox", "current_thread", "compose", "chat"].includes(actionId)
+        ? actionId as AiRoutingIntent
+        : undefined;
+      if (!routingIntent && !customInput) return;
+      setClarificationSubmitting(true);
+      try {
+        actions.resolveAiClarification(message.id, routingIntent || "custom");
+        await actions.sendAiChatMessage({
+          prompt: customInput || clarification.original_input,
+          baseMessages: state.aiChatMessages,
+          routingIntent: customInput ? undefined : routingIntent,
+        });
+      } finally {
+        setClarificationSubmitting(false);
+      }
+    };
     const submitReplyGap = async () => {
       if (
         !message.mailContext ||
@@ -1757,15 +1779,45 @@ function AiAssistantMessage({
           onOpenThread={openThreadReference}
         />
         {clarification && clarification.status === "pending" ? (
-          <div className="ai-clarification is-pending">
+          <div className="ai-clarification ai-routing-dialog" role="group" aria-label={clarification.question}>
+            <p>{clarification.question}</p>
             <div className="ai-clarification-actions">
-              <button
-                className="is-dismiss"
-                onClick={() => actions.dismissAiClarification(message.id)}
-              >
-                Dismiss
-              </button>
+              {clarification.actions.map((action) => (
+                <button
+                  key={action.id}
+                  type="button"
+                  disabled={clarificationSubmitting || state.aiChatLoading}
+                  onClick={() => void submitClarification(action.id)}
+                >
+                  {action.label}
+                </button>
+              ))}
             </div>
+            {clarification.freeform_enabled ? (
+              <div className="ai-routing-custom">
+                <textarea
+                  value={clarificationInput}
+                  disabled={clarificationSubmitting || state.aiChatLoading}
+                  placeholder="Describe what you want Anna to do"
+                  onChange={(event) => setClarificationInput(event.target.value)}
+                />
+                <button
+                  type="button"
+                  disabled={!clarificationInput.trim() || clarificationSubmitting || state.aiChatLoading}
+                  onClick={() => void submitClarification()}
+                >
+                  Continue
+                </button>
+              </div>
+            ) : null}
+            <button
+              type="button"
+              className="ai-routing-dismiss"
+              disabled={clarificationSubmitting}
+              onClick={() => actions.dismissAiClarification(message.id)}
+            >
+              Dismiss
+            </button>
           </div>
         ) : null}
         {proposed ? (
@@ -2167,7 +2219,7 @@ function AiAssistantMessage({
         onOpenThread={openThreadReference}
         onComplete={onTextComplete}
       />
-      {result.title || result.plan_title ? (
+      {aiResultCount(result) > 0 && (result.title || result.plan_title) ? (
         <h2>{result.title || result.plan_title}</h2>
       ) : null}
       {sections.length ? (
@@ -3069,6 +3121,7 @@ export function HomeView() {
     nonce: string;
     threadId: string;
     body: string;
+    bodyHtml?: string;
     cc?: string[];
     bcc?: string[];
     mode?: "reply" | "forward";
@@ -4842,6 +4895,7 @@ export function HomeView() {
       threadId: string;
       to: string;
       body: string;
+      bodyHtml?: string;
       cc?: string[];
       bcc?: string[];
       message: InboxMessage;
@@ -4857,6 +4911,7 @@ export function HomeView() {
             nonce: crypto.randomUUID(),
             threadId: args.threadId,
             body: args.body,
+            bodyHtml: args.bodyHtml,
             cc: args.cc,
             bcc: args.bcc,
             mode: "reply",
@@ -4869,6 +4924,7 @@ export function HomeView() {
             threadId: args.threadId,
             to: args.to,
             body: args.body,
+            bodyHtml: args.bodyHtml,
             cc: args.cc,
             bcc: args.bcc,
             replyMode: "reply_to_sender",
@@ -4967,6 +5023,7 @@ export function HomeView() {
       bcc?: string[];
       subject: string;
       body: string;
+      bodyHtml?: string;
       sourceThreadId: string;
       sourceMessageId: string;
       attachments?: ComposeDraft["attachments"];
@@ -4981,6 +5038,7 @@ export function HomeView() {
         bcc: args.bcc || [],
         subject: args.subject,
         body: args.body,
+        body_html: args.bodyHtml,
         attachments: args.attachments || [],
       }, args.ifMatch);
       setComposeDrafts((current) => [
@@ -5025,6 +5083,7 @@ export function HomeView() {
               nonce: crypto.randomUUID(),
               threadId: source.thread_id || draft.source_thread_id || source.id,
               body: draft.body,
+              bodyHtml: draft.body_html,
               cc: draft.cc,
               bcc: draft.bcc,
               mode: "forward",

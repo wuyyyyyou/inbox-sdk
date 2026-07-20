@@ -15,7 +15,7 @@
   "required_executas": [
     {
       "tool_id": "bundled:inbox-executa",
-      "min_version": "2.2.1",
+      "min_version": "2.2.2",
       "version": "latest"
     }
   ],
@@ -30,10 +30,7 @@
   "ui": {
     "bundle": {
       "format": "static-spa",
-      "entry": "index.html",
-      "external_origins": [
-        "https://claude.ai"
-      ]
+      "entry": "index.html"
     },
     "views": [
       {

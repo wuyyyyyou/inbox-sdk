@@ -316,7 +316,11 @@ def test_render_empty_candidates():
 
 def test_context_selection_limits_body_and_thread_reads():
     """筛选后的全部候选仍保留统计，但最多有限条进入正文与线程读取。"""
-    from mail_agent.ask.answer import _select_candidates_for_context, _MAX_CONTEXT_CANDIDATES
+    from mail_agent.ask.answer import (
+        _select_candidates_for_context,
+        _DEFAULT_CONTEXT_CANDIDATES,
+        resolve_context_candidate_limit,
+    )
     from mail_agent.ask.planner import AskPlan
     from mail_agent.domain.types import MessageLite
 
@@ -331,9 +335,36 @@ def test_context_selection_limits_body_and_thread_reads():
     plan = AskPlan(user_request="Find invoice emails", topics=[{"search_terms": ["invoice"]}])
     selected = _select_candidates_for_context(candidates, plan)
 
-    assert len(selected) == _MAX_CONTEXT_CANDIDATES
+    assert resolve_context_candidate_limit(plan.user_request) == _DEFAULT_CONTEXT_CANDIDATES
+    assert len(selected) == _DEFAULT_CONTEXT_CANDIDATES
     assert selected[0].message_id == "m99"
     print("[PASS] test_context_selection_limits_body_and_thread_reads")
+
+
+def test_resolve_answer_item_limit_parses_custom_count():
+    """用户指定条数（默认 3，最高 8）应驱动 Answer items 与上下文上限。"""
+    from mail_agent.ask.answer import (
+        resolve_answer_item_limit,
+        resolve_context_candidate_limit,
+        _build_answer_system_prompt,
+        _DEFAULT_ANSWER_ITEMS,
+        _MAX_ANSWER_ITEMS,
+        _MAX_CONTEXT_CANDIDATES,
+    )
+
+    assert resolve_answer_item_limit("整理收件箱") == _DEFAULT_ANSWER_ITEMS
+    assert resolve_answer_item_limit("找 5 封邮件") == 5
+    assert resolve_answer_item_limit("请从邮件中找出最需要优先处理的 5 封") == 5
+    assert resolve_answer_item_limit("find top 5 emails that need reply") == 5
+    assert resolve_answer_item_limit("list 12 messages") == _MAX_ANSWER_ITEMS
+    assert resolve_answer_item_limit("0 emails") == 1
+    assert resolve_context_candidate_limit("找 5 封邮件") == 5
+    assert resolve_context_candidate_limit("找 8 封邮件") == _MAX_CONTEXT_CANDIDATES
+    assert resolve_context_candidate_limit("Find invoice emails") == 5
+    prompt = _build_answer_system_prompt(5)
+    assert "at most 5 priority items" in prompt
+    assert "at most 3 priority items" not in prompt
+    print("[PASS] test_resolve_answer_item_limit_parses_custom_count")
 
 
 async def test_filter_candidates_does_not_make_a_second_sampling_call():
@@ -446,9 +477,11 @@ def test_answer_fallback_uses_request_language():
                 direction="inbox", goal="general_qa", task_prompt="", gmail_flags=[])
     chinese = _answer_fallback(AskPlan(user_request="整理收件箱", **base))
     english = _answer_fallback(AskPlan(user_request="Organize my inbox", **base))
-    assert chinese["title"] == "扫描未完成"
-    assert "无法生成" in chinese["summary"]
-    assert english["title"] == "Scan incomplete"
+    assert chinese["title"] == ""
+    assert chinese["summary"] == "AI 分析暂时不可用，请稍后重试。"
+    assert english["summary"] == "AI analysis is temporarily unavailable. Please try again."
+    assert chinese["analysis_error"] is True
+    assert chinese["fallback_used"] is False
     print("[PASS] test_answer_fallback_uses_request_language")
 
 
@@ -462,76 +495,92 @@ def test_empty_sampling_uses_error_fallback_not_local_mail_list():
         "Anna sampling failed",
     )
 
-    assert result["title"] == "Urgent emails"
+    assert result["title"] == ""
     assert result["sections"] == []
     assert "matching emails" not in result["summary"].lower()
     assert "相关邮件" not in result["summary"]
     print("[PASS] test_empty_sampling_uses_error_fallback_not_local_mail_list")
 
 
-def test_answer_fallback_lists_enriched_candidates_when_llm_fails():
-    """已有扫描证据时，Answer 失败应列出真实候选而非空白错误页。"""
+def test_answer_fallback_never_exposes_enriched_candidates():
+    """已有扫描证据时，Answer 失败也必须返回可重试错误而非候选邮件。"""
     from mail_agent.ask.answer import _answer_fallback
     from mail_agent.ask.planner import AskPlan
 
     result = _answer_fallback(
         AskPlan(user_request="What needs my reply?", title="Emails that need your reply", goal="draft_replies"),
         "Expecting value: schema echo",
-        enriched=[
-            {
-                "subject": "BH68B7 is your Gravatar code",
-                "from": "Gravatar <donotreply@gravatar.com>",
-                "snippet": "Verify your email",
-                "mailbox": "owner@example.com",
-                "message_id": "noise1",
-                "thread_id": "noise1",
-            },
-            {
-                "subject": "问候一下",
-                "from": "KateQ Zhou <kateq@anna.partners>",
-                "snippet": "hello",
-                "mailbox": "owner@example.com",
-                "message_id": "m1",
-                "thread_id": "t1",
-                "date": "Jul 10, 2026",
-            },
-        ],
     )
 
-    assert result["fallback_used"] is True
-    assert result["sections"]
-    items = result["sections"][0]["items"]
-    assert len(items) == 1
-    item = items[0]
-    assert item["subject"] == "问候一下"
-    assert item["message_id"] == "m1"
-    assert item["mail_links"][0]["thread_id"] == "t1"
-    assert "unavailable" in result["summary"].lower() or "候选" in result["summary"] or "likely" in result["summary"].lower()
-    print("[PASS] test_answer_fallback_lists_enriched_candidates_when_llm_fails")
+    assert result["analysis_error"] is True
+    assert result["sections"] == []
+    assert result["fallback_used"] is False
+    assert "temporarily unavailable" in result["summary"].lower()
+    print("[PASS] test_answer_fallback_never_exposes_enriched_candidates")
+
+
+async def test_truncated_answer_uses_reserved_retry_then_returns_error():
+    """Sampling 截断后使用预留重试额度，仍失败则返回可重试错误。"""
+    from mail_agent.ask.answer import _generate_answer
+    from mail_agent.ask.planner import AskPlan
+
+    calls: list[dict[str, Any]] = []
+
+    async def truncated_sampling(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {"content": {"type": "text", "text": '{"summary":"partial'}}
+
+    plan = AskPlan(user_request="What needs my reply?", title="Emails that need your reply", goal="draft_replies")
+    result = await _generate_answer(
+        plan,
+        [{
+            "subject": "Project update",
+            "from": "Kate <kate@example.com>",
+            "snippet": "Can you confirm the schedule?",
+            "mailbox": "owner@example.com",
+            "message_id": "m1",
+            "thread_id": "t1",
+        }],
+        "owner@example.com",
+        sampling_create_message=truncated_sampling,
+    )
+
+    assert result["analysis_error"] is True
+    assert result["fallback_used"] is False
+    assert result["sections"] == []
+    assert len(calls) == 2
+    assert calls[0]["max_tokens"] == 4096
+    assert calls[1]["max_tokens"] == 4096
+    print("[PASS] test_truncated_answer_uses_reserved_retry_then_returns_error")
 
 
 def test_answer_system_prompt_avoids_typescript_schema_tokens():
     """System prompt 不得用 string/string? 类型注解，否则模型会原样回显导致 JSON 失败。"""
-    from mail_agent.ask.answer import _ASK_ANSWER_SYSTEM_PROMPT
+    from mail_agent.ask.answer import _ASK_ANSWER_SYSTEM_PROMPT, _build_answer_system_prompt
 
     assert "string?" not in _ASK_ANSWER_SYSTEM_PROMPT
     assert '"title": string' not in _ASK_ANSWER_SYSTEM_PROMPT
     assert "valid JSON" in _ASK_ANSWER_SYSTEM_PROMPT
+    assert "at most 3 priority items" in _ASK_ANSWER_SYSTEM_PROMPT
+    assert "at most 8 priority items" in _build_answer_system_prompt(8)
     print("[PASS] test_answer_system_prompt_avoids_typescript_schema_tokens")
 
 
-def test_answer_sampling_token_limit_stays_below_host_cap():
-    """Ask 各阶段输出额度必须适配公共 6000/4096 预算守卫。"""
-    from mail_agent.ask.sampling_budget import (
-        ASK_ANSWER_MAX_TOKENS,
-        ASK_JSON_REPAIR_MAX_TOKENS,
-        ASK_PLANNER_MAX_TOKENS,
-    )
+def test_answer_sampling_budget_uses_phase_weights():
+    """Ask 无预算 sampler 也按 v1 总额度的阶段比例，而非旧固定值。"""
+    from mail_agent.ask.sampling_budget import ASK_SAMPLING_PHASE_WEIGHTS, ask_sampling_tokens
 
-    assert ASK_PLANNER_MAX_TOKENS == 512
-    assert ASK_ANSWER_MAX_TOKENS == 1536
-    assert ASK_JSON_REPAIR_MAX_TOKENS == 512
-    print("[PASS] test_answer_sampling_token_limit_stays_below_host_cap")
+    assert ASK_SAMPLING_PHASE_WEIGHTS == {
+        "planner": 0.10,
+        "answer": 0.60,
+        "answer_retry": 0.25,
+        "json_repair": 0.05,
+    }
+    assert ask_sampling_tokens(None, "planner") == 600
+    assert ask_sampling_tokens(None, "answer") == 4096
+    assert ask_sampling_tokens(None, "answer_retry") == 4096
+    assert ask_sampling_tokens(None, "json_repair") == 800
+    print("[PASS] test_answer_sampling_budget_uses_phase_weights")
 
 
 # ── Main ────────────────────────────────────────────────────────────────
@@ -561,6 +610,7 @@ def main():
 
     print("\n--- Candidate selection ---\n")
     test_context_selection_limits_body_and_thread_reads()
+    test_resolve_answer_item_limit_parses_custom_count()
     asyncio.run(test_filter_candidates_does_not_make_a_second_sampling_call())
     test_answer_language_instruction()
     test_english_generated_copy_rejects_chinese()
@@ -568,9 +618,10 @@ def main():
     test_answer_requires_synthesis_instead_of_copying_email_body()
     test_answer_fallback_uses_request_language()
     test_empty_sampling_uses_error_fallback_not_local_mail_list()
-    test_answer_fallback_lists_enriched_candidates_when_llm_fails()
+    test_answer_fallback_never_exposes_enriched_candidates()
+    asyncio.run(test_truncated_answer_uses_reserved_retry_then_returns_error())
     test_answer_system_prompt_avoids_typescript_schema_tokens()
-    test_answer_sampling_token_limit_stays_below_host_cap()
+    test_answer_sampling_budget_uses_phase_weights()
 
     print(f"\n[ALL TESTS PASSED]")
 

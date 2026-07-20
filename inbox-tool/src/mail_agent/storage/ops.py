@@ -432,13 +432,15 @@ async def set_inbox_thread_draft(
     thread_id: str,
     body: str,
     *,
+    body_html: str | None = None,
     if_match: str | None = None,
     message: dict[str, Any] | None = None,
     updated_at: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """持久化线程草稿正文与外发附件元数据（不含文件字节）。"""
+    """持久化线程草稿正文、经净化的富文本 HTML 与外发附件元数据（不含文件字节）。"""
     from mail_agent.mail_providers.gmail.outgoing_attachments import normalize_draft_attachment_meta
+    from mail_agent.mail_providers.gmail.outgoing_html import sanitize_outgoing_html
 
     key = _inbox_thread_draft_key(mailbox, thread_id)
     # 未传 attachments 时保留已有附件列表，避免只改正文时丢失附件引用。
@@ -451,6 +453,8 @@ async def set_inbox_thread_draft(
     payload = {
         "thread_id": str(thread_id or ""),
         "body": str(body or ""),
+        # 后端再次净化，防止旧客户端或直接 RPC 绕过浏览器侧的 DOMPurify。
+        "body_html": sanitize_outgoing_html(body_html),
         "message": message if isinstance(message, dict) else {},
         "attachments": attachment_meta,
         "updated_at": str(updated_at or _now()),
@@ -479,6 +483,7 @@ async def list_inbox_thread_drafts(mailbox: str, *, limit: int = 100) -> dict[st
         drafts.append({
             "thread_id": str(value.get("thread_id") or str(key).rsplit("/", 1)[-1]),
             "body": body,
+            "body_html": str(value.get("body_html") or ""),
             "message": value.get("message") if isinstance(value.get("message"), dict) else {},
             "updated_at": str(value.get("updated_at") or ""),
             "etag": str(loaded.get("etag") or ""),

@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from mail_agent.llm_runtime.service import call_llm_json_safe
+from mail_agent.ai_turn.prompts import router_system_prompt
 
 _logger = logging.getLogger(__name__)
 
@@ -40,47 +41,18 @@ _BATCH_REQUIRED_TOOLS = frozenset({
     "batch_outreach",
 })
 
-_ROUTER_MAX_TOKENS = 448
-_ROUTER_SYSTEM = """You are Anna's inbox AI turn router. Choose tools from a fixed whitelist only.
-Return one JSON object. First character must be `{`. No markdown.
-
-Whitelist tools:
-- chat_general: greetings, capability questions, non-mail conversation
-- clarify: missing current email when user refers to "this email", or intent is ambiguous
-- search_mail: find / list / prioritize across the inbox (Gmail search)
-- rank_answer: after search_mail, summarize or rank results (optional second step)
-- summarize_thread: summarize or extract from the currently open email/thread
-- draft_reply: draft a reply to the current open email/thread
-- revise_draft: revise an existing draft body (last_draft or compose body provided)
-- summarize_then_draft: summarize current thread then draft a reply
-- compose_new: write a new outbound email outline/body (not a reply)
-- batch_draft: short reply drafts for MULTIPLE selected emails (selected_threads_count >= 2)
-- batch_outreach: personalized outreach/DM for MULTIPLE selected emails (variables isolated)
-- propose_inbox_actions: SUGGEST organize actions only (mark done/archive/trash cards); never executes
-- remember_preference: user explicitly says remember / 记住 a preference
-
-Schema:
-{
-  "language": "zh" | "en",
-  "use_current_thread": boolean,
-  "clarify": string | null,
-  "steps": [{"tool": "<whitelist>", "params": {}}]
-}
-
-Rules:
-1. steps length 1-3. Prefer one step when enough.
-2. If user says this/that email and no current thread is available, set clarify and empty steps.
-3. Inbox-wide find/search/urgent/unread/invoice → search_mail (+ optional rank_answer).
-4. Open thread + summarize/what is this about/action items → summarize_thread with use_current_thread true.
-5. Open thread + draft/reply/write response → draft_reply (or summarize_then_draft if they ask summarize then reply).
-6. Shorten / friendlier / more professional / revise draft + last_draft present → revise_draft.
-7. Organize my inbox / archive low priority / clean up → propose_inbox_actions (optionally after search_mail).
-8. Remember to… / 记住… → remember_preference.
-9. Search then write FYI / outline / new email → search_mail then compose_new.
-10. Multiple selected threads + draft/reply for each → batch_draft; personalized outreach/DM → batch_outreach.
-11. Hi/hello/what can you do → chat_general.
-12. Never invent tools outside the whitelist. Never choose send/delete/archive/trash/mark_read as tools.
-"""
+# Router 仅输出一个极小 JSON 计划。固定 150 tokens 足够覆盖三步工具计划，
+# 并避免路由阶段挤占后续检索、分析和回答的输出预算。
+_ROUTER_MAX_OUTPUT_TOKENS = 150
+# Router 的系统提示词与动态上下文合计控制在约 500 tokens。这里采用保守估算：
+# 汉字按 1 token、ASCII 单词按约 4 字符，宁可少传上下文也不让路由请求膨胀。
+_ROUTER_INPUT_TOKEN_BUDGET = 500
+# call_llm_json_safe 会在 user message 末尾追加 JSON-only 约束。该固定文本不属于
+# 动态上下文，但仍会进入模型输入，因此提前预留额度以保证总输入不超过目标。
+# 当前 JSON-only 后缀实测约 51 tokens，预留 55 留出估算余量。
+_ROUTER_JSON_PROTOCOL_TOKEN_OVERHEAD = 55
+# Router 提示词与其它 Sampling 提示词统一集中在 prompts.py，避免协议约束散落。
+_ROUTER_SYSTEM = router_system_prompt()
 
 
 def _uses_chinese(text: str) -> bool:
@@ -308,6 +280,155 @@ def _fallback_route(user_text: str, ui_context: dict[str, Any], reason: str) -> 
     }
 
 
+def _fast_local_route(user_text: str, ui_context: dict[str, Any]) -> dict[str, Any] | None:
+    """为无歧义的高频请求跳过 Router Sampling，减少一次网络往返。
+
+    此处只接受已有确定性规则可稳定处理的意图；其余自然语言仍交给 Router，
+    避免用关键词覆盖复杂写作或多步骤请求。
+    """
+    lowered = (user_text or "").casefold().strip()
+    has_thread = _has_thread(ui_context)
+    explicit_inbox_search = any(
+        token in lowered
+        for token in (
+            "find", "search", "inbox", "urgent", "unread", "invoice",
+            "找", "搜索", "收件箱", "未读", "紧急", "发票",
+        )
+    )
+    thread_action = has_thread and any(
+        token in lowered
+        for token in ("summar", "总结", "概括", "this email", "this thread", "这封", "待办", "reply", "回复", "起草")
+    )
+    greeting = bool(re.fullmatch(r"(?:hi|hello|hey|你好|嗨|在吗)[!！。,.?？\s]*", lowered))
+    explicit_preference = bool(re.search(r"\bremember(?:\s+to)?\b|记住", lowered))
+    if explicit_inbox_search or thread_action or greeting or explicit_preference:
+        return _fallback_route(user_text, ui_context, "fast_local_route")
+    return None
+
+
+def _route_for_user_selected_intent(user_text: str, ui_context: dict[str, Any]) -> dict[str, Any] | None:
+    """把澄清弹层中的显式用户选择转换为稳定的白名单执行计划。
+
+    这里不是根据关键词猜测意图：用户已在界面主动选择访问范围，继续让 Router
+    模型二次判断会导致同一个选择反复进入澄清。仅映射范围级计划；邮件内容的
+    检索、排序和生成仍由后续白名单工具与模型完成。
+    """
+    intent = str(ui_context.get("routing_intent") or "").strip()
+    language = "zh" if _uses_chinese(user_text) else "en"
+    if intent == "inbox":
+        return {
+            "language": language,
+            "use_current_thread": False,
+            "clarify": None,
+            "steps": [{"tool": "search_mail", "params": {}}, {"tool": "rank_answer", "params": {}}],
+            "router_fallback": False,
+            "router_user_selected": True,
+            "router_reason": "user_selected_inbox",
+        }
+    if intent == "chat":
+        return {
+            "language": language,
+            "use_current_thread": False,
+            "clarify": None,
+            "steps": [{"tool": "chat_general", "params": {}}],
+            "router_fallback": False,
+            "router_user_selected": True,
+            "router_reason": "user_selected_chat",
+        }
+    if intent == "compose":
+        return {
+            "language": language,
+            "use_current_thread": False,
+            "clarify": None,
+            "steps": [{"tool": "compose_new", "params": {}}],
+            "router_fallback": False,
+            "router_user_selected": True,
+            "router_reason": "user_selected_compose",
+        }
+    if intent == "current_thread" and _has_thread(ui_context):
+        return {
+            "language": language,
+            "use_current_thread": True,
+            "clarify": None,
+            "steps": [{"tool": "summarize_thread", "params": {}}],
+            "router_fallback": False,
+            "router_user_selected": True,
+            "router_reason": "user_selected_current_thread",
+        }
+    return None
+
+
+def _estimate_router_input_tokens(text: str) -> int:
+    """保守估算 Router 输入 token 数，供本地裁剪而非计费或审计使用。"""
+    tokens = 0
+    for chunk in re.findall(r"[\u3400-\u9fff]|[A-Za-z0-9_]+|[^\s]", text or ""):
+        if re.fullmatch(r"[\u3400-\u9fff]", chunk):
+            tokens += 1
+        elif chunk.isascii() and (chunk[0].isalnum() or chunk[0] == "_"):
+            tokens += max(1, (len(chunk) + 3) // 4)
+        else:
+            tokens += 1
+    return tokens
+
+
+def _truncate_router_text(text: str, token_budget: int) -> str:
+    """将动态上下文裁剪到近似 token 额度，保留前缀中的用户原始请求。"""
+    normalized = str(text or "").strip()
+    if not normalized or token_budget <= 0:
+        return ""
+    if _estimate_router_input_tokens(normalized) <= token_budget:
+        return normalized
+    low, high = 0, len(normalized)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = normalized[:middle].rstrip() + "..."
+        if _estimate_router_input_tokens(candidate) <= token_budget:
+            low = middle
+        else:
+            high = middle - 1
+    return normalized[:low].rstrip() + "..."
+
+
+def _build_router_user_message(
+    user_text: str,
+    *,
+    current_thread_kind: str,
+    has_current_thread: bool,
+    has_last_draft: bool,
+    selected_threads_count: int,
+    routing_intent: str,
+    conversation_summary: str,
+    memory_summary: str,
+) -> str:
+    """构造受输入预算约束的 Router 上下文，动态摘要只使用用户请求后的剩余额度。"""
+    fixed_context = (
+        f"\n\nContext: thread_kind={current_thread_kind}; has_current_thread={has_current_thread}; "
+        f"has_last_draft={has_last_draft}; selected_threads_count={selected_threads_count}; "
+        f"routing_intent={routing_intent or 'none'}"
+    )
+    available = max(
+        1,
+        _ROUTER_INPUT_TOKEN_BUDGET
+        - _ROUTER_JSON_PROTOCOL_TOKEN_OVERHEAD
+        - _estimate_router_input_tokens(_ROUTER_SYSTEM),
+    )
+    request_prefix = "User request:\n"
+    request_budget = max(1, available - _estimate_router_input_tokens(request_prefix + fixed_context))
+    request = _truncate_router_text(user_text, request_budget)
+    message = f"{request_prefix}{request}{fixed_context}"
+    remaining = available - _estimate_router_input_tokens(message)
+    for label, summary in (("Conversation", conversation_summary), ("Memory", memory_summary)):
+        if remaining <= 0 or not summary:
+            break
+        prefix = f"\n{label}: "
+        content_budget = remaining - _estimate_router_input_tokens(prefix)
+        if content_budget <= 0:
+            break
+        message += prefix + _truncate_router_text(summary, content_budget)
+        remaining = available - _estimate_router_input_tokens(message)
+    return message
+
+
 def _normalize_route(payload: dict[str, Any], user_text: str, ui_context: dict[str, Any]) -> dict[str, Any]:
     """校验并裁剪 Router JSON。"""
     language = str(payload.get("language") or ("zh" if _uses_chinese(user_text) else "en")).strip().lower()
@@ -377,19 +498,6 @@ def _normalize_route(payload: dict[str, Any], user_text: str, ui_context: dict[s
                 else "Provide a draft to revise first."
             )
 
-    # Router Sampling 偶尔会把「找未读邮件」这类明确检索误判为聊天。仅覆盖纯聊天
-    # 路径，使后续回答必须基于 Ask 候选并返回可验证的 mail_links。
-    if (
-        _has_inbox_search_intent(user_text)
-        and steps
-        and all(step["tool"] == "chat_general" for step in steps)
-    ):
-        clarify = None
-        steps = [
-            {"tool": "search_mail", "params": {}},
-            {"tool": "rank_answer", "params": {}},
-        ]
-
     if clarify and not steps:
         return {
             "language": language,
@@ -400,6 +508,8 @@ def _normalize_route(payload: dict[str, Any], user_text: str, ui_context: dict[s
             "router_reason": "",
         }
     if not steps:
+        # 模型给出空计划代表 Router 输出不可用；使用本地确定性路由继续完成请求，
+        # 不能让用户为本应自动完成的总结、搜索或问候重复选择操作范围。
         return _fallback_route(user_text, ui_context, "empty_steps")
     return {
         "language": language,
@@ -421,29 +531,25 @@ async def route_ai_turn(
 ) -> dict[str, Any]:
     """对用户话术做结构化选型；失败时走确定性降级。"""
     context = ui_context if isinstance(ui_context, dict) else {}
+    selected_route = _route_for_user_selected_intent(user_text, context)
+    if selected_route is not None:
+        return selected_route
+    fast_local_route = _fast_local_route(user_text, context)
+    if fast_local_route is not None:
+        return fast_local_route
     current = context.get("current_thread") if isinstance(context.get("current_thread"), dict) else {}
-    screen = context.get("screen") if isinstance(context.get("screen"), dict) else {}
     last_draft = context.get("last_draft") if isinstance(context.get("last_draft"), dict) else {}
-    thread_hint = {
-        "kind": str(current.get("kind") or "none"),
-        "has_message": bool(str(current.get("message_id") or "").strip()),
-        "has_thread": bool(str(current.get("thread_id") or "").strip()),
-        "subject": str(current.get("subject") or "")[:120],
-    }
-    user_message = (
-        f"User request:\n{user_text}\n\n"
-        f"Screen: view={screen.get('view') or 'unknown'} focus={screen.get('focus') or 'unknown'}\n"
-        f"Current thread hint (no body): {thread_hint}\n"
-        f"has_last_draft={bool(str(last_draft.get('body') or '').strip())} "
-        f"last_draft_source={str(last_draft.get('source') or '')}\n"
-        f"display_range_days={context.get('display_range_days')}\n"
-        f"max_messages={context.get('max_messages')}\n"
-        f"selected_threads_count={len(context.get('selected_threads') or []) if isinstance(context.get('selected_threads'), list) else 0}\n"
+    routing_intent = str(context.get("routing_intent") or "").strip()
+    user_message = _build_router_user_message(
+        user_text,
+        current_thread_kind=str(current.get("kind") or "none"),
+        has_current_thread=_has_thread(context),
+        has_last_draft=bool(str(last_draft.get("body") or "").strip()),
+        selected_threads_count=_selected_threads_count(context),
+        routing_intent=routing_intent,
+        conversation_summary=conversation_summary,
+        memory_summary=memory_summary,
     )
-    if conversation_summary:
-        user_message += f"\n{conversation_summary}\n"
-    if memory_summary:
-        user_message += f"\n{memory_summary}\n"
     if sampling_create_message is None:
         return _fallback_route(user_text, context, "no_sampling")
     try:
@@ -453,9 +559,11 @@ async def route_ai_turn(
             user_message=user_message,
             fallback={},
             temperature=0.0,
-            max_tokens=_ROUTER_MAX_TOKENS,
-            timeout=45.0,
+            max_tokens=_ROUTER_MAX_OUTPUT_TOKENS,
+            timeout=30.0,
             metadata={"tool": "ai_turn_router"},
+            response_format={"type": "json_object"},
+            on_unsupported="text",
             allow_fallback=False,
             allow_sampling_provider_fallback=True,
             max_attempts=1,

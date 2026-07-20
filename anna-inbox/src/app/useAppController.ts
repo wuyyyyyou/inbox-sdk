@@ -19,6 +19,7 @@ import {
 } from "../shared/browserStorage";
 import type {
   ActiveCardsPayload,
+  AiClarificationPayload,
   AiChatMessage,
   AiMailContextRef,
   AppState,
@@ -120,6 +121,9 @@ function buildCustomRunResult(runId: string, result: Record<string, unknown>) {
     title: String(result.title || result.plan_title || ""),
     summary: String(result.summary || ""),
     sections: Array.isArray(result.sections) ? result.sections : [],
+    sampling: result.sampling && typeof result.sampling === "object"
+      ? result.sampling as import("../types/mail").SamplingUsageSummary
+      : undefined,
     trace: (result.trace as Record<string, unknown>) || {},
     planner_fallback: Boolean(planner?.fallback_used),
   };
@@ -289,6 +293,7 @@ function buildAiTurnUiContext(args: {
   messages?: AiChatMessage[];
   savedPromptId?: string;
   selectedThreads?: SendAiMessageOptions["selectedThreads"];
+  routingIntent?: SendAiMessageOptions["routingIntent"];
 }) {
   const mailbox = selectedOrPrimary(args.selectedMailboxes, args.mailbox);
   const plan = normalizeScanPlan(args.scanPlan);
@@ -351,6 +356,7 @@ function buildAiTurnUiContext(args: {
     last_draft: lastDraft,
     saved_prompt_id: args.savedPromptId || "",
     language_hint: args.languageHint || "",
+    routing_intent: args.routingIntent || "",
   };
 }
 
@@ -405,10 +411,18 @@ function safeDiagnosticsFromError(error: unknown): string {
 }
 
 function sanitizeToolError(error: unknown, input: string) {
+  const raw = error instanceof Error ? error.message : String(error);
+  // 后端以稳定错误码标识 Answer 模型未能生成有效分析。该码不直接展示，
+  // 侧栏改为可操作的用户文案，并沿用下方诊断信息的安全过滤规则。
+  const analysisUnavailable = /\banalysis_unavailable\b/i.test(raw);
   const unavailable = prefersChinese(input)
     ? "Anna 暂时无法完成这项邮箱任务，请稍后重试。"
     : "Anna couldn't complete that inbox task right now. Please try again shortly.";
-  const message = isTransientConnectionError(error)
+  const message = analysisUnavailable
+    ? prefersChinese(input)
+      ? "AI 分析暂时不可用，请稍后重试。"
+      : "AI analysis is temporarily unavailable. Please try again."
+    : isTransientConnectionError(error)
     ? prefersChinese(input)
       ? "连接 Anna 服务时出现问题。我已经自动重试；请稍后再试。"
       : "There was a problem connecting to Anna. I retried automatically; please try again shortly."
@@ -610,6 +624,7 @@ export interface AppActions {
     mailbox: string,
     threadId: string,
     body: string,
+    bodyHtml?: string,
     ifMatch?: string,
     message?: Record<string, unknown>,
     attachments?: Array<Record<string, unknown>>,
@@ -656,6 +671,7 @@ export interface AppActions {
     threadId: string;
     to: string;
     body: string;
+    bodyHtml?: string;
     cc?: string[];
     bcc?: string[];
     replyMode?: string;
@@ -708,6 +724,7 @@ export interface AppActions {
   sendAiChatMessage(options?: SendAiMessageOptions): Promise<void>;
   retryAiMessage(messageId: string): void;
   dismissAiClarification(messageId: string): void;
+  resolveAiClarification(messageId: string, actionId: string): void;
   stopAiGeneration(): void;
   startNewAiConversation(): void;
   openAiConversation(index: number): void;
@@ -2799,9 +2816,9 @@ export function useAppController() {
     async listInboxThreadDrafts(mailbox, limit = 100) {
       return loadInboxThreadDrafts(mailbox, limit);
     },
-    async saveInboxThreadDraft(mailbox, threadId, body, ifMatch, message, attachments) {
+    async saveInboxThreadDraft(mailbox, threadId, body, bodyHtml, ifMatch, message, attachments) {
       const normalized = normalizedMailbox(mailbox);
-      const result = await client.saveInboxThreadDraft(normalized, threadId, body, ifMatch, message, attachments);
+      const result = await client.saveInboxThreadDraft(normalized, threadId, body, bodyHtml, ifMatch, message, attachments);
       if (body.trim()) {
         setState((s) => ({
           ...s,
@@ -2976,18 +2993,39 @@ export function useAppController() {
               storage_provider: state.storageProvider,
               run_id: generationRun.runId,
             })
-          : await client.startInboxMailPrompt({
-              mailbox: normalizedMailbox(context.mailbox),
-              thread_id: context.thread_id,
-              anchor_message_id: context.anchor_message_id,
-              latest_message_id: context.latest_message_id,
-              visible_prompt: buildRevisionPrompt(request.visiblePrompt, request.draftToRevise),
-              expected_artifact: requestedArtifact,
-              user_answers: request.userAnswers,
-              ai_provider: state.llmProvider,
-              storage_provider: state.storageProvider,
-              run_id: generationRun.runId,
-            });
+          : await (async () => {
+              const mailbox = normalizedMailbox(context.mailbox);
+              const scanScope = await loadScanPlanForRun(mailbox);
+              // 详情页与侧栏共用 start_ai_turn；artifact 类型是显式前端意图，
+              // 不再由后端 Router 根据提示词关键词猜测。
+              const uiContext = {
+                ...buildAiTurnUiContext({
+                  mailbox,
+                  selectedMailboxes: state.selectedMailboxes,
+                  conversationId,
+                  scanPlan: state.scanPlan,
+                  displayRangeDays: state.inboxSettings?.display_range_days,
+                  currentMailContext: context,
+                  languageHint: prefersChinese(request.visiblePrompt) ? "zh" : "en",
+                  messages: messagesWithUser,
+                }),
+                requested_artifact: requestedArtifact,
+              };
+              return client.startAiTurn({
+                user_text: buildRevisionPrompt(request.visiblePrompt, request.draftToRevise),
+                mailbox,
+                ui_context: uiContext,
+                conversation_id: conversationId,
+                primary_count: scanScope.max_messages,
+                max_messages: scanScope.max_messages,
+                scan_window_days: scanScope.scan_window_days,
+                ai_provider: state.llmProvider,
+                storage_provider: state.storageProvider,
+                run_id: generationRun.runId,
+                // 首次 invoke 在平台 60 秒边界前返回 run_id，剩余阶段走轮询。
+                wait_timeout_seconds: 45,
+              });
+            })();
         if (!isCurrentGeneration()) return null;
         const completed = started.status === "done" && started.result
           ? started
@@ -3053,6 +3091,7 @@ export function useAppController() {
       threadId,
       to,
       body,
+      bodyHtml,
       cc,
       bcc,
       replyMode = "reply_to_sender",
@@ -3064,6 +3103,7 @@ export function useAppController() {
         thread_id: threadId,
         to_addr: to,
         body,
+        body_html: bodyHtml,
         cc_addr: (cc || []).filter(Boolean).join(", "),
         bcc_addr: (bcc || []).filter(Boolean).join(", "),
         reply_mode: replyMode,
@@ -3919,6 +3959,23 @@ export function useAppController() {
         ),
       }));
     },
+    resolveAiClarification(messageId, actionId) {
+      setState((s) => ({
+        ...s,
+        aiChatMessages: s.aiChatMessages.map((message) =>
+          message.id === messageId && message.clarification?.status === "pending"
+            ? {
+                ...message,
+                clarification: {
+                  ...message.clarification,
+                  status: "resolved",
+                  resolved_action: actionId,
+                },
+              }
+            : message,
+        ),
+      }));
+    },
     async sendAiChatMessage(options = {}) {
       const userRequest = String(options.prompt ?? state.customScanInput).trim();
       if (!state.runtime.connected) {
@@ -3992,6 +4049,7 @@ export function useAppController() {
           messages: messagesWithUser,
           savedPromptId: options.savedPromptId,
           selectedThreads: options.selectedThreads,
+          routingIntent: options.routingIntent,
         });
         const started = options.resumeRunId
           ? await client.getRun(runId)
@@ -4006,7 +4064,8 @@ export function useAppController() {
             ai_provider: state.llmProvider,
             storage_provider: state.storageProvider,
             run_id: runId,
-            wait_timeout_seconds: 60,
+            // 首次 invoke 在平台 60 秒边界前返回 run_id，剩余阶段走轮询。
+            wait_timeout_seconds: 45,
           });
         if (!isCurrentGeneration()) return;
         if (started.status === "failed" || started.error) {
@@ -4099,6 +4158,26 @@ export function useAppController() {
           return list.length ? list : undefined;
         };
 
+        const parseClarification = (): AiClarificationPayload | undefined => {
+          const raw = payload.clarification;
+          if (!raw || typeof raw !== "object") return undefined;
+          const value = raw as Record<string, unknown>;
+          const actions = Array.isArray(value.actions)
+            ? value.actions
+              .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+              .map((item) => ({ id: String(item.id || ""), label: String(item.label || "") }))
+              .filter((item) => item.id && item.label)
+              .slice(0, 4)
+            : [];
+          return {
+            original_input: String(value.original_input || userRequest),
+            question: String(value.question || assistantText),
+            actions,
+            freeform_enabled: Boolean(value.freeform_enabled),
+            status: "pending",
+          };
+        };
+
         if (kind === "scan") {
           await loadActiveCards();
           if (!isCurrentGeneration()) return;
@@ -4128,6 +4207,7 @@ export function useAppController() {
               pending: false,
               kind: "clarify",
               content: assistantText,
+              clarification: parseClarification(),
               timestamp: new Date().toISOString(),
             },
           ];

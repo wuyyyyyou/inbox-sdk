@@ -6,8 +6,6 @@ const TEXT_FLOW_BLOCK_SELECTOR = [
   "figure", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "main", "nav",
   "ol", "p", "pre", "section", "table", "ul",
 ].join(",");
-const MIN_FIXED_EMAIL_SCALE = 0.72;
-
 function normalizeLinks(root: DocumentFragment | HTMLElement) {
   root.querySelectorAll("a[href]").forEach((node) => {
     node.setAttribute("target", "_blank");
@@ -36,28 +34,9 @@ function normalizeDocumentMarkup(root: HTMLElement) {
     bodyNode.replaceWith(bodyWrapper);
   }
 
+  const styles = Array.from(root.querySelectorAll("head style"));
+  styles.reverse().forEach((node) => root.prepend(node));
   root.querySelectorAll("head").forEach((node) => node.remove());
-}
-
-function hasFixedEmailLayout(root: HTMLElement) {
-  const hasExplicitFixedWidth = (node: Element) => {
-    const width = Number((node.getAttribute("width") || "").replace(/px$/i, ""));
-    const style = (node.getAttribute("style") || "").toLowerCase();
-    return (Number.isFinite(width) && width >= 600)
-      || /(?:^|;)\s*(?:width|min-width)\s*:\s*(?:[6-9]\d{2,}|[1-9]\d{3,})px/.test(style);
-  };
-  // 普通响应式 table 由容器宽度自然收缩，不能仅因存在 table 就整体 transform 缩小。
-  if (Array.from(root.querySelectorAll("table, td, th, center")).some(hasExplicitFixedWidth)) return true;
-  if (Array.from(root.querySelectorAll("[width]")).some((node) => {
-    const width = Number((node.getAttribute("width") || "").replace(/px$/i, ""));
-    return Number.isFinite(width) && width >= 600;
-  })) {
-    return true;
-  }
-  return Array.from(root.querySelectorAll("[style]")).some((node) => {
-    const style = (node.getAttribute("style") || "").toLowerCase();
-    return /(?:^|;)\s*(?:width|min-width)\s*:\s*(?:[6-9]\d{2,}|[1-9]\d{3,})px/.test(style);
-  });
 }
 
 function isWhitespaceNode(node: ChildNode) {
@@ -167,11 +146,11 @@ function splitTextParagraphs(text: string) {
     .filter(Boolean);
 }
 
-export function SafeEmailHtml({ html, className = "", scaleToFit = false }: { html: string; className?: string; scaleToFit?: boolean }) {
-  const frameRef = useRef<HTMLDivElement | null>(null);
-  const contentRef = useRef<HTMLDivElement | null>(null);
-  const [fit, setFit] = useState({ scale: 1, width: 0, height: 0 });
-  const { sanitized, shouldScale } = useMemo(() => {
+export function SafeEmailHtml({ html, className = "" }: { html: string; className?: string; scaleToFit?: boolean }) {
+  const frameRef = useRef<HTMLIFrameElement | null>(null);
+  const [frameHeight, setFrameHeight] = useState(160);
+  const [documentRevision, setDocumentRevision] = useState(0);
+  const sanitized = useMemo(() => {
     const value = DOMPurify.sanitize(html, {
       USE_PROFILES: { html: true },
       FORBID_TAGS: ["script", "iframe", "object", "embed", "form"],
@@ -183,38 +162,26 @@ export function SafeEmailHtml({ html, className = "", scaleToFit = false }: { ht
     const container = document.createElement("div");
     container.appendChild(value as DocumentFragment);
     normalizeDocumentMarkup(container);
-    const fixedLayout = scaleToFit && hasFixedEmailLayout(container);
-    if (!fixedLayout) {
-      normalizeTextEmailBlocks(container);
-    }
-    return {
-      sanitized: container.innerHTML,
-      shouldScale: fixedLayout,
-    };
-  }, [html, scaleToFit]);
+    return container.innerHTML;
+  }, [html]);
+  const srcDoc = useMemo(() => `<!doctype html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>html,body{margin:0;padding:0}img{max-width:100%;height:auto}</style></head><body>${sanitized}</body></html>`, [sanitized]);
 
   useEffect(() => {
-    if (!shouldScale) {
-      setFit({ scale: 1, width: 0, height: 0 });
-      return;
-    }
     const frame = frameRef.current;
-    const content = contentRef.current;
-    if (!frame || !content) return;
+    const document = frame?.contentDocument;
+    if (!frame || !document?.body) return;
 
     let raf = 0;
     const measure = () => {
       window.cancelAnimationFrame(raf);
       raf = window.requestAnimationFrame(() => {
-        const frameWidth = Math.max(1, frame.clientWidth);
-        const contentWidth = Math.max(content.scrollWidth, content.offsetWidth, frameWidth);
-        const rawScale = Math.min(1, frameWidth / contentWidth);
-        const scale = rawScale < MIN_FIXED_EMAIL_SCALE ? 1 : rawScale;
-        setFit({
-          scale,
-          width: contentWidth,
-          height: Math.ceil(content.scrollHeight * scale),
-        });
+        const nextHeight = Math.max(
+          document.body.scrollHeight,
+          document.documentElement.scrollHeight,
+          1,
+        );
+        setFrameHeight((current) => current === nextHeight ? current : nextHeight);
       });
     };
 
@@ -222,8 +189,8 @@ export function SafeEmailHtml({ html, className = "", scaleToFit = false }: { ht
     const ResizeObserverCtor = window.ResizeObserver;
     const observer = ResizeObserverCtor ? new ResizeObserverCtor(measure) : null;
     observer?.observe(frame);
-    observer?.observe(content);
-    const images = Array.from(content.querySelectorAll("img"));
+    observer?.observe(document.body);
+    const images = Array.from(document.images);
     images.forEach((image) => image.addEventListener("load", measure));
     window.addEventListener("resize", measure);
     return () => {
@@ -232,28 +199,18 @@ export function SafeEmailHtml({ html, className = "", scaleToFit = false }: { ht
       images.forEach((image) => image.removeEventListener("load", measure));
       window.removeEventListener("resize", measure);
     };
-  }, [sanitized, shouldScale]);
-
-  if (!shouldScale) {
-    return <div className={`${className} safe-email-text`} dangerouslySetInnerHTML={{ __html: sanitized }} />;
-  }
+  }, [documentRevision, srcDoc]);
 
   return (
-    <div
-      className={`${className} safe-email-frame`}
+    <iframe
+      className={`${className} safe-email-frame safe-email-html`}
       ref={frameRef}
-      style={fit.height ? { height: fit.height } : undefined}
-    >
-      <div
-        className="safe-email-scaled"
-        ref={contentRef}
-        style={{
-          transform: `scale(${fit.scale})`,
-          width: fit.width ? fit.width : undefined,
-        }}
-        dangerouslySetInnerHTML={{ __html: sanitized }}
-      />
-    </div>
+      srcDoc={srcDoc}
+      sandbox="allow-same-origin allow-popups"
+      title="Email content"
+      style={{ height: frameHeight }}
+      onLoad={() => setDocumentRevision((current) => current + 1)}
+    />
   );
 }
 

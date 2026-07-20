@@ -20,9 +20,12 @@ def _attach_diagnostics(result: dict[str, Any], trace: dict[str, Any]) -> dict[s
     diagnostic = snapshot(trace)
     if not isinstance(data, dict) or not diagnostic:
         return result
+    # 后台 run 已携带累计 diagnostics 时，外层 invoke trace 与其高度重叠。
+    # 保留 run 级诊断，避免响应同时返回 diagnostics 与 invoke_diagnostics。
+    if "diagnostics" in data:
+        return result
     enriched = dict(result)
-    key = "invoke_diagnostics" if "diagnostics" in data else "diagnostics"
-    enriched["data"] = {**data, key: diagnostic}
+    enriched["data"] = {**data, "diagnostics": diagnostic}
     return enriched
 
 
