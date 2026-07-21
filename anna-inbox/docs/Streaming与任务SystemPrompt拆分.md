@@ -1,10 +1,10 @@
 # Streaming 与任务 System Prompt 拆分
 
-状态：已实现（CLI `@anna-ai/cli@0.1.38`；不 bump App/Tool 版本号）。
+状态：侧栏旧路径已被 Host Agent Session 取代；本文保留为历史的 LLM streaming / prompt 拆分记录。
 
 ## 目标
 
-1. **体验**：App 侧使用 Host `anna.llm.stream`（与 `llm.complete` 同请求形）做闲聊流式输出。
+1. **历史体验**：App 侧使用 Host `anna.llm.stream`（与 `llm.complete` 同请求形）做闲聊流式输出。
 2. **治本**：各任务 **独立、尽量短** 的 system prompt；邮件证据只进 user。
 
 ## Streaming（路径 B）

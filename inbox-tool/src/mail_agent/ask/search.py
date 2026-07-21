@@ -317,87 +317,65 @@ async def execute_search(
     max_messages: int = _DEFAULT_MAX_MESSAGES,
     allow_broadening: bool = True,
     search_meta: dict[str, str] | None = None,
+    todo_ids: list[str] | None = None,
+    local_query: str = "",
 ) -> list[MessageLite]:
-    """执行 Gmail 搜索（元数据优先）并在 0 结果时受控放宽。
+    """只扫本地缓存（cache-only），不再调用 Gmail API。
 
-    P0：未缓存命中走 metadata 拉取（header/snippet），不默认 full body。
-    P1：宽查询优先本地缓存；不足再补 Gmail metadata search。
+    ``queries`` 仍可携带旧 Gmail 串，会映射为本地语法再过滤。
+    缓存为空返回 []，由上层提示用户刷新收件箱。
     """
-    from ..mail_providers.gmail.adapter import (
-        get_messages_lite_async,
-        list_cached_messages_lite,
-        live_search_metadata_and_cache,
-    )
+    from mail_agent.local_query import filter_cached_messages, normalize_to_local_query
+    from ..mail_providers.gmail.adapter import list_cached_messages_lite
 
+    _ = max_broaden_attempts, allow_broadening  # 保留签名兼容；cache-only 不再放宽打 Gmail
     try:
         message_cap = max(1, min(int(max_messages), _DEFAULT_MAX_MESSAGES))
     except (TypeError, ValueError):
         message_cap = _DEFAULT_MAX_MESSAGES
-    current_queries = list(queries)
-    broaden_attempts = max_broaden_attempts if allow_broadening else 0
 
-    # P1：宽查询先吃本地索引（含 Inbox/All-mail 已同步缓存）
-    if _queries_are_broad(current_queries):
-        try:
-            cached = list_cached_messages_lite(mailbox, message_cap)
-            cached = _filter_cached_by_window(cached, current_queries)
-            # 本地有足够命中则直接返回，避免冷路径再打 Gmail full 列表
-            if len(cached) >= min(20, message_cap):
-                if search_meta is not None:
-                    search_meta["source"] = "local_cache"
-                if progress_callback:
-                    progress_callback("search_cache_hit", {"cached": len(cached)})
-                return cached[:message_cap]
-        except Exception as exc:
-            _logger.debug("local cache preflight skipped: %s", type(exc).__name__)
+    # 优先使用显式 local_query；否则合并 queries 并映射本地语法
+    raw_parts = [str(local_query or "").strip()]
+    for item in queries or []:
+        text = str((item or {}).get("query") or "").strip()
+        if text:
+            raw_parts.append(text)
+    combined = " ".join(part for part in raw_parts if part).strip()
+    scan_query = normalize_to_local_query(combined or "is:inbox")
+    if search_meta is not None:
+        search_meta["source"] = "local_cache"
+        search_meta["scan_query"] = scan_query
 
     try:
-        for attempt in range(broaden_attempts + 1):
-            message_ids: list[str] = []
-            seen_ids: set[str] = set()
-            for query in current_queries:
-                query_text = str(query.get("query") or "").strip()
-                if not query_text:
-                    continue
-                try:
-                    query_limit = int(query.get("max_results", _DEFAULT_MAX_PER_QUERY))
-                except (TypeError, ValueError):
-                    query_limit = _DEFAULT_MAX_PER_QUERY
-                query_limit = max(1, min(query_limit, message_cap - len(message_ids)))
-                # P0：metadata 路径，不默认 fetch format=full
-                matched_ids = live_search_metadata_and_cache(mailbox, query_text, query_limit)
-                for msg_id in matched_ids:
-                    if msg_id not in seen_ids:
-                        seen_ids.add(msg_id)
-                        message_ids.append(msg_id)
-                    if len(message_ids) >= message_cap:
-                        break
-                if len(message_ids) >= message_cap:
-                    break
-
-            messages = await get_messages_lite_async(mailbox, message_ids)
-            if messages:
-                if search_meta is not None:
-                    search_meta["source"] = "gmail_metadata"
-                if attempt > 0:
-                    _logger.info("Search broadened level %d, found %d messages", attempt, len(messages))
-                return messages
-            if attempt < broaden_attempts:
-                current_queries = [_broaden_query(q, attempt + 1) for q in queries]
-                _logger.info(
-                    "Search attempt %d returned 0 results, broadening to level %d",
-                    attempt + 1,
-                    attempt + 1,
-                )
-    except Exception as exc:
-        # 仅实时 Gmail 调用失败时退回缓存；正常 0 结果不混入过期邮件。
-        _logger.warning("Gmail search failed; using cache: %s", type(exc).__name__)
-        if search_meta is not None:
-            search_meta["source"] = "cache_fallback"
-            search_meta["error_type"] = type(exc).__name__
         cached = list_cached_messages_lite(mailbox, message_cap)
+    except Exception as exc:
+        _logger.warning("list_cached_messages_lite failed: %s", type(exc).__name__)
+        if search_meta is not None:
+            search_meta["source"] = "local_cache"
+            search_meta["cache_empty"] = "1"
+            search_meta["error_type"] = type(exc).__name__
         if progress_callback:
-            progress_callback("search_fallback", {"source": "cache", "cached": len(cached)})
-        return cached
+            progress_callback("search_cache_empty", {"cached": 0})
+        return []
 
-    return []
+    if not cached:
+        if search_meta is not None:
+            search_meta["cache_empty"] = "1"
+        if progress_callback:
+            progress_callback("search_cache_empty", {"cached": 0})
+        return []
+
+    hits, parsed = filter_cached_messages(
+        cached,
+        scan_query,
+        todo_ids=todo_ids or [],
+        limit=message_cap,
+    )
+    if search_meta is not None:
+        search_meta["scan_query"] = parsed.display or scan_query
+    if progress_callback:
+        progress_callback(
+            "search_cache_hit",
+            {"cached": len(cached), "matched": len(hits), "scan_query": parsed.display or scan_query},
+        )
+    return hits

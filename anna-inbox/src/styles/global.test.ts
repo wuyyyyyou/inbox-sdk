@@ -45,6 +45,17 @@ describe("inbox selection toolbar", () => {
   });
 });
 
+describe("AI sidebar collapse", () => {
+  it("hides collapsed chrome with display:none so the expand logo stays visible", () => {
+    expect(styles).toContain(".ai-sidebar.is-collapsed .new-chat-btn");
+    expect(styles).toMatch(
+      /\.ai-sidebar\.is-collapsed \.new-chat-btn,[\s\S]*?display:\s*none;/,
+    );
+    expect(styles).toContain(".ai-sidebar.is-collapsed .anna-wordmark > button");
+    expect(styles).toContain("z-index: 21;");
+  });
+});
+
 describe("mail detail composer controls", () => {
   it("uses icon reply and forward actions with visible tooltips", () => {
     expect(styles).toContain(".mail-detail-reply-action {");

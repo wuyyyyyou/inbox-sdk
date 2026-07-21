@@ -262,116 +262,123 @@ async def test_resolve_people_no_matches():
     print("[PASS] test_resolve_people_no_matches")
 
 
-async def test_execute_search_uses_gmail_query():
-    """execute_search 应该使用 Gmail query 搜索，而不是把 scan_plan dict 传给 run_mail_scan。"""
+async def test_execute_search_uses_local_cache_only():
+    """execute_search 只读本地缓存，不调用 live Gmail search。"""
     from mail_agent.ask.search import execute_search
     from mail_agent.domain.types import MessageLite
-    from mail_agent.mail_providers.gmail import adapter
 
-    calls: list[tuple[str, str, int]] = []
-
-    def fake_live_search_and_cache(mailbox: str, query: str, max_results: int = 100, **_: object) -> list[str]:
-        calls.append((mailbox, query, max_results))
-        return ["m1"]
-
-    async def fake_get_messages_lite_async(mailbox: str, message_ids: list[str]) -> list[MessageLite]:
-        assert mailbox == "test@gmail.com"
-        assert message_ids == ["m1"]
-        return [
-            MessageLite(
-                message_id="m1",
-                thread_id="t1",
-                from_addr="alice@example.com",
-                to_addr="me@example.com",
-                cc="",
-                subject="Project update",
-                snippet="Please reply",
-                internal_date="1710000000000",
-                label_ids=["INBOX"],
-            )
-        ]
-
-    original_live_search = adapter.live_search_and_cache
-    original_get_lite = adapter.get_messages_lite_async
-    adapter.live_search_and_cache = fake_live_search_and_cache
-    adapter.get_messages_lite_async = fake_get_messages_lite_async
-    try:
-        messages = await execute_search(
-            "test@gmail.com",
-            [{"query": "from:alice newer_than:30d", "max_results": 25}],
-            max_broaden_attempts=0,
+    cached = [
+        MessageLite(
+            message_id="m1",
+            thread_id="t1",
+            from_addr="alice@example.com",
+            to_addr="me@example.com",
+            cc="",
+            subject="Project update",
+            snippet="Please reply",
+            internal_date="1710000000000",
+            label_ids=["INBOX"],
         )
-    finally:
-        adapter.live_search_and_cache = original_live_search
-        adapter.get_messages_lite_async = original_get_lite
+    ]
+    live_calls: list[object] = []
 
-    assert calls == [("test@gmail.com", "from:alice newer_than:30d", 25)]
-    assert len(messages) == 1
-    assert messages[0].message_id == "m1"
-    print("[PASS] test_execute_search_uses_gmail_query")
-
-
-async def test_execute_search_does_not_broaden_named_person_query():
-    """指定联系人未命中时不得移除 from: 并把无关收件箱邮件作为结果。"""
-    from mail_agent.ask.search import execute_search
-
-    calls: list[str] = []
-
-    def fake_live_search(_mailbox: str, query: str, _limit: int) -> list[str]:
-        calls.append(query)
-        return []
-
-    async def fake_get_messages(_mailbox: str, _message_ids: list[str]) -> list[str]:
-        return []
+    def forbid_live(*_args: object, **_kwargs: object) -> list[str]:
+        live_calls.append((_args, _kwargs))
+        raise AssertionError("live Gmail must not be called")
 
     fake_adapter = types.SimpleNamespace(
-        live_search_and_cache=fake_live_search,
-        get_messages_lite_async=fake_get_messages,
-        list_cached_messages_lite=lambda *_args, **_kwargs: [],
+        live_search_and_cache=forbid_live,
+        live_search_metadata_and_cache=forbid_live,
+        get_messages_lite_async=lambda *_a, **_k: [],
+        list_cached_messages_lite=lambda *_a, **_k: cached,
     )
+    meta: dict[str, str] = {}
     with patch.dict(sys.modules, {"mail_agent.mail_providers.gmail.adapter": fake_adapter}):
         messages = await execute_search(
-            "owner@example.com",
-            [{"query": "from:alice in:inbox newer_than:7d", "max_results": 25}],
-            max_broaden_attempts=2,
-            allow_broadening=False,
+            "test@gmail.com",
+            [{"query": "from:alice", "max_results": 25}],
+            search_meta=meta,
+            local_query="from:alice",
         )
 
-    assert messages == []
-    assert calls == ["from:alice in:inbox newer_than:7d"]
-    print("[PASS] test_execute_search_does_not_broaden_named_person_query")
+    assert live_calls == []
+    assert len(messages) == 1
+    assert messages[0].message_id == "m1"
+    assert meta.get("source") == "local_cache"
+    assert "from:alice" in str(meta.get("scan_query") or "")
+    print("[PASS] test_execute_search_uses_local_cache_only")
 
 
-async def test_execute_search_falls_back_to_cache_only_on_gmail_error():
-    """Gmail 401/超时等异常时读取缓存；正常零结果不得混入缓存。"""
-    from mail_agent.domain.types import MessageLite
+async def test_execute_search_empty_cache_does_not_call_gmail():
+    """缓存为空时返回 [] 并标记 cache_empty，不打 Gmail。"""
     from mail_agent.ask.search import execute_search
 
-    cached = [MessageLite(
-        message_id="cached-1", thread_id="thread-1", from_addr="alice@example.com",
-        to_addr="owner@example.com", subject="Cached project update", snippet="Please reply",
-    )]
+    live_calls: list[object] = []
 
-    def failing_live_search(*_args: object, **_kwargs: object) -> list[str]:
-        raise RuntimeError("401")
+    def forbid_live(*_args: object, **_kwargs: object) -> list[str]:
+        live_calls.append(1)
+        return []
 
     fake_adapter = types.SimpleNamespace(
-        live_search_and_cache=failing_live_search,
-        get_messages_lite_async=lambda *_args, **_kwargs: [],
-        list_cached_messages_lite=lambda *_args, **_kwargs: cached,
+        live_search_and_cache=forbid_live,
+        live_search_metadata_and_cache=forbid_live,
+        get_messages_lite_async=lambda *_a, **_k: [],
+        list_cached_messages_lite=lambda *_a, **_k: [],
     )
     meta: dict[str, str] = {}
     with patch.dict(sys.modules, {"mail_agent.mail_providers.gmail.adapter": fake_adapter}):
         messages = await execute_search(
             "owner@example.com",
-            [{"query": "in:inbox", "max_results": 10}],
-            max_broaden_attempts=0,
+            [{"query": "from:alice is:inbox", "max_results": 25}],
             search_meta=meta,
         )
 
-    assert [message.message_id for message in messages] == ["cached-1"]
-    assert meta == {"source": "cache_fallback", "error_type": "RuntimeError"}
-    print("[PASS] test_execute_search_falls_back_to_cache_only_on_gmail_error")
+    assert messages == []
+    assert live_calls == []
+    assert meta.get("cache_empty") == "1"
+    print("[PASS] test_execute_search_empty_cache_does_not_call_gmail")
+
+
+async def test_execute_search_filters_cache_with_local_query():
+    """本地 query 过滤缓存：只返回匹配项。"""
+    from mail_agent.domain.types import MessageLite
+    from mail_agent.ask.search import execute_search
+
+    cached = [
+        MessageLite(
+            message_id="hit",
+            thread_id="t1",
+            from_addr="alice@example.com",
+            to_addr="owner@example.com",
+            subject="Project update",
+            snippet="Please reply",
+            label_ids=["INBOX"],
+        ),
+        MessageLite(
+            message_id="miss",
+            thread_id="t2",
+            from_addr="bob@example.com",
+            to_addr="owner@example.com",
+            subject="Hello",
+            snippet="Hi",
+            label_ids=["INBOX"],
+        ),
+    ]
+    fake_adapter = types.SimpleNamespace(
+        list_cached_messages_lite=lambda *_a, **_k: cached,
+    )
+    meta: dict[str, str] = {}
+    with patch.dict(sys.modules, {"mail_agent.mail_providers.gmail.adapter": fake_adapter}):
+        messages = await execute_search(
+            "owner@example.com",
+            [{"query": "from:alice"}],
+            search_meta=meta,
+            local_query="from:alice",
+        )
+
+    assert [message.message_id for message in messages] == ["hit"]
+    assert meta.get("source") == "local_cache"
+    print("[PASS] test_execute_search_filters_cache_with_local_query")
 
 
 def test_live_search_surfaces_all_detail_fetch_failures():
@@ -424,9 +431,9 @@ async def main_async():
     await test_resolve_people_no_matches()
 
     print("\n--- execute_search ---\n")
-    await test_execute_search_uses_gmail_query()
-    await test_execute_search_does_not_broaden_named_person_query()
-    await test_execute_search_falls_back_to_cache_only_on_gmail_error()
+    await test_execute_search_uses_local_cache_only()
+    await test_execute_search_empty_cache_does_not_call_gmail()
+    await test_execute_search_filters_cache_with_local_query()
     test_live_search_surfaces_all_detail_fetch_failures()
 
     print(f"\n[ALL TESTS PASSED]")

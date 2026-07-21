@@ -1,10 +1,10 @@
 # AI 侧栏统一与 Brief 下线
 
-状态：已实现（随 App `2.1.3` / Tool `2.2.3` 发布基线收录）。
+状态：已实现（随 App `2.1.4` / Tool `2.2.4` 发布基线收录）。
 
 ## 目标
 
-- **唯一智能入口**：Inbox Workspace + AI 侧栏（`start_ai_turn`）。
+- **唯一智能入口**：Inbox Workspace + AI 侧栏（主路径为 Host Agent Session；`start_ai_turn` 保留为详情/兼容路径）。
 - **Brief 产品面下线**：不再主路径执行 `start_mail_agent_run` / Phase1 / Phase2 / Attention Card 队列。
 - **能力合并到侧栏**：
   - 问答 / 搜索：`inbox` + Ask pipeline

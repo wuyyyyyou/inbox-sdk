@@ -466,6 +466,9 @@ export interface CustomRunResult {
   sampling?: SamplingUsageSummary;
   trace?: Record<string, unknown>;
   planner_fallback?: boolean;
+  /** 本轮 cache-only 检索使用的本地 query（与主搜索框语法一致） */
+  scan_query?: string;
+  scan_source?: "cache" | string;
 }
 
 export interface MailAttachmentMeta {
@@ -984,6 +987,10 @@ export interface AiChatMessage {
   sourcePrompt?: string;
   assistantFollowupText?: string;
   clarification?: AiClarificationPayload;
+  /** 本轮真实 cache 检索使用的本地 query；有值才展示可点 chip。 */
+  scanQuery?: string;
+  /** 检索数据源；当前固定 cache。 */
+  scanSource?: "cache" | string;
 }
 
 /** 后端 clarify 文案提示；阶段 C 起不再用前端强制 kind 分流 */

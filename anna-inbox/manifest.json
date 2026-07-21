@@ -16,7 +16,7 @@
   "required_executas": [
     {
       "tool_id": "bundled:inbox-executa",
-      "min_version": "2.2.3",
+      "min_version": "2.2.4",
       "version": "latest"
     }
   ],
@@ -80,11 +80,21 @@
         "set_title"
       ],
       "agent": {
+        "tools": [
+          "tool_riazm4777_inbox_executa_dnsb9fqu__search_email",
+          "tool_riazm4777_inbox_executa_dnsb9fqu__read_email",
+          "tool_riazm4777_inbox_executa_dnsb9fqu__ai_summarize_thread",
+          "tool_riazm4777_inbox_executa_dnsb9fqu__ai_draft_reply",
+          "tool_riazm4777_inbox_executa_dnsb9fqu__ai_revise_draft",
+          "tool_riazm4777_inbox_executa_dnsb9fqu__ai_compose_new",
+          "tool_riazm4777_inbox_executa_dnsb9fqu__ai_batch_draft",
+          "tool_riazm4777_inbox_executa_dnsb9fqu__propose_inbox_actions",
+          "tool_riazm4777_inbox_executa_dnsb9fqu__ai_remember_preference"
+        ],
         "session": {
           "auto": true,
           "fixed": {}
-        },
-        "tools": []
+        }
       }
     },
     "csp_overrides": {

@@ -60,6 +60,21 @@ describe("Inbox query language", () => {
     expect(getInboxQuerySuggestions("is:sent")).toEqual([]);
   });
 
+  it("supports Shortwave-style -exclude and is:todo via todoIds context", () => {
+    const message = {
+      id: "todo-1",
+      from: "Bot <noreply@example.com>",
+      subject: "Invoice reminder",
+      label_ids: ["INBOX"],
+    };
+    expect(matchInboxQuery(message, parseInboxQuery("invoice AND -from:noreply"))).toBe(false);
+    expect(matchInboxQuery(message, parseInboxQuery("invoice AND -from:other"))).toBe(true);
+    expect(matchInboxQuery(message, parseInboxQuery("is:todo"), undefined, { todoIds: ["todo-1"] })).toBe(true);
+    expect(matchInboxQuery(message, parseInboxQuery("is:todo"), undefined, { todoIds: ["other"] })).toBe(false);
+    expect(parseInboxQuery("is:inbox AND is:todo").error).toBe("");
+    expect(parseInboxQuery("-").error).toContain("-");
+  });
+
   it("inserts a selected completion with the same token behavior as inbox search", () => {
     expect(applyInboxQuerySuggestion("su", "subject:")).toBe("subject:");
     expect(applyInboxQuerySuggestion("from:alice ", "is:")).toBe("from:alice is: ");

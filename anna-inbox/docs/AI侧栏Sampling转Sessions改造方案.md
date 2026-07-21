@@ -1,7 +1,7 @@
 # AI 侧栏：Sampling 本地 Router → Host Agent Session 改造方案
 
-状态：**方案设计（已与产品对齐，未开工）**  
-基线：App `2.1.2` / Tool `2.2.2`  
+状态：**已实现并纳入 App `2.1.4` / Tool `2.2.4` 发布基线**
+基线：App `2.1.4` / Tool `2.2.4`
 对照官方文档：
 
 - [Agent Sessions（Executa）](https://staging.anna.partners/developers/tools/executa-agent)
@@ -14,7 +14,7 @@
 
 - [AI 对话本地 Router 与白名单工具设计](AI对话本地Router与白名单工具设计.md)（**侧栏路径将被取代**；安全原则仍继承）
 - [Streaming 与任务 SystemPrompt 拆分](Streaming与任务SystemPrompt拆分.md)
-- [2.2.2 架构与发布基线](2.2.2架构与发布基线.md)
+- [2.2.4 架构与发布基线](2.2.4架构与发布基线.md)
 
 ---
 
@@ -30,6 +30,19 @@
 
 **一句话：** 侧栏对话由 **Host Agent 在 `systemPrompt` 约束下选型并调用白名单工具**；工具实现仍在本 Executa；Gmail 状态变更与发送永不进 Agent 自动环。
 
+### 0.1 当前实现状态
+
+- 已实现：App 侧 `anna.agent.session`、官方 `systemPrompt`、侧栏流式帧消费、`agent.tools` 白名单，以及 Host 可调的 `ai_*` Executa 细粒度工具。
+- 已保留：`start_ai_turn` 仅用于既有详情页/兼容路径；侧栏不再调用本地 Router。
+- 已完成代码侧验证：`agent.tools` 使用全限定工具名，前端兼容多种 Host tool_result 流式帧，Agent run 支持取消和会话清理；真实账号下的 Host 长工具超时仍属于发布后观测项。
+
+### 0.2 检索与输出约束（2026-07-21）
+
+- Host 使用 `search_email`，每会话最多 6 次搜索、合计最多 45 封候选邮件；后端按 `mailbox + conversation_id` 强制限额。
+- `search_email` 只返回日期、参与者、主题、`bodySnippet` 和 `THREAD_REF`；`read_email` 默认同样只读 metadata，只有 `readMask` 显式包含 `bodyFull` 才加载正文。
+- `systemPrompt` 禁止 Markdown 表格，要求标题/列表分组、真实 `[THREAD_REF_xxx]` 和简短的最终摘要。
+- App manifest 的 `agent.tools` 必须使用 Host RPC 中出现的全限定工具名（`tool_riazm4777_inbox_executa_dnsb9fqu__<tool>`）；短工具名会解析为空集并触发 `inherit_host_tools: true`。
+
 ---
 
 ## 1. 背景：现状与问题
@@ -38,19 +51,19 @@
 
 ```text
 前端 sendAiChatMessage
-  → start_ai_turn
-  → 本地 Router（Sampling 出 JSON 计划）
-  → 本地 Tool Runner
-  → 再 Sampling 生成回答/草稿
+  → anna.agent.session
+  → Host Agent（systemPrompt + 显式工具白名单）
+  → Executa ai_* 工具
+  → 流式文本与 tool_result 回到侧栏
 ```
 
 | 项 | 现状 |
 | --- | --- |
-| 选型 | Executa 本地 Router + Sampling |
+| 选型 | Host Agent Session + systemPrompt |
 | 执行 | 本地白名单 Runner |
-| 前端 | 轮询 `get_mail_agent_run`；chat 意图可走 `anna.llm.stream` |
-| App manifest | 已有 `agent.session.auto: true`，但 `agent.tools: []` |
-| Tool | 对外主入口偏 `start_ai_turn` 聚合；细粒度能力多在 Runner 内部，**未**作为 Host 可调工具完整暴露 |
+| 前端 | `agentSessionClient` 消费流式文本与工具结果；支持 cancel、resume 和清理 |
+| App manifest | `agent.session.auto: true`，`agent.tools` 显式声明细粒度白名单 |
+| Tool | 新增 `ai_*` Host 可调工具；`start_ai_turn` 保留给详情/兼容路径 |
 
 ### 1.2 改造动机
 
@@ -431,10 +444,9 @@ for await (const frame of stream) {
 
 ---
 
-## 13. 下一步
+## 13. 当前进度与后续观测
 
-1. ~~产品方向对齐~~（已完成，见 §0）。  
-2. **阶段 0** Staging 探针（工具命名 + systemPrompt + 一流式帧）。  
-3. 探针结论写入 §11 后，再开阶段 1 工具上架与阶段 2 前端切换。
-
-**在阶段 0 结论落地前，不修改业务默认路径代码。**
+1. ~~产品方向对齐~~（已完成，见 §0）。
+2. ~~阶段 0：工具命名、systemPrompt 和流式帧探针~~（代码侧结论已落地：使用全限定工具名，适配多种 tool_result 帧）。
+3. ~~阶段 1/2：工具上架与前端切换~~（已完成，纳入 App `2.1.4` / Tool `2.2.4`）。
+4. 发布后继续观测真实 Host 的长工具超时、跨多轮会话稳定性和取消行为；发现协议差异时只调整 `agentSessionClient` 适配层。

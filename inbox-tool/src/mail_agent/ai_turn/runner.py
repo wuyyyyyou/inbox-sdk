@@ -78,7 +78,7 @@ async def _tool_chat_general(
     return {"kind": "error", "assistant_text": unavailable, "error": "chat_unavailable", "fallback_used": False}
 
 
-async def _tool_summarize_thread(
+async def tool_summarize_thread(
     user_text: str,
     ui_context: dict[str, Any],
     *,
@@ -199,7 +199,7 @@ async def _tool_summarize_thread(
     }
 
 
-async def _tool_search_and_answer(
+async def tool_search_and_answer(
     user_text: str,
     ui_context: dict[str, Any],
     arguments: dict[str, Any],
@@ -221,6 +221,8 @@ async def _tool_search_and_answer(
         if progress_callback:
             progress_callback(stage, progress or {})
 
+    todo_raw = ui_context.get("todo_message_ids") if isinstance(ui_context.get("todo_message_ids"), list) else []
+    todo_ids = [str(item) for item in todo_raw if str(item).strip()]
     result = await run_ask_pipeline(
         user_request=user_text,
         mailboxes=mailboxes,
@@ -228,6 +230,7 @@ async def _tool_search_and_answer(
         max_messages=ui_context.get("max_messages") or arguments.get("max_messages"),
         sampling_create_message=sampling_create_message,
         progress_callback=_progress,
+        todo_ids=todo_ids,
     )
     summary = str(result.get("summary") or result.get("plan_title") or "").strip()
     if result.get("analysis_error"):
@@ -257,10 +260,13 @@ async def _tool_search_and_answer(
     if not summary:
         summary = "Scan complete." if not _uses_chinese(user_text) else "扫描完成。"
     _ = with_rank
+    scan_query = str(result.get("scan_query") or "").strip()
     return {
         "kind": "scan",
         "assistant_text": summary,
         "scan_result": result,
+        "scan_query": scan_query,
+        "scan_source": "cache",
         "fallback_used": bool(
             result.get("fallback_used") or (result.get("llm_meta") or {}).get("fallback_used")
         ),
@@ -557,13 +563,13 @@ async def run_ai_turn(
         # 先检索，证据截断后 compose_new
         if progress_callback:
             progress_callback("search", {"stage": "search_mail"})
-        search_out = await _tool_search_and_answer(
+        search_out = await tool_search_and_answer(
             text,
             context,
             arguments,
             sampling_create_message=sampling_create_message,
             progress_callback=progress_callback,
-            with_rank=True,
+            with_rank="rank_answer" in tools,
         )
         if search_out.get("kind") == "error":
             search_out["route"] = route
@@ -603,7 +609,7 @@ async def run_ai_turn(
     if primary == "summarize_thread":
         if progress_callback:
             progress_callback("read", {"stage": "summarize_thread"})
-        outcome = await _tool_summarize_thread(
+        outcome = await tool_summarize_thread(
             text,
             context,
             language=language,
@@ -614,13 +620,13 @@ async def run_ai_turn(
         return _record("summarize_thread", outcome)
 
     if primary == "search_mail":
-        outcome = await _tool_search_and_answer(
+        outcome = await tool_search_and_answer(
             text,
             context,
             arguments,
             sampling_create_message=sampling_create_message,
             progress_callback=progress_callback,
-            with_rank="rank_answer" in tools,
+            with_rank=True,
         )
         outcome["route"] = route
         return _record("search_mail", outcome)
@@ -637,4 +643,4 @@ async def run_ai_turn(
     return _record("chat_general", outcome)
 
 
-__all__ = ["run_ai_turn"]
+__all__ = ["run_ai_turn", "tool_search_and_answer", "tool_summarize_thread"]

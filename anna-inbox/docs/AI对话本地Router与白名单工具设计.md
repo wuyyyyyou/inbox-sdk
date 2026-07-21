@@ -1,10 +1,12 @@
 # AI 对话本地 Router 与白名单工具设计
 
+> 历史实现文档：App `2.1.4` / Tool `2.2.4` 起，AI 侧栏主路径改由 Host Agent Session 选型并调用显式白名单工具。本文件保留本地 Router 的安全约束、工具边界和兼容路径说明；当前主路径以 [AI 侧栏 Sampling → Sessions 改造方案](AI侧栏Sampling转Sessions改造方案.md) 为准。
+
 ## 1. 背景与结论
 
 ### 1.1 背景
 
-当前 AI 侧边栏由前端 `aiRoute.ts` 用正则将用户输入钉死为 `chat | scan | mail_context`，再分别调用：
+历史版本的 AI 侧边栏由前端 `aiRoute.ts` 用正则将用户输入钉死为 `chat | scan | mail_context`，再分别调用：
 
 - `chat` → Host iframe `llm.complete`
 - `scan` → `start_custom_scan` / Ask 管线
@@ -20,15 +22,15 @@
 
 | 决策 | 选择 |
 | --- | --- |
-| 选型权放在哪 | **Executa 本地 Router**（用 Anna Sampling 做结构化选型） |
+| 历史选型权 | **Executa 本地 Router**（用 Anna Sampling 做结构化选型） |
 | 工具谁执行 | **仅本地白名单工具**（Gmail / 草稿 / Ask 搜索等） |
-| Host Agent Session | **不作为默认总控**；保留代码仅作实验，生产默认 Sampling |
+| Host Agent Session | **当前侧栏默认总控**；本地 Router 保留给详情/兼容路径 |
 | 前端职责 | 透传用户话 + 只读 UI 上下文；**删除业务意图正则路由**（可留离线兜底） |
 | LLM 通道 | 生产默认 `sampling/createMessage` + 累计 token 预算 |
 
 一句话：**让 agent 自己选方法，但是在 Executa 里从白名单工具中选；不是让 Host Agent 自由调工具。**
 
-本设计与 [AI 侧边栏意图路由](AI侧边栏意图路由优化方案.md)、[Ask 链路](Ask链路重构方案.md)、Anna 官方 Sampling 文档对齐；产品体验对标 [Shortwave AI Assistant](https://www.shortwave.com/docs/guides/ai-assistant/)（见 §1.3）。Host Agent Session 不作为默认路径（已从工作树移除相关接线）。实现以代码与 manifest 为最终事实来源。
+本设计与 [AI 侧边栏意图路由](AI侧边栏意图路由优化方案.md)、[Ask 链路](Ask链路重构方案.md)、Anna 官方 Sampling 文档对齐；产品体验对标 [Shortwave AI Assistant](https://www.shortwave.com/docs/guides/ai-assistant/)（见 §1.3）。Host Agent Session 已成为侧栏默认路径，本地 Router 仅保留详情/兼容路径。实现以代码与 manifest 为最终事实来源。
 
 ### 1.3 对标 Shortwave：产品原则与差距
 

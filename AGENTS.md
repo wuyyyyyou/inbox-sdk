@@ -22,18 +22,20 @@
 
 ## 项目基线
 
-- **App（前端）**：`2.1.3` — 位于 `anna-inbox/`
-- **Tool（Executa）**：`2.2.3` — 位于 `inbox-tool/`
+- **App（前端）**：`2.1.4` — 位于 `anna-inbox/`
+- **Tool（Executa）**：`2.2.4` — 位于 `inbox-tool/`
 
 - 唯一智能入口：Inbox Workspace + AI 侧栏（`start_ai_turn`）；Brief 产品面下线。
 - AI生成内容过程中，滚动条自动滑动到底部。
 - `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表；Router 澄清弹层支持范围选择；详情打开期间列表短暂丢消息不关抽屉。
 - `anna-inbox/src/features/mail-detail/`：线程详情、正文、富文本草稿（`RichTextEditor`）和附件预览；详情滚动仅限 context 容器；同线程同步刷新不清附件预览。
-- `anna-inbox/src/app/useAppController.ts`：主要状态与工作流控制；AI 侧栏默认 `startAiTurn`；详情页协助统一走 `start_ai_turn`；soft prune 保留 `mailDetailMessageId`。
+- `anna-inbox/src/app/useAppController.ts`：主要状态与工作流控制；AI 侧栏默认 Host Agent Session，支持流式工具结果、取消与会话清理；详情页协助统一走 `start_ai_turn`；soft prune 保留 `mailDetailMessageId`。
+- `anna-inbox/src/api/agentSessionClient.ts`：Host Agent Session 创建、流式帧解析、工具结果消费、run 取消和会话清理。
 - `anna-inbox/src/api/mailAgentClient.ts`：所有 Executa 工具调用的统一 facade。
 - `anna-inbox/manifest.json`、`inbox-tool/src/anna_inbox_executa/common.py` 与 `mailbox_tools.py`：Google Connected accounts 声明、多账号发现状态和安全错误提示。
-- `inbox-tool/src/anna_inbox_executa/`：JSON-RPC 入口与工具分发（含 `start_ai_turn`、整理确认与 Saved prompts / Memory）；Sampling 预算快照与短 wait 建 run；Brief 主路径工具已移除。
-- `inbox-tool/src/mail_agent/ai_turn/`：AI 侧栏本地 Router 与白名单 Runner（含 fast local route、用户选定 `routing_intent`、集中 prompts）。
+- `inbox-tool/src/anna_inbox_executa/`：JSON-RPC 入口与工具分发（含 Agent 细粒度白名单工具、`start_ai_turn`、整理确认与 Saved prompts / Memory）；Sampling 预算快照与短 wait 建 run；Brief 主路径工具已移除。
+- `inbox-tool/src/anna_inbox_executa/ai_agent_tools_flow.py`、`inbox-tool/src/mail_agent/local_query.py`：Agent 工具白名单执行、本地缓存查询、查询条件解析、会话搜索预算和线程引用映射。
+- `inbox-tool/src/mail_agent/ai_turn/`：详情/兼容路径使用的本地 Router 与白名单 Runner；侧栏主路径已迁移到 Host Agent Session。
 - `inbox-tool/src/mail_agent/mail_providers/gmail/adapter.py`：Gmail API、OAuth、本地缓存和正文解码；回复/撰写 HTML 发送。
 - `inbox-tool/src/mail_agent/mail_providers/gmail/outgoing_html.py`：外发富文本白名单净化。
 - `inbox-tool/src/mail_agent/storage/`：APS/local storage 的统一 async 层。
@@ -86,14 +88,14 @@ App 与 Tool **版本号解耦，互不强制对齐**：
 
 | 端 | 当前版本 | 权威文件 | 须同步的文件 |
 | --- | --- | --- | --- |
-| App | `2.1.3` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
-| Tool | `2.2.3` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
+| App | `2.1.4` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
+| Tool | `2.2.4` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
 
 规则：
 
 - 只改前端 / App 发布：只 bump **App** 版本（`anna-inbox/app.json`），**不要**改 Tool 版本。
 - 只改后端 / Executa 发布：只 bump **Tool** 版本；平台若报「同版本已发布且内容不同」，必须再 bump Tool（不可覆盖已发布版本）。
-- Tool 线自 `2.1.1` 起独立演进，现进入 `2.2.x`；App 线自 `2.1.1` 起。当前基线：App `2.1.3` / Tool `2.2.3`。
+- Tool 线自 `2.1.1` 起独立演进，现进入 `2.2.x`；App 线自 `2.1.1` 起。当前基线：App `2.1.4` / Tool `2.2.4`。
 - `min_version` 跟随 **Tool** 版本，不跟随 App 版本。
 - 提交前审核时，若未说明只升哪一端，先与我确认，再改版本号。
 

@@ -1,12 +1,12 @@
 # AI 侧边栏意图路由
 
-## 状态：已由本地 Router 取代（App 2.1.2 / Tool 2.2.2，阶段 C；含澄清与 routing_intent）
+## 状态：历史实现；侧栏主路径已迁移 Host Agent Session（App 2.1.4 / Tool 2.2.4）
 
 侧栏**不再**使用前端正则业务路由（原 `decideAiRoute` → `chat | scan | mail_context`）。
 
-**当前唯一路径**：`sendAiChatMessage` → Executa `start_ai_turn`，由后端本地 Router 在白名单工具中选型；前端只透传 `user_text` 与只读 `ui_context`（当前线程、多选 `selected_threads`、邮箱、展示天数、`last_draft`、Saved prompt 等）。
+侧栏当前主路径：`sendAiChatMessage` → `anna.agent.session`，由 Host Agent 在 systemPrompt 与显式白名单工具约束下选型；前端透传用户文本和只读 `ui_context`，并消费流式文本与工具结果。Executa `start_ai_turn` 仍服务详情协助和兼容路径。
 
-权威设计与工具枚举见 [AI 对话本地 Router 与白名单工具](AI对话本地Router与白名单工具设计.md)。
+权威设计与工具枚举见 [AI 侧栏 Sampling → Sessions 改造方案](AI侧栏Sampling转Sessions改造方案.md)。
 
 ### 已删除 / 降级
 

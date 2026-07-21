@@ -2,7 +2,7 @@
 
 Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；AI 侧栏是唯一智能入口。Brief 产品面已下线，不再代表 2.0 主路径。
 
-当前发布基线：App `2.1.3` / Tool `2.2.3`。本版本重点：AI 侧栏统一与 Brief 下线、Ask 搜索/回答收敛、邮件详情滚动与附件预览在自动同步下的稳定性，以及既有富文本外发与 `start_ai_turn` 路由能力。
+当前发布基线：App `2.1.4` / Tool `2.2.4`。本版本重点：AI 侧栏迁移到 Host Agent Session、显式白名单工具与本地查询、流式会话取消/恢复，以及既有 Ask 搜索/回答、邮件详情和富文本外发能力的联动稳定性。
 
 ## Language
 
@@ -24,7 +24,7 @@ Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 或 All 
 
 **Anna AI Sidebar**
 
-主界面左侧的对话入口。默认调用 Executa `start_ai_turn`：由本地 Router 在白名单工具中选型（对话、搜索、总结、写/改稿、整理建议、记忆等），并透传只读屏上上下文；意图不清时返回澄清选项，用户选定 `routing_intent` 后直达范围级计划。整理类仅产出确认卡片，须用户确认后 mutation。
+主界面左侧的对话入口。默认创建 Host Agent Session，由 Host 在显式白名单中选型并调用搜索、阅读、总结、写/改稿、整理建议和记忆工具；前端透传只读屏上上下文并消费流式文本与工具结果。侧栏支持取消当前 run、复用会话继续对话和清理会话；整理类仅产出确认卡片，须用户确认后 mutation。`start_ai_turn` 保留给详情协助和兼容路径。
 
 **Saved prompts / AI Memory**
 

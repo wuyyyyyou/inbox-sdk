@@ -6,6 +6,7 @@ from anna_inbox_executa.storage_tools import *
 from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.ask_flow import *
 from anna_inbox_executa.ai_turn_flow import *
+from anna_inbox_executa.ai_agent_tools_flow import AI_AGENT_TOOL_NAMES, handle_ai_agent_tool
 from anna_inbox_executa.contact_memory_flow import *
 from anna_inbox_executa.mailbox_tools import *
 from anna_inbox_executa.card_tools import *
@@ -199,6 +200,20 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "tool": tool, "data": re_run_custom_scan(arguments, invoke_id)}
     if tool == "start_ai_turn":
         return {"success": True, "tool": tool, "data": start_ai_turn(arguments, invoke_id)}
+    # Host Agent 侧栏白名单工具：选型在 Host，执行本地（不含 mutation）
+    if tool in AI_AGENT_TOOL_NAMES:
+        future = asyncio.run_coroutine_threadsafe(
+            handle_ai_agent_tool(tool, arguments, invoke_id),
+            loop,
+        )
+        try:
+            # 搜邮 / 草稿可能较长；与 start_ai_turn 同量级超时
+            payload = future.result(timeout=540.0)
+            if isinstance(payload, dict) and payload.get("success") is False:
+                return {"success": False, "tool": tool, "error": payload.get("error") or "ai_agent_tool_failed", "data": payload.get("data")}
+            return {"success": True, "tool": tool, "data": (payload or {}).get("data", payload)}
+        except Exception as exc:
+            return {"success": False, "tool": tool, "error": str(exc)[:300]}
     # 阶段 B：整理确认 / Saved prompts / AI Memory（均非 Router 静默 mutation）
     if tool in (
         "apply_proposed_actions",

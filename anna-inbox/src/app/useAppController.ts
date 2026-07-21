@@ -1,4 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  cancelAiAgentTurn,
+  clearAiAgentSession,
+  runAiAgentTurn,
+  stripTerminalDoneMarker,
+  type AgentToolOutcome,
+} from "../api/agentSessionClient";
 import { MailAgentClient } from "../api/mailAgentClient";
 import { makeCustomRunProgress, scanProgressLabel, scanStageLabel, stageToStep } from "../features/brief/runHelpers";
 import { buildDraftPreferencesInstruction, resolveDraftPreferences } from "../features/handle/draftPreferences";
@@ -111,6 +118,10 @@ function resultToDraft(result: Record<string, unknown> | undefined, fallback: st
 
 function buildCustomRunResult(runId: string, result: Record<string, unknown>) {
   const planner = result.planner_llm as { fallback_used?: boolean } | undefined;
+  const scanQuery = String(result.scan_query || "").trim()
+    || (Array.isArray(result.plan_gmail_queries) && result.plan_gmail_queries[0]
+      ? String((result.plan_gmail_queries[0] as { query?: string }).query || "").trim()
+      : "");
   return {
     runId,
     planId: String(result.plan_id || ""),
@@ -126,7 +137,22 @@ function buildCustomRunResult(runId: string, result: Record<string, unknown>) {
       : undefined,
     trace: (result.trace as Record<string, unknown>) || {},
     planner_fallback: Boolean(planner?.fallback_used),
+    scan_query: scanQuery || undefined,
+    scan_source: scanQuery ? String(result.scan_source || "cache") : undefined,
   };
+}
+
+function payloadScanQuery(payload: Record<string, unknown>): { scanQuery?: string; scanSource?: string } {
+  const direct = String(payload.scan_query || "").trim();
+  if (direct) {
+    return { scanQuery: direct, scanSource: String(payload.scan_source || "cache") };
+  }
+  const queries = payload.plan_gmail_queries;
+  if (Array.isArray(queries) && queries[0] && typeof queries[0] === "object") {
+    const query = String((queries[0] as { query?: string }).query || "").trim();
+    if (query) return { scanQuery: query, scanSource: "cache" };
+  }
+  return {};
 }
 
 function normalizedMailbox(mailbox: string | undefined): string {
@@ -357,7 +383,101 @@ function buildAiTurnUiContext(args: {
     saved_prompt_id: args.savedPromptId || "",
     language_hint: args.languageHint || "",
     routing_intent: args.routingIntent || "",
+    // 与主列表 Todos 标记对齐；仅 message_id 列表，不含邮件正文
+    todo_message_ids: readTodoMessageIds(mailbox),
   };
+}
+
+function buildAiAgentContent(userText: string, uiContext: Record<string, unknown>): string {
+  // ui_context 是用户输入中的只读事实，不能覆盖 session 的 systemPrompt。
+  return `[ui_context]\n${JSON.stringify(uiContext)}\n\n[user]\n${userText}`;
+}
+
+function agentOutcomePayload(outcomes: AgentToolOutcome[], finalText: string): Record<string, unknown> {
+  const latest = [...outcomes].reverse().find((outcome) => typeof outcome.kind === "string") || {};
+  // 仅当本轮真实跑过 search 时带上 scan_query（供 Thinking 后小字 chip）。
+  let scanQuery = "";
+  let scanSource = "";
+  for (const outcome of [...outcomes].reverse()) {
+    const query = String(outcome.scan_query || outcome.query || "").trim();
+    if (query) {
+      scanQuery = query;
+      scanSource = String(outcome.scan_source || "cache");
+      break;
+    }
+    const nested = outcome.scan_result;
+    if (nested && typeof nested === "object") {
+      const nestedQuery = String((nested as Record<string, unknown>).scan_query || "").trim();
+      if (nestedQuery) {
+        scanQuery = nestedQuery;
+        scanSource = String((nested as Record<string, unknown>).scan_source || "cache");
+        break;
+      }
+    }
+    // start_ai_turn 完成态：result 内带 scan_query
+    const result = outcome.result;
+    if (result && typeof result === "object") {
+      const fromResult = String((result as Record<string, unknown>).scan_query || "").trim();
+      if (fromResult) {
+        scanQuery = fromResult;
+        scanSource = String((result as Record<string, unknown>).scan_source || "cache");
+        break;
+      }
+    }
+    const progress = outcome.progress;
+    if (progress && typeof progress === "object") {
+      const fromProgress = String((progress as Record<string, unknown>).scan_query || "").trim();
+      if (fromProgress) {
+        scanQuery = fromProgress;
+        scanSource = "cache";
+        break;
+      }
+    }
+  }
+  // 若 Host 误调 start_ai_turn 且已完成，优先用 run result 的 kind/文案
+  const finishedRun = [...outcomes].reverse().find((outcome) => {
+    const status = String(outcome.status || "");
+    return status === "done" && outcome.result && typeof outcome.result === "object";
+  });
+  const runResult = finishedRun?.result && typeof finishedRun.result === "object"
+    ? finishedRun.result as Record<string, unknown>
+    : null;
+  const kind = String(
+    runResult?.kind
+    || latest.kind
+    || (scanQuery ? "chat" : "chat"),
+  );
+  const assistantFromRun = String(runResult?.assistant_text || runResult?.summary || "").trim();
+  return {
+    ...latest,
+    ...(runResult || {}),
+    kind,
+    assistant_text: finalText || assistantFromRun || String(latest.assistant_text || ""),
+    ...(scanQuery ? { scan_query: scanQuery, scan_source: scanSource || "cache" } : {}),
+  };
+}
+
+/** 从 Host tool 结果中提取 start_ai_turn / custom scan 的 run_id。 */
+function findBackgroundRunId(outcomes: AgentToolOutcome[]): string {
+  for (const outcome of [...outcomes].reverse()) {
+    const runId = String(outcome.run_id || "").trim();
+    if (runId.startsWith("at_") || runId.length >= 8) return runId;
+  }
+  return "";
+}
+
+/** 从本地 mail-flags 读取 todos id，供后端 is:todo cache 过滤。 */
+function readTodoMessageIds(mailbox: string): string[] {
+  if (typeof window === "undefined" || !mailbox) return [];
+  try {
+    const raw = window.localStorage.getItem(`anna-inbox:mail-flags:${mailbox}`);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as { todos?: unknown };
+    if (!Array.isArray(parsed?.todos)) return [];
+    return parsed.todos.map(String).filter(Boolean).slice(0, 500);
+  } catch {
+    return [];
+  }
 }
 
 function isTransientConnectionError(error: unknown) {
@@ -3863,30 +3983,37 @@ export function useAppController() {
       run.cancelled = true;
       run.controller.abort();
       aiGenerationRun.current = null;
+      // Abort 只停前端消费；Host Agent run 必须显式 cancel，否则 RPC 仍会继续。
+      const conversationId = state.aiChatConversationId;
+      if (conversationId) {
+        void cancelAiAgentTurn(conversationId).catch((error) => {
+          console.warn("[agent.session] cancel failed:", error);
+        });
+      }
       setState((s) => {
         const stoppedAt = new Date().toISOString();
         const messages = s.aiChatMessages.map((message) => message.pending
           ? { ...message, pending: false, kind: "stopped" as const, content: "Generation stopped.", timestamp: stoppedAt }
           : message);
         const lastUser = [...messages].reverse().find((message) => message.role === "user");
-        const conversationId = s.aiChatConversationId;
-        if (!lastUser || !conversationId) {
+        const chatId = s.aiChatConversationId;
+        if (!lastUser || !chatId) {
           return { ...s, aiChatMessages: messages, aiChatLoading: false, isCustomScanning: false, scanStatus: "", customRunProgress: null };
         }
         const kind = lastUser.kind === "scan" ? "scan" as const : "chat" as const;
         const timestamp = stoppedAt;
         const entry: AskHistoryEntry = {
-          conversationId,
+          conversationId: chatId,
           kind,
           query: lastUser.content,
           result: syntheticChatResult(messages),
           timestamp,
           messages,
         };
-      const nextHistory = pruneAskHistoryEntries([
-        entry,
-        ...s.askHistory.filter((item) => item.conversationId !== conversationId),
-      ]);
+        const nextHistory = pruneAskHistoryEntries([
+          entry,
+          ...s.askHistory.filter((item) => item.conversationId !== chatId),
+        ]);
         persistAskHistory(nextHistory);
         return {
           ...s,
@@ -3900,11 +4027,15 @@ export function useAppController() {
       });
     },
     startNewAiConversation() {
+      const previousConversationId = state.aiChatConversationId;
       const run = aiGenerationRun.current;
       if (run) {
         run.cancelled = true;
         run.controller.abort();
         aiGenerationRun.current = null;
+      }
+      if (previousConversationId) {
+        void clearAiAgentSession(previousConversationId);
       }
       setState((s) => ({
         ...s,
@@ -3981,6 +4112,7 @@ export function useAppController() {
           run.controller.abort();
           aiGenerationRun.current = null;
         }
+        void clearAiAgentSession(entry.conversationId || "");
       }
       setState((s) => {
         const nextHistory = removeAskHistoryEntry(s.askHistory, index);
@@ -4040,7 +4172,7 @@ export function useAppController() {
       const conversationId = state.aiChatConversationId || createId("chat");
       const baseMessages = options.baseMessages
         ?? (state.aiChatConversationId === conversationId ? state.aiChatMessages : []);
-      // 阶段 C：侧栏仅走 start_ai_turn，已删除前端业务意图路由与旁路开关。
+      // 侧栏选型交由 Host Agent；本地 start_ai_turn Router 不再参与该路径。
       const generationRun = {
         runId: createId("generation"),
         cancelled: false,
@@ -4086,90 +4218,9 @@ export function useAppController() {
           startedAt: "",
         },
       }));
-      let runId = options.resumeRunId || "";
+      let runId = "";
       try {
-        // 路径 B：显式 chat 意图走 Host anna.llm.stream；失败则回退 Executa start_ai_turn。
-        if (options.routingIntent === "chat" && !options.resumeRunId) {
-          try {
-            const language = prefersChinese(userRequest) ? "zh" as const : "en" as const;
-            const { chatStreamSystemPrompt, streamLlmText } = await import("../api/llmClient");
-            let streamed = "";
-            const assistantId = pendingMessage.id;
-            const text = await streamLlmText(
-              state.runtime.client,
-              [
-                { role: "system", content: chatStreamSystemPrompt(language) },
-                { role: "user", content: userRequest },
-              ],
-              {
-                maxTokens: 2048,
-                signal: generationRun.controller.signal,
-                onToken: (piece) => {
-                  if (!isCurrentGeneration()) return;
-                  streamed += piece;
-                  const snapshot = streamed;
-                  setState((s) => ({
-                    ...s,
-                    aiChatMessages: s.aiChatMessages.map((message) =>
-                      message.id === assistantId
-                        ? {
-                            ...message,
-                            content: snapshot || "…",
-                            kind: "chat" as const,
-                            pending: true,
-                          }
-                        : message,
-                    ),
-                    scanStatus: "Streaming reply...",
-                    customRunProgress: {
-                      runId: "llm_stream",
-                      question: userRequest,
-                      status: "running",
-                      stage: "chat",
-                      stageKey: "answer",
-                      progress: {},
-                      partial: {},
-                      startedAt: thinkingStartedAt,
-                    },
-                  }));
-                },
-              },
-            );
-            if (!isCurrentGeneration()) return;
-            const finalText = (text || streamed).trim() || (language === "zh" ? "（空回复）" : "(empty reply)");
-            const finalMessages: AiChatMessage[] = [
-              ...messagesWithUser,
-              {
-                id: assistantId,
-                role: "assistant",
-                content: finalText,
-                timestamp: new Date().toISOString(),
-                thinkingStartedAt,
-                kind: "chat",
-                pending: false,
-              },
-            ];
-            upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
-            setState((s) => ({
-              ...s,
-              aiChatMessages: finalMessages,
-              aiChatLoading: false,
-              isCustomScanning: false,
-              scanStatus: "",
-              customRunProgress: null,
-            }));
-            return;
-          } catch (streamError) {
-            if (generationRun.controller.signal.aborted || !isCurrentGeneration()) return;
-            // stream/complete 不可用时回退 Executa sampling 路径
-            console.warn("[llm.stream] fallback to start_ai_turn:", streamError);
-          }
-        }
-
         const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
-        const scanScope = await loadScanPlanForRun(scanMailbox);
-        runId = runId || `at_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
-        activeBackgroundRunIdRef.current = runId;
         const uiContext = buildAiTurnUiContext({
           mailbox: state.mailbox,
           selectedMailboxes: state.selectedMailboxes,
@@ -4183,43 +4234,132 @@ export function useAppController() {
           selectedThreads: options.selectedThreads,
           routingIntent: options.routingIntent,
         });
-        const started = options.resumeRunId
-          ? await client.getRun(runId)
-          : await client.startAiTurn({
-            user_text: userRequest,
-            mailbox: scanMailbox,
-            ui_context: uiContext,
-            conversation_id: conversationId,
-            primary_count: scanScope.max_messages,
-            max_messages: scanScope.max_messages,
-            scan_window_days: scanScope.scan_window_days,
-            ai_provider: state.llmProvider,
-            storage_provider: state.storageProvider,
-            run_id: runId,
-            // 首次 invoke 在平台 60 秒边界前返回 run_id，剩余阶段走轮询。
-            wait_timeout_seconds: 45,
-          });
-        if (!isCurrentGeneration()) return;
-        if (started.status === "failed" || started.error) {
-          throw new Error(formatRunDiagnostics(started, started.error || "AI turn failed"));
-        }
-        if (started.status !== "done") {
-          // 后端任务可能仍在运行；先保存 runId，页面刷新后由用户主动继续查询。
-          upsertAiConversationHistory(conversationId, [...messagesWithUser, pendingMessage], {
-            kind: "chat",
-            query: userRequest,
-            pendingRun: { runId, question: userRequest },
-          });
-        }
-        const completed = started.status === "done" && started.result
-          ? started
-          : await waitForCustomScanResult(client, runId, (status) => {
+        let streamed = "";
+        const agentTurn = await runAiAgentTurn(
+          state.runtime.client,
+          conversationId,
+          buildAiAgentContent(userRequest, uiContext),
+          {
+            signal: generationRun.controller.signal,
+            onText: (piece) => {
+              if (!isCurrentGeneration()) return;
+              streamed += piece;
+              const snapshot = stripTerminalDoneMarker(streamed);
+              setState((s) => ({
+                ...s,
+                aiChatMessages: s.aiChatMessages.map((message) => message.id === pendingMessage.id
+                  ? { ...message, content: snapshot || "…", kind: "chat", pending: true }
+                  : message),
+                scanStatus: "Generating reply...",
+                customRunProgress: {
+                  runId: "agent_session",
+                  question: userRequest,
+                  status: "running",
+                  stage: "agent",
+                  stageKey: "answer",
+                  progress: {},
+                  partial: {},
+                  startedAt: thinkingStartedAt,
+                },
+              }));
+            },
+            onToolOutcome: (outcome) => {
+              if (!isCurrentGeneration()) return;
+              const bgRunId = String(outcome.run_id || "").trim();
+              if (bgRunId) runId = bgRunId;
+              const stage = String(outcome.stage || "");
+              const scanQ = String(
+                outcome.scan_query
+                || (outcome.progress && typeof outcome.progress === "object"
+                  ? (outcome.progress as Record<string, unknown>).scan_query
+                  : "")
+                || "",
+              ).trim();
+              if (stage || scanQ) {
+                setState((s) => ({
+                  ...s,
+                  scanStatus: stage ? `Working: ${stage}` : s.scanStatus,
+                  customRunProgress: {
+                    runId: bgRunId || s.customRunProgress?.runId || "agent_session",
+                    question: userRequest,
+                    status: "running",
+                    stage: stage || s.customRunProgress?.stage || "agent",
+                    stageKey: stage === "search" ? "search" : stage === "plan" ? "planning" : "answer",
+                    progress: {
+                      ...(typeof outcome.progress === "object" && outcome.progress ? outcome.progress as object : {}),
+                      ...(scanQ ? { scan_query: scanQ } : {}),
+                    },
+                    partial: {},
+                    startedAt: thinkingStartedAt,
+                  },
+                }));
+              }
+            },
+          },
+        );
+        // Host 若误调 start_ai_turn：工具只返回 running，需前端轮询 get_mail_agent_run 拿最终 result/scan_query。
+        let toolOutcomes = agentTurn.toolOutcomes;
+        const backgroundRunId = findBackgroundRunId(toolOutcomes) || runId;
+        if (backgroundRunId && client) {
+          runId = backgroundRunId;
+          let lastStatus: RunStatus | null = null;
+          for (let poll = 0; poll < 80; poll += 1) {
+            if (!isCurrentGeneration() || generationRun.controller.signal.aborted) break;
+            lastStatus = await client.getRun(backgroundRunId);
+            if (!isCurrentGeneration()) break;
+            const stage = String(lastStatus.stage || "");
+            const progress = (lastStatus.progress || {}) as Record<string, unknown>;
+            const scanQ = String(progress.scan_query || "").trim();
             setState((s) => ({
               ...s,
-              customRunProgress: makeCustomRunProgress(s.customRunProgress!, status, { runId, question: userRequest }),
-              scanStatus: scanStageLabel(status.stage, status.progress),
+              scanStatus: stage ? `Working: ${stage}` : s.scanStatus,
+              customRunProgress: {
+                runId: backgroundRunId,
+                question: userRequest,
+                status: String(lastStatus?.status || "running"),
+                stage: stage || "agent",
+                stageKey: stage === "search" ? "search" : stage === "plan" || stage === "routing" ? "planning" : "answer",
+                progress: { ...progress, ...(scanQ ? { scan_query: scanQ } : {}) },
+                partial: (lastStatus?.partial || {}) as Record<string, unknown>,
+                startedAt: thinkingStartedAt,
+              },
             }));
-          }, generationRun.controller.signal);
+            if (
+              lastStatus.status === "done"
+              || lastStatus.status === "failed"
+              || lastStatus.needs_continue === false
+            ) {
+              break;
+            }
+            await abortableSleep(POLL_INTERVAL_MS, generationRun.controller.signal);
+          }
+          if (lastStatus?.status === "failed") {
+            throw new Error(formatRunDiagnostics(lastStatus, lastStatus.error || "AI turn failed"));
+          }
+          if (lastStatus?.result && typeof lastStatus.result === "object") {
+            toolOutcomes = [
+              ...toolOutcomes,
+              {
+                kind: String((lastStatus.result as Record<string, unknown>).kind || "scan"),
+                status: "done",
+                run_id: backgroundRunId,
+                result: lastStatus.result as Record<string, unknown>,
+                scan_query: String((lastStatus.result as Record<string, unknown>).scan_query || "").trim(),
+                scan_source: "cache",
+                assistant_text: String(
+                  (lastStatus.result as Record<string, unknown>).assistant_text
+                  || (lastStatus.result as Record<string, unknown>).summary
+                  || "",
+                ),
+              },
+            ];
+          }
+        }
+        const completed = {
+          status: "done",
+          error: "",
+          result: agentOutcomePayload(toolOutcomes, agentTurn.text || streamed),
+        } as Pick<RunStatus, "status" | "error" | "result">;
         if (!isCurrentGeneration()) return;
         if (completed.status === "failed" || completed.error) {
           throw new Error(formatRunDiagnostics(completed, completed.error || "AI turn failed"));
@@ -4227,7 +4367,12 @@ export function useAppController() {
         const payload = (completed.result || {}) as Record<string, unknown>;
         const kind = String(payload.kind || "chat");
         const assistantText = String(payload.assistant_text || payload.summary || "").trim()
-          || (prefersChinese(userRequest) ? "已完成。" : "Done.");
+          || "";
+        const { scanQuery, scanSource } = payloadScanQuery(payload);
+        // 仅真实检索过才写入消息，驱动 Thinking 后可点 query chip
+        const scanFields = scanQuery
+          ? { scanQuery, scanSource: scanSource || "cache" }
+          : {};
 
         const parseMailContext = (): AiMailContextRef | undefined => {
           const mailCtx = payload.mail_context && typeof payload.mail_context === "object"
@@ -4317,7 +4462,10 @@ export function useAppController() {
           if (!isCurrentGeneration()) return;
           await loadCustomPlans();
           if (!isCurrentGeneration()) return;
-          const result = buildCustomRunResult(runId, payload);
+          const result = buildCustomRunResult(runId, {
+            ...payload,
+            ...(scanQuery ? { scan_query: scanQuery, scan_source: scanSource || "cache" } : {}),
+          });
           const finalMessages: AiChatMessage[] = [
             ...messagesWithUser,
             {
@@ -4328,6 +4476,7 @@ export function useAppController() {
               result,
               sourcePrompt: userRequest,
               timestamp: new Date().toISOString(),
+              ...scanFields,
             },
           ];
           upsertAiConversationHistory(conversationId, finalMessages, { kind: "scan", query: userRequest, result });
@@ -4359,6 +4508,7 @@ export function useAppController() {
               mailContext: parseMailContext(),
               sourcePrompt: userRequest,
               timestamp: new Date().toISOString(),
+              ...scanFields,
             },
           ];
           upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
@@ -4418,6 +4568,7 @@ export function useAppController() {
                   }
                 : null,
               timestamp: new Date().toISOString(),
+              ...scanFields,
             },
           ];
           upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
@@ -4431,18 +4582,23 @@ export function useAppController() {
               content: assistantText,
               mailContext: parseMailContext(),
               timestamp: new Date().toISOString(),
+              ...scanFields,
             },
           ];
           upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
         } else {
+          // search 工具本身不是最终消息类型；Host 回答后归为 chat，并保留 scan chip
+          const messageKind =
+            kind === "memory" ? "memory" : kind === "error" ? "error" : "chat";
           const finalMessages: AiChatMessage[] = [
             ...messagesWithUser,
             {
               ...pendingMessage,
               pending: false,
-              kind: kind === "memory" ? "memory" : "chat",
+              kind: messageKind,
               content: assistantText,
               timestamp: new Date().toISOString(),
+              ...scanFields,
             },
           ];
           upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });

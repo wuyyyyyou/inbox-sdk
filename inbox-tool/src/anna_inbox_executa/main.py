@@ -15,7 +15,16 @@ from anna_inbox_executa.dispatcher import handle_invoke
 
 
 def _attach_diagnostics(result: dict[str, Any], trace: dict[str, Any]) -> dict[str, Any]:
-    """仅向工具 data 附加安全时序摘要，不改变既有成功结果的协议形状。"""
+    """仅向工具 data 附加安全时序摘要，不改变既有成功结果的协议形状。
+
+    Host Agent 白名单工具的结果会进入 session 上下文，附带 diagnostics
+    只会膨胀 input tokens、拖慢后续选型，因此对这些工具跳过附加。
+    """
+    from anna_inbox_executa.ai_agent_tools_flow import AI_AGENT_TOOL_NAMES
+
+    tool_name = str(result.get("tool") or "").strip()
+    if tool_name in AI_AGENT_TOOL_NAMES:
+        return result
     data = result.get("data")
     diagnostic = snapshot(trace)
     if not isinstance(data, dict) or not diagnostic:

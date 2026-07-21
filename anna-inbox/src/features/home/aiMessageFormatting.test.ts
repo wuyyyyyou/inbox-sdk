@@ -52,6 +52,50 @@ describe("parseAiMessageMarkdown", () => {
       },
     ]);
   });
+
+  it("parses Shortwave-compatible non-table Markdown blocks", () => {
+    expect(parseAiMessageMarkdown("#### Note\n\n*italic* ~~old~~ `code`\n\n> Quote\n\n---\n\n```txt\nexample\n```"))
+      .toEqual([
+        { type: "heading", level: 4, content: [{ type: "text", value: "Note" }] },
+        {
+          type: "paragraph",
+          content: [
+            { type: "italic", value: "italic" },
+            { type: "text", value: " " },
+            { type: "strikethrough", value: "old" },
+            { type: "text", value: " " },
+            { type: "code", value: "code" },
+          ],
+        },
+        { type: "blockquote", content: [{ type: "text", value: "Quote" }] },
+        { type: "divider" },
+        { type: "code_block", language: "txt", code: "example" },
+      ]);
+  });
+
+  it("splits one-line email metadata into stable display rows", () => {
+    expect(parseAiMessageMarkdown("发件人：Johnny Tube 主题：Re: Collaboration invite 时间：7月20日 [THREAD_REF_thread-1]")).toEqual([
+      { type: "metadata", label: "发件人", content: [{ type: "text", value: "Johnny Tube" }] },
+      { type: "metadata", label: "主题", content: [{ type: "text", value: "Re: Collaboration invite" }] },
+      { type: "metadata", label: "时间", content: [{ type: "text", value: "7月20日" }] },
+      { type: "metadata", label: "", content: [{ type: "thread_ref", threadId: "thread-1" }] },
+    ]);
+  });
+
+  it("turns a piped sorting explanation into an ordered priority list", () => {
+    expect(parseAiMessageMarkdown("优先级 | 依据 | 1-2 | 需要立即行动 | 3 | 关系维护")).toEqual([
+      { type: "heading", level: 2, content: [{ type: "text", value: "排序依据" }] },
+      {
+        type: "ordered_list",
+        indent: 0,
+        start: 1,
+        items: [
+          [{ type: "bold", value: "优先级 1-2" }, { type: "text", value: "：需要立即行动" }],
+          [{ type: "bold", value: "优先级 3" }, { type: "text", value: "：关系维护" }],
+        ],
+      },
+    ]);
+  });
 });
 
 describe("sliceAiMessageBlocks", () => {

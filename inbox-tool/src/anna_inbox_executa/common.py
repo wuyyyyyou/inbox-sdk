@@ -71,6 +71,130 @@ MAX_INBOX_THREAD_RESPONSE_BYTES = 48 * 1024
 CONNECTIVITY_CHECK_TIMEOUT_SECONDS = 12.0
 CONNECTIVITY_GMAIL_ACCOUNT_TIMEOUT_SECONDS = 3.0
 
+# Host Agent 细粒度工具 schema：描述要短、选型路径要直，避免 Host 多轮犹豫。
+# mutation 不在此列表，必须由前端显式确认后调用。
+AI_AGENT_DEFAULT_TOOLS = [
+    {
+        "name": "search_email",
+        # when: 收件箱范围检索；默认只返回轻量字段，禁止正文
+        "description": (
+            "Search LOCAL inbox cache only (never live Gmail, never list_cached_emails). "
+            "Use for any inbox-wide claim. Query language: is:inbox AND is:todo, from:, subject:, -term. "
+            "Default fields ONLY: date, participants, subject, bodySnippet (+ THREAD_REF). "
+            "Never returns bodyFull — call read_email for full body. Cap 6 searches / 45 hits per conversation. "
+            "If cache empty, tell user to refresh inbox."
+        ),
+        "parameters": [
+            {"name": "about", "type": "string", "description": "Local keywords/fields, e.g. urgent OR from:alice.", "required": False},
+            {"name": "filter", "type": "string", "description": "Local filter, e.g. is:inbox AND is:unread.", "required": False},
+            {"name": "mailbox", "type": "string", "description": "Active mailbox from ui_context.", "required": False},
+            {"name": "ui_context", "type": "object", "description": "Read-only UI facts; copy mailbox + conversation_id.", "required": False},
+            {"name": "conversation_id", "type": "string", "description": "Sidebar conversation id (quota key).", "required": False},
+            {"name": "limit", "type": "integer", "description": "Max hits this call (default 12, hard cap remaining budget).", "required": False},
+            {
+                "name": "readMask",
+                "type": "array",
+                "description": "Optional subset of date,participants,subject,bodySnippet. bodyFull is rejected; use read_email.",
+                "required": False,
+            },
+        ],
+        "timeout": 120,
+    },
+    {
+        "name": "read_email",
+        # when: 已有 THREAD_REF 且 snippet 不够；默认不取全文
+        "description": (
+            "Read ONE searched email by thread_ref. "
+            "Default readMask: date, participants, subject, bodySnippet. "
+            "Request bodyFull ONLY when snippet is insufficient for the answer."
+        ),
+        "parameters": [
+            {"name": "thread_ref", "type": "string", "description": "THREAD_REF from search_email.", "required": True},
+            {"name": "mailbox", "type": "string", "description": "Active mailbox.", "required": False},
+            {"name": "ui_context", "type": "object", "description": "Read-only UI facts.", "required": False},
+            {"name": "readMask", "type": "array", "description": "Fields: date,participants,subject,bodySnippet,bodyFull.", "required": False},
+        ],
+        "timeout": 120,
+    },
+    {
+        "name": "ai_summarize_thread",
+        # when: 当前打开线程的问答/摘要
+        "description": "Answer or summarize the open thread only. Requires open message/thread in ui_context. No inbox-wide search.",
+        "parameters": [
+            {"name": "user_text", "type": "string", "description": "User question.", "required": True},
+            {"name": "mailbox", "type": "string", "description": "Active mailbox.", "required": False},
+            {"name": "ui_context", "type": "object", "description": "Must include current_thread.", "required": False},
+            {"name": "message_id", "type": "string", "description": "Open message id.", "required": False},
+            {"name": "thread_id", "type": "string", "description": "Open thread id.", "required": False},
+        ],
+        "timeout": 300,
+    },
+    {
+        "name": "ai_draft_reply",
+        # when: 为当前线程写回复草稿；永不发送
+        "description": "Draft a reply for the open thread. Never sends.",
+        "parameters": [
+            {"name": "user_text", "type": "string", "description": "Draft instruction.", "required": True},
+            {"name": "mailbox", "type": "string", "description": "Active mailbox.", "required": False},
+            {"name": "ui_context", "type": "object", "description": "Must include current_thread.", "required": False},
+        ],
+        "timeout": 300,
+    },
+    {
+        "name": "ai_revise_draft",
+        # when: 改写已有草稿
+        "description": "Revise ui_context.last_draft (or draft_body). Never sends.",
+        "parameters": [
+            {"name": "user_text", "type": "string", "description": "Revision instruction.", "required": True},
+            {"name": "ui_context", "type": "object", "description": "Should include last_draft.", "required": False},
+            {"name": "draft_body", "type": "string", "description": "Draft text if last_draft missing.", "required": False},
+        ],
+        "timeout": 300,
+    },
+    {
+        "name": "ai_compose_new",
+        # when: 写新邮件（非回复）
+        "description": "Compose a new email draft. Never sends.",
+        "parameters": [
+            {"name": "user_text", "type": "string", "description": "Compose instruction.", "required": True},
+            {"name": "ui_context", "type": "object", "description": "Read-only UI facts.", "required": False},
+        ],
+        "timeout": 300,
+    },
+    {
+        "name": "ai_batch_draft",
+        # when: 多封选中线程批量写稿
+        "description": "Draft replies for selected_threads (max 5). Never sends.",
+        "parameters": [
+            {"name": "user_text", "type": "string", "description": "Batch draft instruction.", "required": True},
+            {"name": "ui_context", "type": "object", "description": "Should include selected_threads.", "required": False},
+            {"name": "selected_threads", "type": "array", "description": "Selected threads.", "required": False},
+        ],
+        "timeout": 600,
+    },
+    {
+        "name": "propose_inbox_actions",
+        # when: Host 已选出低优先级候选，只建确认卡
+        "description": "Create organize confirmation card from items you already chose (message_id/THREAD_REF). No search. No Gmail mutation.",
+        "parameters": [
+            {"name": "items", "type": "array", "description": "Chosen candidates with message_id or thread_ref.", "required": True},
+            {"name": "mailbox", "type": "string", "description": "Active mailbox.", "required": False},
+            {"name": "rationale", "type": "string", "description": "One-line why these items.", "required": False},
+        ],
+        "timeout": 120,
+    },
+    {
+        "name": "ai_remember_preference",
+        # when: 用户明确要求记住偏好
+        "description": "Save a short user preference to memory. No email body.",
+        "parameters": [
+            {"name": "user_text", "type": "string", "description": "Preference utterance.", "required": False},
+            {"name": "preference", "type": "string", "description": "Preference text.", "required": False},
+        ],
+        "timeout": 60,
+    },
+]
+
 DEFAULT_MANIFEST = {
     "name": DEFAULT_TOOL_ID,
     "display_name": "Zhaopy Mail Agent RD6B87R5",
@@ -705,7 +829,7 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "start_ai_turn",
-            "description": "Unified AI sidebar turn: local router selects whitelist tools (chat, search, summarize, draft, propose, memory) then returns a pollable run.",
+            "description": "Legacy unified AI turn with local router. Prefer Host Agent plus ai_* tools for sidebar.",
             "parameters": [
                 {"name": "user_text", "type": "string", "description": "Natural language user message.", "required": True},
                 {"name": "mailbox", "type": "string", "description": "Primary mailbox email address.", "required": False},
@@ -720,6 +844,7 @@ DEFAULT_MANIFEST = {
             ],
             "timeout": 600,
         },
+        *AI_AGENT_DEFAULT_TOOLS,
         {
             "name": "apply_proposed_actions",
             "description": "Apply user-confirmed inbox organize actions (mark_done/archive/trash). Never call without explicit UI confirmation.",

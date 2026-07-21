@@ -1299,9 +1299,70 @@ export function aiSearchStatus(result: CustomRunResult, userRequest = "") {
   const queryCount = result.plan_gmail_queries?.length || 0;
   if (queryCount > 0)
     return chinese
-      ? `已执行 ${queryCount} 个针对性收件箱查询。`
-      : `Searched ${queryCount} focused inbox quer${queryCount === 1 ? "y" : "ies"}.`;
-  return chinese ? "已完成收件箱搜索。" : "Finished searching your inbox.";
+      ? `已在本地缓存执行 ${queryCount} 个查询。`
+      : `Searched local cache with ${queryCount} quer${queryCount === 1 ? "y" : "ies"}.`;
+  return chinese ? "已完成本地缓存搜索。" : "Finished searching local inbox cache.";
+}
+
+/** Thinking 后展示检索依据（对齐 example/12.png：小字 + 搜索图标行，可点进主搜索框）。 */
+function AiScanQueryChip({
+  query,
+  chinese,
+  hitCount,
+  onApply,
+}: {
+  query: string;
+  chinese: boolean;
+  hitCount?: number;
+  onApply?: (query: string) => void;
+}) {
+  const text = query.trim();
+  if (!text) return null;
+  const countLine =
+    typeof hitCount === "number" && hitCount > 0
+      ? chinese
+        ? `找到 ${hitCount} 封相关邮件`
+        : `Found ${hitCount} matching email${hitCount === 1 ? "" : "s"}`
+      : "";
+  return (
+    <div className="ai-scan-query-block">
+      {countLine ? <p className="ai-scan-query-summary">{countLine}</p> : null}
+      <button
+        type="button"
+        className="ai-scan-query-line"
+        title={chinese ? "在收件箱搜索框中打开此条件" : "Open this query in inbox search"}
+        onClick={() => onApply?.(text)}
+      >
+        <span className="ai-scan-query-icon" aria-hidden="true">
+          <SearchIcon />
+        </span>
+        <span className="ai-scan-query-prefix">
+          {chinese ? "搜索条件：" : "Search query: "}
+        </span>
+        <span className="ai-scan-query-text">{text}</span>
+      </button>
+    </div>
+  );
+}
+
+function resolveMessageScanQuery(message: AiChatMessage): string {
+  if (String(message.scanQuery || "").trim()) return String(message.scanQuery).trim();
+  const fromResult = message.result?.scan_query
+    || message.result?.plan_gmail_queries?.[0]?.query
+    || "";
+  return String(fromResult || "").trim();
+}
+
+function resolveMessageScanHitCount(message: AiChatMessage): number | undefined {
+  const sections = message.result?.sections;
+  if (Array.isArray(sections)) {
+    const n = sections.reduce(
+      (total, section) => total + (section.items?.length || 0),
+      0,
+    );
+    if (n > 0) return n;
+  }
+  return undefined;
 }
 
 function aiTimeLabel(value?: string) {
@@ -1378,6 +1439,9 @@ function AiMessageInlineContent({
   return content.map((node, index) => {
     const key = `${node.type}-${index}`;
     if (node.type === "bold") return <strong key={key}>{node.value}</strong>;
+    if (node.type === "italic") return <em key={key}>{node.value}</em>;
+    if (node.type === "strikethrough") return <del key={key}>{node.value}</del>;
+    if (node.type === "code") return <code key={key}>{node.value}</code>;
     if (node.type === "link") {
       return (
         <a key={key} href={node.href} target="_blank" rel="noreferrer noopener">
@@ -1416,7 +1480,7 @@ function RichAssistantBlocks({
       {blocks.map((block, index) => {
         const key = `${block.type}-${index}`;
         if (block.type === "heading") {
-          const Heading = `h${block.level + 2}` as "h3" | "h4" | "h5";
+          const Heading = `h${block.level + 2}` as "h3" | "h4" | "h5" | "h6";
           return (
             <Heading key={key}>
               <AiMessageInlineContent
@@ -1454,6 +1518,27 @@ function RichAssistantBlocks({
             </ol>
           );
         }
+        if (block.type === "metadata") {
+          return (
+            <div key={key} className="ai-message-metadata-row">
+              {block.label ? <span className="ai-message-metadata-label">{block.label}</span> : null}
+              <span className="ai-message-metadata-value">
+                <AiMessageInlineContent content={block.content} onOpenThread={onOpenThread} />
+              </span>
+            </div>
+          );
+        }
+        if (block.type === "blockquote") {
+          return (
+            <blockquote key={key}>
+              <AiMessageInlineContent content={block.content} onOpenThread={onOpenThread} />
+            </blockquote>
+          );
+        }
+        if (block.type === "code_block") {
+          return <pre key={key}><code className={block.language ? `language-${block.language}` : undefined}>{block.code}</code></pre>;
+        }
+        if (block.type === "divider") return <hr key={key} />;
         return (
           <p key={key}>
             <AiMessageInlineContent
@@ -1550,6 +1635,7 @@ function AiAssistantMessage({
   onOpenMail,
   onConfirmSendPlan,
   onTextComplete,
+  onApplyScanQuery,
 }: {
   message: AiChatMessage;
   currentMailContext: AiMailContextRef | null;
@@ -1564,6 +1650,7 @@ function AiAssistantMessage({
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
   onTextComplete?: () => void;
+  onApplyScanQuery?: (query: string) => void;
 }) {
   const { state, actions } = useApp();
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -1675,6 +1762,10 @@ function AiAssistantMessage({
   if (!result) {
     const text = displayAssistantText(message);
     const animate = shouldAnimateAssistantText(message.timestamp);
+    const scanQuery = resolveMessageScanQuery(message);
+    const scanChinese = /[\u3400-\u9fff]/.test(
+      `${message.sourcePrompt || ""}${text}`,
+    );
     const draftArtifact =
       message.artifact?.type === "draft_reply" &&
       (!animate || assistantTextComplete)
@@ -1757,6 +1848,14 @@ function AiAssistantMessage({
       <div
         className={`ai-message is-assistant ${message.kind === "error" ? "is-error" : ""} ${message.kind === "stopped" ? "is-stopped" : ""}`}
       >
+        {scanQuery ? (
+          <AiScanQueryChip
+            query={scanQuery}
+            chinese={scanChinese}
+            hitCount={resolveMessageScanHitCount(message)}
+            onApply={onApplyScanQuery}
+          />
+        ) : null}
         {summaryLink ? (
           <div className="ai-mail-summary-title">
             <span>Here's a summary of</span>
@@ -2205,14 +2304,23 @@ function AiAssistantMessage({
     result.plan_description ||
     "Anna finished scanning your inbox.";
   const animate = shouldAnimateAssistantText(message.timestamp);
+  const scanQuery = resolveMessageScanQuery(message);
+  const scanChinese = /[\u3400-\u9fff]/.test(
+    `${message.sourcePrompt || ""}${summaryText}`,
+  );
   return (
     <div className="ai-message is-assistant">
       <div className="ai-answer-meta">
-        {aiSearchStatus(result, message.sourcePrompt)}{" "}
-        {result.plan_gmail_queries?.[0]?.query ? (
-          <code>{result.plan_gmail_queries[0].query}</code>
-        ) : null}
+        {aiSearchStatus(result, message.sourcePrompt)}
       </div>
+      {scanQuery ? (
+        <AiScanQueryChip
+          query={scanQuery}
+          chinese={scanChinese}
+          hitCount={resolveMessageScanHitCount(message)}
+          onApply={onApplyScanQuery}
+        />
+      ) : null}
       <AnimatedAssistantText
         text={summaryText}
         animate={animate}
@@ -2297,6 +2405,7 @@ function AiMessageBubble({
   onOpenMail,
   onConfirmSendPlan,
   onTextComplete,
+  onApplyScanQuery,
 }: {
   message: AiChatMessage;
   currentMailContext: AiMailContextRef | null;
@@ -2311,6 +2420,7 @@ function AiMessageBubble({
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
   onTextComplete?: () => void;
+  onApplyScanQuery?: (query: string) => void;
 }) {
   if (message.role === "user") {
     return <div className="ai-message is-user">{message.content}</div>;
@@ -2324,6 +2434,7 @@ function AiMessageBubble({
       onOpenMail={onOpenMail}
       onConfirmSendPlan={onConfirmSendPlan}
       onTextComplete={onTextComplete}
+      onApplyScanQuery={onApplyScanQuery}
     />
   );
 }
@@ -2337,6 +2448,7 @@ function AiSidebar({
   onUseComposeArtifact,
   onOpenMail,
   onConfirmSendPlan,
+  onApplyScanQuery,
   composerFocusKey,
 }: {
   collapsed: boolean;
@@ -2358,6 +2470,7 @@ function AiSidebar({
   ) => void;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
+  onApplyScanQuery?: (query: string) => void;
   composerFocusKey: number;
 }) {
   const { state, actions } = useApp();
@@ -2520,6 +2633,7 @@ function AiSidebar({
                 onOpenMail={onOpenMail}
                 onConfirmSendPlan={onConfirmSendPlan}
                 onTextComplete={scrollConversationToBottom}
+                onApplyScanQuery={onApplyScanQuery}
               />
             ))}
           </div>
@@ -3078,7 +3192,13 @@ export function HomeView() {
           setFilter("search");
           return;
         }
-        const view = directStatus === "is" ? "inbox" : directStatus;
+        // is:todo → Todos 视图；其余 is: 状态与侧栏视图同名
+        const view =
+          directStatus === "todo"
+            ? "todos"
+            : directStatus === "is"
+              ? "inbox"
+              : directStatus;
         if (
           [
             "inbox",
@@ -3764,7 +3884,9 @@ export function HomeView() {
       if (!matchesView) return false;
       if (!matchesFilter) return false;
       if (!activeSearch.trim() || parsedActiveSearch.error) return true;
-      return matchInboxQuery(message, parsedActiveSearch);
+      return matchInboxQuery(message, parsedActiveSearch, undefined, {
+        todoIds: flags.todos,
+      });
     });
   }, [
     activeSearch,
@@ -5831,6 +5953,7 @@ export function HomeView() {
         currentMailContext={sidebarMailContext}
         selectedThreads={aiSelectedThreads}
         onUseArtifact={applyDraftReplyArtifact}
+        onApplyScanQuery={applySearch}
         onUseComposeArtifact={(artifact, sourceContext) => {
           if (
             !composeOpen ||

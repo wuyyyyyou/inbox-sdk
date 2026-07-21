@@ -3,7 +3,7 @@ import type { InboxMessage } from "../../types/mail";
 export type InboxQueryField = "subject" | "body" | "from" | "to" | "is" | "has" | "before" | "after";
 
 export type InboxQueryExpression =
-  | { kind: "term"; field: InboxQueryField | "any"; value: string }
+  | { kind: "term"; field: InboxQueryField | "any"; value: string; exclude?: boolean }
   | { kind: "and" | "or"; terms: InboxQueryExpression[] };
 
 export interface ParsedInboxQuery {
@@ -11,8 +11,26 @@ export interface ParsedInboxQuery {
   error: string;
 }
 
+/** 本地 workflow 标记：is:todo 依赖前端 todos 列表，不写在 Gmail label 上。 */
+export type InboxQueryMatchContext = {
+  todoIds?: Iterable<string>;
+};
+
 const FIELDS: InboxQueryField[] = ["subject", "body", "from", "to", "is", "has", "before", "after"];
-const STATUS_VALUES = ["sent", "unread", "done", "inbox", "snoozed", "starred", "important", "draft", "trash", "spam", "all"];
+const STATUS_VALUES = [
+  "sent",
+  "unread",
+  "done",
+  "todo",
+  "inbox",
+  "snoozed",
+  "starred",
+  "important",
+  "draft",
+  "trash",
+  "spam",
+  "all",
+];
 const SUGGESTION_PLACEHOLDERS: Record<string, string> = {
   "AND": "Combine two search queries",
   "OR": "Search for either of two queries",
@@ -20,7 +38,7 @@ const SUGGESTION_PLACEHOLDERS: Record<string, string> = {
   "body:": "Words in cached message content",
   "from:": "Specify the sender",
   "to:": "Specify a recipient",
-  "is:": "Sent, unread, draft, trash, spam, and more",
+  "is:": "Sent, unread, todo, draft, trash, spam, and more",
   "has:": "Attachments",
   "before:": "Messages before a date (YYYY-MM-DD)",
   "after:": "Messages after a date (YYYY-MM-DD)",
@@ -31,8 +49,54 @@ function joinExpression(kind: "and" | "or", terms: InboxQueryExpression[]): Inbo
   return terms.length === 1 ? terms[0] : { kind, terms };
 }
 
+function parseTermToken(token: string): { term: Extract<InboxQueryExpression, { kind: "term" }> | null; error: string } {
+  let raw = token;
+  let exclude = false;
+  // Shortwave / Gmail 风格：-term 排除匹配；仅一元前缀，不做 -- 或单独 -
+  if (raw.startsWith("-") && raw.length > 1) {
+    exclude = true;
+    raw = raw.slice(1);
+  }
+  if (!raw || raw === "-") {
+    return { term: null, error: "The - operator needs a search term after it." };
+  }
+
+  const separator = raw.indexOf(":");
+  let field: InboxQueryField | "any" = "any";
+  let value = raw;
+  if (separator >= 0) {
+    const candidate = raw.slice(0, separator).toLowerCase();
+    value = raw.slice(separator + 1);
+    if (!FIELDS.includes(candidate as InboxQueryField)) {
+      return { term: null, error: `Unknown search field: ${candidate || raw}.` };
+    }
+    if (!value) return { term: null, error: `The ${candidate}: field needs a keyword.` };
+    if (candidate === "is" && !STATUS_VALUES.includes(value.toLowerCase())) {
+      return { term: null, error: `is: must use ${STATUS_VALUES.join(", ")}.` };
+    }
+    if (candidate === "has" && value.toLowerCase() !== "attachment") {
+      return { term: null, error: "has: currently supports attachment only." };
+    }
+    if ((candidate === "before" || candidate === "after") && !/^\d{4}-\d{2}-\d{2}$/u.test(value)) {
+      return { term: null, error: `${candidate}: must use YYYY-MM-DD.` };
+    }
+    field = candidate as InboxQueryField;
+  }
+  return {
+    term: {
+      kind: "term",
+      field,
+      value: value.toLowerCase(),
+      ...(exclude ? { exclude: true } : {}),
+    },
+    error: "",
+  };
+}
+
 /**
- * 解析 Inbox 本地查询。语法只支持空白分隔的关键词和 AND/OR，AND 的优先级高于 OR。
+ * 解析 Inbox 本地查询。
+ * - 空白分隔的关键词需用 AND/OR 连接（AND 优先于 OR）
+ * - `-term` / `-from:x`：排除匹配（Shortwave 风格一元否定）
  */
 export function parseInboxQuery(input: string): ParsedInboxQuery {
   const raw = String(input || "").trim();
@@ -55,20 +119,9 @@ export function parseInboxQuery(input: string): ParsedInboxQuery {
     }
     if (!expectingTerm) return { expression: null, error: "Add an AND or OR operator between search terms." };
 
-    const separator = token.indexOf(":");
-    let field: InboxQueryField | "any" = "any";
-    let value = token;
-    if (separator >= 0) {
-      const candidate = token.slice(0, separator).toLowerCase();
-      value = token.slice(separator + 1);
-      if (!FIELDS.includes(candidate as InboxQueryField)) return { expression: null, error: `Unknown search field: ${candidate || token}.` };
-      if (!value) return { expression: null, error: `The ${candidate}: field needs a keyword.` };
-      if (candidate === "is" && !STATUS_VALUES.includes(value.toLowerCase())) return { expression: null, error: `is: must use ${STATUS_VALUES.join(", ")}.` };
-      if (candidate === "has" && value.toLowerCase() !== "attachment") return { expression: null, error: "has: currently supports attachment only." };
-      if ((candidate === "before" || candidate === "after") && !/^\d{4}-\d{2}-\d{2}$/u.test(value)) return { expression: null, error: `${candidate}: must use YYYY-MM-DD.` };
-      field = candidate as InboxQueryField;
-    }
-    andTerms.push({ kind: "term", field, value: value.toLowerCase() });
+    const parsed = parseTermToken(token);
+    if (!parsed.term) return { expression: null, error: parsed.error };
+    andTerms.push(parsed.term);
     expectingTerm = false;
   }
 
@@ -81,39 +134,79 @@ function hasMatch(value: string | null | undefined, term: string): boolean {
   return String(value || "").toLowerCase().includes(term);
 }
 
-function matchesTerm(message: InboxMessage, term: Extract<InboxQueryExpression, { kind: "term" }>, cachedBody?: string): boolean {
+function matchesTerm(
+  message: InboxMessage,
+  term: Extract<InboxQueryExpression, { kind: "term" }>,
+  cachedBody?: string,
+  context?: InboxQueryMatchContext,
+): boolean {
   const body = cachedBody === undefined ? (message.body_cached ? message.body_preview : "") : cachedBody;
-  if (term.field === "subject") return hasMatch(message.subject || message.latest_subject, term.value);
-  if (term.field === "body") return hasMatch(body, term.value);
-  if (term.field === "from") return hasMatch(message.from, term.value);
-  if (term.field === "to") return hasMatch(message.to, term.value);
-  const labels = new Set((message.label_ids || []).map((label) => label.toUpperCase()));
-  if (term.field === "has") return term.value === "attachment" && Boolean(message.has_attachment || message.attachment_count);
-  if (term.field === "is") {
-    const checks: Record<string, boolean> = {
-      sent: labels.has("SENT"), unread: Boolean(message.unread || labels.has("UNREAD")), done: labels.has("DONE"), inbox: labels.has("INBOX"), snoozed: labels.has("SNOOZED"), starred: Boolean(message.starred || labels.has("STARRED")), important: Boolean(message.important || labels.has("IMPORTANT")), draft: Boolean(message.draft_local || labels.has("DRAFT")), trash: labels.has("TRASH"), spam: labels.has("SPAM"), all: true,
-    };
-    return checks[term.value] || false;
-  }
-  if (term.field === "before" || term.field === "after") {
+  let hit = false;
+  if (term.field === "subject") hit = hasMatch(message.subject || message.latest_subject, term.value);
+  else if (term.field === "body") hit = hasMatch(body, term.value);
+  else if (term.field === "from") hit = hasMatch(message.from, term.value);
+  else if (term.field === "to") hit = hasMatch(message.to, term.value);
+  else if (term.field === "has") {
+    hit = term.value === "attachment" && Boolean(message.has_attachment || message.attachment_count);
+  } else if (term.field === "is") {
+    const labels = new Set((message.label_ids || []).map((label) => label.toUpperCase()));
+    if (term.value === "todo") {
+      const todoIds = new Set(Array.from(context?.todoIds || []).map(String));
+      hit = todoIds.has(String(message.id || ""));
+    } else {
+      const checks: Record<string, boolean> = {
+        sent: labels.has("SENT"),
+        unread: Boolean(message.unread || labels.has("UNREAD")),
+        done: labels.has("DONE"),
+        inbox: labels.has("INBOX"),
+        snoozed: labels.has("SNOOZED"),
+        starred: Boolean(message.starred || labels.has("STARRED")),
+        important: Boolean(message.important || labels.has("IMPORTANT")),
+        draft: Boolean(message.draft_local || labels.has("DRAFT")),
+        trash: labels.has("TRASH"),
+        spam: labels.has("SPAM"),
+        all: true,
+      };
+      hit = Boolean(checks[term.value]);
+    }
+  } else if (term.field === "before" || term.field === "after") {
     const rawDate = message.internal_date || message.date || "";
     const timestamp = /^\d+$/u.test(String(rawDate)) ? Number(rawDate) : Date.parse(String(rawDate));
-    if (!Number.isFinite(timestamp)) return false;
-    const boundary = Date.parse(`${term.value}T00:00:00`);
-    return term.field === "before" ? timestamp < boundary : timestamp >= boundary;
+    if (!Number.isFinite(timestamp)) hit = false;
+    else {
+      const boundary = Date.parse(`${term.value}T00:00:00`);
+      hit = term.field === "before" ? timestamp < boundary : timestamp >= boundary;
+    }
+  } else {
+    hit = [message.from, message.to, message.subject, message.latest_subject, message.snippet, body]
+      .some((value) => hasMatch(value, term.value));
   }
-  return [message.from, message.to, message.subject, message.latest_subject, message.snippet, body].some((value) => hasMatch(value, term.value));
+  return term.exclude ? !hit : hit;
 }
 
-function matchesExpression(message: InboxMessage, expression: InboxQueryExpression, cachedBody?: string): boolean {
-  if (expression.kind === "term") return matchesTerm(message, expression, cachedBody);
+function matchesExpression(
+  message: InboxMessage,
+  expression: InboxQueryExpression,
+  cachedBody?: string,
+  context?: InboxQueryMatchContext,
+): boolean {
+  if (expression.kind === "term") return matchesTerm(message, expression, cachedBody, context);
   const matcher = expression.kind === "and" ? "every" : "some";
-  return expression.terms[matcher]((term) => matchesExpression(message, term, cachedBody));
+  return expression.terms[matcher]((term) => matchesExpression(message, term, cachedBody, context));
 }
 
 /** 仅在语法有效时匹配；调用方可据此避免在错误输入时意外筛选邮件。 */
-export function matchInboxQuery(message: InboxMessage, parsed: ParsedInboxQuery, cachedBody?: string): boolean {
-  return Boolean(parsed.expression && !parsed.error && matchesExpression(message, parsed.expression, cachedBody));
+export function matchInboxQuery(
+  message: InboxMessage,
+  parsed: ParsedInboxQuery,
+  cachedBody?: string,
+  context?: InboxQueryMatchContext,
+): boolean {
+  return Boolean(
+    parsed.expression
+    && !parsed.error
+    && matchesExpression(message, parsed.expression, cachedBody, context),
+  );
 }
 
 /** 为输入末尾尚未完成的字段名提供操作符建议。 */
@@ -123,15 +216,18 @@ export function getInboxQuerySuggestions(input: string): string[] {
   if (!raw.trim()) return FIELDS.map((field) => `${field}:`);
   if (/\s$/u.test(raw) && raw.trim()) return [];
   const current = raw.trim().split(/\s+/u).at(-1)?.toLowerCase() || "";
-  if (!current.includes(":")) {
-    const fields = FIELDS.filter((field) => field.startsWith(current)).map((field) => `${field}:`);
+  const bare = current.startsWith("-") ? current.slice(1) : current;
+  if (!bare.includes(":")) {
+    const fields = FIELDS.filter((field) => field.startsWith(bare)).map((field) => `${field}:`);
     if (fields.length) return fields;
   }
   const complete = parseInboxQuery(raw);
   if (complete.expression && !complete.error) return [];
-  if (current.startsWith("is:")) return STATUS_VALUES.filter((value) => value.startsWith(current.slice(3))).map((value) => `is:${value}`);
-  if (current.startsWith("has:")) return "attachment".startsWith(current.slice(4)) ? ["has:attachment"] : [];
-  if (current.includes(":")) return [];
+  if (bare.startsWith("is:")) {
+    return STATUS_VALUES.filter((value) => value.startsWith(bare.slice(3))).map((value) => `is:${value}`);
+  }
+  if (bare.startsWith("has:")) return "attachment".startsWith(bare.slice(4)) ? ["has:attachment"] : [];
+  if (bare.includes(":")) return [];
   return [];
 }
 
@@ -153,8 +249,22 @@ export function splitInboxQueryTokens(input: string): Array<{ text: string; kind
   return String(input || "").split(/(\s+)/u).filter(Boolean).flatMap<{ text: string; kind: "field" | "value" | "operator" | "plain" }>((token) => {
     if (/^\s+$/u.test(token)) return [{ text: token, kind: "plain" as const }];
     if (/^(AND|OR)$/iu.test(token)) return [{ text: token, kind: "operator" as const }];
-    const match = /^(subject|body|from|to|is|has|before|after):(.*)$/iu.exec(token);
-    return match ? [{ text: `${match[1]}:`, kind: "field" as const }, { text: match[2], kind: "value" as const }] : [{ text: token, kind: "plain" as const }];
+    const excludePrefix = token.startsWith("-") && token.length > 1;
+    const bare = excludePrefix ? token.slice(1) : token;
+    const match = /^(subject|body|from|to|is|has|before|after):(.*)$/iu.exec(bare);
+    if (match) {
+      const pieces: Array<{ text: string; kind: "field" | "value" | "operator" | "plain" }> = [];
+      if (excludePrefix) pieces.push({ text: "-", kind: "operator" });
+      pieces.push({ text: `${match[1]}:`, kind: "field" }, { text: match[2], kind: "value" });
+      return pieces;
+    }
+    if (excludePrefix) {
+      return [
+        { text: "-", kind: "operator" as const },
+        { text: bare, kind: "plain" as const },
+      ];
+    }
+    return [{ text: token, kind: "plain" as const }];
   });
 }
 
@@ -164,6 +274,7 @@ export function getInboxQueryHighlightTerms(parsed: ParsedInboxQuery): string[] 
   const visit = (expression: InboxQueryExpression | null) => {
     if (!expression) return;
     if (expression.kind === "term") {
+      if (expression.exclude) return;
       if (!terms.includes(expression.value)) terms.push(expression.value);
       return;
     }

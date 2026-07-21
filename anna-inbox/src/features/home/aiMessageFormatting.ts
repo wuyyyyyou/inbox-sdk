@@ -1,19 +1,109 @@
 export type AiMessageInline =
   | { type: "text"; value: string }
   | { type: "bold"; value: string }
+  | { type: "italic"; value: string }
+  | { type: "strikethrough"; value: string }
+  | { type: "code"; value: string }
   | { type: "link"; label: string; href: string }
   | { type: "thread_ref"; threadId: string };
 
 export type AiMessageBlock =
   | { type: "paragraph"; content: AiMessageInline[] }
-  | { type: "heading"; level: 1 | 2 | 3; content: AiMessageInline[] }
+  | { type: "heading"; level: 1 | 2 | 3 | 4; content: AiMessageInline[] }
   | { type: "unordered_list"; indent: number; items: AiMessageInline[][] }
-  | { type: "ordered_list"; indent: number; start: number; items: AiMessageInline[][] };
+  | { type: "ordered_list"; indent: number; start: number; items: AiMessageInline[][] }
+  | { type: "metadata"; label: string; content: AiMessageInline[] }
+  | { type: "blockquote"; content: AiMessageInline[] }
+  | { type: "code_block"; language: string; code: string }
+  | { type: "divider" };
 
-const headingPattern = /^(#{1,3})\s+(.+)$/;
+const headingPattern = /^(#{1,4})\s+(.+)$/;
 const unorderedListPattern = /^(\s*)[-*]\s+(.+)$/;
 const orderedListPattern = /^(\s*)(\d+)[.)]\s+(.+)$/;
-const inlinePattern = /\[THREAD_REF_([^\]\s]+)\]|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*/g;
+const quotePattern = /^>\s?(.*)$/;
+const codeFencePattern = /^```([^\s`]*)\s*$/;
+const dividerPattern = /^(?:-{3,}|\*{3,}|_{3,})\s*$/;
+const inlinePattern = /\[THREAD_REF_([^\]\s]+)\]|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*|~~([^~]+)~~|`([^`]+)`|\*([^*]+)\*|_([^_]+)_/g;
+const metadataLabelPattern = /(发件人|主题|时间|寄件人|Sender|Subject|Date|Time)\s*[：:]/gi;
+
+function metadataRowsFromLine(line: string): Array<{ label: string; value: string }> | null {
+  const matches = Array.from(line.matchAll(metadataLabelPattern));
+  if (!matches.length || (matches[0].index || 0) > 4) return null;
+  const rows = matches.map((match, index) => {
+    const start = (match.index || 0) + match[0].length;
+    const end = index + 1 < matches.length ? matches[index + 1].index || line.length : line.length;
+    return {
+      label: match[1],
+      value: line.slice(start, end).replace(/^\s*\|?\s*|\s*\|?\s*$/g, "").trim(),
+    };
+  }).filter((row) => row.value);
+  return rows.length ? rows : null;
+}
+
+function normalizeMarkdownTables(text: string): string {
+  const lines = text.split('\n');
+  const result: string[] = [];
+  let inTable = false;
+  let headers: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const originalLine = lines[i];
+    const trimmedLine = originalLine.trim();
+
+    // Detect header row
+    if (trimmedLine.startsWith('|') && trimmedLine.endsWith('|') && trimmedLine.indexOf('---') === -1) {
+      const cells = trimmedLine.split('|').map(cell => cell.trim()).filter(Boolean);
+      if (cells.length > 0) {
+        headers = cells;
+        inTable = true;
+        result.push('## ' + headers.join(' | ')); // Format header as a heading
+        i++; // Skip the separator line
+        if (lines[i] && lines[i].trim().match(/^\|[-—]+\|([-—]+\|)*$/)) { // Handle separator line
+            i++;
+        }
+        continue;
+      }
+    }
+
+    // Detect data rows
+    if (inTable && trimmedLine.startsWith('|') && trimmedLine.endsWith('|')) {
+      const cells = trimmedLine.split('|').map(cell => cell.trim()).filter(Boolean);
+      if (cells.length === headers.length) {
+        for (let j = 0; j < headers.length; j++) {
+          result.push(`- **${headers[j]}**: ${cells[j]}`);
+        }
+        result.push(''); // Add a blank line for separation between rows
+        continue;
+      } else {
+        // If cell count doesn't match, it's not a valid table row, break out of table mode
+        inTable = false;
+        headers = [];
+      }
+    } else {
+      inTable = false;
+      headers = [];
+    }
+
+    result.push(originalLine); // Preserve original line with leading spaces if not a table part
+  }
+
+  return result.join('\n');
+}
+
+function normalizePipedRanking(text: string): string {
+  return text.replace(/^([^\n]*?(?:排序|优先级|Priority|Ranking)[^\n]*\|[^\n]*)$/gim, (line) => {
+    const cells = line.split("|").map((cell) => cell.trim()).filter(Boolean);
+    const firstRank = cells.findIndex((cell) => /^\d+(?:\s*[-–]\s*\d+)?$/.test(cell));
+    if (firstRank < 0 || firstRank + 1 >= cells.length) return line;
+    const rows: string[] = ["## 排序依据"];
+    for (let index = firstRank; index + 1 < cells.length; index += 2) {
+      if (!/^\d+(?:\s*[-–]\s*\d+)?$/.test(cells[index])) break;
+      rows.push(`${rows.length}. **优先级 ${cells[index]}**：${cells[index + 1]}`);
+    }
+    return rows.length > 1 ? rows.join("\n") : line;
+  });
+}
+
 
 function splitInlineUnorderedListItems(line: string): string[] {
   return Array.from(line.matchAll(/(?:^|\s+)[-*]\s+(.+?)(?=\s+[-*]\s+|$)/g), (match) => match[1].trim());
@@ -45,6 +135,12 @@ export function parseAiMessageInline(text: string): AiMessageInline[] {
       nodes.push({ type: "link", label: match[2], href: match[3] });
     } else if (match[4]) {
       nodes.push({ type: "bold", value: match[4] });
+    } else if (match[5]) {
+      nodes.push({ type: "strikethrough", value: match[5] });
+    } else if (match[6]) {
+      nodes.push({ type: "code", value: match[6] });
+    } else if (match[7] || match[8]) {
+      nodes.push({ type: "italic", value: match[7] || match[8] });
     } else {
       nodes.push({ type: "text", value: match[0] });
     }
@@ -55,7 +151,7 @@ export function parseAiMessageInline(text: string): AiMessageInline[] {
 }
 
 export function parseAiMessageMarkdown(text: string): AiMessageBlock[] {
-  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const lines = normalizeMarkdownTables(normalizePipedRanking(text)).replace(/\r\n?/g, "\n").split("\n");
   const blocks: AiMessageBlock[] = [];
   let index = 0;
 
@@ -65,11 +161,47 @@ export function parseAiMessageMarkdown(text: string): AiMessageBlock[] {
       index += 1;
       continue;
     }
+    const metadataRows = metadataRowsFromLine(line);
+    if (metadataRows) {
+      for (const row of metadataRows) {
+        const threadRefs = row.value.match(/\[THREAD_REF_[^\]\s]+\]/g) || [];
+        const value = row.value.replace(/\s*\|?\s*\[THREAD_REF_[^\]\s]+\]\s*/g, "").trim();
+        if (value) blocks.push({ type: "metadata", label: row.label, content: parseAiMessageInline(value) });
+        for (const threadRef of threadRefs) {
+          blocks.push({ type: "metadata", label: "", content: parseAiMessageInline(threadRef) });
+        }
+      }
+      index += 1;
+      continue;
+    }
+    const codeFence = line.match(codeFencePattern);
+    if (codeFence) {
+      const codeLines: string[] = [];
+      index += 1;
+      while (index < lines.length && !codeFencePattern.test(lines[index])) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      blocks.push({ type: "code_block", language: codeFence[1], code: codeLines.join("\n") });
+      continue;
+    }
+    if (dividerPattern.test(line)) {
+      blocks.push({ type: "divider" });
+      index += 1;
+      continue;
+    }
+    const quote = line.match(quotePattern);
+    if (quote) {
+      blocks.push({ type: "blockquote", content: parseAiMessageInline(quote[1]) });
+      index += 1;
+      continue;
+    }
     const heading = line.match(headingPattern);
     if (heading) {
       blocks.push({
         type: "heading",
-        level: heading[1].length as 1 | 2 | 3,
+        level: heading[1].length as 1 | 2 | 3 | 4,
         content: parseAiMessageInline(heading[2]),
       });
       index += 1;
@@ -111,7 +243,14 @@ export function parseAiMessageMarkdown(text: string): AiMessageBlock[] {
     }
     const paragraph: string[] = [];
     while (index < lines.length && lines[index].trim()) {
-      if (headingPattern.test(lines[index]) || unorderedListPattern.test(lines[index]) || orderedListPattern.test(lines[index])) break;
+      if (
+        codeFencePattern.test(lines[index])
+        || dividerPattern.test(lines[index])
+        || quotePattern.test(lines[index])
+        || headingPattern.test(lines[index])
+        || unorderedListPattern.test(lines[index])
+        || orderedListPattern.test(lines[index])
+      ) break;
       paragraph.push(lines[index]);
       index += 1;
     }
@@ -122,7 +261,7 @@ export function parseAiMessageMarkdown(text: string): AiMessageBlock[] {
 
 /** Visible character cost of one inline node (thread_ref is atomic). */
 function measureInlineNode(node: AiMessageInline): number {
-  if (node.type === "text" || node.type === "bold") return node.value.length;
+  if (node.type === "text" || node.type === "bold" || node.type === "italic" || node.type === "strikethrough" || node.type === "code") return node.value.length;
   if (node.type === "link") return node.label.length;
   return 1;
 }
@@ -136,6 +275,8 @@ export function measureAiMessageBlocks(blocks: AiMessageBlock[]): number {
     if (block.type === "unordered_list" || block.type === "ordered_list") {
       return sum + block.items.reduce((itemSum, item) => itemSum + measureAiMessageInline(item), 0);
     }
+    if (block.type === "code_block") return sum + block.code.length;
+    if (block.type === "divider") return sum;
     return sum + measureAiMessageInline(block.content);
   }, 0);
 }
@@ -149,7 +290,7 @@ function sliceInlineNodes(
   let remaining = budget;
   for (const node of nodes) {
     if (remaining <= 0) break;
-    if (node.type === "text" || node.type === "bold") {
+    if (node.type === "text" || node.type === "bold" || node.type === "italic" || node.type === "strikethrough" || node.type === "code") {
       if (node.value.length <= remaining) {
         next.push(node);
         remaining -= node.value.length;
@@ -191,15 +332,32 @@ export function sliceAiMessageBlocks(blocks: AiMessageBlock[], maxChars: number)
   for (const block of blocks) {
     if (remaining <= 0) break;
 
-    if (block.type === "paragraph" || block.type === "heading") {
+    if (block.type === "paragraph" || block.type === "heading" || block.type === "blockquote" || block.type === "metadata") {
       const sliced = sliceInlineNodes(block.content, remaining);
       if (!sliced.nodes.length) break;
       if (block.type === "heading") {
         next.push({ type: "heading", level: block.level, content: sliced.nodes });
+      } else if (block.type === "blockquote") {
+        next.push({ type: "blockquote", content: sliced.nodes });
+      } else if (block.type === "metadata") {
+        next.push({ type: "metadata", label: block.label, content: sliced.nodes });
       } else {
         next.push({ type: "paragraph", content: sliced.nodes });
       }
       remaining = sliced.remaining;
+      continue;
+    }
+
+    if (block.type === "divider") {
+      next.push(block);
+      continue;
+    }
+
+    if (block.type === "code_block") {
+      const code = block.code.slice(0, remaining);
+      if (!code) break;
+      next.push({ ...block, code });
+      remaining -= code.length;
       continue;
     }
 

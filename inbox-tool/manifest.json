@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.2.3",
+  "version": "2.2.4",
   "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Ask / AI sidebar, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
@@ -836,13 +836,48 @@
       "name": "begin_stage_outgoing_attachment",
       "description": "Begin staging an outgoing attachment. Returns an APS Files upload URL and object path.",
       "parameters": [
-        {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": true},
-        {"name": "filename", "type": "string", "description": "Original filename.", "required": true},
-        {"name": "mime_type", "type": "string", "description": "MIME type.", "required": false},
-        {"name": "size", "type": "number", "description": "Declared file size in bytes.", "required": true},
-        {"name": "existing_total_bytes", "type": "number", "description": "Total size of already staged attachments.", "required": false},
-        {"name": "draft_scope", "type": "string", "description": "compose or thread.", "required": false},
-        {"name": "draft_key", "type": "string", "description": "Draft id or thread id for association.", "required": false}
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "filename",
+          "type": "string",
+          "description": "Original filename.",
+          "required": true
+        },
+        {
+          "name": "mime_type",
+          "type": "string",
+          "description": "MIME type.",
+          "required": false
+        },
+        {
+          "name": "size",
+          "type": "number",
+          "description": "Declared file size in bytes.",
+          "required": true
+        },
+        {
+          "name": "existing_total_bytes",
+          "type": "number",
+          "description": "Total size of already staged attachments.",
+          "required": false
+        },
+        {
+          "name": "draft_scope",
+          "type": "string",
+          "description": "compose or thread.",
+          "required": false
+        },
+        {
+          "name": "draft_key",
+          "type": "string",
+          "description": "Draft id or thread id for association.",
+          "required": false
+        }
       ],
       "timeout": 120
     },
@@ -850,10 +885,30 @@
       "name": "complete_stage_outgoing_attachment",
       "description": "Confirm that an outgoing attachment has been uploaded to APS Files.",
       "parameters": [
-        {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": true},
-        {"name": "storage_key", "type": "string", "description": "APS object path returned by begin_stage_outgoing_attachment.", "required": true},
-        {"name": "size", "type": "number", "description": "Uploaded file size in bytes.", "required": true},
-        {"name": "mime_type", "type": "string", "description": "MIME type.", "required": false}
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "storage_key",
+          "type": "string",
+          "description": "APS object path returned by begin_stage_outgoing_attachment.",
+          "required": true
+        },
+        {
+          "name": "size",
+          "type": "number",
+          "description": "Uploaded file size in bytes.",
+          "required": true
+        },
+        {
+          "name": "mime_type",
+          "type": "string",
+          "description": "MIME type.",
+          "required": false
+        }
       ],
       "timeout": 120
     },
@@ -861,8 +916,18 @@
       "name": "delete_staged_outgoing_attachment",
       "description": "Delete one staged outgoing attachment from APS Files or local stage.",
       "parameters": [
-        {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": true},
-        {"name": "storage_key", "type": "string", "description": "Object path returned by begin_stage_outgoing_attachment.", "required": true}
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "storage_key",
+          "type": "string",
+          "description": "Object path returned by begin_stage_outgoing_attachment.",
+          "required": true
+        }
       ],
       "timeout": 120
     },
@@ -870,10 +935,30 @@
       "name": "prepare_staged_outgoing_attachment_access",
       "description": "Prepare a short-lived preview URL for a staged outgoing attachment (draft restore).",
       "parameters": [
-        {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": true},
-        {"name": "storage_key", "type": "string", "description": "Object path returned by begin_stage_outgoing_attachment.", "required": true},
-        {"name": "filename", "type": "string", "description": "Filename for Content-Disposition.", "required": false},
-        {"name": "mime_type", "type": "string", "description": "MIME type.", "required": false}
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "storage_key",
+          "type": "string",
+          "description": "Object path returned by begin_stage_outgoing_attachment.",
+          "required": true
+        },
+        {
+          "name": "filename",
+          "type": "string",
+          "description": "Filename for Content-Disposition.",
+          "required": false
+        },
+        {
+          "name": "mime_type",
+          "type": "string",
+          "description": "MIME type.",
+          "required": false
+        }
       ],
       "timeout": 120
     },
@@ -1742,7 +1827,7 @@
     },
     {
       "name": "start_ai_turn",
-      "description": "Unified AI sidebar turn: local router selects whitelist tools (chat, search, summarize, draft, propose, memory) then returns a pollable run.",
+      "description": "Legacy unified AI turn with local router. Prefer Host Agent + ai_* tools for sidebar. Still pollable via run_id.",
       "parameters": [
         {
           "name": "user_text",
@@ -1806,6 +1891,261 @@
         }
       ],
       "timeout": 600
+    },
+    {
+      "name": "search_email",
+      "description": "Search LOCAL inbox cache only (never live Gmail, never list_cached_emails). Use for any inbox-wide claim. Query language: is:inbox AND is:todo, from:, subject:, -term. Default fields ONLY: date, participants, subject, bodySnippet (+ THREAD_REF). Never returns bodyFull — call read_email for full body. Cap 6 searches / 45 hits per conversation. If cache empty, tell user to refresh inbox.",
+      "parameters": [
+        {
+          "name": "about",
+          "type": "string",
+          "description": "Local keywords/fields, e.g. urgent OR from:alice.",
+          "required": false
+        },
+        {
+          "name": "filter",
+          "type": "string",
+          "description": "Local filter, e.g. is:inbox AND is:unread.",
+          "required": false
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Active mailbox from ui_context.",
+          "required": false
+        },
+        {
+          "name": "ui_context",
+          "type": "object",
+          "description": "Read-only UI facts; copy mailbox + conversation_id.",
+          "required": false
+        },
+        {
+          "name": "conversation_id",
+          "type": "string",
+          "description": "Sidebar conversation id (quota key).",
+          "required": false
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Max hits this call (default 12, hard cap remaining budget).",
+          "required": false
+        },
+        {
+          "name": "readMask",
+          "type": "array",
+          "description": "Optional subset of date,participants,subject,bodySnippet. bodyFull is rejected; use read_email.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "read_email",
+      "description": "Read ONE searched email by thread_ref. Default readMask: date, participants, subject, bodySnippet. Request bodyFull ONLY when snippet is insufficient for the answer.",
+      "parameters": [
+        {
+          "name": "thread_ref",
+          "type": "string",
+          "description": "THREAD_REF from search_email.",
+          "required": true
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Active mailbox.",
+          "required": false
+        },
+        {
+          "name": "ui_context",
+          "type": "object",
+          "description": "Read-only UI facts.",
+          "required": false
+        },
+        {
+          "name": "readMask",
+          "type": "array",
+          "description": "Fields: date,participants,subject,bodySnippet,bodyFull.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "ai_summarize_thread",
+      "description": "Answer or summarize the open thread only. Requires open message/thread in ui_context. No inbox-wide search.",
+      "parameters": [
+        {
+          "name": "user_text",
+          "type": "string",
+          "description": "User question.",
+          "required": true
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Active mailbox.",
+          "required": false
+        },
+        {
+          "name": "ui_context",
+          "type": "object",
+          "description": "Must include current_thread.",
+          "required": false
+        },
+        {
+          "name": "message_id",
+          "type": "string",
+          "description": "Open message id.",
+          "required": false
+        },
+        {
+          "name": "thread_id",
+          "type": "string",
+          "description": "Open thread id.",
+          "required": false
+        }
+      ],
+      "timeout": 300
+    },
+    {
+      "name": "ai_draft_reply",
+      "description": "Draft a reply for the open thread. Never sends.",
+      "parameters": [
+        {
+          "name": "user_text",
+          "type": "string",
+          "description": "Draft instruction.",
+          "required": true
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Active mailbox.",
+          "required": false
+        },
+        {
+          "name": "ui_context",
+          "type": "object",
+          "description": "Must include current_thread.",
+          "required": false
+        }
+      ],
+      "timeout": 300
+    },
+    {
+      "name": "ai_revise_draft",
+      "description": "Revise ui_context.last_draft (or draft_body). Never sends.",
+      "parameters": [
+        {
+          "name": "user_text",
+          "type": "string",
+          "description": "Revision instruction.",
+          "required": true
+        },
+        {
+          "name": "ui_context",
+          "type": "object",
+          "description": "Should include last_draft.",
+          "required": false
+        },
+        {
+          "name": "draft_body",
+          "type": "string",
+          "description": "Draft text if last_draft missing.",
+          "required": false
+        }
+      ],
+      "timeout": 300
+    },
+    {
+      "name": "ai_compose_new",
+      "description": "Compose a new email draft. Never sends.",
+      "parameters": [
+        {
+          "name": "user_text",
+          "type": "string",
+          "description": "Compose instruction.",
+          "required": true
+        },
+        {
+          "name": "ui_context",
+          "type": "object",
+          "description": "Read-only UI facts.",
+          "required": false
+        }
+      ],
+      "timeout": 300
+    },
+    {
+      "name": "ai_batch_draft",
+      "description": "Draft replies for selected_threads (max 5). Never sends.",
+      "parameters": [
+        {
+          "name": "user_text",
+          "type": "string",
+          "description": "Batch draft instruction.",
+          "required": true
+        },
+        {
+          "name": "ui_context",
+          "type": "object",
+          "description": "Should include selected_threads.",
+          "required": false
+        },
+        {
+          "name": "selected_threads",
+          "type": "array",
+          "description": "Selected threads.",
+          "required": false
+        }
+      ],
+      "timeout": 600
+    },
+    {
+      "name": "propose_inbox_actions",
+      "description": "Create organize confirmation card from items you already chose (message_id/THREAD_REF). No search. No Gmail mutation.",
+      "parameters": [
+        {
+          "name": "items",
+          "type": "array",
+          "description": "Chosen candidates with message_id or thread_ref.",
+          "required": true
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Active mailbox.",
+          "required": false
+        },
+        {
+          "name": "rationale",
+          "type": "string",
+          "description": "One-line why these items.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "ai_remember_preference",
+      "description": "Save a short user preference to memory. No email body.",
+      "parameters": [
+        {
+          "name": "user_text",
+          "type": "string",
+          "description": "Preference utterance.",
+          "required": false
+        },
+        {
+          "name": "preference",
+          "type": "string",
+          "description": "Preference text.",
+          "required": false
+        }
+      ],
+      "timeout": 60
     },
     {
       "name": "apply_proposed_actions",

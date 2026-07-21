@@ -163,28 +163,31 @@ body.is-resizing-ai-sidebar {
 .new-chat-btn {
   margin-right: 0;
 }
+/* 收起时必须 display:none：visibility:hidden 仍占位，会把展开按钮挤出 54px 列外。 */
 .ai-sidebar.is-collapsed .anna-wordmark label,
 .ai-sidebar.is-collapsed .new-chat-btn,
 .ai-sidebar.is-collapsed .ai-conversation,
 .ai-sidebar.is-collapsed .ai-composer-wrap,
 .ai-sidebar.is-collapsed .ai-sidebar-foot,
 .ai-sidebar.is-collapsed .ask-history-drawer {
-  visibility: hidden;
-  opacity: 0;
-  pointer-events: none;
+  display: none;
+}
+.ai-sidebar.is-collapsed {
+  grid-template-rows: auto;
+  overflow: visible;
 }
 .ai-sidebar.is-collapsed .ai-sidebar-head {
   padding: 0;
   justify-content: center;
+  z-index: 20;
 }
 .ai-sidebar.is-collapsed .anna-wordmark {
   gap: 0;
 }
-.ai-sidebar.is-collapsed .ai-conversation,
-.ai-sidebar.is-collapsed .ai-composer-wrap,
-.ai-sidebar.is-collapsed .ai-sidebar-foot {
-  opacity: 0;
-  transition: opacity 120ms ease;
+.ai-sidebar.is-collapsed .anna-wordmark > button {
+  position: relative;
+  z-index: 21;
+  flex: 0 0 auto;
 }
 
 .anna-wordmark {
@@ -387,6 +390,29 @@ body.is-resizing-ai-sidebar {
 
 .ai-message-rich-text li + li {
   margin-top: 2px;
+}
+
+.ai-message-metadata-row {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  margin: 0 0 3px;
+  min-width: 0;
+}
+
+.ai-message-metadata-label {
+  flex: 0 0 auto;
+  color: #596176;
+  font-weight: 700;
+}
+
+.ai-message-metadata-label::after {
+  content: "：";
+}
+
+.ai-message-metadata-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .ai-message-rich-text a,
@@ -13012,6 +13038,71 @@ body,
 .ai-thinking-elapsed {
   color: #949aaa;
   font-size: 12px;
+}
+
+/* 对齐 example/12.png：思考结束后的小字检索依据行 */
+.ai-scan-query-block {
+  margin: 0 0 10px;
+  color: #8b93a7;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.ai-scan-query-summary {
+  margin: 0 0 4px;
+  color: #8b93a7;
+  font-size: 12px;
+}
+
+.ai-scan-query-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #8b93a7;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ai-scan-query-line:hover {
+  color: #5a6a9a;
+}
+
+.ai-scan-query-line:hover .ai-scan-query-text {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.ai-scan-query-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  opacity: 0.75;
+}
+
+.ai-scan-query-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.ai-scan-query-prefix {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.ai-scan-query-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
 }
 
 .mail-thread-message-loading {

@@ -1061,22 +1061,25 @@ async def run_ask_pipeline(
     max_messages: int | None = None,
     sampling_create_message: Any = None,
     progress_callback: Any = None,
+    todo_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Full Ask pipeline: plan → search → filter → context → answer → guard.
+    """Full Ask pipeline: plan → cache-only search → filter → context → answer → guard.
 
     Supports multiple mailboxes: plan once, search+filter concurrently per mailbox,
     merge candidates, then single answer pass.
 
     If `plan` is provided, skips the Planner LLM and uses the given plan directly
     (for re-running saved plans without re-planning).
+    ``todo_ids`` 供本地 is:todo 与前端 Todos 标记对齐。
     """
+    from mail_agent.local_query import build_local_query_from_plan
     from .planner import (
         normalize_actionable_browse_plan,
         normalize_user_facing_plan_copy,
         plan_ask_request,
         resolve_effective_timeframe,
     )
-    from .search import build_queries, execute_search
+    from .search import execute_search
 
     if not mailboxes:
         return {"title": "Error", "summary": "No mailbox selected.", "sections": []}
@@ -1112,7 +1115,7 @@ async def run_ask_pipeline(
 
     primary_queries: list[dict[str, Any]] = []
     all_sources: list[dict[str, str]] = []
-    cache_fallback_mailboxes: list[str] = []
+    cache_empty_mailboxes: list[str] = []
     # 指定联系人属于精确检索意图。若移除 from:/to: 后继续扫描，返回的只是
     # 同时间范围内的无关邮件，可能造成“找到结果”与“未找到该联系人”同时出现。
     has_person_constraint = any(
@@ -1120,33 +1123,33 @@ async def run_ask_pipeline(
         for person in plan.people
         if isinstance(person, dict)
     )
+    _ = has_person_constraint  # cache-only 不再 broaden 打 Gmail；保留变量供后续策略使用
+    # 本地 scan_query：Thinking 后小字与一键搜索共用
+    local_scan_query = build_local_query_from_plan(plan)
+    primary_queries = [{"query": local_scan_query, "purpose": "local_cache", "max_results": 100, "priority": "high"}]
 
     async def _search_one(mbox: str) -> tuple[str, list[MessageLite], list[MessageLite]]:
-        """Search + filter for a single mailbox. Returns (mailbox, all_messages, candidates)."""
-        nonlocal primary_queries
-        queries = await build_queries(plan, mbox)
-        if not primary_queries and mbox == primary_mailbox:
-            primary_queries = queries
+        """只扫本地缓存并过滤，返回 (mailbox, all_messages, candidates)。"""
         if progress_callback:
             progress_callback("search", {
                 "mailbox": mbox,
-                "query_total": len(queries),
+                "query_total": 1,
                 "scan_window_days": timeframe_days,
+                "scan_query": local_scan_query,
             })
 
-        # 多邮箱并发时最多 broaden 1 次，避免 0 结果时 Gmail 调用成倍放大。
         search_meta: dict[str, str] = {}
         messages = await execute_search(
             mbox,
-            queries,
+            primary_queries,
             progress_callback=progress_callback,
-            max_broaden_attempts=1 if len(mailboxes) > 1 else 2,
             max_messages=max_messages if max_messages is not None else 200,
-            allow_broadening=not has_person_constraint,
             search_meta=search_meta,
+            todo_ids=list(todo_ids or []),
+            local_query=local_scan_query,
         )
-        if search_meta.get("source") == "cache_fallback":
-            cache_fallback_mailboxes.append(mbox)
+        if search_meta.get("cache_empty") == "1":
+            cache_empty_mailboxes.append(mbox)
         if not messages:
             return (mbox, [], [])
 
@@ -1200,6 +1203,9 @@ async def run_ask_pipeline(
             "plan_gmail_flags": plan.gmail_flags,
             "plan_topics": plan.topics,
             "plan_queries": primary_queries,
+            "plan_gmail_queries": primary_queries,
+            "scan_query": local_scan_query,
+            "scan_source": "cache",
             "planner_llm": plan.llm_meta,
             "messages_scanned": total_scanned,
             "candidates_found": 0,
@@ -1210,18 +1216,18 @@ async def run_ask_pipeline(
                 **empty_base,
                 "title": "",
                 "summary": (
-                    "实时 Gmail 暂时不可用，本地和 APS 缓存中也没有可分析的邮件。"
-                    if cache_fallback_mailboxes
-                    else f"已扫描 {len(mailboxes)} 个邮箱中的 {total_scanned} 封邮件，但没有找到符合你要求的内容。"
+                    "本地收件箱缓存为空。请先在收件箱刷新同步，再重试。"
+                    if cache_empty_mailboxes
+                    else f"已在本地缓存中扫描 {len(mailboxes)} 个邮箱、{total_scanned} 封邮件，但没有找到符合你要求的内容。"
                 ),
             }
         return {
             **empty_base,
             "title": "",
             "summary": (
-                "Live Gmail is temporarily unavailable, and no analyzable mail is available in local or APS cache."
-                if cache_fallback_mailboxes
-                else f"Scanned {total_scanned} emails across {len(mailboxes)} mailbox(es) but none matched your request."
+                "Local inbox cache is empty. Refresh the inbox first, then try again."
+                if cache_empty_mailboxes
+                else f"Scanned {total_scanned} cached emails across {len(mailboxes)} mailbox(es) but none matched your request."
             ),
         }
 
@@ -1278,17 +1284,13 @@ async def run_ask_pipeline(
     result.setdefault("plan_gmail_flags", plan.gmail_flags)
     result.setdefault("plan_topics", plan.topics)
     result.setdefault("plan_queries", primary_queries)
+    result.setdefault("plan_gmail_queries", primary_queries)
+    result.setdefault("scan_query", local_scan_query)
+    result.setdefault("scan_source", "cache")
     result.setdefault("planner_llm", plan.llm_meta)
     result.setdefault("messages_scanned", total_scanned)
     result.setdefault("candidates_found", len(all_candidates))
-    if cache_fallback_mailboxes:
-        prefix = (
-            "实时 Gmail 暂时不可用，以下结果来自本地或 APS 缓存。"
-            if _uses_chinese(plan.user_request)
-            else "Live Gmail is temporarily unavailable; these results are from local or APS cache."
-        )
-        result["summary"] = f"{prefix} {str(result.get('summary') or '').strip()}".strip()
-        result["data_source"] = "cache_fallback"
+    result["data_source"] = "local_cache"
 
     return result
 

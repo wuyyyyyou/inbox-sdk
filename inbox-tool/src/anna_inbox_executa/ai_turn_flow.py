@@ -43,6 +43,14 @@ def _log_ai_turn_failure(run_id: str, error: object) -> None:
 def _public_ai_turn_state(run_id: str) -> dict[str, Any]:
     state = MAIL_AGENT_RUNS.get(run_id) or {}
     status = str(state.get("status") or "queued")
+    progress = state.get("progress") if isinstance(state.get("progress"), dict) else {}
+    result = _compact_run_result(state.get("result"))
+    # 尽早把 scan_query 顶到公开状态，便于 Host/前端在 Thinking 后展示可点 chip
+    scan_query = ""
+    if isinstance(progress, dict):
+        scan_query = str(progress.get("scan_query") or "").strip()
+    if not scan_query and isinstance(result, dict):
+        scan_query = str(result.get("scan_query") or "").strip()
     return {
         # JSON-RPC facade 将 success:false 解释为本次工具调用失败并直接抛错。
         # running/queued 是已成功建立、等待前端轮询的异步状态，不能误报失败。
@@ -50,13 +58,15 @@ def _public_ai_turn_state(run_id: str) -> dict[str, Any]:
         "run_id": run_id,
         "status": status,
         "stage": state.get("stage", ""),
-        "progress": state.get("progress", {}),
+        "progress": progress,
         "partial": state.get("partial", {}),
         "started_at": state.get("started_at"),
         "updated_at": state.get("updated_at"),
-        "result": _compact_run_result(state.get("result")),
+        "result": result,
         "error": state.get("error", ""),
         "needs_continue": bool(state.get("needs_continue")),
+        "scan_query": scan_query,
+        "scan_source": "cache" if scan_query else "",
         "diagnostics": snapshot(state.get("diagnostics")),
     }
 

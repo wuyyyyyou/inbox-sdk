@@ -316,13 +316,13 @@ async def test_mailbox_runner_bypasses_keyword_router():
     """有邮箱上下文的邮件问题由 Router 选择 Ask，而不是后端关键词分流。"""
     from mail_agent.ai_turn import runner
 
-    original = runner._tool_search_and_answer
+    original = runner.tool_search_and_answer
     original_route = runner.route_ai_turn
 
     async def fake_search(*_args, **_kwargs):
         return {"kind": "scan", "assistant_text": "## Inbox answer", "scan_result": {}}
 
-    runner._tool_search_and_answer = fake_search
+    runner.tool_search_and_answer = fake_search
     async def mail_route(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {
             "language": "en",
@@ -339,7 +339,7 @@ async def test_mailbox_runner_bypasses_keyword_router():
             sampling_create_message=None,
         )
     finally:
-        runner._tool_search_and_answer = original
+        runner.tool_search_and_answer = original
         runner.route_ai_turn = original_route
 
     assert result["kind"] == "scan"
@@ -351,7 +351,7 @@ async def test_mailbox_context_routes_general_question_to_chat_without_search():
     """邮箱页面的纯聊天问题不得因为 mailbox 上下文而读取邮件。"""
     from mail_agent.ai_turn import runner
 
-    original_search = runner._tool_search_and_answer
+    original_search = runner.tool_search_and_answer
     sampling_calls: list[dict[str, Any]] = []
 
     async def forbidden_search(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -368,7 +368,7 @@ async def test_mailbox_context_routes_general_question_to_chat_without_search():
             }
         return {"content": {"type": "text", "text": "现在是上海时间。"}}
 
-    runner._tool_search_and_answer = forbidden_search
+    runner.tool_search_and_answer = forbidden_search
     try:
         result = await runner.run_ai_turn(
             "量子纠缠是什么？",
@@ -377,7 +377,7 @@ async def test_mailbox_context_routes_general_question_to_chat_without_search():
             sampling_create_message=chat_sampling,
         )
     finally:
-        runner._tool_search_and_answer = original_search
+        runner.tool_search_and_answer = original_search
 
     assert result["kind"] == "chat"
     assert result["route"]["steps"] == [{"tool": "chat_general", "params": {}}]
@@ -405,7 +405,7 @@ async def test_analysis_error_becomes_retryable_run_error():
 
     answer.run_ask_pipeline = fake_pipeline
     try:
-        result = await runner._tool_search_and_answer(
+        result = await runner.tool_search_and_answer(
             "What needs my reply?",
             {"mailbox": "a@b.com"},
             {"mailbox": "a@b.com"},

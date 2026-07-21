@@ -36,20 +36,25 @@ describe("Manage Splits tooltip", () => {
 });
 
 describe("AI scan invocation", () => {
-  it("uses the current Scan Plan and returns AI turns before the platform timeout boundary", () => {
-    expect(controllerSource.match(/wait_timeout_seconds: 45/g)?.length || 0).toBeGreaterThanOrEqual(2);
-    expect(controllerSource.match(/scan_window_days: scanScope\.scan_window_days/g)?.length || 0).toBeGreaterThanOrEqual(3);
-    expect(controllerSource.match(/max_messages: scanScope\.max_messages/g)?.length || 0).toBeGreaterThanOrEqual(3);
+  it("keeps the current Scan Plan for remaining pollable scans and passes it to Agent context", () => {
+    expect(controllerSource.match(/wait_timeout_seconds: 45/g)?.length || 0).toBeGreaterThanOrEqual(1);
+    expect(controllerSource.match(/scan_window_days: scanScope\.scan_window_days/g)?.length || 0).toBeGreaterThanOrEqual(2);
+    expect(controllerSource.match(/max_messages: scanScope\.max_messages/g)?.length || 0).toBeGreaterThanOrEqual(2);
+    expect(controllerSource).toMatch(/max_messages: plan\.max_messages/);
+    expect(controllerSource).toMatch(/display_range_days: rangeDays/);
   });
 
   it("uses the Inbox display range as the AI scan time range", () => {
     expect(controllerSource).toMatch(/scan_window_days: clampInt\(settings\.display_range_days, plan\.scan_window_days, 1, 90\)/);
   });
 
-  it("wires the unified startAiTurn path for the sidebar", () => {
-    expect(controllerSource).toMatch(/client\.startAiTurn\(/);
+  it("wires the Host Agent session path for the sidebar", () => {
+    expect(controllerSource).toMatch(/runAiAgentTurn\(/);
+    expect(controllerSource).toMatch(/buildAiAgentContent\(/);
     expect(controllerSource).toMatch(/buildAiTurnUiContext\(/);
     expect(controllerSource).toMatch(/selected_threads:/);
+    const sidebarHandler = controllerSource.match(/async sendAiChatMessage\(options = \{\}\)[\s\S]*?retryAiMessage\(messageId\)/)?.[0] || "";
+    expect(sidebarHandler).not.toContain("client.startAiTurn(");
     expect(controllerSource).not.toMatch(/decideAiRoute\(/);
     expect(controllerSource).not.toMatch(/isAiTurnEnabled\(/);
   });
@@ -61,11 +66,15 @@ describe("AI scan invocation", () => {
     expect(detailPromptHandler).toContain("requested_artifact: requestedArtifact");
   });
 
-  it("resumes a timed-out sidebar turn by polling its existing run", () => {
-    expect(controllerSource).toMatch(/resumeAiConversation\(index: number\)/);
-    expect(controllerSource).toMatch(/resumeRunId: pendingRun\.runId/);
-    expect(controllerSource).toMatch(/options\.resumeRunId\s*\? await client\.getRun\(runId\)/);
-    expect(homeViewSource).toContain('aria-label="Refresh timed out request"');
+  it("clears the Host session when a sidebar conversation is discarded", () => {
+    expect(controllerSource).toMatch(/clearAiAgentSession\(previousConversationId\)/);
+    expect(controllerSource).toMatch(/clearAiAgentSession\(entry\.conversationId \|\| ""\)/);
+  });
+
+  it("stops the Host Agent run when the user presses Stop", () => {
+    const stopHandler = controllerSource.match(/stopAiGeneration\(\) \{[\s\S]*?startNewAiConversation\(\)/)?.[0] || "";
+    expect(stopHandler).toContain("cancelAiAgentTurn");
+    expect(stopHandler).toContain("run.controller.abort()");
   });
 });
 
