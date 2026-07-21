@@ -173,6 +173,8 @@ export function SafeEmailHtml({ html, className = "" }: { html: string; classNam
     if (!frame || !document?.body) return;
 
     let raf = 0;
+    // 不用 ResizeObserver：跨文档 observe body 并改 iframe 高度会触发 Chrome
+    // “ResizeObserver loop …” 并被 Anna host 当成 iframe error。
     const measure = () => {
       window.cancelAnimationFrame(raf);
       raf = window.requestAnimationFrame(() => {
@@ -181,25 +183,36 @@ export function SafeEmailHtml({ html, className = "" }: { html: string; classNam
           document.documentElement.scrollHeight,
           1,
         );
-        setFrameHeight((current) => current === nextHeight ? current : nextHeight);
+        setFrameHeight((current) => (current === nextHeight ? current : nextHeight));
       });
     };
 
     measure();
-    const ResizeObserverCtor = window.ResizeObserver;
-    const observer = ResizeObserverCtor ? new ResizeObserverCtor(measure) : null;
-    observer?.observe(frame);
-    observer?.observe(document.body);
+    const mutationObserver = new MutationObserver(measure);
+    mutationObserver.observe(document.body, {
+      attributes: true,
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
     const images = Array.from(document.images);
-    images.forEach((image) => image.addEventListener("load", measure));
+    images.forEach((image) => {
+      image.addEventListener("load", measure);
+      image.addEventListener("error", measure);
+    });
     window.addEventListener("resize", measure);
+    void document.fonts?.ready?.then(measure);
     return () => {
       window.cancelAnimationFrame(raf);
-      observer?.disconnect();
-      images.forEach((image) => image.removeEventListener("load", measure));
+      mutationObserver.disconnect();
+      images.forEach((image) => {
+        image.removeEventListener("load", measure);
+        image.removeEventListener("error", measure);
+      });
       window.removeEventListener("resize", measure);
     };
   }, [documentRevision, srcDoc]);
+
 
   return (
     <iframe

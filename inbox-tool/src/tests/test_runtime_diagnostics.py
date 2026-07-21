@@ -111,10 +111,25 @@ def test_running_ai_turn_is_a_successful_async_start() -> None:
     assert state["needs_continue"] is True
 
 
+def test_ai_turn_failure_logs_frontend_error_safely() -> None:
+    """后台失败必须记录前端 error；模型原文 preview 不得进入 stderr。"""
+    from anna_inbox_executa import ai_turn_flow
+
+    with patch.object(ai_turn_flow, "log") as mocked_log:
+        ai_turn_flow._log_ai_turn_failure("at_test", "could not convert string to float: 'high'")
+        ai_turn_flow._log_ai_turn_failure("at_test", ValueError("preview='private email body'"))
+
+    messages = [str(call.args[0]) for call in mocked_log.call_args_list]
+    assert "error=could not convert string to float: 'high'" in messages[0]
+    assert messages[1].endswith("error=ValueError")
+    assert "private email body" not in messages[1]
+
+
 if __name__ == "__main__":
     test_span_redacts_unapproved_fields()
     test_invoke_response_includes_diagnostics()
     test_existing_run_diagnostics_are_not_duplicated()
     test_gmail_401_without_candidates_is_not_presented_as_empty_search()
     test_running_ai_turn_is_a_successful_async_start()
+    test_ai_turn_failure_logs_frontend_error_safely()
     print("Runtime diagnostics: OK")

@@ -241,72 +241,21 @@ with urllib.request.urlopen(request, timeout=float(payload["timeout"])) as respo
 
 
 async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
-    """Upload attachment bytes and return a short-lived URL.
+    """将收件附件写入 APS Files，并返回短期下载地址。
 
-    Prefer host/uploadFile because it is independent of the selected KV
-    backend. Fall back to APS Files only when host upload is unavailable.
+    Cloud Agent 中前端和 Executa 不在同一台机器，附件不再经过 localhost
+    或 Host transient upload；稳定 object path 只作为返回元数据，URL 不持久化。
     """
     from mail_agent.mail_providers.gmail.adapter import sanitize_mailbox_id
 
     filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
     mime_type = _normalized_attachment_mime_type(attachment)
 
-    host_presign_started = False
-    host_unavailable_error = ""
-    try:
-        negotiated = await host_upload.negotiate(
-            filename=filename,
-            mime_type=mime_type,
-            size_bytes=len(content),
-            purpose="user_artifact",
-            metadata={
-                "mailbox": mailbox,
-                "card_id": card_id,
-                "message_id": str(attachment.get("message_id") or ""),
-                "artifact_kind": "email_attachment",
-            },
-            timeout=30.0,
-        )
-        host_presign_started = True
-        put_url = str(negotiated.get("put_url") or "")
-        r2_key = str(negotiated.get("r2_key") or "")
-        if not put_url or not r2_key:
-            raise RuntimeError("Host upload did not return a presigned upload target.")
-        put_error: Exception | None = None
-        try:
-            await asyncio.to_thread(_put_presigned_url_sync, put_url, negotiated.get("headers") or {}, content, mime_type)
-        except Exception as exc:
-            put_error = exc
-            log(f"host attachment presigned PUT returned error before confirm: {type(exc).__name__}: {exc}")
-        if put_error is None:
-            return await host_upload.confirm(r2_key=r2_key, timeout=30.0)
-        try:
-            return await host_upload.confirm(r2_key=r2_key, timeout=30.0)
-        except Exception as confirm_exc:
-            raise RuntimeError(f"Temporary attachment upload failed after presigned PUT error: {put_error}") from confirm_exc
-    except Exception as host_exc:
-        if host_presign_started:
-            raise
-        host_unavailable_error = f"{type(host_exc).__name__}: {host_exc}"
-        log(f"host attachment upload unavailable: {type(host_exc).__name__}: {host_exc}")
-
-    from mail_agent.storage.client import get_files
-
-    files = get_files()
-    for method_name in ("upload_begin", "upload_complete", "download_url"):
-        if not hasattr(files, method_name):
-            if host_unavailable_error:
-                raise RuntimeError(
-                    "Attachment download requires host upload or Anna Files storage in this runtime. "
-                    f"Host upload failed first: {host_unavailable_error}"
-                )
-            raise RuntimeError("Attachment download requires host upload or Anna Files storage in this runtime.")
-
     path = (
         f"anna-inbox/mailbox/{sanitize_mailbox_id(mailbox)}/attachments/"
-        f"{_safe_attachment_filename(card_id)}/{attachment.get('id')}/{filename}"
+        f"{_safe_attachment_filename(card_id)}/{_safe_attachment_filename(str(attachment.get('id') or 'attachment'))}/{filename}"
     )
-    begin = await files.upload_begin(
+    begin = await _aps_files.upload_begin(
         path=path,
         size_bytes=len(content),
         content_type=mime_type,
@@ -330,7 +279,7 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
         put_error = exc
         log(f"aps files presigned PUT returned error before complete: {type(exc).__name__}: {exc}")
     try:
-        await files.upload_complete(
+        await _aps_files.upload_complete(
             path=path,
             etag=etag or None,
             size_bytes=len(content),
@@ -341,7 +290,66 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
         if put_error is not None:
             raise RuntimeError(f"Attachment file upload failed after presigned PUT error: {put_error}") from complete_exc
         raise
-    return await files.download_url(path=path, expires_in=900, scope="user")
+    result = await _aps_files.download_url(path=path, expires_in=900, scope="user")
+    result["storage_key"] = path
+    return result
+
+
+def _download_presigned_url_sync(url: str) -> bytes:
+    """通过 APS 返回的短期 URL 下载字节，不把大内容放进 JSON-RPC。"""
+    request = urllib.request.Request(url, headers={"User-Agent": "anna-inbox-aps-files/1.0"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return response.read()
+
+
+def _aps_outgoing_attachment_path(mailbox: str, attachment_id: str, filename: str) -> str:
+    from mail_agent.mail_providers.gmail.adapter import sanitize_mailbox_id
+    return (
+        f"anna-inbox/mailbox/{sanitize_mailbox_id(mailbox)}/outgoing/"
+        f"{_safe_attachment_filename(attachment_id)}/{_safe_attachment_filename(filename)}"
+    )
+
+
+async def _load_outgoing_attachments_for_send(mailbox: str, items: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """按当前存储后端读取外发附件；APS 模式通过短期 URL 读取对象。"""
+    if not _should_use_aps_files():
+        from mail_agent.mail_providers.gmail.outgoing_attachments import load_outgoing_attachments_for_send
+        return await asyncio.to_thread(load_outgoing_attachments_for_send, mailbox, items)
+    loaded: list[dict[str, Any]] = []
+    total = 0
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        storage_key = str(item.get("storage_key") or "").strip()
+        if not storage_key:
+            continue
+        access = await _aps_files.download_url(path=storage_key, expires_in=300, scope="user")
+        url = str(access.get("url") or access.get("download_url") or "")
+        if not url:
+            raise RuntimeError("APS Files did not return a download URL for outgoing attachment.")
+        content = await asyncio.to_thread(_download_presigned_url_sync, url)
+        total += len(content)
+        if total > 25 * 1024 * 1024:
+            raise ValueError("Total attachments exceed the 25 MB limit")
+        loaded.append({
+            "id": str(item.get("id") or ""),
+            "filename": _safe_attachment_filename(str(item.get("filename") or "attachment")),
+            "mime_type": str(item.get("mime_type") or "application/octet-stream"),
+            "size": len(content),
+            "content": content,
+        })
+    return loaded
+
+
+async def _delete_outgoing_attachments(mailbox: str, items: list[dict[str, Any]] | None) -> None:
+    """删除 APS object，local 模式仍调用本地 stage 清理逻辑。"""
+    if not _should_use_aps_files():
+        from mail_agent.mail_providers.gmail.outgoing_attachments import delete_staged_attachments
+        await asyncio.to_thread(delete_staged_attachments, mailbox, items)
+        return
+    for item in items or []:
+        if isinstance(item, dict) and str(item.get("storage_key") or "").strip():
+            await _aps_files.delete(path=str(item["storage_key"]), scope="user")
 
 
 def _inline_attachment_download_payload(attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
@@ -689,6 +697,8 @@ INBOX_PAGE_BODY_LIMIT_STEPS = (200000, 120000, 80000, 48000, 24000, 12000, 6000,
 INBOX_PROMPT_MESSAGE_LIMIT = 4
 INBOX_PROMPT_BODY_LIMIT = 600
 THREAD_ASSIST_CACHE_VERSION = 2
+# 同一线程概览在缓存落盘前只允许一个后台 run，避免详情页重渲染或重试重复 Sampling。
+INBOX_THREAD_ASSIST_INFLIGHT: dict[str, str] = {}
 
 
 def _uses_chinese_text(value: str) -> bool:
@@ -735,26 +745,12 @@ def _sidebar_fallback_text(visible_prompt: str, kind: str) -> str:
     }[kind]
 
 
-THREAD_ASSIST_SYSTEM = """You are Anna's inbox thread assistant.
+THREAD_ASSIST_SYSTEM = """Return JSON only:
+{"overview":"one complete factual sentence","quick_replies":[{"id":"short_id","label":"2-5 words","intent":"short grounded instruction"}]}
 
-Return JSON only:
-{
-  "overview": "one short factual sentence",
-  "quick_replies": [
-    {"id": "short_stable_id", "label": "button text", "intent": "instruction for the assistant"}
-  ]
-}
-
-Rules:
-- Use the full thread context, not just the latest snippet.
-- Write one complete, self-contained factual sentence of up to 24 words. Never end with a dangling preposition, unfinished clause, or ellipsis.
-- Generate 2-3 quick_replies tailored to this exact thread.
-- quick_replies labels must be short button text, 2-5 words.
-- quick_replies intents must be concrete assistant instructions grounded in the thread.
-- Do not invent facts or user commitments.
-- If there is little to say, summarize the sender's visible intent.
-- Never include HTML.
-"""
+Use the supplied thread only. overview: one complete sentence, <=24 words.
+Return exactly 2 quick_replies. Keep each intent <=12 words.
+Never invent facts, commitments, or HTML. Never leave a sentence unfinished."""
 
 MAIL_PROMPT_SYSTEM = """You are Anna, an executive email assistant working with a Gmail thread.
 
@@ -1381,11 +1377,16 @@ async def _generate_thread_assist_result(
         # Retry，不能把主题、snippet 或正文片段伪装成 AI 概览。
         fallback={},
         temperature=0.2,
-        max_tokens=320,
+        # 模型可能先生成 reasoning；320 token 不足以稳定完成 overview + 两个动作的 JSON。
+        max_tokens=768,
         timeout=45.0,
         metadata={"tool": "inbox_thread_assist", "thread_id": thread_id},
         allow_fallback=False,
-        max_attempts=1,
+        # 残缺 JSON 不能用本地修补恢复事实，直接用更高输出额度重试一次。
+        max_attempts=2,
+        retry_max_tokens=1024,
+        response_format={"type": "json_object"},
+        on_unsupported="text",
     )
     payload = overview_result.get("payload") if isinstance(overview_result.get("payload"), dict) else {}
     overview = _one_line_overview(payload.get("overview"))
@@ -1726,6 +1727,7 @@ async def _handle_inbox_thread_assist_background(run_id: str, arguments: dict[st
     thread_id = str(arguments.get("thread_id", "")).strip()
     latest_message_id = str(arguments.get("latest_message_id", "")).strip()
     anchor_message_id = str(arguments.get("anchor_message_id", "")).strip()
+    inflight_key = f"{mailbox.casefold()}:{thread_id}:{latest_message_id}"
     try:
         cached = await get_inbox_thread_assist(mailbox, thread_id, latest_message_id)
         cached_value = cached.get("value") if isinstance(cached.get("value"), dict) else {}
@@ -1752,7 +1754,11 @@ async def _handle_inbox_thread_assist_background(run_id: str, arguments: dict[st
         MAIL_AGENT_RUNS[run_id].update(status="done", result=result, updated_at=beijing_now())
     except Exception as exc:
         MAIL_AGENT_RUNS[run_id].update(status="failed", error=str(exc), updated_at=beijing_now())
-    _save_run_checkpoint(run_id)
+    finally:
+        # 仅移除当前 run 自己登记的 key，避免旧 run 覆盖新的请求。
+        if INBOX_THREAD_ASSIST_INFLIGHT.get(inflight_key) == run_id:
+            INBOX_THREAD_ASSIST_INFLIGHT.pop(inflight_key, None)
+        _save_run_checkpoint(run_id)
 
 
 async def _handle_inbox_mail_prompt_background(run_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
@@ -2105,12 +2111,10 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 str(attachment.get("gmail_attachment_id") or ""),
             )
             download_mode = _attachment_download_mode()
-            if not _should_use_aps_storage():
+            if not _should_use_aps_files():
                 return _loopback_attachment_download_payload(attachment, content)
-            if download_mode == "loopback":
+            if download_mode == "loopback" and not _is_platform():
                 return _loopback_attachment_download_payload(attachment, content)
-            if download_mode != "host_preferred" and len(content) <= INLINE_ATTACHMENT_DIRECT_MAX_BYTES:
-                return _inline_attachment_download_payload(attachment, content)
             try:
                 download = await _upload_attachment_for_download(normalized_mailbox, card_id, attachment, content)
                 return {
@@ -2119,16 +2123,11 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                     "filename": attachment.get("filename") or "attachment",
                     "mime_type": attachment.get("mime_type") or "application/octet-stream",
                     "size": len(content),
-                    "download_url": download.get("url") or download.get("download_url") or "",
-                    "expires_at": download.get("expires_at") or "",
+                        "download_url": download.get("url") or download.get("download_url") or "",
+                        "storage_key": download.get("storage_key") or "",
+                        "expires_at": download.get("expires_at") or "",
                 }
             except Exception as upload_exc:
-                if len(content) <= INLINE_ATTACHMENT_DIRECT_MAX_BYTES:
-                    log(
-                        "attachment download falling back to inline payload "
-                        f"({len(content)} bytes): {type(upload_exc).__name__}: {upload_exc}"
-                    )
-                    return _inline_attachment_download_payload(attachment, content)
                 raise RuntimeError(
                     "Attachment download requires host upload or Anna Files storage in this runtime "
                     f"for files larger than {INLINE_ATTACHMENT_DIRECT_MAX_BYTES // (1024 * 1024)} MB. "
@@ -2191,8 +2190,21 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 str(attachment.get("gmail_attachment_id") or ""),
             )
             if mode == "preview":
-                preview = _loopback_attachment_download_payload(attachment, content, disposition="inline")
-                preview["preview_url"] = preview.get("download_url") or ""
+                if _should_use_aps_files():
+                    preview = await _upload_attachment_for_download(normalized_mailbox, message_id, attachment, content)
+                    preview = {
+                        "ok": True,
+                        "delivery": "url",
+                        "filename": attachment.get("filename") or "attachment",
+                        "size": len(content),
+                        "preview_url": preview.get("url") or preview.get("download_url") or "",
+                        "download_url": preview.get("url") or preview.get("download_url") or "",
+                        "storage_key": preview.get("storage_key") or "",
+                        "expires_at": preview.get("expires_at") or "",
+                    }
+                else:
+                    preview = _loopback_attachment_download_payload(attachment, content, disposition="inline")
+                    preview["preview_url"] = preview.get("download_url") or ""
                 return _finalize_attachment_access_payload(
                     preview,
                     mode=mode,
@@ -2201,18 +2213,10 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                     attachment=attachment,
                 )
             download_mode = _attachment_download_mode()
-            if not _should_use_aps_storage() or download_mode == "loopback":
+            if not _should_use_aps_files() or (download_mode == "loopback" and not _is_platform()):
                 download = _loopback_attachment_download_payload(attachment, content, disposition="attachment")
                 return _finalize_attachment_access_payload(
                     download,
-                    mode=mode,
-                    message_id=message_id,
-                    attachment_id=attachment_id,
-                    attachment=attachment,
-                )
-            if download_mode != "host_preferred" and len(content) <= INLINE_ATTACHMENT_DIRECT_MAX_BYTES:
-                return _finalize_attachment_access_payload(
-                    _inline_attachment_download_payload(attachment, content),
                     mode=mode,
                     message_id=message_id,
                     attachment_id=attachment_id,
@@ -2227,6 +2231,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                         "filename": attachment.get("filename") or "attachment",
                         "size": len(content),
                         "download_url": uploaded.get("url") or uploaded.get("download_url") or "",
+                        "storage_key": uploaded.get("storage_key") or "",
                         "expires_at": uploaded.get("expires_at") or "",
                     },
                     mode=mode,
@@ -2236,22 +2241,9 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 )
             except Exception as upload_exc:
                 log(f"inbox attachment upload fallback: {type(upload_exc).__name__}: {upload_exc}")
-                if len(content) <= INLINE_ATTACHMENT_DIRECT_MAX_BYTES:
-                    return _finalize_attachment_access_payload(
-                        _inline_attachment_download_payload(attachment, content),
-                        mode=mode,
-                        message_id=message_id,
-                        attachment_id=attachment_id,
-                        attachment=attachment,
-                    )
-                download = _loopback_attachment_download_payload(attachment, content, disposition="attachment")
-                return _finalize_attachment_access_payload(
-                    download,
-                    mode=mode,
-                    message_id=message_id,
-                    attachment_id=attachment_id,
-                    attachment=attachment,
-                )
+                raise RuntimeError(
+                    "APS Files attachment delivery failed; retry the attachment access request."
+                ) from upload_exc
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -2299,8 +2291,21 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 }
         except Exception as exc:
             log(f"inbox thread assist cache lookup skipped: {type(exc).__name__}: {exc}")
+        inflight_key = f"{mailbox.casefold()}:{thread_id}:{latest_message_id}"
+        existing_run_id = INBOX_THREAD_ASSIST_INFLIGHT.get(inflight_key)
+        existing_run = MAIL_AGENT_RUNS.get(existing_run_id or "") if existing_run_id else None
+        if existing_run and str(existing_run.get("status") or "") in {"queued", "running"}:
+            return {
+                "success": True,
+                "run_id": existing_run_id,
+                "status": existing_run.get("status", "queued"),
+                "stage": existing_run.get("stage", "inbox_thread_assist"),
+            }
+        if existing_run_id:
+            INBOX_THREAD_ASSIST_INFLIGHT.pop(inflight_key, None)
         run_id = f"bg_{uuid.uuid4().hex[:12]}"
         MAIL_AGENT_RUNS[run_id] = {"run_id": run_id, "status": "queued", "stage": "inbox_thread_assist", "progress": {}, "warnings": [], "started_at": beijing_now(), "updated_at": beijing_now(), "result": None, "error": "", "partial": {}}
+        INBOX_THREAD_ASSIST_INFLIGHT[inflight_key] = run_id
         _save_run_checkpoint(run_id)
         asyncio.ensure_future(_handle_inbox_thread_assist_background(run_id, arguments, invoke_id))
         return {"success": True, "run_id": run_id, "status": "queued"}
@@ -2743,14 +2748,13 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         from mail_agent.mail_providers.gmail.adapter import send_reply
         from mail_agent.mail_providers.gmail.outgoing_attachments import (
             delete_staged_attachments,
-            load_outgoing_attachments_for_send,
         )
         import asyncio as _asyncio
         attachment_meta = arguments.get("attachments") if isinstance(arguments.get("attachments"), list) else []
         if dry_run:
             return {"ok": True, "dry_run": True, "message": "Mock: reply was NOT sent."}
         try:
-            loaded_attachments = load_outgoing_attachments_for_send(mailbox, attachment_meta)
+            loaded_attachments = await _load_outgoing_attachments_for_send(mailbox, attachment_meta)
             result = await _asyncio.to_thread(
                 send_reply,
                 mailbox,
@@ -2763,7 +2767,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 bcc_addr=bcc_addr,
                 attachments=loaded_attachments,
             )
-            delete_staged_attachments(mailbox, attachment_meta)
+            await _delete_outgoing_attachments(mailbox, attachment_meta)
             from mail_agent.storage.ops import append_card_action
             await append_card_action(mailbox, "", thread_id, "reply_from_ask", body[:80])
             return {"ok": True, "dry_run": False, "result": result}
@@ -2782,7 +2786,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             return {"ok": False, "error": str(exc)}
 
     if tool == "begin_stage_outgoing_attachment":
-        # 创建本地 stage 槽位，前端再 PUT 字节到 loopback，避免大文件走 JSON-RPC。
+        # APS 模式只协商预签名地址；文件字节由浏览器直接上传到 APS。
         if not mailbox:
             return {"error": "mailbox is required"}
         filename = str(arguments.get("filename") or "attachment")
@@ -2798,12 +2802,42 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         draft_scope = str(arguments.get("draft_scope") or "compose").strip().lower() or "compose"
         draft_key = str(arguments.get("draft_key") or "").strip()
         try:
-            from mail_agent.mail_providers.gmail.outgoing_attachments import create_stage_upload_slot
-            slot = create_stage_upload_slot(
-                mailbox,
+            from mail_agent.mail_providers.gmail.outgoing_attachments import create_stage_upload_slot, validate_outgoing_attachment_meta
+            meta = validate_outgoing_attachment_meta(
                 filename=filename,
                 mime_type=mime_type,
                 size=size,
+                existing_total_bytes=existing_total,
+            )
+            attachment_id = uuid.uuid4().hex
+            if _should_use_aps_files():
+                storage_key = _aps_outgoing_attachment_path(mailbox, attachment_id, meta["filename"])
+                begin = await _aps_files.upload_begin(
+                    path=storage_key,
+                    size_bytes=meta["size"],
+                    content_type=meta["mime_type"],
+                    metadata={"mailbox": mailbox, "attachment_id": attachment_id, "draft_scope": draft_scope, "draft_key": draft_key},
+                    scope="user",
+                )
+                upload_url = str(begin.get("put_url") or begin.get("presigned_url") or "")
+                if not upload_url:
+                    raise RuntimeError("APS Files did not return an upload URL.")
+                return {
+                    "ok": True,
+                    "attachment_id": attachment_id,
+                    "filename": meta["filename"],
+                    "mime_type": meta["mime_type"],
+                    "size": meta["size"],
+                    "storage_key": storage_key,
+                    "upload_url": upload_url,
+                    "upload_headers": begin.get("headers") or begin.get("fields") or {},
+                    "expires_at": begin.get("expires_at") or "",
+                }
+            slot = create_stage_upload_slot(
+                mailbox,
+                filename=meta["filename"],
+                mime_type=meta["mime_type"],
+                size=meta["size"],
                 existing_total_bytes=existing_total,
                 draft_scope=draft_scope,
                 draft_key=draft_key,
@@ -2822,12 +2856,43 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    if tool == "complete_stage_outgoing_attachment":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        storage_key = str(arguments.get("storage_key") or "").strip()
+        if not storage_key:
+            return {"error": "storage_key is required"}
+        try:
+            size = int(arguments.get("size") or 0)
+        except (TypeError, ValueError):
+            return {"error": "size is required"}
+        if _should_use_aps_files():
+            from mail_agent.mail_providers.gmail.adapter import sanitize_mailbox_id
+            expected_prefix = f"anna-inbox/mailbox/{sanitize_mailbox_id(mailbox)}/outgoing/"
+            if not storage_key.startswith(expected_prefix):
+                return {"ok": False, "error": "Invalid APS attachment object path"}
+            result = await _aps_files.upload_complete(
+                path=storage_key,
+                size_bytes=size,
+                content_type=str(arguments.get("mime_type") or "application/octet-stream"),
+                scope="user",
+            )
+            return {"ok": True, "storage_key": storage_key, **result}
+        return {"ok": True, "storage_key": storage_key}
+
     if tool == "delete_staged_outgoing_attachment":
         if not mailbox:
             return {"error": "mailbox is required"}
         storage_key = str(arguments.get("storage_key") or "").strip()
         if not storage_key:
             return {"error": "storage_key is required"}
+        if _should_use_aps_files():
+            from mail_agent.mail_providers.gmail.adapter import sanitize_mailbox_id
+            expected_prefix = f"anna-inbox/mailbox/{sanitize_mailbox_id(mailbox)}/outgoing/"
+            if not storage_key.startswith(expected_prefix):
+                return {"ok": False, "error": "Invalid APS attachment object path"}
+            result = await _aps_files.delete(path=storage_key, scope="user")
+            return {"ok": True, **result}
         from mail_agent.mail_providers.gmail.outgoing_attachments import delete_staged_attachment
         deleted = delete_staged_attachment(mailbox, storage_key)
         return {"ok": True, "deleted": deleted}
@@ -2842,13 +2907,22 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if not storage_key:
             return {"error": "storage_key is required"}
         try:
-            from mail_agent.mail_providers.gmail.outgoing_attachments import read_staged_attachment
-            content = read_staged_attachment(mailbox, storage_key)
-            payload = _loopback_attachment_download_payload(
-                {"filename": filename, "mime_type": mime_type},
-                content,
-                disposition="inline",
-            )
+            if _should_use_aps_files():
+                from mail_agent.mail_providers.gmail.adapter import sanitize_mailbox_id
+                expected_prefix = f"anna-inbox/mailbox/{sanitize_mailbox_id(mailbox)}/outgoing/"
+                if not storage_key.startswith(expected_prefix):
+                    return {"ok": False, "error": "Invalid APS attachment object path"}
+                access = await _aps_files.download_url(path=storage_key, expires_in=900, scope="user")
+                preview_url = str(access.get("url") or access.get("download_url") or "")
+                payload = {"ok": True, "delivery": "url", "filename": filename, "mime_type": mime_type, "preview_url": preview_url, "download_url": preview_url, "expires_at": access.get("expires_at") or ""}
+            else:
+                from mail_agent.mail_providers.gmail.outgoing_attachments import read_staged_attachment
+                content = read_staged_attachment(mailbox, storage_key)
+                payload = _loopback_attachment_download_payload(
+                    {"filename": filename, "mime_type": mime_type},
+                    content,
+                    disposition="inline",
+                )
             payload["preview_url"] = payload.get("download_url") or ""
             return payload
         except Exception as exc:
@@ -2869,8 +2943,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             try:
                 existing = await get_compose_draft(mailbox, draft_id)
                 draft_value = existing.get("draft") if isinstance(existing.get("draft"), dict) else {}
-                from mail_agent.mail_providers.gmail.outgoing_attachments import delete_staged_attachments
-                delete_staged_attachments(mailbox, draft_value.get("attachments") if isinstance(draft_value, dict) else [])
+                await _delete_outgoing_attachments(mailbox, draft_value.get("attachments") if isinstance(draft_value, dict) else [])
             except Exception:
                 pass
             await delete_compose_draft(mailbox, draft_id)
@@ -2894,7 +2967,6 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         from mail_agent.mail_providers.gmail.adapter import send_compose_email
         from mail_agent.mail_providers.gmail.outgoing_attachments import (
             delete_staged_attachments,
-            load_outgoing_attachments_for_send,
         )
         import asyncio as _asyncio
         results: list[dict[str, Any]] = []
@@ -2903,7 +2975,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             draft_id = str(draft.get("id") or "")
             try:
                 attachment_meta = draft.get("attachments") if isinstance(draft.get("attachments"), list) else []
-                loaded_attachments = load_outgoing_attachments_for_send(mailbox, attachment_meta)
+                loaded_attachments = await _load_outgoing_attachments_for_send(mailbox, attachment_meta)
                 sent = await _asyncio.to_thread(
                     send_compose_email,
                     mailbox,
@@ -2915,7 +2987,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                     body_html=str(draft.get("body_html") or "") or None,
                     attachments=loaded_attachments,
                 )
-                delete_staged_attachments(mailbox, attachment_meta)
+                await _delete_outgoing_attachments(mailbox, attachment_meta)
                 results.append({"id": draft_id, "ok": True, "result": sent})
             except Exception as exc:
                 results.append({"id": draft_id, "ok": False, "error": str(exc)})
@@ -3156,8 +3228,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         try:
             existing = await get_inbox_thread_draft(mailbox, thread_id)
             value = existing.get("value") if isinstance(existing.get("value"), dict) else {}
-            from mail_agent.mail_providers.gmail.outgoing_attachments import delete_staged_attachments
-            delete_staged_attachments(mailbox, value.get("attachments") if isinstance(value, dict) else [])
+            await _delete_outgoing_attachments(mailbox, value.get("attachments") if isinstance(value, dict) else [])
         except Exception:
             pass
         result = await delete_inbox_thread_draft(mailbox, thread_id)

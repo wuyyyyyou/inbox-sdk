@@ -88,6 +88,31 @@ class FakePresignedHostUpload:
         }
 
 
+class FakeApsFiles:
+    """收件附件下载迁移后的 APS Files fake。"""
+
+    def __init__(self) -> None:
+        self.begin_calls: list[dict[str, Any]] = []
+        self.complete_calls: list[dict[str, Any]] = []
+
+    async def upload_begin(self, **kwargs: Any) -> dict[str, Any]:
+        self.begin_calls.append(kwargs)
+        return {
+            "put_url": "https://upload.example.test/aps-object",
+            "headers": {"Content-Type": kwargs["content_type"]},
+        }
+
+    async def upload_complete(self, **kwargs: Any) -> dict[str, Any]:
+        self.complete_calls.append(kwargs)
+        return {"completed": True}
+
+    async def download_url(self, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "url": "https://files.example.test/aps-attachment.pdf",
+            "expires_at": "2026-06-24T12:00:00Z",
+        }
+
+
 async def main_async() -> None:
     from anna_inbox_executa import v2_tools
     from executa_sdk.host_upload import HostUploadClient
@@ -130,10 +155,10 @@ async def main_async() -> None:
     check("presigned helper returns etag", etag == "etag-local")
     check("presigned helper sends body", PutHandler.received_body == b"helper-bytes")
 
-    original_host_upload = v2_tools.host_upload
+    original_aps_files = v2_tools._aps_files
     original_put = v2_tools._put_presigned_url_sync
-    fake_host_upload = FakeInlineOnlyHostUpload()
-    v2_tools.host_upload = fake_host_upload
+    fake_aps_files = FakeApsFiles()
+    v2_tools._aps_files = fake_aps_files
     v2_tools._put_presigned_url_sync = lambda *args, **kwargs: "etag-1"
     try:
         result = await v2_tools._upload_attachment_for_download(
@@ -147,41 +172,14 @@ async def main_async() -> None:
             b"pdf-bytes",
         )
     finally:
-        v2_tools.host_upload = original_host_upload
+        v2_tools._aps_files = original_aps_files
         v2_tools._put_presigned_url_sync = original_put
 
-    check("download url comes from host upload", result["download_url"].startswith("https://files.example.test/"))
-    check("host inline upload is not used", not fake_host_upload.inline_called)
-    check("host negotiate was called once", len(fake_host_upload.negotiate_calls) == 1)
-    check("attachment purpose is set", fake_host_upload.negotiate_calls[0]["purpose"] == "user_artifact")
-    check("declared bytes is set", fake_host_upload.negotiate_calls[0]["size_bytes"] == len(b"pdf-bytes"))
-    check("host confirm was called", fake_host_upload.confirmed)
+    check("download url comes from APS Files", result["url"].startswith("https://files.example.test/"))
+    check("APS upload begins once", len(fake_aps_files.begin_calls) == 1)
+    check("APS upload carries declared bytes", fake_aps_files.begin_calls[0]["size_bytes"] == len(b"pdf-bytes"))
+    check("APS upload completes once", len(fake_aps_files.complete_calls) == 1)
     check("content bytes stay out of JSON result", "content" not in result and "content_b64" not in result)
-
-    fake_presigned_upload = FakePresignedHostUpload()
-    v2_tools.host_upload = fake_presigned_upload
-
-    def _raise_ssl_eof(*args: Any, **kwargs: Any) -> str:
-        raise OSError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
-
-    v2_tools._put_presigned_url_sync = _raise_ssl_eof
-    try:
-        presigned_result = await v2_tools._upload_attachment_for_download(
-            "user@example.com",
-            "card-1",
-            {
-                "filename": "large.pdf",
-                "mime_type": "application/pdf",
-                "message_id": "msg-1",
-            },
-            b"pdf-bytes",
-        )
-    finally:
-        v2_tools.host_upload = original_host_upload
-        v2_tools._put_presigned_url_sync = original_put
-
-    check("presigned upload confirms after put eof", fake_presigned_upload.confirmed)
-    check("presigned download url is returned", presigned_result["download_url"].endswith("/presigned.pdf"))
 
     os.environ.pop("ANNA_INBOX_ATTACHMENT_DOWNLOAD_MODE", None)
     check("default attachment download mode is direct inline", v2_tools._attachment_download_mode() == "direct_inline")
@@ -347,7 +345,8 @@ async def main_async() -> None:
             },
             "invoke-2",
         )
-        check("download tool falls back to inline for small content", download_result["delivery"] == "inline")
+        check("local download falls back to loopback", download_result["delivery"] == "url")
+        check("local fallback stays on loopback", str(download_result["download_url"]).startswith("http://127.0.0.1:"))
         check("download tool returns mode", download_result["mode"] == "download")
         check("download tool returns message id", download_result["message_id"] == "msg-88")
         check("download tool normalizes mime", download_result["mime_type"] == "application/pdf")

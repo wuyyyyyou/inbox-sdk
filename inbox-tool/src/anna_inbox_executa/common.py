@@ -80,10 +80,7 @@ DEFAULT_MANIFEST = {
     "host_capabilities": [
         "llm.sample",
         "llm.complete",
-        "host.upload",
-        "upload.inline",
-        "upload.negotiate",
-        "upload.confirm",
+        "aps.files",
         "storage.user",
         "aps.kv",
         "aps.scope.user.read",
@@ -201,73 +198,17 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
-            "name": "run_mail_agent",
-            "description": "Run the full Anna mail agent pipeline: scan emails, generate candidates, evaluate with LLM, and produce an action plan.",
-            "parameters": [
-                {"name": "user_request", "type": "string", "description": "Natural language request from user, e.g. '帮我看看有什么重要邮件'", "required": True},
-                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
-                {"name": "mode", "type": "string", "description": "Strategy mode: auto, default_secretary, creator_opportunity, security_billing", "required": False},
-                {"name": "max_messages", "type": "integer", "description": "Maximum messages to scan.", "required": False},
-                {"name": "primary_count", "type": "integer", "description": "How many recent Primary emails to fetch first.", "required": False},
-                {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
-            ],
-        },
-        {
-            "name": "start_mail_agent_run",
-            "description": "Prepare a pollable brief run. Follow with continue_mail_agent_run to execute scan and LLM phases.",
-            "parameters": [
-                {"name": "user_request", "type": "string", "description": "Natural language request from user.", "required": True},
-                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
-                {"name": "mode", "type": "string", "description": "Strategy mode: auto, default_secretary, creator_opportunity, security_billing", "required": False},
-                {"name": "max_messages", "type": "integer", "description": "Maximum messages to scan.", "required": False},
-                {"name": "primary_count", "type": "integer", "description": "How many recent Primary emails to fetch first.", "required": False},
-                {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
-                {"name": "run_id", "type": "string", "description": "Client-generated run ID for polling progress.", "required": False},
-                {"name": "storage_provider", "type": "string", "description": "Storage provider: local or aps.", "required": False},
-            ],
-        },
-        {
-            "name": "continue_mail_agent_run",
-            "description": "Advance one short Brief state-machine slice with sampling bound to this invoke.",
-            "parameters": [
-                {"name": "run_id", "type": "string", "description": "Run ID from start_mail_agent_run.", "required": True},
-                {"name": "user_request", "type": "string", "description": "Natural language request from user.", "required": False},
-                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": False},
-                {"name": "mode", "type": "string", "description": "Strategy mode.", "required": False},
-                {"name": "max_messages", "type": "integer", "description": "Maximum messages to scan.", "required": False},
-                {"name": "primary_count", "type": "integer", "description": "How many recent Primary emails to fetch first.", "required": False},
-                {"name": "ai_provider", "type": "string", "description": "LLM provider: dashscope or anna-llm.", "required": False},
-            ],
-        },
-        {
             "name": "get_mail_agent_run",
-            "description": "Poll a background mail-agent run by run id.",
+            "description": "Poll a background AI turn or custom-scan run by run id.",
             "parameters": [
-                {"name": "run_id", "type": "string", "description": "Run id returned by start_mail_agent_run.", "required": True},
+                {"name": "run_id", "type": "string", "description": "Run id returned by start_ai_turn or custom scan.", "required": True},
             ],
         },
         {
             "name": "cancel_mail_agent_run",
-            "description": "Cancel a running Brief/Ask mail-agent run so mailbox switch can free Gmail credentials immediately.",
+            "description": "Cancel a running AI turn / custom-scan so mailbox switch can free Gmail credentials immediately.",
             "parameters": [
-                {"name": "run_id", "type": "string", "description": "Run id returned by start_mail_agent_run or custom scan.", "required": True},
-            ],
-        },
-        {
-            "name": "get_active_cards",
-            "description": "Get all active attention cards for a mailbox from persistent storage.",
-            "parameters": [
-                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
-            ],
-        },
-        {
-            "name": "get_cleanup_bundle_page",
-            "description": "Get one page of cleanup bundle messages without refreshing active cards.",
-            "parameters": [
-                {"name": "mailbox", "type": "string", "description": "Mailbox email address or all.", "required": True},
-                {"name": "offset", "type": "integer", "description": "Cleanup item offset.", "required": False},
-                {"name": "limit", "type": "integer", "description": "Maximum cleanup items to return.", "required": False},
-                {"name": "storage_provider", "type": "string", "description": "Storage provider: local or aps.", "required": False},
+                {"name": "run_id", "type": "string", "description": "Run id returned by start_ai_turn or custom scan.", "required": True},
             ],
         },
         {
@@ -282,7 +223,7 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "set_mailbox_selected",
-            "description": "Set whether a mailbox participates in Brief scans and card display.",
+            "description": "Set whether a mailbox is selected for multi-mailbox AI and inbox views.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
                 {"name": "selected", "type": "boolean", "description": "Whether the mailbox is selected.", "required": True},
@@ -409,7 +350,7 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "begin_stage_outgoing_attachment",
-            "description": "Begin staging an outgoing attachment. Returns a loopback upload_url for PUT of file bytes.",
+            "description": "Begin staging an outgoing attachment. Returns an APS Files upload URL and object path.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
                 {"name": "filename", "type": "string", "description": "Original filename.", "required": True},
@@ -421,11 +362,21 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
-            "name": "delete_staged_outgoing_attachment",
-            "description": "Delete one staged outgoing attachment file by storage_key.",
+            "name": "complete_stage_outgoing_attachment",
+            "description": "Confirm that an outgoing attachment has been uploaded to APS Files.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
-                {"name": "storage_key", "type": "string", "description": "Local stage path from begin_stage_outgoing_attachment.", "required": True},
+                {"name": "storage_key", "type": "string", "description": "APS object path returned by begin_stage_outgoing_attachment.", "required": True},
+                {"name": "size", "type": "number", "description": "Uploaded file size in bytes.", "required": True},
+                {"name": "mime_type", "type": "string", "description": "MIME type.", "required": False},
+            ],
+        },
+        {
+            "name": "delete_staged_outgoing_attachment",
+            "description": "Delete one staged outgoing attachment from APS Files or local stage.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "storage_key", "type": "string", "description": "Object path returned by begin_stage_outgoing_attachment.", "required": True},
             ],
         },
         {
@@ -433,7 +384,7 @@ DEFAULT_MANIFEST = {
             "description": "Prepare a short-lived preview URL for a staged outgoing attachment (draft restore).",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
-                {"name": "storage_key", "type": "string", "description": "Local stage path.", "required": True},
+                {"name": "storage_key", "type": "string", "description": "Object path returned by begin_stage_outgoing_attachment.", "required": True},
                 {"name": "filename", "type": "string", "description": "Filename for Content-Disposition.", "required": False},
                 {"name": "mime_type", "type": "string", "description": "MIME type.", "required": False},
             ],
@@ -1168,14 +1119,20 @@ def _set_storage_backend(provider: Any = "") -> str:
 def _apply_storage_provider(arguments: dict[str, Any]) -> str:
     if "storage_provider" in arguments:
         return _set_storage_backend(arguments.get("storage_provider"))
-    return _active_storage_provider or _set_storage_backend(os.environ.get("ANNA_STORAGE_BACKEND", "local"))
+    default_backend = "aps" if _is_platform() else "local"
+    return _active_storage_provider or _set_storage_backend(os.environ.get("ANNA_STORAGE_BACKEND", default_backend))
 
 
 def _should_use_aps_storage() -> bool:
     return _active_storage_provider == "aps"
 
 
-_set_storage_backend(os.environ.get("ANNA_STORAGE_BACKEND", "local"))
+def _should_use_aps_files() -> bool:
+    """附件在 Cloud Agent 始终走 APS，避免被 KV 后端选择切回本地。"""
+    return _is_platform() or _should_use_aps_storage()
+
+
+_set_storage_backend(os.environ.get("ANNA_STORAGE_BACKEND", "aps" if _is_platform() else "local"))
 
 loop = asyncio.new_event_loop()
 loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
@@ -1319,6 +1276,50 @@ configure_platform_accounts(refresh_platform_google_accounts, resolve_platform_g
 MAIL_AGENT_RUNS: dict[str, dict[str, Any]] = {}
 RUN_STATE_LOCK = threading.RLock()
 RUN_CHECKPOINT_DIR = data_root() / "anna-inbox" / "runs" / "background"
+
+
+def _merge_partial(run_id: str, partial_update: dict[str, Any]) -> None:
+    """合并 run 的 partial 进度字段（嵌套 dict 浅合并）。"""
+    target = MAIL_AGENT_RUNS[run_id].setdefault("partial", {})
+    for key, value in partial_update.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            target[key].update(value)
+        else:
+            target[key] = value
+
+
+def cancel_mail_agent_run(run_id_arg: str) -> dict[str, Any]:
+    """取消后台 run（AI turn / custom scan 共用 MAIL_AGENT_RUNS）。
+
+    切换邮箱时由前端调用，阻止 continue 继续推进。已结束的 run 幂等返回。
+    """
+    run_id = str(run_id_arg or "").strip()
+    if not run_id:
+        return {"success": False, "run_id": "", "error": "run_id is required", "cancelled": False}
+    state = _get_run_state(run_id)
+    if not state:
+        return {"success": False, "run_id": run_id, "error": "run not found", "cancelled": False}
+    if state.get("cancel_requested") or str(state.get("stage") or "") == "cancelled":
+        view = _public_run_view(state)
+        view["success"] = True
+        view["cancelled"] = True
+        return view
+    if state.get("status") in {"done", "failed"} and not state.get("needs_continue"):
+        view = _public_run_view(state)
+        view["success"] = True
+        view["cancelled"] = False
+        return view
+    state["cancel_requested"] = True
+    state["status"] = "failed"
+    state["stage"] = "cancelled"
+    state["error"] = "cancelled"
+    state["needs_continue"] = False
+    state["updated_at"] = beijing_now()
+    _save_run_checkpoint(run_id)
+    view = _public_run_view(state)
+    view["success"] = True
+    view["cancelled"] = True
+    return view
 
 
 def _run_checkpoint_path(run_id: str) -> Path:

@@ -373,8 +373,15 @@ async def tool_propose_inbox_actions(
     sampling_create_message: Any,
     progress_callback: Any = None,
 ) -> dict[str, Any]:
-    """仅产出整理建议包，不执行 Gmail mutation。"""
-    from mail_agent.ask.answer import run_ask_pipeline
+    """产出整理建议：Needs reply（只读分段）+ Can clean up（确认后 mutation）。
+
+    不写 Attention Card；不执行 Gmail mutation。时间窗用 display_range_days。
+    """
+    from mail_agent.ask.answer import (
+        _is_automated_noise_entry,
+        run_ask_pipeline,
+    )
+    from mail_agent.domain.types import MessageLite
 
     mailboxes = []
     selected = ui_context.get("selected_mailboxes")
@@ -392,12 +399,16 @@ async def tool_propose_inbox_actions(
         if progress_callback:
             progress_callback(stage, progress or {})
 
-    # 复用 Ask 检索候选，再组装确认卡片
-    search_request = user_text
-    if language == "zh" and "整理" in user_text:
-        search_request = f"{user_text}；优先信息类/低优先级/可归档邮件"
-    elif "organize" in user_text.casefold():
-        search_request = f"{user_text}; prefer low-priority informational mail that can be marked done"
+    # 统一扫描：需回复 + 可清理；窗口跟随设置 display_range_days
+    if language == "zh":
+        search_request = (
+            f"{user_text}；请分段列出：1) 需要我回复的邮件 2) 低优先级/通知类可清理邮件"
+        )
+    else:
+        search_request = (
+            f"{user_text}; split into: 1) emails that need my reply "
+            f"2) low-priority informational mail that can be cleaned up"
+        )
 
     result = await run_ask_pipeline(
         user_request=search_request,
@@ -408,8 +419,6 @@ async def tool_propose_inbox_actions(
         progress_callback=_progress,
     )
     if result.get("analysis_error"):
-        # 整理建议必须建立在完整分析之上；模型输出被截断时不能生成空确认卡，
-        # 更不能暗示用户可以对 0 封邮件执行状态变更。
         return {
             "kind": "error",
             "assistant_text": str(result.get("summary") or "AI analysis is temporarily unavailable. Please try again."),
@@ -418,77 +427,129 @@ async def tool_propose_inbox_actions(
             "fallback_used": False,
         }
 
-    items: list[dict[str, Any]] = []
+    def _item_row(msg: dict[str, Any], *, default_selected: bool) -> dict[str, Any] | None:
+        mid = str(msg.get("message_id") or msg.get("id") or "").strip()
+        tid = str(msg.get("thread_id") or mid).strip()
+        if not mid and not tid:
+            return None
+        return {
+            "mailbox": str(msg.get("mailbox") or mailboxes[0]),
+            "message_id": mid,
+            "thread_id": tid,
+            "subject": str(msg.get("subject") or msg.get("title") or "")[:200],
+            "default_selected": default_selected,
+        }
+
+    def _looks_like_reply_section(heading: str, body: str) -> bool:
+        blob = f"{heading} {body}".casefold()
+        return any(
+            token in blob
+            for token in (
+                "need", "reply", "respond", "action required",
+                "需回复", "待回复", "需要回复", "回复", "待办",
+            )
+        )
+
+    def _looks_like_cleanup_section(heading: str, body: str) -> bool:
+        blob = f"{heading} {body}".casefold()
+        return any(
+            token in blob
+            for token in (
+                "clean", "archive", "low-priority", "low priority", "noise",
+                "notification", "newsletter", "cleanup", "organize",
+                "清理", "归档", "低优先", "通知", "可整理", "信息类",
+            )
+        )
+
+    needs_reply_items: list[dict[str, Any]] = []
+    cleanup_items: list[dict[str, Any]] = []
     sections = result.get("sections") if isinstance(result.get("sections"), list) else []
     for section in sections:
         if not isinstance(section, dict):
             continue
+        heading = str(section.get("heading") or "")
+        body = str(section.get("body") or "")
+        is_reply = _looks_like_reply_section(heading, body)
+        is_cleanup = _looks_like_cleanup_section(heading, body)
         for msg in (section.get("messages") or section.get("items") or [])[:12]:
             if not isinstance(msg, dict):
                 continue
-            mid = str(msg.get("message_id") or msg.get("id") or "").strip()
-            tid = str(msg.get("thread_id") or mid).strip()
-            if not mid and not tid:
+            # 本地噪声启发式：自动发件人/OTP 归清理，真人未读优先需回复
+            lite = MessageLite(
+                message_id=str(msg.get("message_id") or msg.get("id") or ""),
+                thread_id=str(msg.get("thread_id") or ""),
+                from_addr=str(msg.get("from") or msg.get("from_addr") or ""),
+                to_addr=str(msg.get("to") or msg.get("to_addr") or ""),
+                subject=str(msg.get("subject") or msg.get("title") or ""),
+                snippet=str(msg.get("snippet") or msg.get("context") or ""),
+                unread=bool(msg.get("unread", True)),
+            )
+            noise = _is_automated_noise_entry(lite)
+            row = _item_row(msg, default_selected=noise or is_cleanup)
+            if not row:
                 continue
-            items.append({
-                "mailbox": str(msg.get("mailbox") or mailboxes[0]),
-                "message_id": mid,
-                "thread_id": tid,
-                "subject": str(msg.get("subject") or msg.get("title") or "")[:200],
-                "default_selected": True,
-            })
-            if len(items) >= 12:
-                break
-        if len(items) >= 12:
-            break
+            if is_reply and not noise:
+                if len(needs_reply_items) < 8:
+                    needs_reply_items.append(row)
+            elif is_cleanup or noise:
+                if len(cleanup_items) < 12:
+                    cleanup_items.append(row)
+            else:
+                if len(needs_reply_items) < 8:
+                    needs_reply_items.append(row)
 
-    # 无结构化 section 时尝试 candidates / messages
-    if not items:
+    if not needs_reply_items and not cleanup_items:
         for key in ("candidates", "messages", "mail_links"):
             raw = result.get(key)
             if not isinstance(raw, list):
                 continue
-            for msg in raw[:12]:
+            for msg in raw[:16]:
                 if not isinstance(msg, dict):
                     continue
-                mid = str(msg.get("message_id") or msg.get("id") or "").strip()
-                tid = str(msg.get("thread_id") or mid).strip()
-                if not mid and not tid:
+                lite = MessageLite(
+                    message_id=str(msg.get("message_id") or msg.get("id") or ""),
+                    thread_id=str(msg.get("thread_id") or ""),
+                    from_addr=str(msg.get("from") or msg.get("from_addr") or ""),
+                    to_addr=str(msg.get("to") or msg.get("to_addr") or ""),
+                    subject=str(msg.get("subject") or msg.get("title") or ""),
+                    snippet=str(msg.get("snippet") or ""),
+                    unread=bool(msg.get("unread", True)),
+                )
+                noise = _is_automated_noise_entry(lite)
+                row = _item_row(msg, default_selected=noise)
+                if not row:
                     continue
-                items.append({
-                    "mailbox": str(msg.get("mailbox") or mailboxes[0]),
-                    "message_id": mid,
-                    "thread_id": tid,
-                    "subject": str(msg.get("subject") or msg.get("title") or "")[:200],
-                    "default_selected": True,
-                })
+                if noise:
+                    if len(cleanup_items) < 12:
+                        cleanup_items.append(row)
+                else:
+                    if len(needs_reply_items) < 8:
+                        needs_reply_items.append(row)
 
-    n = len(items)
-    # 主题列表不塞进 assistant_text（避免无链接/无分行）；由前端用 items 渲染可点击列表
+    # 去重：同一 message 不进入两侧
+    reply_ids = {item.get("message_id") for item in needs_reply_items}
+    cleanup_items = [item for item in cleanup_items if item.get("message_id") not in reply_ids]
+
+    n_reply = len(needs_reply_items)
+    n_clean = len(cleanup_items)
     if language == "zh":
-        step_title = "移除低优先级/信息类邮件"
+        step_title = "清理低优先级/信息类邮件"
         rationale = (
             str(result.get("summary") or "").strip()
             or "以下为可整理的候选线程，确认后才会变更状态。"
         )
         assistant_text = (
-            f"我找到 {n} 封可整理的邮件。请先在下方确认本批操作（跳过无副作用）。"
-            f"确认后我会给出完整建议，并询问是否继续整理剩余邮件。"
+            f"扫描完成：{n_reply} 封建议回复，{n_clean} 封可清理。"
+            f"需回复请点邮件打开处理；可清理请在下方确认批量操作（跳过无副作用）。"
         )
         followup_after_apply = (
-            "本批已处理。我还建议继续整理其余类似邮件（通知 / 试用 / 低优先级）。\n\n"
-            "需要我继续把剩余相关邮件标为已处理并清理未读吗？"
+            "本批清理已处理。还需要继续整理其余通知/低优先级邮件吗？"
         )
-        followup_after_skip = (
-            "已跳过本批。仍建议整理下列类型的邮件。\n\n"
-            "需要我继续为剩余邮件生成整理建议吗？"
-        )
-        followup_after_dismiss = (
-            "好的。我仍建议你关注这些可整理邮件（见下方列表）。"
-            "之后可以说「继续整理」随时再来。"
-        )
+        followup_after_skip = "已跳过本批清理。可以说「继续整理」再来一批。"
+        followup_after_dismiss = "好的。之后可以说「整理收件箱」随时再来。"
         continue_prompt = "继续整理剩余邮件"
-        group_title = "可标为已处理的邮件"
+        reply_group = "需要回复"
+        clean_group = "可标为已处理的邮件"
     else:
         step_title = "Remove low-priority informational emails"
         rationale = (
@@ -496,24 +557,84 @@ async def tool_propose_inbox_actions(
             or "Suggested threads to organize. Nothing changes until you confirm."
         )
         assistant_text = (
-            f"I found {n} emails to organize. Confirm the batch below first (Skip has no side effects). "
-            f"After that I'll show full recommendations and ask whether to continue with the rest."
+            f"Scan complete: {n_reply} need a reply, {n_clean} can be cleaned up. "
+            f"Open reply items from the list; confirm the cleanup batch below (Skip has no side effects)."
         )
         followup_after_apply = (
-            "Done with this batch. I still recommend organizing similar remaining emails "
-            "(notifications / trials / low-priority).\n\n"
-            "Would you like me to continue and mark more of these as done to clean up unread?"
+            "Cleanup batch applied. Continue with more low-priority mail?"
         )
-        followup_after_skip = (
-            "Skipped this batch. I still recommend organizing emails like the list below.\n\n"
-            "Would you like me to continue with suggestions for the remaining emails?"
-        )
-        followup_after_dismiss = (
-            "Okay. I still recommend reviewing the emails listed below. "
-            "You can say “continue organizing” anytime."
-        )
+        followup_after_skip = "Skipped this cleanup batch. Say “continue organizing” anytime."
+        followup_after_dismiss = "Okay. You can say “organize my inbox” anytime."
         continue_prompt = "Continue organizing the remaining emails"
-        group_title = "Low-priority emails to mark done"
+        reply_group = "Needs reply"
+        clean_group = "Low-priority emails to mark done"
+
+    recommendation_groups: list[dict[str, Any]] = []
+    if needs_reply_items:
+        recommendation_groups.append({
+            "title": reply_group,
+            "items": [
+                {
+                    "mailbox": item.get("mailbox"),
+                    "message_id": item.get("message_id"),
+                    "thread_id": item.get("thread_id"),
+                    "subject": item.get("subject") or "",
+                }
+                for item in needs_reply_items
+            ],
+        })
+    if cleanup_items:
+        recommendation_groups.append({
+            "title": clean_group,
+            "items": [
+                {
+                    "mailbox": item.get("mailbox"),
+                    "message_id": item.get("message_id"),
+                    "thread_id": item.get("thread_id"),
+                    "subject": item.get("subject") or "",
+                }
+                for item in cleanup_items
+            ],
+        })
+
+    # 确保 scan_result 至少有分段标题，便于侧栏展示
+    if needs_reply_items or cleanup_items:
+        result = dict(result)
+        merged_sections: list[dict[str, Any]] = []
+        if needs_reply_items:
+            merged_sections.append({
+                "heading": reply_group,
+                "body": "",
+                "items": [
+                    {
+                        "subject": item.get("subject") or "",
+                        "mailbox": item.get("mailbox"),
+                        "message_id": item.get("message_id"),
+                        "thread_id": item.get("thread_id"),
+                        "context": "",
+                        "suggestion": "Reply" if language != "zh" else "回复",
+                    }
+                    for item in needs_reply_items
+                ],
+            })
+        if cleanup_items:
+            merged_sections.append({
+                "heading": clean_group,
+                "body": "",
+                "items": [
+                    {
+                        "subject": item.get("subject") or "",
+                        "mailbox": item.get("mailbox"),
+                        "message_id": item.get("message_id"),
+                        "thread_id": item.get("thread_id"),
+                        "context": "",
+                        "suggestion": "Mark done" if language != "zh" else "标为已处理",
+                    }
+                    for item in cleanup_items
+                ],
+            })
+        result["sections"] = merged_sections
+        result["summary"] = rationale[:500]
 
     proposed = {
         "step_index": 1,
@@ -521,29 +642,14 @@ async def tool_propose_inbox_actions(
         "rationale": rationale[:800],
         "primary_action": "mark_done",
         "allowed_actions": ["mark_done", "archive", "trash"],
-        "items": items,
+        "items": cleanup_items,
         "requires_user_confirmation": True,
         "language": language,
-        # 确认/跳过/暂不继续后的叙事（对标 example/6.png）
         "followup_after_apply": followup_after_apply,
         "followup_after_skip": followup_after_skip,
         "followup_after_dismiss": followup_after_dismiss,
         "continue_prompt": continue_prompt,
-        "recommendation_groups": [
-            {
-                "title": group_title,
-                # 带 id，前端渲染为可点击链接并分行
-                "items": [
-                    {
-                        "mailbox": item.get("mailbox"),
-                        "message_id": item.get("message_id"),
-                        "thread_id": item.get("thread_id"),
-                        "subject": item.get("subject") or "",
-                    }
-                    for item in items
-                ],
-            }
-        ],
+        "recommendation_groups": recommendation_groups,
     }
     return {
         "kind": "propose",

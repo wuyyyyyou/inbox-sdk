@@ -22,7 +22,10 @@ class SamplingStub:
 
     async def __call__(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(dict(kwargs))
-        return {"content": {"type": "text", "text": "{}"}}
+        return {
+            "content": {"type": "text", "text": "{}"},
+            "usage": {"inputTokens": 100, "outputTokens": 50, "totalTokens": 150},
+        }
 
 
 class FailingSamplingStub:
@@ -68,9 +71,12 @@ async def test_budget_guard_caps_requests_and_stops_before_host() -> None:
     assert [call["max_tokens"] for call in stub.calls] == [4096, 1904]
     assert all(call["timeout"] == 60.0 for call in stub.calls)
     joined_logs = "\n".join(logs)
-    assert "requested_tokens=4096" in joined_logs
-    assert "granted_tokens=4096" in joined_logs
-    assert "remaining_tokens=1904" in joined_logs
+    assert "requested_tokens=" not in joined_logs
+    assert "granted_tokens=" not in joined_logs
+    assert "remaining_tokens=" not in joined_logs
+    assert "input_tokens=" in joined_logs
+    assert "output_tokens=" in joined_logs
+    assert "tps=" in joined_logs
     assert "prompt_bytes=" in joined_logs
     assert "private email body" not in joined_logs
     assert "Never log this private prompt" not in joined_logs

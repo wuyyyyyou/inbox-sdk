@@ -2219,9 +2219,6 @@ function AiAssistantMessage({
         onOpenThread={openThreadReference}
         onComplete={onTextComplete}
       />
-      {aiResultCount(result) > 0 && (result.title || result.plan_title) ? (
-        <h2>{result.title || result.plan_title}</h2>
-      ) : null}
       {sections.length ? (
         <ul className="ai-answer-list">
           {sections.map((section, index) => (
@@ -2382,10 +2379,11 @@ function AiSidebar({
     );
   // 仅在明确探测失败时禁用输入；checking/unknown 不打断编辑
   const llmOffline = state.llmStatus.status === "unavailable" || state.llmStatus.status === "error";
-  const starters = [
-    "What needs my reply?",
-    "Find urgent emails",
-    "Organize my inbox",
+  // 侧栏 starter 为按钮级显式意图：带 routingIntent，后端跳过 Router Sampling。
+  const starters: Array<{ label: string; routingIntent: AiRoutingIntent }> = [
+    { label: "What needs my reply?", routingIntent: "inbox" },
+    { label: "Find urgent emails", routingIntent: "inbox" },
+    { label: "Organize my inbox", routingIntent: "organize" },
   ];
   const conversation = state.aiChatMessages;
 
@@ -2745,11 +2743,26 @@ function AiSidebar({
           <div className="ai-starters">
             {starters.map((starter) => (
               <button
-                key={starter}
-                disabled={llmOffline}
-                onClick={() => actions.setInput("customScanInput", starter)}
+                key={starter.label}
+                disabled={llmOffline || running}
+                onClick={() => {
+                  if (llmOffline || running) return;
+                  setHistoryOpen(false);
+                  setSavedPromptsOpen(false);
+                  setShowNewMessagePrompt(false);
+                  pinnedToBottomRef.current = true;
+                  scrollAfterSubmitRef.current = true;
+                  window.requestAnimationFrame(() => scrollConversationToBottom("smooth"));
+                  // 按钮级意图：prompt 仅作展示文案，选型由 routingIntent 决定。
+                  void actions.sendAiChatMessage({
+                    prompt: starter.label,
+                    routingIntent: starter.routingIntent,
+                    currentMailContext,
+                    selectedThreads: selectedThreads?.length ? selectedThreads : undefined,
+                  });
+                }}
               >
-                {starter}
+                {starter.label}
               </button>
             ))}
           </div>
@@ -4537,14 +4550,15 @@ export function HomeView() {
   }, [selectedMessage]);
 
   useEffect(() => {
-    if (selectedMessage || !drawerMessage || !drawerOpen) return;
+    // 仅用户清空 selectedId 时关抽屉；列表同步短暂找不到邮件时保留详情/附件预览
+    if (selectedId || !drawerMessage || !drawerOpen) return;
     setDrawerOpen(false);
     if (drawerCloseTimer.current) window.clearTimeout(drawerCloseTimer.current);
     drawerCloseTimer.current = window.setTimeout(() => {
       setDrawerMessage(null);
       drawerCloseTimer.current = null;
     }, DETAIL_DRAWER_TRANSITION_MS);
-  }, [drawerMessage, drawerOpen, selectedMessage]);
+  }, [drawerMessage, drawerOpen, selectedId]);
 
   useEffect(
     () => () => {
@@ -5055,9 +5069,12 @@ export function HomeView() {
     setMailDetailOpenRef.current = actions.setMailDetailOpen;
   }, [actions.setMailDetailOpen]);
   useEffect(() => {
-    setMailDetailOpenRef.current(drawerOpen);
-    return () => setMailDetailOpenRef.current(false);
-  }, [drawerOpen]);
+    const detailMessageId = drawerOpen
+      ? (drawerMessage?.id || selectedId || "")
+      : "";
+    setMailDetailOpenRef.current(drawerOpen, detailMessageId);
+    return () => setMailDetailOpenRef.current(false, "");
+  }, [drawerMessage?.id, drawerOpen, selectedId]);
 
   const openMessageDetail = useCallback(
     (message: InboxMessage) => {

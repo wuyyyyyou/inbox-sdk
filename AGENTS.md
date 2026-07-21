@@ -22,22 +22,23 @@
 
 ## 项目基线
 
-- **App（前端）**：`2.1.2` — 位于 `anna-inbox/`
-- **Tool（Executa）**：`2.2.2` — 位于 `inbox-tool/`
+- **App（前端）**：`2.1.3` — 位于 `anna-inbox/`
+- **Tool（Executa）**：`2.2.3` — 位于 `inbox-tool/`
 
+- 唯一智能入口：Inbox Workspace + AI 侧栏（`start_ai_turn`）；Brief 产品面下线。
 - AI生成内容过程中，滚动条自动滑动到底部。
-- `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表；Router 澄清弹层支持范围选择。
-- `anna-inbox/src/features/mail-detail/`：线程详情、正文、富文本草稿（`RichTextEditor`）和附件预览。
-- `anna-inbox/src/app/useAppController.ts`：主要状态与工作流控制；AI 侧栏默认 `startAiTurn`；详情页协助统一走 `start_ai_turn`。
+- `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表；Router 澄清弹层支持范围选择；详情打开期间列表短暂丢消息不关抽屉。
+- `anna-inbox/src/features/mail-detail/`：线程详情、正文、富文本草稿（`RichTextEditor`）和附件预览；详情滚动仅限 context 容器；同线程同步刷新不清附件预览。
+- `anna-inbox/src/app/useAppController.ts`：主要状态与工作流控制；AI 侧栏默认 `startAiTurn`；详情页协助统一走 `start_ai_turn`；soft prune 保留 `mailDetailMessageId`。
 - `anna-inbox/src/api/mailAgentClient.ts`：所有 Executa 工具调用的统一 facade。
 - `anna-inbox/manifest.json`、`inbox-tool/src/anna_inbox_executa/common.py` 与 `mailbox_tools.py`：Google Connected accounts 声明、多账号发现状态和安全错误提示。
-- `inbox-tool/src/anna_inbox_executa/`：JSON-RPC 入口与工具分发（含 `start_ai_turn`、整理确认与 Saved prompts / Memory）；Sampling 预算快照与短 wait 建 run。
+- `inbox-tool/src/anna_inbox_executa/`：JSON-RPC 入口与工具分发（含 `start_ai_turn`、整理确认与 Saved prompts / Memory）；Sampling 预算快照与短 wait 建 run；Brief 主路径工具已移除。
 - `inbox-tool/src/mail_agent/ai_turn/`：AI 侧栏本地 Router 与白名单 Runner（含 fast local route、用户选定 `routing_intent`、集中 prompts）。
 - `inbox-tool/src/mail_agent/mail_providers/gmail/adapter.py`：Gmail API、OAuth、本地缓存和正文解码；回复/撰写 HTML 发送。
 - `inbox-tool/src/mail_agent/mail_providers/gmail/outgoing_html.py`：外发富文本白名单净化。
 - `inbox-tool/src/mail_agent/storage/`：APS/local storage 的统一 async 层。
 - `inbox-tool/src/mail_agent/ask/`：Ask 规划、搜索和回答（条数解析、预算分配、截断 JSON 不伪装成功）。
-- `inbox-tool/src/mail_agent/core/`、`cards/`、`judgment_engine/`：Brief 管线。
+- `inbox-tool/src/mail_agent/core/`：custom scan 等残留；Brief Phase1 管线已删除。
 - 连通性检测：反向 RPC 响应必须由 stdin 线程直接路由；LLM / Gmail 检测共用 12 秒后端总预算，避免与业务 worker 或正常邮箱操作互相阻塞。
 - 平台超时诊断：每个 invoke 及后台 AI run 以独立安全 trace 记录 Sampling、Connected accounts、Gmail HTTP 和 Executa 阶段耗时；不得包含邮件或凭据。
 
@@ -85,14 +86,14 @@ App 与 Tool **版本号解耦，互不强制对齐**：
 
 | 端 | 当前版本 | 权威文件 | 须同步的文件 |
 | --- | --- | --- | --- |
-| App | `2.1.2` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
-| Tool | `2.2.2` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
+| App | `2.1.3` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
+| Tool | `2.2.3` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
 
 规则：
 
 - 只改前端 / App 发布：只 bump **App** 版本（`anna-inbox/app.json`），**不要**改 Tool 版本。
 - 只改后端 / Executa 发布：只 bump **Tool** 版本；平台若报「同版本已发布且内容不同」，必须再 bump Tool（不可覆盖已发布版本）。
-- Tool 线自 `2.1.1` 起独立演进，现进入 `2.2.x`；App 线自 `2.1.1` 起。当前基线：App `2.1.2` / Tool `2.2.2`。
+- Tool 线自 `2.1.1` 起独立演进，现进入 `2.2.x`；App 线自 `2.1.1` 起。当前基线：App `2.1.3` / Tool `2.2.3`。
 - `min_version` 跟随 **Tool** 版本，不跟随 App 版本。
 - 提交前审核时，若未说明只升哪一端，先与我确认，再改版本号。
 

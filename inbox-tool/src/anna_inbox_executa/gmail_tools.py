@@ -810,10 +810,8 @@ def list_cached_emails(
     limit = max(1, min(int(limit_arg or 100), 100))
     offset = max(0, int(offset_arg or 0))
     category = _normalize_inbox_category(category_arg)
-    started_at = time.perf_counter()
     feed_meta = ensure_cached_feed_index(mailbox)
     page_descriptors = feed_meta.get("pages") if isinstance(feed_meta.get("pages"), list) else []
-    total_cached_messages = int(feed_meta.get("message_count") or 0)
     cutoff = int((time.time() - days * 24 * 60 * 60) * 1000) if days > 0 else 0
     cache_info = cache_debug_info(mailbox)
     updated_at = feed_meta.get("updated_at")
@@ -870,26 +868,6 @@ def list_cached_emails(
             continue
     next_offset = offset + len(messages)
     has_more = matched_total > next_offset
-    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
-    print(
-        json.dumps(
-            {
-                "scope": "gmail_feed_cache",
-                "mailbox": mailbox,
-                "days": days,
-                "limit": limit,
-                "offset": offset,
-                "category": category,
-                "cache_messages": total_cached_messages,
-                "page_count": len(page_descriptors),
-                "matched_messages": matched_total,
-                "returned_messages": len(messages),
-                "elapsed_ms": elapsed_ms,
-            },
-            ensure_ascii=False,
-        ),
-        file=sys.stderr,
-    )
     return {
         "mailbox": mailbox,
         "days": days,

@@ -2,12 +2,38 @@ import type { AppState } from "../types/mail";
 import { DEFAULT_MODE, getSavedMailbox } from "./constants";
 
 const AI_ASK_HISTORY_STORAGE_KEY = "anna-inbox:ai-ask-history:v1";
+/** 侧栏会话历史仅保留 7 天；每条为独立 conversationId。 */
+const AI_ASK_HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const AI_ASK_HISTORY_MAX_ENTRIES = 30;
+
+export function pruneAskHistory(
+  history: AppState["askHistory"],
+  nowMs = Date.now(),
+): AppState["askHistory"] {
+  if (!Array.isArray(history) || !history.length) return [];
+  const cutoff = nowMs - AI_ASK_HISTORY_MAX_AGE_MS;
+  return history
+    .filter((entry) => {
+      const ts = Date.parse(String(entry?.timestamp || ""));
+      return Number.isFinite(ts) && ts >= cutoff;
+    })
+    .slice(0, AI_ASK_HISTORY_MAX_ENTRIES);
+}
 
 function loadSavedAskHistory(): AppState["askHistory"] {
   if (typeof window === "undefined") return [];
   try {
     const parsed = JSON.parse(window.localStorage.getItem(AI_ASK_HISTORY_STORAGE_KEY) || "[]");
-    return Array.isArray(parsed) ? parsed.slice(0, 30) : [];
+    const pruned = pruneAskHistory(Array.isArray(parsed) ? parsed : []);
+    // 启动时回写裁剪结果，避免过期会话长期占用 localStorage。
+    if (pruned.length !== (Array.isArray(parsed) ? parsed.length : 0)) {
+      try {
+        window.localStorage.setItem(AI_ASK_HISTORY_STORAGE_KEY, JSON.stringify(pruned));
+      } catch {
+        /* ignore */
+      }
+    }
+    return pruned;
   } catch {
     // 历史记录只是 UI 恢复能力，损坏时直接丢弃，避免阻塞 App 启动。
     return [];
@@ -57,6 +83,7 @@ export function createInitialState(): AppState {
     aiChatConversationId: "",
     aiChatLoading: false,
     mailDetailOpen: false,
+    mailDetailMessageId: "",
     customTraceOpen: false,
     settingsOpen: false,
     settingsFocusRequest: 0,

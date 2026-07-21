@@ -71,20 +71,30 @@ function PdfAttachmentPreviewContent({ url, onReady }: { url: string; onReady?: 
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    let timer = 0;
     const updateWidth = () => {
-      const nextWidth = Math.max(1, Math.min(1100, Math.floor(container.clientWidth)));
-      setWidth((current) => current === nextWidth ? current : nextWidth);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        const nextWidth = Math.max(1, Math.min(1100, Math.floor(container.clientWidth)));
+        setWidth((current) => (current === nextWidth ? current : nextWidth));
+      }, 0);
     };
     updateWidth();
     if (typeof window.ResizeObserver === "function") {
       const observer = new window.ResizeObserver(updateWidth);
       observer.observe(container);
-      return () => observer.disconnect();
+      return () => {
+        window.clearTimeout(timer);
+        observer.disconnect();
+      };
     }
     // Some Anna Edge runtimes do not expose ResizeObserver. An uncaught constructor error here
     // tears down the whole React tree, which looks like the app jumping back to Home.
     window.addEventListener("resize", updateWidth);
-    return () => window.removeEventListener("resize", updateWidth);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("resize", updateWidth);
+    };
   }, []);
 
   useEffect(() => {

@@ -376,8 +376,18 @@ export class MailAgentClient {
       size?: number;
       storage_key?: string;
       upload_url?: string;
+      upload_headers?: Record<string, string>;
       expires_at?: string;
     }>("begin_stage_outgoing_attachment", { mailbox, ...args }, { timeoutMs: 60_000 });
+  }
+
+  completeStageOutgoingAttachment(mailbox: string, storageKey: string, size: number, mimeType?: string) {
+    return this.invoke<{ ok?: boolean; storage_key?: string }>("complete_stage_outgoing_attachment", {
+      mailbox,
+      storage_key: storageKey,
+      size,
+      mime_type: mimeType,
+    }, { timeoutMs: 60_000 });
   }
 
   deleteStagedOutgoingAttachment(mailbox: string, storageKey: string) {

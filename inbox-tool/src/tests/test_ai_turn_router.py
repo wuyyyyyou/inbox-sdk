@@ -62,6 +62,25 @@ async def test_user_selected_inbox_bypasses_router_and_starts_search():
     print("[PASS] test_user_selected_inbox_bypasses_router_and_starts_search")
 
 
+async def test_user_selected_organize_bypasses_router():
+    """侧栏整理 starter 带 routing_intent=organize，跳过 Sampling 直接提议动作。"""
+    from mail_agent.ai_turn.router import route_ai_turn
+
+    async def forbidden_sampling(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("显式 organize 不应调用 Router Sampling")
+
+    route = await route_ai_turn(
+        "Organize my inbox",
+        {"routing_intent": "organize", "current_thread": {"kind": "none"}},
+        sampling_create_message=forbidden_sampling,
+    )
+
+    assert route["steps"] == [{"tool": "propose_inbox_actions", "params": {}}]
+    assert route["router_user_selected"] is True
+    assert route["router_reason"] == "user_selected_organize"
+    print("[PASS] test_user_selected_organize_bypasses_router")
+
+
 async def test_normalize_rejects_unknown_tool():
     from mail_agent.ai_turn.router import _normalize_route
 
@@ -151,7 +170,7 @@ async def test_chat_general_uses_single_final_generation():
         message_text.encode("ascii")
         system_prompt.encode("ascii")
         assert tool == "ai_turn_chat"
-        assert kwargs["max_tokens"] == 500
+        assert kwargs["max_tokens"] == 2048
         assert "complete final answer" in system_prompt
         return {"content": {"type": "text", "text": "I can help you with that."}}
 
@@ -197,6 +216,10 @@ def test_ai_turn_system_prompts_use_xml_modules():
             assert f"<{tag}>" in prompt
             assert f"</{tag}>" in prompt
     assert '"steps"' in router_prompt
+    # 语义决策须覆盖「需读邮箱 → search」与「勿误用 chat_general」。
+    assert "search_mail" in router_prompt
+    assert "chat_general" in router_prompt
+    assert "Evidence-needed mail" in router_prompt
     assert '"markdown"' in prompts[1]
     assert '"draft_body"' in prompts[2]
     assert "<memory>" in prompts[0]
@@ -212,8 +235,12 @@ def test_router_output_budget_is_fixed_and_small():
 
 
 async def test_router_input_stays_within_compact_budget():
-    """Router 的系统提示词和动态上下文合计应控制在约 500 tokens。"""
-    from mail_agent.ai_turn.router import _ROUTER_INPUT_TOKEN_BUDGET, _estimate_router_input_tokens
+    """Router 的系统提示词和动态上下文合计应控制在输入预算内。"""
+    from mail_agent.ai_turn.router import (
+        _ROUTER_INPUT_TOKEN_BUDGET,
+        _ROUTER_SAMPLING_MAX_ATTEMPTS,
+        _estimate_router_input_tokens,
+    )
 
     calls: list[dict[str, Any]] = []
 
@@ -239,6 +266,8 @@ async def test_router_input_stays_within_compact_budget():
     assert len(calls) == 1
     call = calls[0]
     assert call["max_tokens"] == 150
+    assert _ROUTER_INPUT_TOKEN_BUDGET == 480
+    assert _ROUTER_SAMPLING_MAX_ATTEMPTS == 2
     # Sampling transport 将中文编码为 ASCII ``\\uXXXX``，该转义在 Host 解码后不会
     # 以六个字符进入模型上下文；按解码后的语义文本核对实际 Router 输入预算。
     raw_message = str(call["messages"][0]["content"]["text"]).encode("ascii").decode("unicode_escape")
@@ -263,6 +292,24 @@ async def test_high_confidence_search_skips_router_sampling():
     assert [step["tool"] for step in route["steps"]] == ["search_mail", "rank_answer"]
     assert route["router_reason"] == "fast_local_route"
     print("[PASS] test_high_confidence_search_skips_router_sampling")
+
+
+async def test_needs_my_reply_skips_router_sampling():
+    """待用户回复属于邮箱证据请求，不能落入普通聊天。"""
+    from mail_agent.ai_turn.router import route_ai_turn
+
+    async def forbidden_sampling(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("needs my reply 不应调用 Router Sampling")
+
+    route = await route_ai_turn(
+        "What needs my reply?",
+        {"current_thread": {"kind": "none"}},
+        sampling_create_message=forbidden_sampling,
+    )
+
+    assert [step["tool"] for step in route["steps"]] == ["search_mail", "rank_answer"]
+    assert route["router_reason"] == "fast_local_route"
+    print("[PASS] test_needs_my_reply_skips_router_sampling")
 
 
 async def test_mailbox_runner_bypasses_keyword_router():
@@ -336,7 +383,7 @@ async def test_mailbox_context_routes_general_question_to_chat_without_search():
     assert result["route"]["steps"] == [{"tool": "chat_general", "params": {}}]
     assert len(sampling_calls) == 2
     system_prompt = str(sampling_calls[1]["system_prompt"])
-    assert "chat-only turn" in system_prompt
+    assert "Do not read or summarize email" in system_prompt
     assert "live time" in system_prompt
     assert "complete final answer" in system_prompt
     print("[PASS] test_mailbox_context_routes_general_question_to_chat_without_search")
@@ -379,6 +426,7 @@ def main():
     asyncio.run(test_router_unavailable_uses_deterministic_inbox_route())
     asyncio.run(test_router_unavailable_summarizes_current_thread())
     asyncio.run(test_user_selected_inbox_bypasses_router_and_starts_search())
+    asyncio.run(test_user_selected_organize_bypasses_router())
     asyncio.run(test_normalize_rejects_unknown_tool())
     asyncio.run(test_normalize_preserves_router_chat_decision())
     asyncio.run(test_sampling_router_payload())
@@ -388,6 +436,7 @@ def main():
     test_router_output_budget_is_fixed_and_small()
     asyncio.run(test_router_input_stays_within_compact_budget())
     asyncio.run(test_high_confidence_search_skips_router_sampling())
+    asyncio.run(test_needs_my_reply_skips_router_sampling())
     asyncio.run(test_mailbox_runner_bypasses_keyword_router())
     asyncio.run(test_mailbox_context_routes_general_question_to_chat_without_search())
     asyncio.run(test_analysis_error_becomes_retryable_run_error())

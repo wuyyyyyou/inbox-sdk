@@ -433,10 +433,23 @@ function sanitizeToolError(error: unknown, input: string) {
   return diagnostics ? `${message}\n\n${diagnostics}` : message;
 }
 
+function pruneAskHistoryEntries(history: AskHistoryEntry[], nowMs = Date.now()): AskHistoryEntry[] {
+  const cutoff = nowMs - 7 * 24 * 60 * 60 * 1000;
+  return history
+    .filter((entry) => {
+      const ts = Date.parse(String(entry?.timestamp || ""));
+      return Number.isFinite(ts) && ts >= cutoff;
+    })
+    .slice(0, 30);
+}
+
 function persistAskHistory(history: AskHistoryEntry[]) {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(AI_ASK_HISTORY_STORAGE_KEY, JSON.stringify(history.slice(0, 30)));
+    window.localStorage.setItem(
+      AI_ASK_HISTORY_STORAGE_KEY,
+      JSON.stringify(pruneAskHistoryEntries(history)),
+    );
   } catch {
     // localStorage 写入失败不影响主流程，最多只是刷新后不能恢复侧栏对话。
   }
@@ -582,7 +595,7 @@ export interface AppActions {
   toggleCustomTrace(): void;
   toggleThreadContext(cardId: string): void;
   toggleSnoozeMenu(cardId: string): void;
-  setMailDetailOpen(open: boolean): void;
+  setMailDetailOpen(open: boolean, messageId?: string): void;
   setProvider(kind: "llm" | "storage", value: string): void;
   setDrawer(drawer: "sources" | "history" | "memory" | "scanPlan", open: boolean): void;
   minimize(value: boolean): void;
@@ -655,7 +668,9 @@ export interface AppActions {
     size?: number;
     storage_key?: string;
     upload_url?: string;
+    upload_headers?: Record<string, string>;
   }>;
+  completeStageOutgoingAttachment(mailbox: string, storageKey: string, size: number, mimeType?: string): Promise<{ ok?: boolean; storage_key?: string }>;
   deleteStagedOutgoingAttachment(mailbox: string, storageKey: string): Promise<void>;
   prepareStagedOutgoingAttachmentAccess(
     mailbox: string,
@@ -866,9 +881,12 @@ export function useAppController() {
         snapshotMessages = sortInboxMessagesDesc(pageMessages);
       }
       if (options.keepIds) {
+        // 详情页打开的邮件不得被 soft prune 清掉，否则会退出详情/附件预览
+        const keepIds = new Set(options.keepIds);
+        if (s.mailDetailMessageId) keepIds.add(s.mailDetailMessageId);
         snapshotMessages = pruneInboxMessagesToCacheWindow(
           snapshotMessages,
-          options.keepIds,
+          keepIds,
           options.pruneDays ?? 0,
         );
       }
@@ -1208,7 +1226,10 @@ export function useAppController() {
         messages,
         pendingRun: options.pendingRun,
       };
-      const nextHistory = [entry, ...s.askHistory.filter((item) => item.conversationId !== conversationId)].slice(0, 30);
+      const nextHistory = pruneAskHistoryEntries([
+        entry,
+        ...s.askHistory.filter((item) => item.conversationId !== conversationId),
+      ]);
       persistAskHistory(nextHistory);
       // Ask history 是“会话索引”；点击历史恢复 messages 后，用户可以继续在同一 conversationId 里追问。
       return { ...s, askHistory: nextHistory, aiChatMessages: messages, aiChatConversationId: conversationId };
@@ -2324,8 +2345,31 @@ export function useAppController() {
           loadScanPlan(currentMailbox),
           // settings 已在预热前加载；此处再拉一次保证 etag / 与当前邮箱对齐（不再触发 30 天预热）
           loadInboxSettings(currentMailbox),
-          loadActiveCards(undefined, "all"),
         ]);
+        // Brief 管线已下线：启动时清空 cards / processed / scan_state，不再加载 Attention Cards。
+        try {
+          const targets = (state.selectedMailboxes?.length
+            ? state.selectedMailboxes
+            : currentMailbox
+              ? [currentMailbox]
+              : []
+          ).map((m) => String(m || "").trim()).filter(Boolean);
+          await Promise.all(
+            targets.map((mailbox) =>
+              client.resetMailboxScanHistory(mailbox, state.storageProvider).catch(() => undefined),
+            ),
+          );
+          setState((s) => ({
+            ...s,
+            cards: [],
+            allCards: [],
+            scanState: null,
+            cleanupBundle: null,
+            actionCount: 0,
+          }));
+        } catch {
+          setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, actionCount: 0 }));
+        }
         // 初始化请求释放后再运行端到端延迟探测，避免启动阶段挤占 Executa worker 与 Host 反向 RPC。
         void refreshConnectivityStatus();
         console.info(`[inbox-startup] initialize elapsed_ms=${Math.round(performance.now() - startedAt)} mailbox=${currentMailbox || ""} range_days=${rangeDays}`);
@@ -2335,7 +2379,7 @@ export function useAppController() {
       showToast(`Init failed: ${msg}`);
       setState((s) => ({ ...s, loading: false, inboxLoading: false, inboxError: msg }));
     }
-  }, [client, discoverMailbox, getRuntime, loadActiveCards, loadCustomPlans, loadInboxSettings, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshConnectivityStatus, showToast, state.mailbox]);
+  }, [client, discoverMailbox, getRuntime, loadCustomPlans, loadInboxSettings, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshConnectivityStatus, showToast, state.mailbox, state.selectedMailboxes, state.storageProvider]);
 
   // 初次连接失败不会再永久缓存 mock runtime；前台保持每 5 秒尝试一次完整初始化，
   // 成功后 effect 自动停止。业务 mutation 不在此处重放，仍需用户再次确认。
@@ -2430,8 +2474,13 @@ export function useAppController() {
     toggleSnoozeMenu(cardId) {
       setState((s) => ({ ...s, snoozeMenuCardId: s.snoozeMenuCardId === cardId ? "" : cardId }));
     },
-    setMailDetailOpen(open) {
-      setState((s) => s.mailDetailOpen === open ? s : { ...s, mailDetailOpen: open });
+    setMailDetailOpen(open, messageId = "") {
+      const nextMessageId = open ? String(messageId || "").trim() : "";
+      setState((s) => (
+        s.mailDetailOpen === open && s.mailDetailMessageId === nextMessageId
+          ? s
+          : { ...s, mailDetailOpen: open, mailDetailMessageId: nextMessageId }
+      ));
     },
     setProvider(kind, value) {
       if (kind === "llm" && (value === "dashscope" || value === "anna-llm")) {
@@ -2848,6 +2897,9 @@ export function useAppController() {
     },
     async beginStageOutgoingAttachment(mailbox, args) {
       return client.beginStageOutgoingAttachment(normalizedMailbox(mailbox), args);
+    },
+    async completeStageOutgoingAttachment(mailbox, storageKey, size, mimeType) {
+      return client.completeStageOutgoingAttachment(normalizedMailbox(mailbox), storageKey, size, mimeType);
     },
     async deleteStagedOutgoingAttachment(mailbox, storageKey) {
       await client.deleteStagedOutgoingAttachment(normalizedMailbox(mailbox), storageKey);
@@ -3376,10 +3428,9 @@ export function useAppController() {
       setState((s) => ({ ...s, configMailbox: mailbox }));
       await loadScanPlan(mailbox || undefined);
     },
-    async startScan(reason = "manual", mailboxOverride?: string) {
-      const scanRequest = await resolveScanRequest(mailboxOverride);
-      if (!scanRequest) return;
-      await runBriefScan(scanRequest, reason);
+    async startScan(_reason = "manual", _mailboxOverride?: string) {
+      // Brief 已下线：请用 AI 侧栏（organize / 需回复）完成扫描。
+      showToast("Brief scan is retired. Use the AI sidebar to organize or find mail that needs a reply.");
     },
     async openCard(cardId) {
       const card = findCard(state.cards, cardId);
@@ -3832,7 +3883,10 @@ export function useAppController() {
           timestamp,
           messages,
         };
-        const nextHistory = [entry, ...s.askHistory.filter((item) => item.conversationId !== conversationId)].slice(0, 30);
+      const nextHistory = pruneAskHistoryEntries([
+        entry,
+        ...s.askHistory.filter((item) => item.conversationId !== conversationId),
+      ]);
         persistAskHistory(nextHistory);
         return {
           ...s,
@@ -4034,6 +4088,84 @@ export function useAppController() {
       }));
       let runId = options.resumeRunId || "";
       try {
+        // 路径 B：显式 chat 意图走 Host anna.llm.stream；失败则回退 Executa start_ai_turn。
+        if (options.routingIntent === "chat" && !options.resumeRunId) {
+          try {
+            const language = prefersChinese(userRequest) ? "zh" as const : "en" as const;
+            const { chatStreamSystemPrompt, streamLlmText } = await import("../api/llmClient");
+            let streamed = "";
+            const assistantId = pendingMessage.id;
+            const text = await streamLlmText(
+              state.runtime.client,
+              [
+                { role: "system", content: chatStreamSystemPrompt(language) },
+                { role: "user", content: userRequest },
+              ],
+              {
+                maxTokens: 2048,
+                signal: generationRun.controller.signal,
+                onToken: (piece) => {
+                  if (!isCurrentGeneration()) return;
+                  streamed += piece;
+                  const snapshot = streamed;
+                  setState((s) => ({
+                    ...s,
+                    aiChatMessages: s.aiChatMessages.map((message) =>
+                      message.id === assistantId
+                        ? {
+                            ...message,
+                            content: snapshot || "…",
+                            kind: "chat" as const,
+                            pending: true,
+                          }
+                        : message,
+                    ),
+                    scanStatus: "Streaming reply...",
+                    customRunProgress: {
+                      runId: "llm_stream",
+                      question: userRequest,
+                      status: "running",
+                      stage: "chat",
+                      stageKey: "answer",
+                      progress: {},
+                      partial: {},
+                      startedAt: thinkingStartedAt,
+                    },
+                  }));
+                },
+              },
+            );
+            if (!isCurrentGeneration()) return;
+            const finalText = (text || streamed).trim() || (language === "zh" ? "（空回复）" : "(empty reply)");
+            const finalMessages: AiChatMessage[] = [
+              ...messagesWithUser,
+              {
+                id: assistantId,
+                role: "assistant",
+                content: finalText,
+                timestamp: new Date().toISOString(),
+                thinkingStartedAt,
+                kind: "chat",
+                pending: false,
+              },
+            ];
+            upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
+            setState((s) => ({
+              ...s,
+              aiChatMessages: finalMessages,
+              aiChatLoading: false,
+              isCustomScanning: false,
+              scanStatus: "",
+              customRunProgress: null,
+            }));
+            return;
+          } catch (streamError) {
+            if (generationRun.controller.signal.aborted || !isCurrentGeneration()) return;
+            // stream/complete 不可用时回退 Executa sampling 路径
+            console.warn("[llm.stream] fallback to start_ai_turn:", streamError);
+          }
+        }
+
         const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
         const scanScope = await loadScanPlanForRun(scanMailbox);
         runId = runId || `at_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -4588,26 +4720,24 @@ export function useAppController() {
     async resetAndStartScan(mailbox) {
       const normalized = normalizedMailbox(mailbox);
       if (!normalized) return;
-      const scanRequest = await resolveScanRequest(normalized);
-      if (!scanRequest) return;
-      setState((s) => ({
-        ...s,
-        isPreparingScan: true,
-        isScanning: false,
-        scanError: "",
-        scanStatus: "Preparing fresh scan...",
-        scanStepIndex: 0,
-        scanStage: "scan",
-        scanProgress: {},
-        resultFilter: "all",
-      }));
       try {
         await actions.resetMailboxScanHistory(normalized);
+        setState((s) => ({
+          ...s,
+          isPreparingScan: false,
+          isScanning: false,
+          cards: [],
+          allCards: [],
+          scanState: null,
+          cleanupBundle: null,
+          actionCount: 0,
+          scanStatus: "",
+        }));
+        showToast("Brief data cleared. Use the AI sidebar for inbox scan.");
       } catch (error) {
         setState((s) => ({ ...s, isPreparingScan: false }));
         throw error;
       }
-      await runBriefScan(scanRequest, "reset");
     },
     async deleteMailboxData(mailbox) {
       try {

@@ -8,11 +8,12 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timezone, timedelta
+from html import escape
 from typing import Any
 
 from ..domain.types import MessageLite
 from .planner import AskPlan, is_actionable_browse_request, is_needs_reply_request
-from .sampling_budget import ask_sampling_tokens
+from .sampling_budget import ask_answer_output_token_cap, ask_sampling_tokens
 
 # 自动通知 / 验证码噪声：needs-reply 与 browse 排序时降权或剔除。
 _NOISE_SENDER_MARKERS = (
@@ -36,9 +37,17 @@ _BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 # 用户未指定数量时默认返回 3 条；显式数量上限 8，避免 token 与延迟爆炸。
 _DEFAULT_ANSWER_ITEMS = 3
 _MAX_ANSWER_ITEMS = 8
-# 未指定条数时仍给模型多几封证据；指定 N 时上下文至少覆盖 N（上限 8）。
-_DEFAULT_CONTEXT_CANDIDATES = 5
+# 进入 Answer 的候选数与返回条数对齐（默认 3，上限 8），降低输入体积与截断风险。
+_DEFAULT_CONTEXT_CANDIDATES = 3
 _MAX_CONTEXT_CANDIDATES = 8
+# 紧凑渲染：正文/线程上限（needs-reply 才带 1 条短线程）；进一步压 input tokens。
+_ANSWER_BODY_LIMIT = 220
+_ANSWER_THREAD_BODY_LIMIT = 80
+_ANSWER_MAX_THREAD_MESSAGES = 1
+_ANSWER_SNIPPET_LIMIT = 120
+_ANSWER_SUBJECT_LIMIT = 120
+_ANSWER_TASK_PROMPT_LIMIT = 150
+_ANSWER_REQUEST_LIMIT = 360
 # 正文/线程 Gmail 读限并发，避免过多候选放大上下文与模型首 token 延迟。
 _CONTEXT_READ_CONCURRENCY = 4
 # 从用户话术解析「要几封」：中文「5封/找5封邮件」、英文「top 5 / 5 emails」。
@@ -60,56 +69,16 @@ _ASK_SYNTHESIS_INSTRUCTION = (
     "Do not copy email body verbatim, except for a short necessary quote or an exact subject."
 )
 # {item_limit} 由 resolve_answer_item_limit 注入；默认 3，用户指定时最高 8。
-_ASK_ANSWER_SYSTEM_PROMPT_TEMPLATE = """You are Anna, an executive email assistant. Return ONE valid JSON object only. The first non-whitespace character MUST be `{{`. No markdown fences, no commentary, no reasoning preamble, no TypeScript/schema type names.
+def parse_answer_item_limit(user_request: str) -> tuple[int, bool]:
+    """解析期望条数。
 
-Example shape (replace every value with real content from the emails; never copy the words string/array/object or trailing ?):
-{{
-  "title": "Emails awaiting your reply",
-  "summary": "Two threads look like they need a response.",
-  "sections": [
-    {{
-      "heading": "Needs reply",
-      "body": "Human senders asked a question or requested action.",
-      "items": [
-        {{
-          "subject": "exact subject from evidence",
-          "from": "exact from from evidence",
-          "context": "why this needs attention",
-          "suggestion": "what you could do next",
-          "mailbox": "provided mailbox",
-          "message_id": "provided message id",
-          "thread_id": "provided thread id",
-          "mail_links": [
-            {{
-              "label": "exact subject",
-              "mailbox": "provided mailbox",
-              "thread_id": "provided thread id",
-              "message_id": "provided message id"
-            }}
-          ]
-        }}
-      ]
-    }}
-  ]
-}}
-
-Rules:
-- Use only the supplied email evidence. Prefer real subjects/IDs from the evidence list.
-- Keep generated copy concise and in the user's language.
-- Return at most {item_limit} priority items. Keep each context and suggestion to one short sentence.
-- Do not draft replies, ask clarification questions, or claim to have read content not present in the evidence.
-- If nothing matches the request, still return valid JSON with an honest summary and empty sections/items."""
-
-
-def resolve_answer_item_limit(user_request: str) -> int:
-    """从用户请求解析期望返回的邮件条数。
-
-    未指定时默认 3；显式数字 clamp 到 [1, 8]。
-    例如「找 5 封邮件」「top 5 emails」「需要优先处理的 8 封」。
+    返回 ``(limit, explicit)``：
+    - explicit=True：用户话术里写了数字（如「5 封」「top 5」）
+    - explicit=False：走默认 3
     """
     text = str(user_request or "").strip()
     if not text:
-        return _DEFAULT_ANSWER_ITEMS
+        return _DEFAULT_ANSWER_ITEMS, False
     for pattern in _ANSWER_ITEM_COUNT_PATTERNS:
         matched = pattern.search(text)
         if not matched:
@@ -118,20 +87,36 @@ def resolve_answer_item_limit(user_request: str) -> int:
             count = int(matched.group(1))
         except (TypeError, ValueError):
             continue
-        return max(1, min(count, _MAX_ANSWER_ITEMS))
-    return _DEFAULT_ANSWER_ITEMS
+        return max(1, min(count, _MAX_ANSWER_ITEMS)), True
+    return _DEFAULT_ANSWER_ITEMS, False
+
+
+def resolve_answer_item_limit(user_request: str) -> int:
+    """从用户请求解析期望返回的邮件条数。
+
+    未指定时默认 3；显式数字 clamp 到 [1, 8]。
+    例如「找 5 封邮件」「top 5 emails」「需要优先处理的 8 封」。
+    """
+    limit, _explicit = parse_answer_item_limit(user_request)
+    return limit
 
 
 def resolve_context_candidate_limit(user_request: str) -> int:
-    """解析进入 Answer 上下文的候选上限：至少覆盖返回条数，默认 5，最高 8。"""
-    item_limit = resolve_answer_item_limit(user_request)
-    return min(_MAX_CONTEXT_CANDIDATES, max(item_limit, _DEFAULT_CONTEXT_CANDIDATES))
+    """进入 Answer 的候选上限。
+
+    - 默认：与默认 item 上限一致（3）
+    - 用户显式要 N 封：与 N 对齐（硬顶 8），不再 +2，避免 input 膨胀
+    """
+    item_limit, _explicit = parse_answer_item_limit(user_request)
+    return min(_MAX_CONTEXT_CANDIDATES, max(1, item_limit))
 
 
 def _build_answer_system_prompt(item_limit: int) -> str:
-    """按本次请求的条数上限生成 Answer system prompt。"""
+    """按本次请求的条数上限生成 Answer system prompt（prompts.py 任务隔离）。"""
+    from mail_agent.ai_turn.prompts import ask_answer_system_prompt
+
     limit = max(1, min(int(item_limit or _DEFAULT_ANSWER_ITEMS), _MAX_ANSWER_ITEMS))
-    return _ASK_ANSWER_SYSTEM_PROMPT_TEMPLATE.format(item_limit=limit)
+    return ask_answer_system_prompt(limit)
 
 
 # 兼容旧测试与外部引用：默认「最多 3 条」的 system prompt。
@@ -139,17 +124,10 @@ _ASK_ANSWER_SYSTEM_PROMPT = _build_answer_system_prompt(_DEFAULT_ANSWER_ITEMS)
 
 
 def _answer_language_instruction(user_request: str) -> str:
-    """Keep generated answer copy aligned with the user's language."""
+    """极短语言约束（省 input tokens）。"""
     if re.search(r"[\u3400-\u9fff]", user_request):
-        return (
-            "Write all generated natural-language fields in Simplified Chinese. "
-            "Keep email subjects, names, addresses, and quoted source text in their original language."
-        )
-    return (
-        "Write all generated natural-language fields in English. Do not output Chinese or another language "
-        "for generated copy. "
-        "Keep email subjects, names, addresses, and quoted source text in their original language."
-    )
+        return "lang=zh; keep subjects/names original"
+    return "lang=en; keep subjects/names original"
 
 
 def _uses_chinese(user_request: str) -> bool:
@@ -306,7 +284,7 @@ def _fmt_ts(epoch_ms: str) -> str:
 def _select_candidates_for_context(candidates: list[MessageLite], plan: AskPlan) -> list[MessageLite]:
     """按请求相关度排序并选择有限候选，避免将所有正文交给模型。"""
     # 这里是确定性本地排序，不新增 Sampling 调用；关键词仅用于缩小正文读取集合。
-    # 候选上限随用户「要几封」动态调整（默认 5，最高 8）。
+    # 候选上限随用户「要几封」动态调整（与 item_limit 对齐，默认 3，最高 8）。
     context_limit = resolve_context_candidate_limit(plan.user_request)
     needs_reply = is_needs_reply_request(plan.user_request) or plan.goal == "draft_replies"
     actionable = is_actionable_browse_request(plan.user_request) or needs_reply
@@ -474,7 +452,8 @@ async def _read_candidate_context(
             try:
                 detail = await _asyncio.to_thread(get_message_detail, source_mailbox, msg.message_id)
                 if detail:
-                    entry["body"] = (getattr(detail, "body_text", "") or "")[:1200]
+                    # 与 Answer 渲染 body 上限对齐，避免多读无用正文。
+                    entry["body"] = (getattr(detail, "body_text", "") or "")[:_ANSWER_BODY_LIMIT]
             except Exception:
                 pass
             try:
@@ -483,13 +462,13 @@ async def _read_candidate_context(
                 )
                 if thread_ctx and thread_ctx.messages:
                     entry["thread"] = []
-                    for tm in thread_ctx.messages[:3]:
+                    for tm in thread_ctx.messages[:_ANSWER_MAX_THREAD_MESSAGES]:
                         entry["thread"].append({
                             "from": getattr(tm, "from_addr", "") or "",
                             "to": getattr(tm, "to_addr", "") or "",
                             "subject": getattr(tm, "subject", "") or "",
                             "date": _fmt_ts(getattr(tm, "internal_date", "") or ""),
-                            "body": (getattr(tm, "body_text", "") or "")[:400],
+                            "body": (getattr(tm, "body_text", "") or "")[:_ANSWER_THREAD_BODY_LIMIT],
                         })
             except Exception:
                 entry["thread"] = []
@@ -506,6 +485,14 @@ async def _read_candidate_context(
 # _EXECUTION_SYSTEM_PROMPT imported from core.pipeline at module top
 
 
+def _clip_field(value: Any, limit: int) -> str:
+    """截断单字段，去掉换行以压证据体积。"""
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+
 def _render_candidates_for_llm(
     enriched: list[dict[str, Any]],
     *,
@@ -513,40 +500,219 @@ def _render_candidates_for_llm(
     thread_body_limit: int = 2000,
     max_thread_messages: int = 20,
 ) -> str:
-    """Render enriched candidates as compact text for the Answer LLM."""
-    parts: list[str] = []
+    """将候选渲染为单行紧凑证据（显著降低 input tokens）。"""
+    # 同一 mailbox 多数情况下重复；首行声明一次即可。
+    mailboxes = sorted({
+        str(e.get("mailbox") or "").strip()
+        for e in enriched
+        if str(e.get("mailbox") or "").strip()
+    })
+    lines: list[str] = []
+    if mailboxes:
+        lines.append("mb=" + ",".join(mailboxes))
     for i, e in enumerate(enriched, 1):
-        unread_label = " (UNREAD)" if e.get("unread") else ""
-        labels = [str(l) for l in (e.get("label_ids") or []) if str(l) not in ("UNREAD",)]
-        labels_str = f"  Labels: {', '.join(labels)}" if labels else ""
-        parts.append(
-            f"### Email {i}\n"
-            f"From: {e.get('from', '')}\n"
-            f"Subject: {e.get('subject', '')}{unread_label}\n"
-            f"Date: {e.get('date', '')}\n"
-            f"Mailbox: {e.get('mailbox', '')}\n"
-            f"Thread ID: {e.get('thread_id', '')}\n"
-            f"Message ID: {e.get('message_id', '')}{labels_str}"
+        unread = "1" if e.get("unread") else "0"
+        row = (
+            f"#{i}"
+            f" mid={_clip_field(e.get('message_id'), 64)}"
+            f" tid={_clip_field(e.get('thread_id'), 64)}"
+            f" u={unread}"
+            f" from={_clip_field(e.get('from'), 80)}"
+            f" subj={_clip_field(e.get('subject'), _ANSWER_SUBJECT_LIMIT)}"
+            f" date={_clip_field(e.get('date'), 24)}"
+            f" snip={_clip_field(e.get('snippet'), _ANSWER_SNIPPET_LIMIT)}"
         )
         if e.get("body") and body_limit > 0:
-            parts.append(f"Snippet: {e.get('snippet', '')}")
-            parts.append(f"Body:\n{e['body'][:body_limit]}")
-        else:
-            parts.append(f"Snippet: {e.get('snippet', '')}")
+            row += f" body={_clip_field(e.get('body'), body_limit)}"
         if e.get("thread") and thread_body_limit > 0 and max_thread_messages > 0:
-            thread_msgs = e["thread"][:max_thread_messages]
-            parts.append(f"\nThread history ({len(thread_msgs)} messages):")
-            for tm in thread_msgs:
-                parts.append(
-                    f"  [{tm.get('date', '')}] {tm.get('from', '')}: "
-                    f"{tm.get('subject', '')}\n"
-                    f"    {tm.get('body', '')[:thread_body_limit]}"
+            tm = (e.get("thread") or [])[:max_thread_messages]
+            if tm:
+                t0 = tm[0] if isinstance(tm[0], dict) else {}
+                row += (
+                    f" thr={_clip_field(t0.get('from'), 40)}|"
+                    f"{_clip_field(t0.get('body'), thread_body_limit)}"
                 )
-        # Contact context
-        if e.get("contact_context"):
-            parts.append(f"Contact context: {e['contact_context']}")
-        parts.append("")
-    return "\n".join(parts)
+        lines.append(row)
+    return "\n".join(lines)
+
+
+def _include_thread_for_answer(plan: AskPlan) -> bool:
+    """仅 needs-reply / 草稿类目标附带短线程，其它请求只靠 headers/snippet。"""
+    return (
+        is_needs_reply_request(plan.user_request)
+        or plan.goal in ("draft_replies", "check_reply_status", "summarize_threads")
+    )
+
+
+def _materialize_flat_answer_payload(payload: dict[str, Any], item_limit: int) -> dict[str, Any]:
+    """将模型扁平 items 转为下游 sections，并去掉模型侧 mail_links（由 guard 重建）。"""
+    limit = max(1, min(int(item_limit or _DEFAULT_ANSWER_ITEMS), _MAX_ANSWER_ITEMS))
+    raw_items: list[Any] = []
+    top_items = payload.get("items")
+    if isinstance(top_items, list) and top_items:
+        raw_items = top_items
+    else:
+        sections = payload.get("sections")
+        if isinstance(sections, list):
+            for section in sections:
+                if not isinstance(section, dict):
+                    continue
+                section_items = section.get("items")
+                if isinstance(section_items, list):
+                    raw_items.extend(section_items)
+
+    clean_items: list[dict[str, Any]] = []
+    for entry in raw_items[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        item = dict(entry)
+        item.pop("mail_links", None)
+        clean_items.append(item)
+
+    title = str(payload.get("title") or "").strip()
+    summary = str(payload.get("summary") or "").strip()
+    return {
+        "title": title,
+        "summary": summary,
+        "sections": (
+            [{"heading": title[:80] if title else "", "body": "", "items": clean_items}]
+            if clean_items
+            else []
+        ),
+    }
+
+
+def _local_answer_from_evidence(
+    plan: AskPlan,
+    enriched: list[dict[str, Any]],
+    *,
+    item_limit: int,
+) -> dict[str, Any]:
+    """Sampling 截断/失败且已有候选时：用证据构造可展示结果，避免整次 Ask 报错。
+
+    不编造邮件事实，仅使用候选 headers/snippet；标记 local_fallback 供诊断。
+    """
+    limit = max(1, min(int(item_limit or _DEFAULT_ANSWER_ITEMS), _MAX_ANSWER_ITEMS))
+    zh = _uses_chinese(plan.user_request)
+    rows: list[dict[str, Any]] = []
+    for entry in enriched[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        rows.append({
+            "subject": str(entry.get("subject") or ""),
+            "from": str(entry.get("from") or ""),
+            "context": _clip_field(entry.get("snippet") or entry.get("context") or "", 80)
+            or ("候选邮件" if zh else "Priority candidate"),
+            "suggestion": "请打开查看并决定是否处理。" if zh else "Open and decide next action.",
+            "mailbox": str(entry.get("mailbox") or ""),
+            "message_id": str(entry.get("message_id") or ""),
+            "thread_id": str(entry.get("thread_id") or ""),
+            "_local_fallback": True,
+        })
+    title = str(plan.title or "").strip() or ("优先邮件" if zh else "Priority emails")
+    if rows:
+        summary = (
+            f"模型输出不完整，已按检索候选列出 {len(rows)} 封供你处理。"
+            if zh
+            else f"Model output was incomplete; listed {len(rows)} candidates from search."
+        )
+    else:
+        summary = (
+            "未找到可展示的候选邮件。"
+            if zh
+            else "No candidates available to display."
+        )
+    return {
+        "title": title,
+        "summary": summary,
+        "sections": ([{"heading": title[:80], "body": "", "items": rows}] if rows else []),
+        "local_fallback": True,
+        "analysis_error": False,
+        "fallback_used": False,
+    }
+
+
+def _backfill_items_to_target(
+    payload: dict[str, Any],
+    enriched: list[dict[str, Any]],
+    *,
+    target: int,
+    user_request: str,
+) -> dict[str, Any]:
+    """用户显式要 N 条而模型少返回时，用证据列表补齐到 min(N, 证据数)。
+
+    只补已有候选上的 subject/from/id；context/suggestion 用简短占位，不编造邮件事实。
+    """
+    limit = max(1, min(int(target or _DEFAULT_ANSWER_ITEMS), _MAX_ANSWER_ITEMS))
+    sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
+    items: list[dict[str, Any]] = []
+    if sections and isinstance(sections[0], dict):
+        raw = sections[0].get("items")
+        if isinstance(raw, list):
+            items = [dict(x) for x in raw if isinstance(x, dict)]
+
+    used_ids = {
+        str(item.get("message_id") or "").strip()
+        for item in items
+        if str(item.get("message_id") or "").strip()
+    }
+    used_threads = {
+        (
+            str(item.get("mailbox") or "").strip().lower(),
+            str(item.get("thread_id") or "").strip(),
+        )
+        for item in items
+        if str(item.get("thread_id") or "").strip()
+    }
+
+    zh = _uses_chinese(user_request)
+    default_context = "进入优先列表的候选邮件。" if zh else "Included as a priority candidate."
+    default_suggestion = "请打开查看并决定是否处理。" if zh else "Open and decide next action."
+
+    for entry in enriched:
+        if len(items) >= limit:
+            break
+        if not isinstance(entry, dict):
+            continue
+        mid = str(entry.get("message_id") or "").strip()
+        tid = str(entry.get("thread_id") or "").strip()
+        mailbox = str(entry.get("mailbox") or "").strip()
+        if mid and mid in used_ids:
+            continue
+        thread_key = (mailbox.lower(), tid)
+        if tid and thread_key in used_threads:
+            continue
+        if mid:
+            used_ids.add(mid)
+        if tid:
+            used_threads.add(thread_key)
+        items.append({
+            "subject": str(entry.get("subject") or ""),
+            "from": str(entry.get("from") or ""),
+            "context": default_context,
+            "suggestion": default_suggestion,
+            "mailbox": mailbox,
+            "message_id": mid,
+            "thread_id": tid,
+            "_backfilled": True,
+        })
+
+    title = str(payload.get("title") or "").strip()
+    summary = str(payload.get("summary") or "").strip()
+    if items and len(items) > 1 and zh and "封" not in summary:
+        summary = (summary + f" 共 {len(items)} 封按优先级列出。").strip()
+    elif items and len(items) > 1 and not zh and "emails" not in summary.casefold():
+        summary = (summary + f" Showing {len(items)} emails by priority.").strip()
+
+    payload = dict(payload)
+    payload["title"] = title
+    payload["summary"] = summary
+    payload["sections"] = (
+        [{"heading": title[:80] if title else "", "body": "", "items": items[:limit]}]
+        if items
+        else []
+    )
+    return payload
 
 
 async def _generate_answer(
@@ -557,118 +723,142 @@ async def _generate_answer(
     sampling_create_message: Any = None,
     progress_callback: Any = None,
 ) -> dict[str, Any]:
-    """Run the Answer LLM on filtered, context-enriched candidates.
+    """对筛选后的候选跑 Answer LLM，并保留一次格式恢复预算。
 
-    Progressive truncation fallback: full → compact → short → headers.
+    截断 JSON 先由解析器本地闭合；无 JSON 或语法错误时仅重试一次，仍失败才走
+    本地候选列表，避免把模型格式失败暴露为整个 Ask 页面不可用。
     """
     from ..llm_runtime.service import call_llm_json_safe
 
     # 用户「找 5 封」等请求抬高 items 上限；未指定仍默认 3，硬顶 8。
-    item_limit = resolve_answer_item_limit(plan.user_request)
+    item_limit, item_limit_explicit = parse_answer_item_limit(plan.user_request)
     system_prompt = _build_answer_system_prompt(item_limit)
+    include_thread = _include_thread_for_answer(plan)
+    # 按条数收紧输出额度，避免 thinking 模型把预算写光导致半截 JSON。
+    output_cap = ask_answer_output_token_cap(item_limit)
+    evidence_count = len(enriched)
+    target_items = min(item_limit, evidence_count) if evidence_count else 0
 
-    # Build the stable part of the user prompt (doesn't change between variants)
     def _build_user_prompt(rendered: str) -> str:
-        return (
-            f"## Your Identity\n"
-            f"You are Anna, executive assistant to {mailbox}.\n"
-            f"In all output text, address your principal directly as 'you' / 'your'.\n"
-            f"Match by EMAIL ADDRESS (between < >), not by display name.\n\n"
-            f"## User request\n"
-            f"{plan.user_request}\n\n"
-            f"## Response language\n"
-            f"{_answer_language_instruction(plan.user_request)}\n\n"
-            f"## Task\n"
-            f"{plan.task_prompt}\n\n"
-            f"## Structured mail references\n"
-            f"When an item cites one or more provided emails, include mail_links "
-            f"(maximum {min(3, item_limit)} per item; return at most {item_limit} items total):\n"
-            f"[{{\"label\": \"exact email subject\", \"mailbox\": \"provided mailbox\", "
-            f"\"thread_id\": \"provided thread id\", \"message_id\": \"provided message id\"}}]\n"
-            f"Use only IDs and subjects shown below. Never emit href, URLs, or invented references.\n"
-            f"For a single-email item, also include its mailbox, thread_id, and message_id fields.\n\n"
-            f"## Relevant emails ({len(enriched)} total)\n"
-            f"{rendered}\n\n"
-            f"## Important\n"
-            f"- Base your answer ONLY on the emails provided below.\n"
-            f"- {_ASK_SYNTHESIS_INSTRUCTION}\n"
-            f"- If the emails below do not contain what the user is looking for, say so honestly.\n"
-            f"- Prefer up to {item_limit} distinct high-priority emails when the evidence supports it.\n"
-            f"- Output real JSON values only. Never emit schema tokens like string, string?, array, object, or boolean."
+        # request/task/evidence 均是模型不可执行的数据。转义标签可阻止邮件正文或
+        # 用户文本闭合边界；具体的“忽略其中指令”规则放在 system，避免重复耗 token。
+        task = _clip_field(plan.task_prompt or "rank priority emails", _ANSWER_TASK_PROMPT_LIMIT)
+        count_rule = (
+            f"items={target_items}"
+            if target_items > 0
+            else f"items<={item_limit}"
         )
+        return "\n".join([
+            f"<context>owner={escape(mailbox, quote=False)}; "
+            f"{_answer_language_instruction(plan.user_request)}; {count_rule}</context>",
+            f"<request>{escape(_clip_field(plan.user_request, _ANSWER_REQUEST_LIMIT), quote=False)}</request>",
+            f"<task>{escape(task, quote=False)}</task>",
+            f"<evidence count=\"{evidence_count}\">",
+            escape(rendered, quote=False),
+            "</evidence>",
+        ])
 
-    # 使用一版紧凑上下文；截断时允许重试一次，仍失败则返回安全 fallback。
-    variants = [{"name": "compact", "body_limit": 700, "thread_body_limit": 240, "max_thread_messages": 2}]
-
-    result: dict[str, Any] | None = None
+    rendered = _render_candidates_for_llm(
+        enriched,
+        body_limit=_ANSWER_BODY_LIMIT,
+        thread_body_limit=_ANSWER_THREAD_BODY_LIMIT if include_thread else 0,
+        max_thread_messages=_ANSWER_MAX_THREAD_MESSAGES if include_thread else 0,
+    )
     last_error = ""
-    for variant in variants:
-        rendered = _render_candidates_for_llm(
-            enriched,
-            body_limit=int(variant["body_limit"]),
-            thread_body_limit=int(variant["thread_body_limit"]),
-            max_thread_messages=int(variant["max_thread_messages"]),
-        )
-        try:
-            # 首次回答优先占用主要比例；截断重试与 JSON 修复各自保留额度，
-            # 从而避免 1800 token 的固定上限把较长结构化答案直接截断。
-            answer_tokens = ask_sampling_tokens(
+    result: dict[str, Any] | None = None
+    try:
+        answer_tokens = min(
+            ask_sampling_tokens(
                 sampling_create_message,
                 "answer",
                 reserve_for=("answer_retry", "json_repair"),
-            )
-            retry_tokens = ask_sampling_tokens(
+            ),
+            output_cap,
+        )
+        retry_tokens = min(
+            ask_sampling_tokens(
                 sampling_create_message,
                 "answer_retry",
                 reserve_for=("json_repair",),
-            )
-            json_repair_tokens = ask_sampling_tokens(
-                sampling_create_message,
-                "json_repair",
-            )
-            result = await call_llm_json_safe(
-                sampling_create_message,
-                system_prompt=system_prompt,
-                user_message=_build_user_prompt(rendered),
-                # 结构化模型回答失败时由下方返回稳定错误语义；不向用户暴露
-                # Sampling 截断或 JSON 解析等内部异常。
-                fallback={},
-                temperature=0.2,
-                max_tokens=answer_tokens,
-                timeout=45.0,
-                metadata={"tool": "ask_answer", "email_count": str(len(enriched)), "variant": variant["name"]},
-                # 交给 Host JSON mode 约束语法，避免模型把结构说明或半截文本回显为结果。
-                response_format={"type": "json_object"},
-                on_unsupported="text",
-                allow_fallback=True,
-                allow_sampling_provider_fallback=True,
-                max_attempts=2 if sampling_create_message is not None else None,
-                retry_max_tokens=retry_tokens,
-                json_repair_max_tokens=json_repair_tokens,
-            )
-            break
-        except Exception as exc:
-            last_error = str(exc)
-            if progress_callback:
-                progress_callback("evaluate", {"variant": variant["name"], "reason": last_error[:200]})
+            ),
+            output_cap,
+        )
+        json_repair_tokens = ask_sampling_tokens(sampling_create_message, "json_repair")
+        result = await call_llm_json_safe(
+            sampling_create_message,
+            system_prompt=system_prompt,
+            user_message=_build_user_prompt(rendered),
+            fallback={},
+            temperature=0.0,
+            max_tokens=answer_tokens,
+            timeout=45.0,
+            metadata={
+                "tool": "ask_answer",
+                "email_count": str(len(enriched)),
+                "variant": "compact",
+            },
+            response_format={"type": "json_object"},
+            on_unsupported="text",
+            allow_fallback=True,
+            # 纯散文没有 JSON 骨架时，短重试会附带解析失败提示；已有 JSON 骨架但
+            # 语法损坏时优先使用独立 repair 额度，避免再次执行邮件分析任务。
+            allow_sampling_provider_fallback=False,
+            allow_json_repair=True,
+            max_attempts=2,
+            retry_max_tokens=retry_tokens,
+            json_repair_max_tokens=json_repair_tokens,
+        )
+        if result and result.get("fallback_used"):
+            last_error = str(result.get("fallback_reason") or "Anna sampling failed")
+            result = None
+        elif not (result and isinstance(result.get("payload"), dict)):
+            last_error = "empty payload"
+            result = None
+    except Exception as exc:
+        last_error = str(exc)
+        result = None
+        if progress_callback:
+            progress_callback("evaluate", {"variant": "compact", "reason": last_error[:200]})
 
     if result is None:
+        # 有检索证据时优先本地列表，而不是整页报错。
+        if enriched:
+            _logger.warning("ask answer local evidence fallback: detail=%s", last_error[:300])
+            local = _local_answer_from_evidence(plan, enriched, item_limit=item_limit)
+            local["llm_meta"] = {"fallback_reason": last_error[:300], "local_fallback": True}
+            return local
         return _answer_fallback(plan, last_error or "Anna sampling failed")
-
-    if result.get("fallback_used"):
-        return _answer_fallback(
-            plan,
-            str(result.get("fallback_reason") or "Anna sampling failed"),
-        )
 
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
     if not payload:
+        if enriched:
+            return _local_answer_from_evidence(plan, enriched, item_limit=item_limit)
         return _answer_fallback(plan, "Anna returned empty analysis")
+    # 扁平 items → sections，供 guard / 前端消费。
+    payload = _materialize_flat_answer_payload(payload, item_limit)
+    # 用户明确要 N 条而模型少吐时，用证据补齐（不编造正文事实）。
+    if item_limit_explicit and target_items > 1:
+        payload = _backfill_items_to_target(
+            payload,
+            enriched,
+            target=target_items,
+            user_request=plan.user_request,
+        )
+    # 无 items 但有证据：本地补全，避免空结果页。
+    sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
+    has_items = any(
+        isinstance(sec, dict) and isinstance(sec.get("items"), list) and sec.get("items")
+        for sec in sections
+    )
+    if not has_items and enriched:
+        payload = _local_answer_from_evidence(plan, enriched, item_limit=item_limit)
     # 英文请求若模型生成文案混入中文：优先 scrub 保留结构，避免整份答案被丢弃。
     if not _uses_chinese(plan.user_request) and _generated_copy_contains_chinese(payload):
         _logger.warning("ask answer scrubbed Chinese generated copy for English request")
         payload = _scrub_chinese_generated_copy(payload, plan)
-        if _generated_copy_contains_chinese(payload):
+        if _generated_copy_contains_chinese(payload) and enriched:
+            payload = _local_answer_from_evidence(plan, enriched, item_limit=item_limit)
+        elif _generated_copy_contains_chinese(payload):
             return _answer_fallback(
                 plan,
                 "Anna returned Chinese generated copy for an English request",
@@ -1105,7 +1295,10 @@ async def run_ask_pipeline(
 
 # ── Ask item draft generation ─────────────────────────────────────────
 
-_ASK_DRAFT_SYSTEM = """You are Anna, an executive email assistant. Generate a professional, concise email reply. Use the user's answers to the clarifying questions to fill in the details they provided. Do NOT make up information beyond what the user told you."""
+def _ask_draft_system() -> str:
+    """Ask 条目草稿 system（短、任务隔离）。"""
+    from mail_agent.ai_turn.prompts import ask_item_draft_system_prompt
+    return ask_item_draft_system_prompt()
 
 
 async def generate_ask_item_draft(
@@ -1140,9 +1333,11 @@ async def generate_ask_item_draft(
     # Format user answers
     answers_text = "\n".join(f"Q: {q}\nA: {a}" for q, a in user_answers.items() if a.strip())
 
+    from mail_agent.ai_turn.prompts import ask_item_draft_system_prompt
+
     result = await call_llm_json_safe(
         sampling_create_message,
-        system_prompt=_ASK_DRAFT_SYSTEM,
+        system_prompt=ask_item_draft_system_prompt(),
         user_message=(
             f"## Original email\n"
             f"From: {from_addr}\n"

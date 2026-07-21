@@ -47,6 +47,45 @@ async def test_thread_assist_refuses_raw_mail_fallback() -> None:
     print("[PASS] test_thread_assist_refuses_raw_mail_fallback")
 
 
+async def test_thread_assist_retries_truncated_json_with_larger_budget() -> None:
+    """概览首次 JSON 截断时，应以更大输出额度重试而非直接报不可用。"""
+    import anna_inbox_executa.v2_tools as tools
+
+    calls: list[dict[str, object]] = []
+
+    async def truncated_then_complete_sampling(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {"content": {"type": "text", "text": '{"overview":"The sender asks'}}
+        return {
+            "content": {
+                "type": "text",
+                "text": (
+                    '{"overview":"The sender asks you to confirm the delivery date.",'
+                    '"quick_replies":[{"id":"confirm","label":"Confirm date",'
+                    '"intent":"Draft a reply confirming the delivery date."},'
+                    '{"id":"ask","label":"Ask details",'
+                    '"intent":"Draft a reply asking for delivery details."}]}'
+                ),
+            }
+        }
+
+    with patch.object(tools, "_load_thread_messages", return_value=[_message(1, body_text="Please confirm the delivery date.")]):
+        result = await tools._generate_thread_assist_result(
+            "user@example.com",
+            "thread-1",
+            "m1",
+            "m1",
+            truncated_then_complete_sampling,
+        )
+
+    assert result["overview"] == "The sender asks you to confirm the delivery date."
+    assert len(result["quick_replies"]) == 2
+    assert [int(call["max_tokens"]) for call in calls] == [768, 1024]
+    assert all(call["response_format"] == {"type": "json_object"} for call in calls)
+    print("[PASS] test_thread_assist_retries_truncated_json_with_larger_budget")
+
+
 def main() -> None:
     import anna_inbox_executa.common as common
     import anna_inbox_executa.v2_tools as tools
@@ -270,6 +309,7 @@ def main() -> None:
     assert all(not item.get("body_html") for item in fitted["result"]["data"]["messages"])
 
     asyncio.run(test_thread_assist_refuses_raw_mail_fallback())
+    asyncio.run(test_thread_assist_retries_truncated_json_with_larger_budget())
 
     print("PASS inbox thread response budget tests")
 

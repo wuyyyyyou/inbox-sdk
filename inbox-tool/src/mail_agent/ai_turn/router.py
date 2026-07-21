@@ -44,13 +44,15 @@ _BATCH_REQUIRED_TOOLS = frozenset({
 # Router 仅输出一个极小 JSON 计划。固定 150 tokens 足够覆盖三步工具计划，
 # 并避免路由阶段挤占后续检索、分析和回答的输出预算。
 _ROUTER_MAX_OUTPUT_TOKENS = 150
-# Router 的系统提示词与动态上下文合计控制在约 500 tokens。这里采用保守估算：
-# 汉字按 1 token、ASCII 单词按约 4 字符，宁可少传上下文也不让路由请求膨胀。
-_ROUTER_INPUT_TOKEN_BUDGET = 500
+# Router 的总输入必须低于 500 tokens。这里额外预留 20 tokens 给估算误差，
+# 宁可裁掉旧摘要，也不让 Router 挤占后续检索和回答阶段的上下文。
+_ROUTER_INPUT_TOKEN_BUDGET = 480
 # call_llm_json_safe 会在 user message 末尾追加 JSON-only 约束。该固定文本不属于
 # 动态上下文，但仍会进入模型输入，因此提前预留额度以保证总输入不超过目标。
 # 当前 JSON-only 后缀实测约 51 tokens，预留 55 留出估算余量。
 _ROUTER_JSON_PROTOCOL_TOKEN_OVERHEAD = 55
+# 瞬时 Sampling 失败时最多尝试 2 次，再进入确定性 fallback。
+_ROUTER_SAMPLING_MAX_ATTEMPTS = 2
 # Router 提示词与其它 Sampling 提示词统一集中在 prompts.py，避免协议约束散落。
 _ROUTER_SYSTEM = router_system_prompt()
 
@@ -83,8 +85,9 @@ def _selected_threads_count(ui_context: dict[str, Any]) -> int:
 def _has_inbox_search_intent(user_text: str) -> bool:
     """识别明确的全邮箱检索请求，避免 Router 将其错误降级为普通聊天。
 
-    该判断只用于覆盖 ``chat_general``：用户明确要求查找、搜索、列举未读或紧急
-    邮件时，必须进入 ``search_mail``，由 Ask 管线返回经过候选校验的邮件链接。
+    该判断只用于覆盖 ``chat_general``：用户明确要求查找、搜索、列举未读/紧急
+    邮件或找出待自己回复的邮件时，必须进入 ``search_mail``，由 Ask 管线返回
+    经过候选校验的邮件链接。
     写信、改稿等非聊天工具不会被这里改写，仍由结构化 Router 处理。
     """
     lowered = (user_text or "").casefold()
@@ -92,6 +95,8 @@ def _has_inbox_search_intent(user_text: str) -> bool:
         token in lowered
         for token in (
             "find", "search", "inbox", "email", "mail", "urgent", "unread", "invoice",
+            "needs my reply", "need my reply", "awaiting my reply", "waiting for my reply",
+            "等我回复", "待我回复", "需要我回复", "谁在等我",
             "找", "搜索", "收件箱", "邮件", "未读", "紧急", "发票",
         )
     )
@@ -288,13 +293,8 @@ def _fast_local_route(user_text: str, ui_context: dict[str, Any]) -> dict[str, A
     """
     lowered = (user_text or "").casefold().strip()
     has_thread = _has_thread(ui_context)
-    explicit_inbox_search = any(
-        token in lowered
-        for token in (
-            "find", "search", "inbox", "urgent", "unread", "invoice",
-            "找", "搜索", "收件箱", "未读", "紧急", "发票",
-        )
-    )
+    # 复用同一意图判断，避免快速路径和 fallback 各自维护关键词导致待回复邮件误入聊天。
+    explicit_inbox_search = _has_inbox_search_intent(user_text)
     thread_action = has_thread and any(
         token in lowered
         for token in ("summar", "总结", "概括", "this email", "this thread", "这封", "待办", "reply", "回复", "起草")
@@ -307,11 +307,12 @@ def _fast_local_route(user_text: str, ui_context: dict[str, Any]) -> dict[str, A
 
 
 def _route_for_user_selected_intent(user_text: str, ui_context: dict[str, Any]) -> dict[str, Any] | None:
-    """把澄清弹层中的显式用户选择转换为稳定的白名单执行计划。
+    """把界面中的显式用户选择转换为稳定的白名单执行计划。
 
-    这里不是根据关键词猜测意图：用户已在界面主动选择访问范围，继续让 Router
-    模型二次判断会导致同一个选择反复进入澄清。仅映射范围级计划；邮件内容的
-    检索、排序和生成仍由后续白名单工具与模型完成。
+    来源包括：Router 澄清弹层、侧栏 starter 快捷按钮。这里不是根据关键词猜测
+    意图：用户已在界面主动选定范围或任务类型，继续让 Router 模型二次判断会
+    导致同一选择反复进入澄清或误落到 chat_general。仅映射范围级计划；邮件
+    内容的检索、排序和生成仍由后续白名单工具与模型完成。
     """
     intent = str(ui_context.get("routing_intent") or "").strip()
     language = "zh" if _uses_chinese(user_text) else "en"
@@ -324,6 +325,17 @@ def _route_for_user_selected_intent(user_text: str, ui_context: dict[str, Any]) 
             "router_fallback": False,
             "router_user_selected": True,
             "router_reason": "user_selected_inbox",
+        }
+    if intent == "organize":
+        # 侧栏「整理收件箱」starter：只提议动作，不直接变更 Gmail 状态。
+        return {
+            "language": language,
+            "use_current_thread": False,
+            "clarify": None,
+            "steps": [{"tool": "propose_inbox_actions", "params": {}}],
+            "router_fallback": False,
+            "router_user_selected": True,
+            "router_reason": "user_selected_organize",
         }
     if intent == "chat":
         return {
@@ -566,7 +578,8 @@ async def route_ai_turn(
             on_unsupported="text",
             allow_fallback=False,
             allow_sampling_provider_fallback=True,
-            max_attempts=1,
+            # 瞬时 SamplingError / 空响应时重试一次，再走本地 fallback。
+            max_attempts=_ROUTER_SAMPLING_MAX_ATTEMPTS,
         )
     except Exception as exc:
         return _fallback_route(user_text, context, f"router_error:{type(exc).__name__}")

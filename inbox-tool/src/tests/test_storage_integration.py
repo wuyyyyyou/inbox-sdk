@@ -367,54 +367,7 @@ async def main():
     backfilled_memory = await get_contact_memory("test@example.com", "alice@x.com")
     check("contact memory backfills active cards", backfilled.get("backfilled") == 1 and backfilled_memory is not None)
     await clear_memory(["test@example.com"])
-    from mail_agent.core.pipeline import _persist_run_results
-    from mail_agent.domain.types import CandidateItem, FinalDecision, JudgmentResult, MessageLite
-
-    persisted_msg = MessageLite(
-        message_id="msg_persist_memory",
-        thread_id="thread_persist_memory",
-        from_addr="Bob <bob@x.com>",
-        to_addr="test@example.com",
-        subject="Investor follow-up",
-        snippet="Can you send the deck?",
-        internal_date="1780000000000",
-    )
-    persisted_candidate = CandidateItem(
-        candidate_id="cand_persist_memory",
-        kind="reply_required_possible",
-        message_ids=["msg_persist_memory"],
-        thread_id="thread_persist_memory",
-        evidence={"from": "Bob <bob@x.com>", "subject": "Investor follow-up", "snippet": "Can you send the deck?"},
-        priority_hint="high",
-        read_depth_required="message_detail",
-        source="rule",
-    )
-    persisted_judgment = JudgmentResult(
-        candidate_id="cand_persist_memory",
-        final_decision=FinalDecision(
-            display_bucket="Reply",
-            priority="high",
-            should_show_in_main_result=True,
-            user_facing_summary="Bob asks for the deck",
-            user_facing_reason="Bob is waiting for materials.",
-            user_facing_recommendation="Send the deck.",
-            user_action="reply",
-        ),
-        confidence=0.9,
-    )
-    await _persist_run_results(
-        run_id="run_persist_memory",
-        mailbox="test@example.com",
-        messages=[persisted_msg],
-        candidates=[persisted_candidate],
-        judgments=[persisted_judgment],
-        strategy_mode="default_secretary",
-        user_request="test persist memory",
-        mode="auto",
-        sampling_create_message=None,
-    )
-    persisted_memory = await get_contact_memory("test@example.com", "bob@x.com")
-    check("persist run writes contact memory for generated card", persisted_memory is not None and len(persisted_memory.threads) == 1)
+    # Brief pipeline / _persist_run_results 已下线，contact memory 改由侧栏与线程事件写入。
 
     # ── Summary ──
     print(f"\n{'='*50}")

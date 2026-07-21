@@ -1,24 +1,30 @@
-"""Mail agent pipeline orchestrator."""
+"""Ask / custom-scan 编排（Brief 管线已下线）。
+
+仅保留 `run_custom_scan`：搜邮件 → 按需读 → 一次 LLM → 结构化答案。
+不走 phase1 / judgment / Attention Cards。
+"""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import math
-import sys
-import time
 from collections.abc import Callable
-from dataclasses import asdict
 from datetime import datetime, timezone, timedelta
 from typing import Any
+
+from .plan import create_run_id
+from .scan import run_mail_scan
+from ..domain.types import CustomScanPlan
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
 _logger = logging.getLogger(__name__)
 
+ProgressCallback = Callable[[str, dict[str, Any]], None]
+_storage_available: bool | None = None
+
 
 def _fmt_ts(epoch_ms: str) -> str:
-    """Convert Gmail internalDate (epoch ms string) to human-readable Beijing time."""
+    """将 Gmail internalDate（epoch 毫秒字符串）转为北京时间可读文本。"""
     if not epoch_ms:
         return ""
     try:
@@ -27,48 +33,9 @@ def _fmt_ts(epoch_ms: str) -> str:
     except (ValueError, TypeError, OSError):
         return epoch_ms
 
-from .candidate import generate_candidates
-from .context import read_candidate_context
-from .phase1 import run_phase1_batch_classify
-from .guards import apply_rule_guards
-from ..planning.intent import parse_intent
-from ..judgment_engine.service import (
-    build_anna_single_judgment_prompt,
-    create_fallback_judgment,
-    evaluate_item,
-    evaluate_items_batch,
-)
-from ..llm_runtime.service import call_llm_json_safe as _call_llm_json_safe
-from .plan import create_run_id, generate_action_plan
-from .scan import build_scan_plan, run_mail_scan
-from ..planning.strategies import get as get_strategy
-from ..domain.types import (
-    ActionPlan,
-    CustomScanPlan,
-    MailTaskInput,
-    MailTaskPlan,
-    MailboxProfile,
-)
-
-ProgressCallback = Callable[[str, dict[str, Any]], None]
-EVALUATE_CONCURRENCY = 2  # maxCalls=8 per invoke; 2 main + retries within limit
-_PERSIST_LOCKS: dict[str, asyncio.Lock] = {}
-
-# Storage integration (lazy import to avoid circular deps at module level)
-_storage_available: bool | None = None
-
-
-def _apply_incremental_window(scan_plan: dict[str, Any], last_internal_date: str) -> None:
-    """为增量扫描设置 stop_at_internal_date，避免重复扫描已处理的旧邮件。"""
-    if not last_internal_date:
-        return
-    queries = scan_plan.get("queries") if isinstance(scan_plan.get("queries"), list) else []
-    for query in queries:
-        if isinstance(query, dict):
-            query["stop_at_internal_date"] = last_internal_date
-
 
 def _storage_ready() -> bool:
+    """惰性检测存储层是否可用。"""
     global _storage_available
     if _storage_available is None:
         try:
@@ -88,562 +55,10 @@ def _report_progress(
         progress_callback(stage, progress)
 
 
-def _dedupe_by_thread(messages: list[Any]) -> list[Any]:
-    """每个线程保留一条消息，优先级：最新 INBOX > 最新 DRAFT > 丢弃。
-
-    纯 SENT 线程（用户发出但无回复）直接丢弃——用户已处理过，不需要提醒。
-    DRAFT 仅在没有 INBOX 时保留——表示用户开始写但未发送。
-
-    Gmail 一个 thread 下同时包含 INBOX（收件）和 SENT（发件）消息，
-    旧的按时间戳去重会让用户自己的 SENT 回复覆盖掉对方的最新 INBOX。
-    """
-    from collections import defaultdict
-
-    thread_msgs: dict[str, list[Any]] = defaultdict(list)
-    for m in messages:
-        tid = m.thread_id or m.message_id
-        thread_msgs[tid].append(m)
-
-    def _max_by_date(msgs: list[Any]) -> Any:
-        return max(msgs, key=lambda m: int(getattr(m, 'internal_date', '0') or 0))
-
-    result: list[Any] = []
-    for msgs in thread_msgs.values():
-        inbox_msgs = [m for m in msgs if 'INBOX' in (getattr(m, 'label_ids', None) or [])]
-        draft_msgs = [m for m in msgs if 'DRAFT' in (getattr(m, 'label_ids', None) or [])]
-
-        if inbox_msgs:
-            result.append(_max_by_date(inbox_msgs))
-        elif draft_msgs:
-            result.append(_max_by_date(draft_msgs))
-        # else: 纯 SENT → 丢弃
-
-    return result
-
-
-def _thread_latest_is_from_owner(mailbox: str, thread_id: str, owner_email: str) -> bool | None:
-    """通过 Gmail API 检查线程最新一封是否来自用户本人（即已回复过）。
-
-    返回 True=已回复, False=未回复, None=检查失败（超时/网络错误）。
-    """
-    import re
-    import urllib.parse
-    import urllib.request
-    from ..mail_providers.gmail.adapter import get_access_token, GMAIL_API_BASE
-
-    try:
-        token = get_access_token(mailbox)
-        path = f"/users/me/threads/{urllib.parse.quote(thread_id, safe='')}"
-        url = GMAIL_API_BASE + path + "?fields=messages(id,internalDate,payload/headers)"
-        req = urllib.request.Request(
-            url,
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-            method="GET",
-        )
-        with urllib.request.urlopen(req, timeout=15) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except Exception as exc:
-        _logger.warning("thread_latest_is_from_owner failed for thread %s: %s", thread_id, exc)
-        return None
-
-    messages = data.get("messages") or []
-    if not messages:
-        return False
-
-    latest = max(messages, key=lambda m: int(m.get("internalDate", "0") or 0))
-    headers = (latest.get("payload") or {}).get("headers") or []
-
-    from_addr = ""
-    for h in headers:
-        if (h.get("name") or "").lower() == "from":
-            from_addr = h.get("value") or ""
-            break
-
-    match = re.search(r"<([^>]+)>", from_addr)
-    if match:
-        from_addr = match.group(1)
-
-    return from_addr.strip().lower() == (owner_email or "").strip().lower()
-
-
-async def _get_scan_plan_config(mailbox: str) -> Any | None:
-    """读取用户的扫描计划配置。无配置或存储不可用时返回 None。"""
-    if not _storage_ready():
-        return None
-    try:
-        from ..storage.ops import get_scan_plan
-        return await get_scan_plan(mailbox)
-    except Exception:
-        return None
-
-
-async def run_mail_task(
-    input_: MailTaskInput,
-    *,
-    sampling_create_message: Any,
-    primary_count: int = 20,
-    progress_callback: ProgressCallback | None = None,
-    skip_contact_memory: bool = False,
-) -> ActionPlan:
-    """Run the full mail agent pipeline."""
-    run_id = create_run_id()
-
-    _t_total = time.time()
-    _t = _t_total
-
-    def _tick(label: str) -> None:
-        nonlocal _t
-        now = time.time()
-        sys.stderr.write(f"[pipeline] ⏱ {label}: +{int((now - _t) * 1000)}ms (total {int((now - _t_total) * 1000)}ms)\n")
-        sys.stderr.flush()
-        _t = now
-
-    sys.stderr.write(f"[pipeline] ⏱ START mailbox={input_.mailbox_id} run_id={run_id}\n")
-    sys.stderr.flush()
-    _tick("begin")
-
-    _report_progress(progress_callback, "parse_intent")
-    task_plan = await parse_intent(input_, sampling_create_message)
-    _tick("parse_intent")
-
-    strategy = get_strategy(task_plan.strategy_mode)
-    if not strategy:
-        raise ValueError(f"Unknown strategy mode: {task_plan.strategy_mode}")
-
-    mailbox_profile = MailboxProfile(mailbox_id=input_.mailbox_id, owner=input_.mailbox_id)
-
-    import re as _re
-
-    # Read scan state and user config
-    last_message_internal_date = ""
-    is_first_scan = True
-    if _storage_ready():
-        try:
-            from ..storage.ops import get_scan_state as _gss
-            _st = await _gss(input_.mailbox_id)
-            last_message_internal_date = _st.last_message_internal_date
-            is_first_scan = _st.total_scans == 0
-        except Exception:
-            pass
-
-    scan_plan_config = await _get_scan_plan_config(input_.mailbox_id)
-
-    max_threads = scan_plan_config.max_messages if scan_plan_config else 100
-    scan_window_days = scan_plan_config.scan_window_days if scan_plan_config else 7
-
-    # Quick Gmail connectivity check (platform only; skip in local dev)
-    import os as _os, sys as _sys
-    _on_platform = bool(getattr(_sys, "_MEIPASS", "") or _os.environ.get("GMAIL_ACCESS_TOKEN") or _os.environ.get("GOOGLE_ACCESS_TOKEN"))
-    if _on_platform:
-        _report_progress(progress_callback, "scan", stage="gmail_check")
-        try:
-            from ..mail_providers.gmail.adapter import get_access_token, GMAIL_API_BASE
-            import urllib.request as _ur
-            _token = get_access_token(input_.mailbox_id)
-            _req = _ur.Request(
-                f"{GMAIL_API_BASE}/users/me/profile",
-                headers={"Authorization": f"Bearer {_token}", "Accept": "application/json"},
-                method="GET",
-            )
-            with _ur.urlopen(_req, timeout=8) as _resp:
-                _profile = json.loads(_resp.read().decode("utf-8"))
-            _logger.info("gmail_check ok: %s", _profile.get("emailAddress"))
-        except Exception as _exc:
-            _logger.warning("gmail_check failed: %s", _exc)
-            raise RuntimeError(f"Gmail connection failed — check your token or network. ({_exc})") from _exc
-
-    _report_progress(progress_callback, "scan", max_messages=max_threads, scan_window_days=scan_window_days)
-    _logger.info("scan started: mailbox=%s max_threads=%s scan_window_days=%s first=%s after_ts=%s",
-                 input_.mailbox_id, max_threads, scan_window_days, is_first_scan, last_message_internal_date[:20])
-    messages = await run_mail_scan(
-        input_.mailbox_id, max_threads,
-        newer_than_days=scan_window_days,
-        after_timestamp="" if is_first_scan else last_message_internal_date,
-        progress_callback=progress_callback,
-    )
-    _report_progress(progress_callback, "scan_done", scanned=len(messages), max_messages=max_threads)
-    _logger.info("scan done: %d messages fetched", len(messages))
-
-    # ── Storage: filter already-processed messages ─────────────────
-    all_message_ids = [m.message_id for m in messages if m.message_id]
-    new_message_ids = all_message_ids
-    if _storage_ready() and all_message_ids:
-        from ..storage.ops import filter_unprocessed
-        new_message_ids = await filter_unprocessed(input_.mailbox_id, all_message_ids)
-        skipped = len(all_message_ids) - len(new_message_ids)
-        _report_progress(
-            progress_callback,
-            "storage_filter",
-            total=len(all_message_ids),
-            new=len(new_message_ids),
-            skipped=skipped,
-            partial={
-                "brief_debug": {
-                    "total_scanned_ids": len(all_message_ids),
-                    "skipped_processed": skipped,
-                    "new_after_processed": len(new_message_ids),
-                }
-            },
-        )
-        _logger.info("storage_filter: %d total, %d new, %d skipped", len(all_message_ids), len(new_message_ids), skipped)
-    new_id_set = set(new_message_ids)
-    new_messages = [m for m in messages if m.message_id in new_id_set]
-
-    new_messages = _dedupe_by_thread(new_messages)
-    _report_progress(progress_callback, "thread_dedup", before=len(new_id_set), after=len(new_messages))
-    _logger.info("thread_dedup: %d messages → %d after dedup", len(new_id_set), len(new_messages))
-
-    # ── Phase 1: classify BEFORE thread check ──
-    # Gmail thread checks are expensive (1 API call per thread).  Run phase1
-    # first to narrow 200 messages → ~20-50 candidates, then only check those.
-    _report_progress(progress_callback, "phase1", scanned=len(new_messages))
-    _logger.info("phase1 started: %d messages to classify", len(new_messages))
-    phase1_result = await run_phase1_batch_classify(new_messages, strategy, mailbox_profile, sampling_create_message)
-    candidates = phase1_result["candidates"]
-    low_value_items = phase1_result["low_value_items"]
-    _report_progress(
-        progress_callback,
-        "phase1_done",
-        scanned=len(messages),
-        candidates=len(candidates),
-        low_value=len(low_value_items),
-        partial={
-            "brief_debug": {
-                "candidates": len(candidates),
-                "low_value": len(low_value_items),
-            }
-        },
-    )
-    _tick(f"phase1_done candidates={len(candidates)}")
-    _logger.info("phase1 done: %d candidates, %d low_value", len(candidates), len(low_value_items))
-
-    # ── Thread reply check (only for candidate threads, not all messages) ──
-    candidate_tids: set[str] = {c.thread_id for c in candidates if c.thread_id}
-    already_replied_count = 0
-    check_timeouts = 0
-    filtered_candidates: list[Any] = []
-    tid_to_candidate = {c.thread_id: c for c in candidates if c.thread_id}
-    for i, tid in enumerate(candidate_tids, start=1):
-        _report_progress(progress_callback, "check_replied", current=i, total=len(candidate_tids))
-        try:
-            result = _thread_latest_is_from_owner(input_.mailbox_id, tid, input_.mailbox_id)
-            if result is None:
-                check_timeouts += 1
-            elif result:
-                already_replied_count += 1
-                try:
-                    from ..contact_memory.indexer import ingest_thread_observation
-                    c = tid_to_candidate[tid]
-                    await ingest_thread_observation(
-                        input_.mailbox_id,
-                        tid,
-                        c.evidence.get("from", ""),
-                        c.evidence.get("subject", ""),
-                        sampling_create_message=sampling_create_message,
-                        source="gmail_scan",
-                        user_action="owner_replied",
-                    )
-                except Exception:
-                    pass
-                continue
-        except Exception:
-            _logger.warning("check_replied error for thread %s, keeping candidate", tid)
-            check_timeouts += 1
-        filtered_candidates.append(tid)
-    candidates = [c for c in candidates if (c.thread_id or "") in set(filtered_candidates)]
-    _tick(f"already_replied_filter filtered={already_replied_count} timeouts={check_timeouts}")
-    _logger.info("already_replied_filter: %d filtered (already replied), %d timeouts, %d candidates remaining",
-                 already_replied_count, check_timeouts, len(candidates))
-    _report_progress(
-        progress_callback,
-        "already_replied_filter",
-        filtered=already_replied_count,
-        remaining=len(candidates),
-        timeout=check_timeouts,
-    )
-
-    contexts = []
-    for index, candidate in enumerate(candidates, start=1):
-        _report_progress(progress_callback, "read_context", current=index, total=len(candidates))
-        ctx = await read_candidate_context(input_.mailbox_id, candidate)
-        try:
-            from ..contact_memory.retriever import contact_email_from_header, format_contact_context_for_prompt, retrieve_contact_context
-            from ..contact_memory.types import ContactMemoryQuery
-            contact_context = await retrieve_contact_context(ContactMemoryQuery(
-                mailbox=input_.mailbox_id,
-                contact_email=contact_email_from_header(str(candidate.evidence.get("from", ""))),
-                current_subject=str(candidate.evidence.get("subject", "")),
-                current_body=str(candidate.evidence.get("snippet", "")),
-                current_thread_id=candidate.thread_id,
-                purpose="card_generation",
-            ), sampling_create_message=sampling_create_message)
-            rendered_contact_context = format_contact_context_for_prompt(contact_context)
-            if rendered_contact_context != "No relevant contact memory.":
-                ctx.contact_context = rendered_contact_context
-        except Exception:
-            pass
-        contexts.append(ctx)
-    _tick(f"read_context_done candidates={len(contexts)}")
-    _report_progress(progress_callback, "read_context_done", total=len(contexts))
-    _logger.info("read_context done: %d candidates", len(contexts))
-
-    # Load snooze preferences once for both evaluation paths
-    snooze_prefs = None
-    if _storage_ready():
-        try:
-            from ..storage.ops import get_user_prefs
-            prefs = await get_user_prefs()
-            snooze_prefs = prefs.snooze
-        except Exception:
-            snooze_prefs = None
-
-    _tick(f"eval_start calls={len(contexts)}")
-    if sampling_create_message is not None and contexts:
-        # Concurrent Anna evaluation — same semaphore pattern as DashScope path.
-        # Each evaluate_item_single call issues one sampling/createMessage RPC.
-        # 4 concurrent calls fit within the invoke's maxCalls=8 grant.
-        ann_sem = asyncio.Semaphore(EVALUATE_CONCURRENCY)
-        ann_progress_lock = asyncio.Lock()
-        ann_evaluated = 0
-        ann_succeeded = 0
-        ann_fallback = 0
-
-        async def _ann_evaluate_one(index: int, ctx: Any) -> Any:
-            nonlocal ann_evaluated, ann_succeeded, ann_fallback
-            _ev_start = time.time()
-            async with ann_sem:
-                sys.stderr.write(f"[pipeline] ⏱ eval #{index}/{len(contexts)} enter sem\n")
-                sys.stderr.flush()
-                _report_progress(
-                    progress_callback, "evaluate",
-                    current=index, total=len(contexts),
-                    evaluated=ann_evaluated, succeeded=ann_succeeded, fallback=ann_fallback,
-                    concurrency=EVALUATE_CONCURRENCY, mode="anna_concurrent",
-                )
-                try:
-                    prompt = build_anna_single_judgment_prompt(task_plan, strategy, mailbox_profile, ctx, snooze_prefs)
-                    result = await _call_llm_json_safe(
-                        sampling_create_message,
-                        system_prompt="You are a strict JSON generator. Output ONLY valid JSON — no explanation, no markdown, no code fences.",
-                        user_message=prompt,
-                        fallback={},
-                        temperature=0.1,
-                        max_tokens=8000,
-                        timeout=120.0,
-                        metadata={"tool": "evaluate_item_single", "strategy_mode": strategy.id, "candidate_count": "1"},
-                        allow_fallback=True,
-                        allow_sampling_provider_fallback=False,
-                        max_attempts=2,
-                    )
-                    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
-                    if not payload or result.get("fallback_used"):
-                        raise ValueError(result.get("fallback_reason") or "empty or fallback Anna sampling response")
-                    from ..judgment_engine.service import _parse_compact_batch_item as _parse
-                    judgment = _parse(payload, strategy)
-                    judgment = apply_rule_guards(judgment, strategy)
-                except Exception as exc:
-                    judgment = create_fallback_judgment(
-                        ctx.candidate.candidate_id, strategy,
-                        f"evaluation failed: {type(exc).__name__}: {exc}",
-                    )
-                async with ann_progress_lock:
-                    ann_evaluated += 1
-                    if getattr(judgment, "mode_judgment", None) and isinstance(judgment.mode_judgment, dict) and "fallback_reason" in judgment.mode_judgment:
-                        ann_fallback += 1
-                    else:
-                        ann_succeeded += 1
-                    _report_progress(
-                        progress_callback, "evaluate",
-                        current=index, total=len(contexts),
-                        evaluated=ann_evaluated, succeeded=ann_succeeded, fallback=ann_fallback,
-                        concurrency=EVALUATE_CONCURRENCY, mode="anna_concurrent",
-                    )
-                sys.stderr.write(f"[pipeline] ⏱ eval #{index}/{len(contexts)} done: {int((time.time() - _ev_start) * 1000)}ms\n")
-                sys.stderr.flush()
-                return judgment
-
-        judgments = await asyncio.gather(*(_ann_evaluate_one(i, ctx) for i, ctx in enumerate(contexts, start=1)))
-        _tick("eval_all_done")
-        _report_progress(progress_callback, "evaluate_done", total=len(judgments), evaluated=len(judgments), mode="anna_concurrent")
-        _report_progress(progress_callback, "plan", judgments=len(judgments))
-
-        if _storage_ready():
-            try:
-                _tick("persist_start")
-                await _persist_run_results(
-                    run_id=run_id,
-                    mailbox=input_.mailbox_id,
-                    messages=messages,
-                    candidates=candidates,
-                    judgments=judgments,
-                    strategy_mode=task_plan.strategy_mode,
-                    user_request=input_.user_request,
-                    mode=input_.mode if hasattr(input_, 'mode') else "auto",
-                    low_value_items=low_value_items,
-                    sampling_create_message=sampling_create_message,
-                    skip_contact_memory=skip_contact_memory,
-                )
-                _tick("persist_done")
-                _report_progress(progress_callback, "storage_saved")
-            except Exception as exc:
-                _report_progress(progress_callback, "storage_error", reason=str(exc)[:200])
-
-        _tick("plan_start")
-        result = generate_action_plan(run_id, task_plan, judgments)
-        _tick("all_done (anna path)")
-        return result
-
-    semaphore = asyncio.Semaphore(EVALUATE_CONCURRENCY)
-    progress_lock = asyncio.Lock()
-    evaluated_count = 0
-    succeeded_count = 0
-    fallback_count = 0
-
-    def _is_fallback(judgment: Any) -> bool:
-        """Detect fallback judgments created by create_fallback_judgment."""
-        mode = getattr(judgment, "mode_judgment", None)
-        return isinstance(mode, dict) and "fallback_reason" in mode
-
-    async def _evaluate_one(index: int, ctx: Any) -> Any:
-        nonlocal evaluated_count, succeeded_count, fallback_count
-        async with semaphore:
-            _report_progress(
-                progress_callback,
-                "evaluate",
-                current=index,
-                total=len(contexts),
-                evaluated=evaluated_count,
-                succeeded=succeeded_count,
-                fallback=fallback_count,
-                concurrency=EVALUATE_CONCURRENCY,
-            )
-            try:
-                judgment = await evaluate_item(
-                    task_plan=task_plan,
-                    strategy=strategy,
-                    mailbox_profile=mailbox_profile,
-                    candidate_context=ctx,
-                    sampling_create_message=sampling_create_message,
-                    snooze_prefs=snooze_prefs,
-                )
-                judgment = apply_rule_guards(judgment, strategy)
-            except Exception as exc:
-                from ..judgment_engine.service import create_fallback_judgment
-                judgment = create_fallback_judgment(
-                    ctx.candidate.candidate_id,
-                    strategy,
-                    f"evaluation failed: {type(exc).__name__}: {exc}",
-                )
-            async with progress_lock:
-                evaluated_count += 1
-                if _is_fallback(judgment):
-                    fallback_count += 1
-                else:
-                    succeeded_count += 1
-                _report_progress(
-                    progress_callback,
-                    "evaluate",
-                    current=index,
-                    total=len(contexts),
-                    evaluated=evaluated_count,
-                    succeeded=succeeded_count,
-                    fallback=fallback_count,
-                    concurrency=EVALUATE_CONCURRENCY,
-                )
-            return judgment
-
-    if contexts:
-        judgments = await asyncio.gather(*(_evaluate_one(index, ctx) for index, ctx in enumerate(contexts, start=1)))
-    else:
-        judgments = []
-    _report_progress(progress_callback, "evaluate_done", total=len(judgments), evaluated=len(judgments), succeeded=succeeded_count, fallback=fallback_count)
-
-    _report_progress(progress_callback, "plan", judgments=len(judgments))
-    action_plan = generate_action_plan(run_id, task_plan, judgments)
-
-    # ── Storage: persist results ──────────────────────────────────
-    if _storage_ready():
-        try:
-            await _persist_run_results(
-                run_id=run_id,
-                mailbox=input_.mailbox_id,
-                messages=messages,
-                candidates=candidates,
-                judgments=judgments,
-                strategy_mode=task_plan.strategy_mode,
-                user_request=input_.user_request,
-                mode=input_.mode if hasattr(input_, 'mode') else "auto",
-                low_value_items=low_value_items,
-                sampling_create_message=sampling_create_message,
-                skip_contact_memory=skip_contact_memory,
-            )
-            _report_progress(progress_callback, "storage_saved")
-        except Exception as exc:
-            _report_progress(progress_callback, "storage_error", reason=str(exc)[:200])
-
-    _tick("all_done (dashscope path)")
-    return action_plan
-
-
-_EXECUTION_SYSTEM_PROMPT = """You are Anna, an executive email assistant. The mailbox owner is your principal — address them directly as "you" in all title, summary, context, and suggestion text. Analyze the emails below based on the task instructions. Output a single JSON object — the very first character of your response MUST be `{`. Do NOT wrap the JSON in markdown fences.
-
-## Output format
-{
-  "title": "Brief answer title (<=12 words)",
-  "summary": "One or two sentences summarizing the key finding",
-  "sections": [
-    {
-      "heading": "Section heading",
-      "body": "Narrative text (optional — for timeline, explanation, context)",
-      "items": [
-        {
-          "subject": "Email subject or person name",
-          "from": "Sender email address copied from email data",
-          "context": "What this is about (verifiable facts)",
-          "suggestion": "What to do (optional)",
-          "draft": "Draft reply text. Omit when reply_gaps.needs_user_input is true — use reply_gaps to ask the user first, then the draft will be generated later from their answers.",
-          "message_id": "Gmail message ID copied from email data (e.g. 19e62c874f8b17df)",
-          "thread_id": "Gmail thread ID copied from email data",
-          "reply_gaps": {"needs_user_input": false, "summary": "Brief summary of what info is needed", "questions": [{"id": "q1", "question": "What days work for you next week?", "hint": "e.g. Mon/Wed/Fri", "required": true}]}
-        }
-      ]
-    }
-  ]
-}
-
-## Field guide
-- title: concise answer to the user's question
-- summary: 1-2 sentences of the most important finding. If nothing found, say so honestly.
-- sections: 1-4 focused groups. Each covers one topic, person, or action category.
-  - heading: short label for this group
-  - body: optional narrative (timeline, explanation). Omit if items communicate enough.
-  - items: specific emails, people, or actions. Use context for verifiable facts, suggestion for next steps.
-  - draft ↔ reply_gaps (two-phase reply generation):
-    For EVERY item that needs a reply, decide between two paths:
-    PATH A — You have enough context to draft confidently:
-      → Set draft to a professional reply. Set reply_gaps.needs_user_input to false.
-    PATH B — You lack key info only the user knows (availability, budget, opinions, dates):
-      → Omit the draft field entirely. Set reply_gaps.needs_user_input=true, write a 1-sentence summary of what info is missing, and provide 1-4 specific, answerable questions. Each question must have:
-        - id: short slug ("q1", "q2")
-        - question: one clear sentence
-        - hint: an example answer to guide the user (optional)
-        - required: true if this question must be answered
-      The user will see these questions, answer them, and a draft will be generated from their answers.
-    CRITICAL: NEVER guess when you don't know. Path B is always better than a wrong draft.
-- message_id: copy from the "Message ID:" field in the email data. REQUIRED when draft is present — the user needs this to send or act on the email. Only omit for pure informational items without a draft.
-- thread_id: copy from the "Thread:" field in the email data. REQUIRED when draft is present.
-- from: copy from the "From:" field in the email data. REQUIRED when draft is present — this is the reply recipient.
-- Use "body" alone for narrative answers (no items needed).
-- Use "items" alone for lists (no body needed).
-- Include "suggestion" when the user needs to decide or act.
-
-## Rules
-- Base your answer ONLY on the emails provided. If nothing matches, say so in summary.
-- Use verifiable facts from the emails — no speculation, no AI reasoning.
-- Be specific in suggestions. Avoid generic 'evaluate and respond.'
-- REPLY DRAFTS: For items needing a reply, choose Path A (draft directly) or Path B (reply_gaps to ask user). NEVER include both draft AND reply_gaps.needs_user_input=true on the same item — they are mutually exclusive.
-- NEVER fill in reply_gaps.questions with information you can verify from the emails — only ask about what you genuinely cannot know.
-- CRITICAL — Time format: NEVER use relative time words. ALWAYS use "Mon DD, YYYY" format. Examples: "May 28, 2026", "Jan 3, 2026". If time of day matters, append it: "May 28, 2026, 2:30 PM". If no date is available, say "recently"."""
+def _execution_system_prompt() -> str:
+    """Custom scan 执行 system（按任务拆分、集中在 prompts.py）。"""
+    from mail_agent.ai_turn.prompts import custom_scan_system_prompt
+    return custom_scan_system_prompt()
 
 
 async def run_custom_scan(
@@ -655,8 +70,7 @@ async def run_custom_scan(
 ) -> dict[str, Any]:
     """Ask Agent：搜邮件 → 按需读 → 一次 LLM → 答案。
 
-    与 Brief 管线完全解耦。不走 phase1/judgment/guards/cards。
-    执行 LLM 根据 plan.task_prompt 直接完成分析和输出。
+    与已下线的 Brief 管线完全解耦。不走 phase1/judgment/guards/cards。
     """
     from mail_agent.mail_providers.gmail.adapter import normalize_mailbox, get_message_detail_async
     from mail_agent.llm_runtime.service import call_llm_json_safe
@@ -679,7 +93,6 @@ async def run_custom_scan(
     )
     normalized_mailbox = normalize_mailbox(mailbox)
 
-    # 1. Search
     max_threads_ask = (plan.scan_budget or {}).get("max_messages", 200) if isinstance(plan.scan_budget, dict) else 200
     messages = await run_mail_scan(mailbox, max_threads_ask, progress_callback=progress_callback)
     sources = [
@@ -706,7 +119,6 @@ async def run_custom_scan(
             "sections": [],
         }
 
-    # 2. Read emails at the depth the planner chose
     read_depth = plan.read_depth or "message_detail"
     _report_progress(progress_callback, "read_context", current=0, total=len(messages), read_depth=read_depth)
 
@@ -754,7 +166,6 @@ async def run_custom_scan(
 
     _report_progress(progress_callback, "read_context_done", current=len(email_data), total=len(email_data), read_depth=read_depth)
 
-    # 3. One LLM call with task_prompt
     _report_progress(
         progress_callback,
         "evaluate",
@@ -766,7 +177,6 @@ async def run_custom_scan(
     )
 
     def _build_user_prompt(rendered_emails: str) -> str:
-        # 执行阶段会多次降载重试，只替换邮件正文渲染，保持任务约束一致。
         return f"""## Your Identity
 You are Anna, executive assistant to {mailbox}.
 In all output text, address your principal directly as "you" / "your".
@@ -817,7 +227,7 @@ Match by EMAIL ADDRESS (between < >), not by display name.
         try:
             result = await call_llm_json_safe(
                 sampling_create_message,
-                system_prompt=_EXECUTION_SYSTEM_PROMPT,
+                system_prompt=_execution_system_prompt(),
                 user_message=_build_user_prompt(rendered_emails),
                 fallback={"title": "Scan failed", "summary": "Unable to analyze emails.", "sections": []},
                 temperature=0.2,
@@ -847,7 +257,6 @@ Match by EMAIL ADDRESS (between < >), not by display name.
                 reason=last_error[:200],
             )
     if result is None:
-        # Anna 多轮降载仍失败时，返回可展示结果，避免 Ask 链路整体失败。
         result = {
             "payload": {
                 "title": plan.title or "Scan incomplete",
@@ -872,23 +281,25 @@ Match by EMAIL ADDRESS (between < >), not by display name.
         "fallback_reason": result.get("fallback_reason", ""),
     }
 
-    # 4. Persist run record
+    # 仅写跨会话 run history 索引，不再生成 Attention Cards / processed 标记。
     if _storage_ready():
         try:
-            await _persist_run_results(
+            from ..storage.ops import append_run_history
+            from ..storage.types import RunHistoryEntry, _now
+            section_count = len(payload.get("sections") or []) if isinstance(payload, dict) else 0
+            await append_run_history(RunHistoryEntry(
                 run_id=create_run_id(),
                 mailbox=mailbox,
-                messages=messages,
-                candidates=[],
-                judgments=[],
-                strategy_mode="custom",
-                user_request=plan.user_request,
+                ts=_now(),
+                request=(plan.user_request or "")[:100],
                 mode="custom",
-                plan_id=plan.plan_id,
-                sampling_create_message=sampling_create_message,
-            )
-        except Exception:
-            pass
+                strategy="custom",
+                plan_id=plan.plan_id or "",
+                result=f"custom scan: {section_count} sections",
+                summary=str(payload.get("summary") or "")[:300],
+            ))
+        except Exception as exc:
+            _logger.debug("custom scan history write skipped: %s", type(exc).__name__)
 
     return payload
 
@@ -901,7 +312,7 @@ def _render_emails_for_llm(
     thread_body_limit: int = 2000,
     max_thread_messages: int = 20,
 ) -> str:
-    """Render email data as compact text for the LLM prompt."""
+    """将邮件数据渲染为紧凑文本供 LLM 使用。"""
     parts: list[str] = []
     for i, e in enumerate(email_data, 1):
         unread_label = " (UNREAD)" if e.get("unread") else ""
@@ -933,279 +344,6 @@ def _render_emails_for_llm(
     return "\n".join(parts)
 
 
-async def _persist_run_results(
-    *,
-    run_id: str,
-    mailbox: str,
-    messages: list[Any],
-    candidates: list[Any],
-    judgments: list[Any],
-    strategy_mode: str,
-    user_request: str,
-    mode: str,
-    plan_id: str = "",
-    low_value_items: list[dict[str, Any]] | None = None,
-    sampling_create_message: Any = None,
-    skip_contact_memory: bool = False,
-) -> None:
-    lock = _PERSIST_LOCKS.setdefault(mailbox, asyncio.Lock())
-    async with lock:
-        return await _persist_run_results_locked(
-            run_id=run_id, mailbox=mailbox, messages=messages,
-            candidates=candidates, judgments=judgments,
-            strategy_mode=strategy_mode, user_request=user_request, mode=mode,
-            plan_id=plan_id, low_value_items=low_value_items,
-            sampling_create_message=sampling_create_message,
-            skip_contact_memory=skip_contact_memory,
-        )
-
-
-async def _persist_run_results_locked(
-    *,
-    run_id: str,
-    mailbox: str,
-    messages: list[Any],
-    candidates: list[Any],
-    judgments: list[Any],
-    strategy_mode: str,
-    user_request: str,
-    mode: str,
-    plan_id: str = "",
-    low_value_items: list[dict[str, Any]] | None = None,
-    sampling_create_message: Any = None,
-    skip_contact_memory: bool = False,
-) -> None:
-    from ..storage.ops import (
-        mark_messages_processed_batch,
-        save_run_record,
-        append_run_history,
-        get_scan_state,
-        get_active_cards,
-        set_active_cards,
-        set_scan_state,
-    )
-    from ..storage.types import (
-        ProcessedMessage,
-        RunRecord,
-        RunHistoryEntry,
-        ScanState,
-        _now,
-    )
-    from ..cards.service import build_card, build_action_memo, build_cleanup_bundle, cards_to_frontend, is_card_actionable, merge_cards
-
-    # 1. Mark ALL scanned messages as processed
-    processed_msgs: list[ProcessedMessage] = []
-    candidate_msg_ids: set[str] = {c.message_ids[0] for c in candidates if c.message_ids}
-    candidate_map: dict[str, Any] = {}
-    judgment_map: dict[str, Any] = {}
-    for c in candidates:
-        if c.message_ids:
-            candidate_map[c.message_ids[0]] = c
-    for j in judgments:
-        candidate_map_j = {c.message_ids[0]: c for c in candidates if c.message_ids}
-        judgment_map[j.candidate_id] = j
-    # Build judgment lookup by candidate's message_id
-    j_by_msg: dict[str, Any] = {}
-    for c in candidates:
-        if c.message_ids:
-            j_by_msg[c.message_ids[0]] = c.candidate_id
-    j_by_cand: dict[str, Any] = {j.candidate_id: j for j in judgments}
-
-    for msg in messages:
-        if not msg.message_id:
-            continue
-        is_candidate = msg.message_id in candidate_msg_ids
-        pm = ProcessedMessage(
-            message_id=msg.message_id,
-            thread_id=msg.thread_id or "",
-            from_addr=msg.from_addr or "",
-            subject=msg.subject or "",
-            snippet=msg.snippet or "",
-            internal_date=msg.internal_date or "",
-            processed_at=_now(),
-            run_id=run_id,
-            is_candidate=is_candidate,
-            candidate_kind="",
-            priority="low",
-            read_depth="header_only",
-        )
-        if is_candidate:
-            cand_id = j_by_msg.get(msg.message_id, "")
-            c = next((cc for cc in candidates if cc.message_ids and cc.message_ids[0] == msg.message_id), None)
-            j = j_by_cand.get(cand_id)
-            if c:
-                pm.candidate_kind = c.kind or ""
-                pm.priority = c.priority_hint or "low"
-                pm.read_depth = c.read_depth_required or "header_only"
-            if j:
-                pm.priority = j.final_decision.priority or pm.priority
-                pm.confidence = j.confidence
-        processed_msgs.append(pm)
-
-    await mark_messages_processed_batch(mailbox, processed_msgs)
-
-    # 2. Build cards from candidates + judgments
-    msg_map: dict[str, Any] = {m.message_id: m for m in messages if m.message_id}
-    new_cards = []
-    for c in candidates:
-        if not c.message_ids:
-            continue
-        mid = c.message_ids[0]
-        msg = msg_map.get(mid)
-        j = j_by_cand.get(c.candidate_id)
-        if j:
-            card = build_card(c, j, msg, mailbox)
-            new_cards.append(card)
-
-    # 2a. Build cleanup bundle — persist full list separately, store preview in card
-    cleanup_full: list[dict[str, Any]] = []
-    if low_value_items:
-        cleanup_card, cleanup_full = build_cleanup_bundle(run_id, mailbox, low_value_items, messages)
-        if cleanup_card is not None:
-            new_cards.append(cleanup_card)
-
-    # 3. 持久化 cleanup 明细（与历史合并去重），卡片预览总数。
-    if cleanup_full:
-        from ..storage.ops import set_cleanup_bundle as _scb
-        result = await _scb(mailbox, cleanup_full, preserve_existing=False)
-        merged_total = int(result.get("total", len(cleanup_full)))
-        for c in new_cards:
-            if getattr(c, "card_type", "") == "cleanup_bundle":
-                c.bundled_count = merged_total
-
-    # 3a. 补齐 Gmail 线程状态并过滤掉已经不需要展示的普通卡片。
-    # 扫描层保持宽入口；卡片层只保留未完成的 reply/review 注意力任务。
-    if new_cards:
-        from ..sync.gmail_status import fetch_gmail_thread_state
-
-        actionable_cards = []
-        for card in new_cards:
-            if getattr(card, "thread_id", "") and getattr(card, "user_action", "") in ("reply", "review") and not getattr(card, "card_type", ""):
-                try:
-                    state = await asyncio.to_thread(fetch_gmail_thread_state, mailbox, card.thread_id)
-                    card.gmail_state = state.to_card_state()
-                except Exception as exc:
-                    card.gmail_state = {
-                        **(card.gmail_state or {}),
-                        "last_synced_at": _now(),
-                        "sync_failed": True,
-                        "sync_error": f"{type(exc).__name__}: {str(exc)[:160]}",
-                    }
-                    _logger.warning("new_card_gmail_state_failed mailbox=%s thread=%s error=%s", mailbox, card.thread_id, exc)
-            if is_card_actionable(card) or getattr(card, "card_type", "") == "cleanup_bundle":
-                actionable_cards.append(card)
-        new_cards = actionable_cards
-
-    # 4. Merge with existing active cards
-    existing = await get_active_cards(mailbox)
-    merged = merge_cards(existing, new_cards)
-    await set_active_cards(mailbox, merged)
-
-    if not skip_contact_memory:
-        try:
-            from ..contact_memory.indexer import ingest_card_event, ingest_thread_observation
-            card_thread_ids = {card.thread_id for card in new_cards if getattr(card, "thread_id", "")}
-            for card in new_cards:
-                if getattr(card, "card_type", "") != "cleanup_bundle":
-                    await ingest_card_event(
-                        mailbox,
-                        card,
-                        event_type="card_created",
-                        source="gmail_scan",
-                        sampling_create_message=sampling_create_message,
-                    )
-            for candidate in candidates:
-                if candidate.thread_id and candidate.thread_id not in card_thread_ids:
-                    await ingest_thread_observation(
-                        mailbox,
-                        candidate.thread_id,
-                        str(candidate.evidence.get("from", "")),
-                        str(candidate.evidence.get("subject", "")),
-                        sampling_create_message=sampling_create_message,
-                        source="gmail_scan",
-                        user_action="message_seen",
-                    )
-        except Exception as exc:
-            _logger.warning("contact_memory_ingest_failed mailbox=%s error=%s", mailbox, exc)
-
-    # 4. Save run record
-    cards_summary = cards_to_frontend(merged)
-    scanned_count = len(messages)
-    candidate_count = len(candidates)
-    main_count = sum(1 for j in judgments if j.final_decision.should_show_in_main_result)
-    lower_count = sum(1 for j in judgments if j.final_decision.should_show_in_lower_priority)
-    # Per-category breakdown
-    reply_count = sum(1 for j in judgments if j.final_decision.user_action == "reply")
-    review_count = sum(1 for j in judgments if j.final_decision.user_action == "review")
-    cleanup_count = sum(1 for j in judgments if j.final_decision.priority in ("low", "ignore"))
-    important_count = sum(1 for j in judgments if j.final_decision.priority in ("critical", "high", "medium"))
-
-    run = RunRecord(
-        run_id=run_id,
-        mailbox=mailbox,
-        strategy_mode=strategy_mode,
-        user_request=user_request,
-        mode=mode,
-        plan_id=plan_id,
-        scanned_count=scanned_count,
-        candidate_count=candidate_count,
-        main_count=main_count,
-        lower_count=lower_count,
-        summary=[f"Scanned {scanned_count} messages, found {candidate_count} candidates."],
-        strategy=[f"Strategy: {strategy_mode}"],
-        cards=[{"id": c["id"], "title": c["title"]} for c in cards_summary],
-    )
-    await save_run_record(mailbox, run)
-
-    # 5. Update scan state
-    previous_state = await get_scan_state(mailbox)
-    def _internal_date_sort_key(value: str) -> int:
-        try:
-            return int(value or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    latest_internal_date = max(
-        (str(m.internal_date) for m in messages if getattr(m, "internal_date", "")),
-        default=previous_state.last_message_internal_date,
-        key=_internal_date_sort_key,
-    )
-    scan_state = ScanState(
-        mailbox=mailbox,
-        last_scan_ts=_now(),
-        last_message_internal_date=latest_internal_date,
-        total_scans=previous_state.total_scans + 1,
-        total_processed=previous_state.total_processed + len(processed_msgs),
-    )
-    await set_scan_state(mailbox, scan_state)
-
-    # 6. Append run history (cross-mailbox)
-    parts = [f"Scanned {scanned_count} emails"]
-    if reply_count: parts.append(f"{reply_count} needs reply")
-    if review_count: parts.append(f"{review_count} needs review")
-    if cleanup_count: parts.append(f"{cleanup_count} cleanup")
-    if important_count: parts.append(f"{important_count} important")
-    history_entry = RunHistoryEntry(
-        run_id=run_id,
-        mailbox=mailbox,
-        ts=_now(),
-        request=user_request[:100],
-        mode=mode,
-        strategy=strategy_mode,
-        plan_id=plan_id,
-        result=", ".join(parts),
-        summary=f"Scanned {scanned_count} messages\n"
-                f"Needs reply: {reply_count} · Needs review: {review_count} · Cleanup: {cleanup_count}\n"
-                f"Important (medium+): {important_count}",
-    )
-    await append_run_history(history_entry)
-
-
 __all__ = [
-    "run_mail_task",
-    "MailTaskInput",
-    "MailTaskPlan",
-    "ActionPlan",
-    "asdict",
-    "generate_candidates",
+    "run_custom_scan",
 ]

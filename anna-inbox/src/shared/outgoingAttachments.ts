@@ -57,12 +57,14 @@ export function formatOutgoingAttachmentSize(bytes: number) {
 export async function putFileToUploadUrl(
   uploadUrl: string,
   file: File,
+  headers: Record<string, string> = {},
   onProgress?: (ratio: number) => void,
 ): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", uploadUrl, true);
-    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+    const requestHeaders = { "Content-Type": file.type || "application/octet-stream", ...headers };
+    Object.entries(requestHeaders).forEach(([name, value]) => xhr.setRequestHeader(name, value));
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) return;
       onProgress?.(Math.min(1, event.loaded / Math.max(1, event.total)));

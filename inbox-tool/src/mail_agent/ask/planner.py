@@ -11,6 +11,7 @@ import uuid
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from html import escape
 from typing import Any
 
 from .sampling_budget import ask_sampling_tokens
@@ -47,201 +48,73 @@ class AskPlan:
 
 # ── Planner prompts ───────────────────────────────────────────────────
 
-_PLANNER_SYSTEM_PROMPT = """You are Anna's Ask pipeline planner. Given a natural-language email assistant request, extract structured search parameters. You do NOT write Gmail search syntax — code will build queries from your parameters.
+# Planner 的总输入目标低于 500 tokens。系统提示、运行时 JSON 后缀和结构标签
+# 会占固定额度，因此只把剩余部分分给用户原始请求，避免长请求挤占整个 Sampling。
+_PLANNER_INPUT_TOKEN_BUDGET = 480
+_PLANNER_JSON_PROTOCOL_TOKEN_OVERHEAD = 55
+# XML 转义会把少量符号扩展为实体；该预留覆盖最坏的短请求，保证转义后仍不超预算。
+_PLANNER_XML_ESCAPE_TOKEN_MARGIN = 40
 
-Your most important job is SEMANTIC EXPANSION: users speak in abstract concepts ("job candidates", "cooperation opportunities", "security issues"), but emails contain concrete words ("resume", "partnership", "password reset"). Translate concepts into searchable terms.
 
-Output a single valid JSON object. The very first character you write MUST be `{`. Do NOT write any text before or after the JSON — no markdown fences, no explanation, no commentary.
+def _estimate_planner_input_tokens(text: str) -> int:
+    """以 Router 同口径估算 token，仅用于本地截断而非计费。"""
+    tokens = 0
+    for chunk in re.findall(r"[\u3400-\u9fff]|[A-Za-z0-9_]+|[^\s]", text or ""):
+        if re.fullmatch(r"[\u3400-\u9fff]", chunk):
+            tokens += 1
+        elif chunk.isascii() and (chunk[0].isalnum() or chunk[0] == "_"):
+            tokens += max(1, (len(chunk) + 3) // 4)
+        else:
+            tokens += 1
+    return tokens
 
-## Output format
-{
-  "title": "Short user-facing task title (<=12 words, in the same language as the user's request)",
-  "description": "One-sentence user-facing summary in the same language as the user's request",
-  "people": [
-    {"name_hint": "The name exactly as the user mentioned it", "role": "sender|recipient|either"}
-  ],
-  "topics": [
-    {
-      "concept": "What the user means (e.g. 'job candidates')",
-      "search_terms": ["concrete", "searchable", "terms", "that", "appear", "in", "emails"],
-      "relevance_hint": "1-2 sentences describing how to judge if an email matches this concept — sender type, email purpose, content patterns"
-    }
-  ],
-  "timeframe": "1d|3d|7d|14d|30d|90d|180d|365d",
-  "direction": "inbox|sent|all",
-  "goal": "count_items|summarize_threads|find_emails|check_reply_status|draft_replies|general_qa",
-  "task_prompt": "Analysis instructions for the Answer LLM. What to look for, how to group findings, what to surface. Do NOT include JSON output format instructions.",
-  "gmail_flags": ["is:unread", "has:attachment"],
-  "confidence": 0.85
-}
 
-## topics — the core semantic expansion job
+def _truncate_planner_text(text: str, token_budget: int) -> str:
+    """保留请求前缀并按估算额度截断，防止动态输入突破 Planner 预算。"""
+    normalized = str(text or "").strip()
+    if not normalized or token_budget <= 0:
+        return ""
+    if _estimate_planner_input_tokens(normalized) <= token_budget:
+        return normalized
+    low, high = 0, len(normalized)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = normalized[:middle].rstrip() + "..."
+        if _estimate_planner_input_tokens(candidate) <= token_budget:
+            low = middle
+        else:
+            high = middle - 1
+    return normalized[:low].rstrip() + "..."
 
-## User-facing language
 
-- title and description are shown to the user. Write both in the same language as the user's request. In particular, use Simplified Chinese when the request contains Chinese.
-- Keep concept, relevance_hint, and task_prompt in English because they are internal planning fields.
+def _build_planner_user_message(user_request: str, mailbox: str, system_prompt: str) -> str:
+    """构造带数据边界且受总输入预算约束的 Planner user message。"""
+    mailbox_data = escape(mailbox or "unknown", quote=False)
+    prefix = f"<mailbox>{mailbox_data}</mailbox>\n<request>\n"
+    suffix = "\n</request>"
+    available = max(
+        1,
+        _PLANNER_INPUT_TOKEN_BUDGET
+        - _PLANNER_JSON_PROTOCOL_TOKEN_OVERHEAD
+        - _PLANNER_XML_ESCAPE_TOKEN_MARGIN
+        - _estimate_planner_input_tokens(system_prompt)
+        - _estimate_planner_input_tokens(prefix + suffix),
+    )
+    request = escape(_truncate_planner_text(user_request, available), quote=False)
+    return prefix + request + suffix
 
-Users say "job candidates" but emails say "resume", "CV", "interview". Users say "cooperation" but emails say "partnership", "proposal", "demo". Your job: translate the user's abstract concept into concrete searchable terms AND a relevance hint for filtering.
 
-- concept: what the user means, in English (readable label for debugging)
-- search_terms: 5-15 concrete words/phrases that actually appear in matching emails. Cover both Chinese and English. Expand abbreviations. Cover synonym variants. Do NOT put the concept word itself unless it literally appears in emails (e.g. "invoice" is fine, "job candidates" is not — use "resume","CV","interview","求职","简历"). You may use Gmail operators inside search_terms for precision: subject:"Application for" targets the subject line; subject:invoice matches subjects containing "invoice".
-- relevance_hint: 1-2 English sentences describing HOW to recognize a match. Don't repeat search_terms — describe sender characteristics, email purpose, content patterns. This will guide a downstream relevance filter LLM.
-
-Examples of good semantic expansion:
-
-User: "找找候选人的未回复邮件"
-→ concept: "job candidates awaiting reply"
-→ search_terms: ["resume","CV","application","interview","cover letter","position","hiring","求职","简历","面试","应聘","position"]
-→ relevance_hint: "unknown senders (not colleagues) discussing job applications, interviews, or position inquiries — especially where the sender appears to be waiting for a response"
-→ direction: "all"
-→ timeframe: "7d" (need both inbox and sent to determine who replied last)
-→ goal: "draft_replies"
-
-User: "有没有合作相关的邮件"
-→ concept: "partnership opportunities"
-→ search_terms: ["partnership","collaboration","sponsor","proposal","demo","cooperation","合作","提案","partner"]
-→ relevance_hint: "external senders proposing collaboration, partnership, sponsorship, or product demos — not internal discussion"
-→ direction: "inbox"
-→ timeframe: "7d"
-
-User: "帮我看看最近有什么需要处理的" / "找找最近需要浏览的邮件"
-→ concept: "emails needing user attention"
-→ search_terms: []  ← abstract “to browse / to handle” cannot be Gmail keywords; leave empty for broad sweep
-→ relevance_hint: "emails that need the user to open, reply, decide, or act — prefer unread/human requests; deprioritize newsletters and automated notifications"
-→ direction: "inbox"
-→ timeframe: "30d"  ← bare “最近/recent” is NOT an explicit window; code uses the user’s current Scan Plan
-→ goal: "find_emails"
-
-User: "找找 Sarah 最近发的邮件"
-→ concept: "emails from Sarah"
-→ search_terms: []  ← person-based search; the system resolves "Sarah" to email via contact memory
-→ relevance_hint: "emails sent by Sarah to the user"
-→ direction: "inbox"
-→ timeframe: "7d"
-→ people: [{"name_hint": "Sarah", "role": "sender"}]
-
-User: "等我回复的邮件"
-→ concept: "emails awaiting my reply"
-→ search_terms: []  ← This concept cannot be expressed in Gmail keywords! Leave empty, code will do a broad sweep.
-→ relevance_hint: "sender explicitly asked a question, sent a proposal, or followed up — and the latest message in the thread is from them, not me"
-→ direction: "all" (need both sides to determine who sent last)
-→ timeframe: "7d"
-→ goal: "draft_replies"
-
-User: "帮我看看未读邮件"
-→ concept: "unread inbox"
-→ search_terms: []
-→ relevance_hint: "all unread emails in the inbox"
-→ direction: "inbox"
-→ timeframe: "7d"
-→ gmail_flags: ["is:unread"]
-
-User: "我发了邮件但谁还没回复我"
-→ concept: "sent mail awaiting reply"
-→ search_terms: []
-→ relevance_hint: "threads where the user sent a message and the other person hasn't replied — latest message is from the user"
-→ direction: "all" (need sent mail to find threads the user started, plus inbox to check if there's a reply)
-→ timeframe: "14d"
-→ goal: "draft_replies"
-
-User: "总结一下我和Alice最近的沟通"
-→ concept: "conversation summary with Alice"
-→ search_terms: []
-→ relevance_hint: "all emails exchanged between the user and Alice — group by thread to understand the discussion"
-→ direction: "all" (complete back-and-forth, no direction filter)
-→ people: [{"name_hint": "Alice", "role": "either"}]
-→ timeframe: "30d"
-→ goal: "summarize_threads"
-
-User: "本月有多少发票"
-→ concept: "invoice count this month"
-→ search_terms: ["invoice","receipt","payment","billing","charged","发票","账单","付款"]
-→ relevance_hint: "billing-related emails: invoices, receipts, payment confirmations, subscription charges"
-→ timeframe: "30d"
-→ goal: "count_items"
-
-## people
-
-Extract person names exactly as the user mentions them. Use name_hint (NOT email — the system resolves names to email addresses via contact memory). DO NOT guess email domains.
-
-If the user mentions multiple people, list each as a separate entry.
-If no specific person is mentioned, return empty array [].
-
-## timeframe
-
-Choose the most appropriate window only when the user gives an **explicit** time unit or number.
-Bare “recent / 最近 / 这几天” is NOT explicit — keep timeframe "30d" as a placeholder; runtime will replace it with the user’s current Scan Plan (display_range_days).
-"today" -> 1d
-"yesterday" / "last 2 days" -> 2d
-"this week" / "last week" / "past week" / "本周" / "上周" -> 7d
-"last N days" / "最近 N 天" -> Nd (use the number the user wrote)
-"two weeks" / "past fortnight" -> 14d
-"this month" / "本月" -> 30d
-"last three months" / "past quarter" -> 90d
-"past 6 months" / "last half year" -> 180d
-"this year" / "past year" -> 365d
-"all time" / "everything" -> 365d
-Apply the same logic for non-English requests when they name a concrete unit or number.
-Apply the same logic for non-English requests — map common time words in the user's language to the appropriate duration.
-
-## direction
-
-Choose based on what the user needs to SEE:
-
-inbox — only what others sent to the user.
-  Use for: "check my inbox", "what needs attention", "find emails from X", "what arrived recently"
-
-sent — only what the user sent themselves.
-  Use for: "what did I send", "my proposals", "my outreach", "review my sent mail"
-
-all — NO direction filter. Gmail searches BOTH inbox and sent.
-  REQUIRED for: reply status checks, "did I reply?", "needs reply?", conversation summaries,
-  catch-up, "waiting for reply", "who hasn't replied to me".
-  WHY: the execution LLM needs BOTH sides to determine who sent the latest message.
-  If you exclude sent mail, the LLM can't tell whether the user already replied.
-
-In detail:
-
-- User asks about reply status / "did I reply" / "needs reply" / "have I responded" → **NO direction filter** (all).
-  The execution LLM needs BOTH sides to know who sent the latest message in each thread.
-
-- User asks "who hasn't replied to me" / "what am I waiting for" → **include sent mail** (all or in:sent).
-  The execution LLM needs to see threads where the user was the last sender.
-
-- User asks to summarize a conversation / catch up on a discussion → **NO direction filter** (all).
-  The execution LLM needs the complete back-and-forth.
-
-- Default (unclear intent): use **inbox** — show what others sent to the user.
-
-## goal
-
-count_items — user asks "how many", "count"
-summarize_threads — summarizing conversations, catching up on discussions
-find_emails — looking for specific emails
-check_reply_status — asking about reply/waiting status WITHOUT needing drafts (e.g. "did I reply to X?", "has anyone replied to my proposal?")
-draft_replies — asking for reply drafts, OR looking for emails that need a reply ("find emails I haven't replied to", "what needs my response", "谁还没回复"). When the user wants to FIND emails needing replies, the natural next step is drafting one — use draft_replies so the answer includes ready-to-send drafts.
-general_qa — everything else
-
-## task_prompt
-
-Write as if instructing a smart assistant. Tell it:
-1. What to look for in the emails
-2. How to group and organize findings into sections
-3. What kind of items to surface (people, threads, action items, dates)
-4. For thread-aware tasks: check who sent the LATEST message — if from mailbox owner → already handled; if from someone else → needs attention
-5. When goal is draft_replies: instruct it to draft a reply for EVERY item that needs one. If key information is missing, use reply_gaps to ask the user instead of guessing.
-
-Do NOT include JSON output format in task_prompt.
-
-## Notes
-- topics and people may both be empty if the request is a broad check (e.g. "what's new in my inbox")
-- For requests that don't need topic search (general inbox check), set topics to empty []
-- If the user's request is broad/ambiguous, default to direction=inbox, timeframe=30d, goal=general_qa
-"""
-
-_PLANNER_USER_TEMPLATE = """Mailbox owner: {mailbox}
-User request: {user_request}"""
+def _parse_planner_confidence(value: Any) -> float:
+    """兼容旧模型的 high/medium/low，并把数值置信度限制在合法范围。"""
+    if isinstance(value, str):
+        named = {"high": 0.9, "medium": 0.6, "low": 0.3}
+        if value.strip().casefold() in named:
+            return named[value.strip().casefold()]
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.8
+    return min(1.0, max(0.0, confidence))
 
 
 def resolve_effective_timeframe(
@@ -550,17 +423,17 @@ async def plan_ask_request(
     """
     from ..llm_runtime.service import call_llm_json_safe
 
-    user_message = _PLANNER_USER_TEMPLATE.format(
-        user_request=user_request,
-        mailbox=mailbox or "unknown",
-    )
+    from mail_agent.ai_turn.prompts import ask_planner_system_prompt
+
+    system_prompt = ask_planner_system_prompt()
+    user_message = _build_planner_user_message(user_request, mailbox, system_prompt)
 
     strict_anna_sampling = sampling_create_message is not None
 
     try:
         result = await call_llm_json_safe(
             sampling_create_message,
-            system_prompt=_PLANNER_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             user_message=user_message,
             fallback={},
             temperature=0.1,
@@ -637,7 +510,7 @@ async def plan_ask_request(
         task_prompt=str(payload.get("task_prompt") or ""),
         gmail_flags=gmail_flags,
         created_at=now,
-        confidence=float(payload.get("confidence") or 0.8),
+        confidence=_parse_planner_confidence(payload.get("confidence")),
         llm_meta={
             "provider": result.get("provider"),
             "model": result.get("model"),

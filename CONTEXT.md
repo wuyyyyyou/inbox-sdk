@@ -1,8 +1,8 @@
 # Anna Inbox
 
-Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；Brief、Attention Card 和 Custom Scan 是仍由后端提供的工作流能力，不再代表 2.0 的整体界面结构。
+Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；AI 侧栏是唯一智能入口。Brief 产品面已下线，不再代表 2.0 主路径。
 
-当前发布基线：App `2.1.2` / Tool `2.2.2`。本版本重点：回复/转发/Compose 富文本（`body_html` + 后端白名单净化）、AI Router 澄清弹层与 `routing_intent`、Ask/线程回答预算与失败语义收紧、Sampling grant 预算快照，以及 `start_ai_turn` 短 wait 建 run。
+当前发布基线：App `2.1.3` / Tool `2.2.3`。本版本重点：AI 侧栏统一与 Brief 下线、Ask 搜索/回答收敛、邮件详情滚动与附件预览在自动同步下的稳定性，以及既有富文本外发与 `start_ai_turn` 路由能力。
 
 ## Language
 
@@ -34,9 +34,9 @@ AI Personalization：可复用提示词与长期偏好短句（无邮件正文�
 
 按 mailbox 和 thread 持久化、尚未发送到 Gmail 的用户草稿。可同时保存 `body`（纯文本）与 `body_html`（白名单净化后的富文本）。发送成功或用户丢弃后删除。
 
-**Brief**
+**Brief（已下线）**
 
-后端中稳定、可续跑的邮箱注意力扫描工作流，产出 Attention Cards。Brief 不是 2.0 Inbox Workspace 的同义词。
+历史上的邮箱注意力扫描工作流，曾产出 Attention Cards。产品面与主路径已下线；能力由 AI 侧栏 Ask / organize 承接。Brief 不是 2.0 Inbox Workspace 的同义词。
 
 **Attention Card**
 

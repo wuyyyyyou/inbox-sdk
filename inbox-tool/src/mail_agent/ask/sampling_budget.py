@@ -16,15 +16,21 @@ ASK_SAMPLING_PHASE_WEIGHTS = {
 # 公共 sampler 最终强制执行；这里仅为不带预算接口的兼容 sampler 提供基数。
 _COMPATIBILITY_TOTAL_TOKENS = 32_000
 _HOST_SINGLE_CALL_MAX_TOKENS = 8_192
-# 邮箱问答只需少量优先事项，但仍须为 Host 侧 thinking/推理模型预留输出空间：
-# 若硬上限过低，模型可能把额度耗在推理正文上，最终回答里连 `{` 都没有。
-# 同时继续远低于 8192 单次平台上限，避免单阶段吞掉整笔 grant。
+# Ask Answer 需要在较长证据、模型 reasoning 或结构化重试后仍有足够余量闭合 JSON。
+# 首次回答与一次格式重试都固定允许 4096，仍低于平台单次 8192 上限；JSON repair
+# 仅修复已有结构，因此继续使用较小独立额度，避免重新执行完整邮件分析。
 _ASK_PHASE_TOKEN_CAPS = {
     "planner": 600,
     "answer": 4096,
     "answer_retry": 4096,
     "json_repair": 800,
 }
+
+
+def ask_answer_output_token_cap(item_limit: int) -> int:
+    """Answer 阶段统一允许 4096 输出 token，避免因条目数低估而截断 JSON。"""
+    _ = item_limit
+    return _ASK_PHASE_TOKEN_CAPS["answer"]
 
 
 def ask_sampling_tokens(

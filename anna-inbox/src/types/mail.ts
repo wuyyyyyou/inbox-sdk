@@ -487,6 +487,7 @@ export interface AttachmentDownloadPayload {
   size?: number;
   download_url?: string;
   preview_url?: string;
+  storage_key?: string;
   content_b64?: string;
   expires_at?: string;
   error?: string;
@@ -683,7 +684,7 @@ export interface OutgoingAttachmentMeta {
   mime_type: string;
   size: number;
   storage_key: string;
-  /** 前端本地预览（blob: 或 loopback），不持久化 */
+  /** 前端临时预览（blob: 或 APS 短期 URL），不持久化 */
   preview_url?: string;
   status?: "uploading" | "ready" | "error";
   progress?: number;
@@ -825,6 +826,8 @@ export interface AppState {
   aiChatConversationId: string;
   aiChatLoading: boolean;
   mailDetailOpen: boolean;
+  /** 当前打开详情的 message id；soft prune 时保留，避免同步误删导致退出详情/附件预览 */
+  mailDetailMessageId: string;
   customTraceOpen: boolean;
   settingsOpen: boolean;
   settingsFocusRequest: number;
@@ -998,8 +1001,11 @@ export interface AiClarificationPayload {
   resolved_action?: string;
 }
 
-/** 用户在 Router 澄清弹层中选择的任务范围。 */
-export type AiRoutingIntent = "inbox" | "current_thread" | "compose" | "chat";
+/**
+ * 用户显式选定的任务范围（澄清弹层或侧栏 starter 按钮）。
+ * 后端收到后跳过 Router Sampling，直接执行对应白名单工具。
+ */
+export type AiRoutingIntent = "inbox" | "current_thread" | "compose" | "chat" | "organize";
 
 /** 收件箱多选线程，写入 ui_context.selected_threads */
 export interface AiSelectedThreadRef {

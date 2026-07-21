@@ -1,13 +1,14 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.2.2",
-  "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Brief workflows, Ask, and Anna LLM sampling.",
+  "version": "2.2.3",
+  "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Ask / AI sidebar, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
     "llm.sample",
     "llm.complete",
     "storage.user",
+    "aps.files",
     "aps.kv",
     "aps.scope.user.read",
     "aps.scope.user.write"
@@ -338,160 +339,13 @@
       "timeout": 120
     },
     {
-      "name": "run_mail_agent",
-      "description": "Run the full Anna mail agent pipeline: scan emails, generate candidates, evaluate with LLM, and produce an action plan.",
-      "parameters": [
-        {
-          "name": "user_request",
-          "type": "string",
-          "description": "Natural language request from user, e.g. '帮我看看有什么重要邮件'",
-          "required": true
-        },
-        {
-          "name": "mailbox",
-          "type": "string",
-          "description": "Mailbox email address.",
-          "required": true
-        },
-        {
-          "name": "mode",
-          "type": "string",
-          "description": "Strategy mode: auto, default_secretary, creator_opportunity, security_billing",
-          "required": false
-        },
-        {
-          "name": "max_messages",
-          "type": "integer",
-          "description": "Maximum messages to scan.",
-          "required": false
-        },
-        {
-          "name": "primary_count",
-          "type": "integer",
-          "description": "How many recent Primary emails to fetch first.",
-          "required": false
-        },
-        {
-          "name": "ai_provider",
-          "type": "string",
-          "description": "LLM provider: dashscope or anna-llm.",
-          "required": false
-        }
-      ],
-      "timeout": 120
-    },
-    {
-      "name": "start_mail_agent_run",
-      "description": "Prepare a pollable brief run. Follow with continue_mail_agent_run to execute scan and LLM phases.",
-      "parameters": [
-        {
-          "name": "user_request",
-          "type": "string",
-          "description": "Natural language request from user.",
-          "required": true
-        },
-        {
-          "name": "mailbox",
-          "type": "string",
-          "description": "Mailbox email address.",
-          "required": true
-        },
-        {
-          "name": "mode",
-          "type": "string",
-          "description": "Strategy mode: auto, default_secretary, creator_opportunity, security_billing",
-          "required": false
-        },
-        {
-          "name": "max_messages",
-          "type": "integer",
-          "description": "Maximum messages to scan.",
-          "required": false
-        },
-        {
-          "name": "primary_count",
-          "type": "integer",
-          "description": "How many recent Primary emails to fetch first.",
-          "required": false
-        },
-        {
-          "name": "ai_provider",
-          "type": "string",
-          "description": "LLM provider: dashscope or anna-llm.",
-          "required": false
-        },
-        {
-          "name": "run_id",
-          "type": "string",
-          "description": "Client-generated run ID for polling progress.",
-          "required": false
-        },
-        {
-          "name": "storage_provider",
-          "type": "string",
-          "description": "Storage provider: local or aps.",
-          "required": false
-        }
-      ],
-      "timeout": 60
-    },
-    {
-      "name": "continue_mail_agent_run",
-      "description": "Advance one short Brief state-machine slice with sampling bound to this invoke.",
-      "parameters": [
-        {
-          "name": "run_id",
-          "type": "string",
-          "description": "Run ID from start_mail_agent_run.",
-          "required": true
-        },
-        {
-          "name": "user_request",
-          "type": "string",
-          "description": "Natural language request from user.",
-          "required": false
-        },
-        {
-          "name": "mailbox",
-          "type": "string",
-          "description": "Mailbox email address.",
-          "required": false
-        },
-        {
-          "name": "mode",
-          "type": "string",
-          "description": "Strategy mode.",
-          "required": false
-        },
-        {
-          "name": "max_messages",
-          "type": "integer",
-          "description": "Maximum messages to scan.",
-          "required": false
-        },
-        {
-          "name": "primary_count",
-          "type": "integer",
-          "description": "How many recent Primary emails to fetch first.",
-          "required": false
-        },
-        {
-          "name": "ai_provider",
-          "type": "string",
-          "description": "LLM provider: dashscope or anna-llm.",
-          "required": false
-        }
-      ],
-      "timeout": 60
-    },
-    {
       "name": "get_mail_agent_run",
-      "description": "Poll a background mail-agent run by run id.",
+      "description": "Poll a background AI turn or custom-scan run by run id.",
       "parameters": [
         {
           "name": "run_id",
           "type": "string",
-          "description": "Run id returned by start_mail_agent_run.",
+          "description": "Run id returned by start_ai_turn or custom scan.",
           "required": true
         }
       ],
@@ -499,7 +353,7 @@
     },
     {
       "name": "get_active_cards",
-      "description": "Get all active attention cards for a mailbox from persistent storage.",
+      "description": "Legacy Brief cards API (returns empty after Brief retirement).",
       "parameters": [
         {
           "name": "mailbox",
@@ -507,12 +361,11 @@
           "description": "Mailbox email address.",
           "required": true
         }
-      ],
-      "timeout": 60
+      ]
     },
     {
       "name": "get_cleanup_bundle_page",
-      "description": "Get one page of cleanup bundle messages without refreshing active cards.",
+      "description": "Legacy cleanup bundle page API (returns empty after Brief retirement).",
       "parameters": [
         {
           "name": "mailbox",
@@ -538,8 +391,19 @@
           "description": "Storage provider: local or aps.",
           "required": false
         }
-      ],
-      "timeout": 60
+      ]
+    },
+    {
+      "name": "cancel_mail_agent_run",
+      "description": "Cancel a running AI turn / custom-scan so mailbox switch can free Gmail credentials immediately.",
+      "parameters": [
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "Run id returned by start_ai_turn or custom scan.",
+          "required": true
+        }
+      ]
     },
     {
       "name": "list_mailboxes",
@@ -604,7 +468,7 @@
     },
     {
       "name": "set_mailbox_selected",
-      "description": "Set whether a mailbox participates in Brief scans and card display.",
+      "description": "Set whether a mailbox is selected for multi-mailbox AI and inbox views.",
       "parameters": [
         {
           "name": "mailbox",
@@ -965,6 +829,51 @@
           "description": "Opaque attachment ID from get_card_detail.",
           "required": true
         }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "begin_stage_outgoing_attachment",
+      "description": "Begin staging an outgoing attachment. Returns an APS Files upload URL and object path.",
+      "parameters": [
+        {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": true},
+        {"name": "filename", "type": "string", "description": "Original filename.", "required": true},
+        {"name": "mime_type", "type": "string", "description": "MIME type.", "required": false},
+        {"name": "size", "type": "number", "description": "Declared file size in bytes.", "required": true},
+        {"name": "existing_total_bytes", "type": "number", "description": "Total size of already staged attachments.", "required": false},
+        {"name": "draft_scope", "type": "string", "description": "compose or thread.", "required": false},
+        {"name": "draft_key", "type": "string", "description": "Draft id or thread id for association.", "required": false}
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "complete_stage_outgoing_attachment",
+      "description": "Confirm that an outgoing attachment has been uploaded to APS Files.",
+      "parameters": [
+        {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": true},
+        {"name": "storage_key", "type": "string", "description": "APS object path returned by begin_stage_outgoing_attachment.", "required": true},
+        {"name": "size", "type": "number", "description": "Uploaded file size in bytes.", "required": true},
+        {"name": "mime_type", "type": "string", "description": "MIME type.", "required": false}
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "delete_staged_outgoing_attachment",
+      "description": "Delete one staged outgoing attachment from APS Files or local stage.",
+      "parameters": [
+        {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": true},
+        {"name": "storage_key", "type": "string", "description": "Object path returned by begin_stage_outgoing_attachment.", "required": true}
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "prepare_staged_outgoing_attachment_access",
+      "description": "Prepare a short-lived preview URL for a staged outgoing attachment (draft restore).",
+      "parameters": [
+        {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": true},
+        {"name": "storage_key", "type": "string", "description": "Object path returned by begin_stage_outgoing_attachment.", "required": true},
+        {"name": "filename", "type": "string", "description": "Filename for Content-Disposition.", "required": false},
+        {"name": "mime_type", "type": "string", "description": "MIME type.", "required": false}
       ],
       "timeout": 120
     },
@@ -2126,7 +2035,7 @@
     },
     {
       "name": "generate_contact_memories",
-      "description": "Start a contact-memory backfill run for active brief cards. Prefer start_contact_memory_run + continue_contact_memory_run.",
+      "description": "Start a contact-memory backfill run. Prefer start_contact_memory_run + continue_contact_memory_run.",
       "parameters": [
         {
           "name": "mailbox",

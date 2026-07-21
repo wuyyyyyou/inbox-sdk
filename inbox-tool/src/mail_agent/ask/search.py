@@ -267,6 +267,47 @@ def _broaden_query(query: dict[str, Any], level: int) -> dict[str, Any]:
     }
 
 
+def _is_broad_query(query_text: str) -> bool:
+    """宽查询：仅方向/时间/标签类约束，无 from/to/主题词 OR 组。"""
+    q = (query_text or "").strip().casefold()
+    if not q:
+        return True
+    # 强约束：人物/话题/精确短语 → 必须走 Gmail live
+    if re.search(r"\bfrom:|\bto:|\bcc:|\bbcc:|\bsubject:", q):
+        return False
+    if "{" in q or '"' in q:
+        return False
+    return True
+
+
+def _queries_are_broad(queries: list[dict[str, Any]]) -> bool:
+    texts = [str(q.get("query") or "").strip() for q in queries if str(q.get("query") or "").strip()]
+    return bool(texts) and all(_is_broad_query(t) for t in texts)
+
+
+def _filter_cached_by_window(messages: list[MessageLite], queries: list[dict[str, Any]]) -> list[MessageLite]:
+    """按查询中的 newer_than 粗滤本地缓存（仅 epoch 时间，无 Gmail 语法完整复刻）。"""
+    days = 0
+    for query in queries:
+        text = str(query.get("query") or "")
+        match = re.search(r"newer_than:(\d+)d", text, re.IGNORECASE)
+        if match:
+            days = max(days, int(match.group(1)))
+    if days <= 0:
+        return messages
+    import time
+    cutoff_ms = int((time.time() - days * 86400) * 1000)
+    filtered: list[MessageLite] = []
+    for msg in messages:
+        try:
+            ts = int(msg.internal_date or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        if ts >= cutoff_ms:
+            filtered.append(msg)
+    return filtered
+
+
 async def execute_search(
     mailbox: str,
     queries: list[dict[str, Any]],
@@ -277,30 +318,38 @@ async def execute_search(
     allow_broadening: bool = True,
     search_meta: dict[str, str] | None = None,
 ) -> list[MessageLite]:
-    """Execute Gmail search with adaptive broadening.
+    """执行 Gmail 搜索（元数据优先）并在 0 结果时受控放宽。
 
-    Attempt 1: search as-is
-    Attempt 2 (0 results): broaden level 1 (drop person/topic filters)
-    Attempt 3 (0 results): broaden level 2 (keep only direction + timeframe)
-
-    allow_broadening 为 false 时只执行原始查询。指定联系人的请求必须保留
-    from:/to: 条件；移除后会把“查找 Alice 的邮件”错误扩大为无关收件箱扫描。
-
-    Uses Gmail query search, caches matched messages, and returns MessageLite.
+    P0：未缓存命中走 metadata 拉取（header/snippet），不默认 full body。
+    P1：宽查询优先本地缓存；不足再补 Gmail metadata search。
     """
     from ..mail_providers.gmail.adapter import (
         get_messages_lite_async,
         list_cached_messages_lite,
-        live_search_and_cache,
+        live_search_metadata_and_cache,
     )
 
-    # 前端 Scan Plan 的数量上限必须覆盖每个查询，防止多查询合并后超量读取。
     try:
         message_cap = max(1, min(int(max_messages), _DEFAULT_MAX_MESSAGES))
     except (TypeError, ValueError):
         message_cap = _DEFAULT_MAX_MESSAGES
     current_queries = list(queries)
     broaden_attempts = max_broaden_attempts if allow_broadening else 0
+
+    # P1：宽查询先吃本地索引（含 Inbox/All-mail 已同步缓存）
+    if _queries_are_broad(current_queries):
+        try:
+            cached = list_cached_messages_lite(mailbox, message_cap)
+            cached = _filter_cached_by_window(cached, current_queries)
+            # 本地有足够命中则直接返回，避免冷路径再打 Gmail full 列表
+            if len(cached) >= min(20, message_cap):
+                if search_meta is not None:
+                    search_meta["source"] = "local_cache"
+                if progress_callback:
+                    progress_callback("search_cache_hit", {"cached": len(cached)})
+                return cached[:message_cap]
+        except Exception as exc:
+            _logger.debug("local cache preflight skipped: %s", type(exc).__name__)
 
     try:
         for attempt in range(broaden_attempts + 1):
@@ -315,7 +364,8 @@ async def execute_search(
                 except (TypeError, ValueError):
                     query_limit = _DEFAULT_MAX_PER_QUERY
                 query_limit = max(1, min(query_limit, message_cap - len(message_ids)))
-                matched_ids = live_search_and_cache(mailbox, query_text, query_limit)
+                # P0：metadata 路径，不默认 fetch format=full
+                matched_ids = live_search_metadata_and_cache(mailbox, query_text, query_limit)
                 for msg_id in matched_ids:
                     if msg_id not in seen_ids:
                         seen_ids.add(msg_id)
@@ -328,14 +378,17 @@ async def execute_search(
             messages = await get_messages_lite_async(mailbox, message_ids)
             if messages:
                 if search_meta is not None:
-                    search_meta["source"] = "gmail_live"
+                    search_meta["source"] = "gmail_metadata"
                 if attempt > 0:
                     _logger.info("Search broadened level %d, found %d messages", attempt, len(messages))
                 return messages
             if attempt < broaden_attempts:
                 current_queries = [_broaden_query(q, attempt + 1) for q in queries]
-                _logger.info("Search attempt %d returned 0 results, broadening to level %d",
-                             attempt + 1, attempt + 1)
+                _logger.info(
+                    "Search attempt %d returned 0 results, broadening to level %d",
+                    attempt + 1,
+                    attempt + 1,
+                )
     except Exception as exc:
         # 仅实时 Gmail 调用失败时退回缓存；正常 0 结果不混入过期邮件。
         _logger.warning("Gmail search failed; using cache: %s", type(exc).__name__)

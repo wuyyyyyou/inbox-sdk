@@ -56,6 +56,36 @@ def _sampling_prompt_bytes(request: dict[str, Any]) -> int:
     return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
 
 
+def _extract_usage_tokens(raw_usage: Any) -> tuple[int, int, int]:
+    """从 Host usage 解析 input/output/total token（兼容驼峰与蛇形字段）。"""
+    if not isinstance(raw_usage, dict):
+        return 0, 0, 0
+
+    def _pick(*keys: str) -> int:
+        for key in keys:
+            try:
+                value = int(raw_usage.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return 0
+
+    input_tokens = _pick("inputTokens", "input_tokens", "promptTokens", "prompt_tokens")
+    output_tokens = _pick("outputTokens", "output_tokens", "completionTokens", "completion_tokens")
+    total_tokens = _pick("totalTokens", "total_tokens")
+    if total_tokens <= 0 and (input_tokens or output_tokens):
+        total_tokens = input_tokens + output_tokens
+    return input_tokens, output_tokens, total_tokens
+
+
+def _tokens_per_second(token_count: int, elapsed_ms: int) -> str:
+    """按耗时计算 TPS（token/s）；elapsed 无效时返回 0.0。"""
+    if elapsed_ms <= 0 or token_count <= 0:
+        return "0.0"
+    return f"{(token_count * 1000.0) / float(elapsed_ms):.1f}"
+
+
 def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str, sampling_grant: Any = None) -> Any:
     """为一个 Executa invoke 创建带累计预算、统一超时和安全日志的 sampler。"""
     max_calls, total_tokens = _sampling_grant_limits(sampling_grant)
@@ -129,8 +159,7 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str, sampling_grant:
                 last_error = "max_tokens_exceeded"
                 log(
                     "anna sampling rejected: "
-                    f"tool={tool_name} requested_tokens={requested_tokens} "
-                    f"granted_tokens=0 remaining_tokens=0 "
+                    f"tool={tool_name} "
                     f"timeout_s={ANNA_SAMPLING_TIMEOUT_SECONDS} "
                     "error_type=SamplingBudgetExceeded"
                 )
@@ -138,7 +167,6 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str, sampling_grant:
             remaining_tokens -= granted_tokens
             call_count += 1
             reserved_tokens += granted_tokens
-            remaining_after_reservation = remaining_tokens
 
         request = dict(kwargs)
         request["max_tokens"] = granted_tokens
@@ -157,8 +185,7 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str, sampling_grant:
         started = time.monotonic()
         log(
             "anna sampling started: "
-            f"tool={tool_name} requested_tokens={requested_tokens} "
-            f"granted_tokens={granted_tokens} remaining_tokens={remaining_after_reservation} "
+            f"tool={tool_name} "
             f"timeout_s={request['timeout']} prompt_bytes={prompt_bytes}"
         )
         try:
@@ -166,6 +193,7 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str, sampling_grant:
         except Exception as exc:
             failed_calls += 1
             last_error = type(exc).__name__
+            elapsed_ms = int((time.monotonic() - started) * 1000)
             record_span(
                 "sampling.create_message",
                 started,
@@ -174,29 +202,33 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str, sampling_grant:
             )
             log(
                 "anna sampling failed: "
-                f"tool={tool_name} requested_tokens={requested_tokens} "
-                f"granted_tokens={granted_tokens} remaining_tokens={remaining_after_reservation} "
+                f"tool={tool_name} "
                 f"timeout_s={request['timeout']} "
                 f"prompt_bytes={prompt_bytes} "
-                f"elapsed_ms={int((time.monotonic() - started) * 1000)} "
+                f"elapsed_ms={elapsed_ms} "
                 f"error_type={type(exc).__name__}"
             )
             raise
-        raw_usage = result.get("usage") if isinstance(result, dict) else {}
-        if isinstance(raw_usage, dict):
-            for source, target in (("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"), ("totalTokens", "total_tokens")):
-                try:
-                    usage[target] += max(0, int(raw_usage.get(source) or 0))
-                except (TypeError, ValueError):
-                    pass
+        # 累计 usage，并写入本 call 的 input/output token 与 TPS（按输出 token / 耗时）。
+        call_input, call_output, call_total = _extract_usage_tokens(
+            result.get("usage") if isinstance(result, dict) else None
+        )
+        usage["input_tokens"] += call_input
+        usage["output_tokens"] += call_output
+        usage["total_tokens"] += call_total
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        # TPS 以输出 token 计吞吐；无输出时回退 total，避免除零假象。
+        tps_base = call_output if call_output > 0 else call_total
+        tps = _tokens_per_second(tps_base, elapsed_ms)
         record_span("sampling.create_message", started)
         log(
             "anna sampling completed: "
-            f"tool={tool_name} requested_tokens={requested_tokens} "
-            f"granted_tokens={granted_tokens} remaining_tokens={remaining_after_reservation} "
+            f"tool={tool_name} "
+            f"input_tokens={call_input} output_tokens={call_output} "
             f"timeout_s={request['timeout']} "
             f"prompt_bytes={prompt_bytes} "
-            f"elapsed_ms={int((time.monotonic() - started) * 1000)}"
+            f"elapsed_ms={elapsed_ms} "
+            f"tps={tps}"
         )
         return result
 

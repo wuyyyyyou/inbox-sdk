@@ -58,7 +58,8 @@ async def _tool_chat_general(
                     "text": _ascii_escape_for_host_transport(user_text),
                 },
             }],
-            max_tokens=500,
+            # 闲聊输出不宜过紧：500 易在句中被 Host stopReason=length 截断。
+            max_tokens=2048,
             system_prompt=_ascii_escape_for_host_transport(system),
             temperature=0.4,
             include_context="none",

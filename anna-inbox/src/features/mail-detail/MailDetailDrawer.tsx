@@ -584,9 +584,12 @@ function scrollToLatestMessage(
   if (!container || !latestMessageId) return;
   const target = Array.from(container.querySelectorAll<HTMLElement>("[data-message-id]"))
     .find((element) => element.dataset.messageId === latestMessageId);
-  if (target) {
-    target.scrollIntoView({ block: "start", behavior });
-  }
+  if (!target) return;
+  // 只滚详情 context，避免 scrollIntoView 带动外层 / 浏览器滚动条
+  const containerRect = container.getBoundingClientRect();
+  const targetRect = target.getBoundingClientRect();
+  const nextTop = container.scrollTop + (targetRect.top - containerRect.top);
+  container.scrollTo({ top: Math.max(0, nextTop), behavior });
 }
 
 function scrollTargetForPage(page: InboxThreadPagePayload, fallbackMessageId: string) {
@@ -1072,15 +1075,23 @@ export function MailDetailDrawer({
     }
     let previousHeight = scroller.clientHeight;
     composerContextHeightRef.current = previousHeight;
+    let timer = 0;
     const observer = new ResizeObserver(() => {
-      const currentHeight = scroller.clientHeight;
-      const heightDelta = previousHeight - currentHeight;
-      if (heightDelta) scroller.scrollTop += heightDelta;
-      previousHeight = currentHeight;
-      composerContextHeightRef.current = currentHeight;
+      window.clearTimeout(timer);
+      // setTimeout 完全跳出 RO 投递周期，比 rAF 更能避免 loop 通知。
+      timer = window.setTimeout(() => {
+        const currentHeight = scroller.clientHeight;
+        const heightDelta = previousHeight - currentHeight;
+        if (heightDelta) scroller.scrollTop += heightDelta;
+        previousHeight = currentHeight;
+        composerContextHeightRef.current = currentHeight;
+      }, 0);
     });
     observer.observe(scroller);
-    return () => observer.disconnect();
+    return () => {
+      window.clearTimeout(timer);
+      observer.disconnect();
+    };
   }, [messageId, open, threadId]);
 
   useEffect(() => {
@@ -1101,6 +1112,12 @@ export function MailDetailDrawer({
     attachmentDownloadsRef.current.clear();
     if (composerCloseTimerRef.current) window.clearTimeout(composerCloseTimerRef.current);
   }, []);
+
+  // 导航邮件/线程时跳过一次 soft refresh，避免与完整加载双发请求
+  const skipSoftThreadRefreshRef = useRef(true);
+  useEffect(() => {
+    skipSoftThreadRefreshRef.current = true;
+  }, [autoOpenDraftComposer, mailbox, messageId, open, threadId]);
 
   useEffect(() => {
     if (!open || !message || !mailbox || !messageId) return;
@@ -1128,6 +1145,7 @@ export function MailDetailDrawer({
     draftLoadKeyRef.current = "";
     composerContextHeightRef.current = null;
     suppressDraftLoadForRef.current = "";
+    // 仅切换邮件时清附件预览；同线程后台同步刷新不得打断预览
     setPreviewAttachment(null);
     invalidatePreviewCache();
     setPreviewText("");
@@ -1253,7 +1271,60 @@ export function MailDetailDrawer({
   // A saved local draft overlays the selected inbox message with a new object. That
   // is not a navigation event, so avoid using the whole message as a dependency:
   // doing so would reload the thread and reset the composer after an AI insertion.
-  }, [autoOpenDraftComposer, latestThreadMessageId, mailbox, messageId, open, threadId]);
+  // latestThreadMessageId 变更走下方 soft refresh，避免清附件预览。
+  }, [autoOpenDraftComposer, mailbox, messageId, open, threadId]);
+
+  // 同线程最新消息变化（同步/新邮件）：静默刷新线程页，不关附件预览、不重置编辑区
+  useEffect(() => {
+    if (!open || !mailbox || !messageId || !threadId || !latestThreadMessageId) return;
+    if (skipSoftThreadRefreshRef.current) {
+      skipSoftThreadRefreshRef.current = false;
+      return;
+    }
+    let cancelled = false;
+    const softRefresh = async () => {
+      try {
+        const nextPage = await loadInboxThreadPageRef.current(mailbox, threadId, {
+          anchorMessageId: messageId,
+          limit: 5,
+          includeDisplayBody: true,
+        });
+        if (cancelled) return;
+        const visiblePage = withoutGmailDraftThreadMessages(nextPage);
+        setPage(visiblePage);
+        void cacheThreadPage(mailbox, visiblePage);
+        const requestKey = `${mailbox}:${threadId}:${visiblePage.latest_message_id || latestThreadMessageId}:${messageId}`;
+        if (assistRequestKeyRef.current !== requestKey) {
+          assistRequestKeyRef.current = requestKey;
+          setAssistError("");
+          setAssistLoading(true);
+          void loadInboxThreadAssistRef.current(
+            mailbox,
+            threadId,
+            visiblePage.latest_message_id || latestThreadMessageId,
+            messageId,
+          )
+            .then((result) => {
+              if (!cancelled && assistRequestKeyRef.current === requestKey) setAssist(result);
+            })
+            .catch((reason) => {
+              if (!cancelled && assistRequestKeyRef.current === requestKey) {
+                setAssistError(reason instanceof Error ? reason.message : String(reason));
+              }
+            })
+            .finally(() => {
+              if (!cancelled && assistRequestKeyRef.current === requestKey) setAssistLoading(false);
+            });
+        }
+      } catch {
+        // soft refresh 失败保留当前页，不打断附件预览
+      }
+    };
+    void softRefresh();
+    return () => {
+      cancelled = true;
+    };
+  }, [latestThreadMessageId, mailbox, messageId, open, threadId]);
 
   useEffect(() => {
     setResolvedAvatars(contactAvatars || {});
@@ -1969,11 +2040,12 @@ export function MailDetailDrawer({
         if (!begun.ok || !begun.upload_url || !begun.attachment_id || !begun.storage_key) {
           throw new Error(begun.error || "Failed to stage attachment");
         }
-        await putFileToUploadUrl(begun.upload_url, file, (ratio) => {
+         await putFileToUploadUrl(begun.upload_url, file, begun.upload_headers || {}, (ratio) => {
           setComposerAttachments((current) =>
             current.map((item) => (item.id === tempId ? { ...item, progress: ratio } : item)),
           );
-        });
+         });
+         await actions.completeStageOutgoingAttachment(mailbox, begun.storage_key, file.size, file.type || "application/octet-stream");
         runningTotal += file.size;
         setComposerAttachments((current) =>
           current.map((item) =>

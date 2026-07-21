@@ -23,16 +23,17 @@ afterEach(() => {
 
 describe("createInitialState", () => {
   it("starts a fresh Ask chat after reload while keeping old conversations in history", () => {
+    const recentTs = new Date().toISOString();
     const savedHistory = [{
       conversationId: "chat_previous",
       kind: "chat",
       query: "hello",
-      timestamp: "2026-06-30T10:00:00.000Z",
+      timestamp: recentTs,
       result: { title: "hello", summary: "hi", sections: [] },
       pendingRun: { runId: "at_pending123", question: "hello" },
       messages: [
-        { id: "msg_user", role: "user", content: "hello", timestamp: "2026-06-30T10:00:00.000Z" },
-        { id: "msg_assistant", role: "assistant", content: "hi", timestamp: "2026-06-30T10:00:01.000Z" },
+        { id: "msg_user", role: "user", content: "hello", timestamp: recentTs },
+        { id: "msg_assistant", role: "assistant", content: "hi", timestamp: recentTs },
       ],
     }];
     installLocalStorage({
@@ -47,6 +48,20 @@ describe("createInitialState", () => {
     expect(state.aiChatMessages).toEqual([]);
     expect(state.aiChatConversationId).toBe("");
     expect(state.askHistory[0].pendingRun).toEqual({ runId: "at_pending123", question: "hello" });
+  });
+
+  it("drops ask history older than 7 days on load", () => {
+    const oldTs = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const recentTs = new Date().toISOString();
+    installLocalStorage({
+      [MAILBOX_STORAGE_KEY]: "owner@example.com",
+      [AI_ASK_HISTORY_STORAGE_KEY]: JSON.stringify([
+        { conversationId: "old", query: "old", timestamp: oldTs, result: { title: "old", sections: [] } },
+        { conversationId: "new", query: "new", timestamp: recentTs, result: { title: "new", sections: [] } },
+      ]),
+    });
+    const state = createInitialState();
+    expect(state.askHistory.map((e) => e.conversationId)).toEqual(["new"]);
   });
 });
 

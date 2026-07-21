@@ -4,7 +4,6 @@ from anna_inbox_executa.common import *
 from anna_inbox_executa.gmail_tools import *
 from anna_inbox_executa.storage_tools import *
 from anna_inbox_executa.sampling_tools import *
-from anna_inbox_executa.brief_flow import *
 from anna_inbox_executa.ask_flow import *
 from anna_inbox_executa.ai_turn_flow import *
 from anna_inbox_executa.contact_memory_flow import *
@@ -190,16 +189,6 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "tool": tool, "data": future.result(timeout=180.0)}
     if tool == "test_sampling_async":
         return {"success": True, "tool": tool, "data": _start_test_sampling_async(arguments, invoke_id)}
-    if tool == "start_mail_agent_run":
-        return {"success": True, "tool": tool, "data": start_mail_agent_run(arguments, invoke_id)}
-    if tool == "continue_mail_agent_run":
-        future = asyncio.run_coroutine_threadsafe(_continue_mail_agent_run_async(arguments, invoke_id), loop)
-        return {"success": True, "tool": tool, "data": _resolve_continue_future(
-            future,
-            run_id=str(arguments.get("run_id") or ""),
-            timeout=50.0,
-            label="continue_mail_agent_run",
-        )}
     if tool == "get_mail_agent_run":
         return {"success": True, "tool": tool, "data": get_mail_agent_run(arguments.get("run_id", ""))}
     if tool == "cancel_mail_agent_run":
@@ -295,7 +284,7 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         "save_inbox_thread_draft", "delete_inbox_thread_draft", "modify_message_labels", "set_message_starred",
         "update_inbox_thread_state", "search_compose_contacts", "get_compose_draft", "create_or_update_compose_draft",
         "delete_compose_draft", "list_compose_drafts", "send_compose_emails",
-        "begin_stage_outgoing_attachment", "delete_staged_outgoing_attachment",
+        "begin_stage_outgoing_attachment", "complete_stage_outgoing_attachment", "delete_staged_outgoing_attachment",
         "prepare_staged_outgoing_attachment_access",
     ):
         future = asyncio.run_coroutine_threadsafe(
@@ -307,23 +296,13 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         except SamplingError as exc:
             raise RuntimeError(json.dumps({"code": exc.code, "message": exc.message, "data": exc.data}, ensure_ascii=False)) from exc
 
-    if tool == "run_mail_agent":
-        future = asyncio.run_coroutine_threadsafe(
-            run_mail_agent_pipeline(
-                user_request=arguments.get("user_request", ""),
-                mailbox=arguments.get("mailbox", ""),
-                mode=arguments.get("mode", "auto"),
-                max_messages=arguments.get("max_messages", arguments.get("primary_count", 20)),
-                primary_count=arguments.get("primary_count", 20),
-                ai_provider=arguments.get("ai_provider", "anna-llm"),
-                invoke_id=invoke_id,
-            ),
-            loop,
-        )
-        try:
-            return {"success": True, "tool": tool, "data": future.result(timeout=600.0)}
-        except SamplingError as exc:
-            raise RuntimeError(json.dumps({"code": exc.code, "message": exc.message, "data": exc.data}, ensure_ascii=False)) from exc
+    if tool in ("run_mail_agent", "start_mail_agent_run", "continue_mail_agent_run"):
+        # Brief 管线已下线；保留明确错误避免旧客户端静默失败。
+        return {
+            "success": False,
+            "tool": tool,
+            "error": "Brief pipeline retired. Use start_ai_turn / AI sidebar instead.",
+        }
 
     raise ValueError(f"Unknown tool: {tool}")
 

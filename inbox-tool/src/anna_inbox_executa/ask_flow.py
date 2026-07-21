@@ -3,7 +3,6 @@ from __future__ import annotations
 from anna_inbox_executa.common import *
 from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.contact_memory_flow import _memory_mailboxes, _memory_mailboxes_async
-from anna_inbox_executa.brief_flow import _merge_partial
 
 
 async def run_custom_scan_background(run_id: str, plan: Any, arguments: dict[str, Any], invoke_id: str) -> None:

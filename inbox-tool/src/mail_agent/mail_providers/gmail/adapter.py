@@ -2790,10 +2790,16 @@ async def get_messages_lite_async(mailbox: str, message_ids: list[str]) -> list[
 
 
 def get_message_detail(mailbox: str, message_id: str) -> MessageDetail | None:
+    """读取单封详情；若仅有 metadata 缓存（无正文）则按需 full fetch。"""
     try:
         msg = read_message(mailbox, message_id)
     except (ValueError, RuntimeError, TimeoutError, json.JSONDecodeError):
-        return None
+        msg = None
+    if not isinstance(msg, dict) or not str(msg.get("body_text") or "").strip():
+        # Ask 搜索默认只缓存 header/snippet；正文仅在 top-N / 显式详情路径按需拉取。
+        fetched = fetch_and_cache_message(mailbox, message_id)
+        if isinstance(fetched, dict):
+            msg = fetched
     if not isinstance(msg, dict):
         return None
 
@@ -2832,10 +2838,16 @@ def _to_message_detail(msg: dict[str, Any], body_text: str | None = None) -> Mes
 
 
 async def get_message_detail_async(mailbox: str, message_id: str) -> MessageDetail | None:
+    """异步读取详情；metadata 无正文时按需 full fetch（线程池）。"""
     try:
         msg = await read_message_async(mailbox, message_id)
     except (ValueError, RuntimeError, TimeoutError, json.JSONDecodeError):
-        return None
+        msg = None
+    if not isinstance(msg, dict) or not str(msg.get("body_text") or "").strip():
+        import asyncio as _asyncio
+        fetched = await _asyncio.to_thread(fetch_and_cache_message, mailbox, message_id)
+        if isinstance(fetched, dict):
+            msg = fetched
     if not isinstance(msg, dict):
         return None
     return _to_message_detail(msg)

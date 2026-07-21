@@ -5,8 +5,8 @@ from __future__ import annotations
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any
 
+from anna_inbox_executa.common import log
 from anna_inbox_executa.sampling_tools import *
-from anna_inbox_executa.brief_flow import _merge_partial
 from anna_inbox_executa.diagnostics import activate_trace, current_trace, deactivate_trace, snapshot
 
 
@@ -29,6 +29,15 @@ def _gmail_access_unavailable_message(user_text: str) -> str:
     if any("\u3400" <= char <= "\u9fff" for char in str(user_text or "")):
         return "AI 暂时无法读取邮箱。Google 账号授权已失效或权限不足，请在设置中重新连接 Google 账号，刷新收件箱后再重试。"
     return "AI is temporarily unavailable because Google account access has expired or lacks permission. Reconnect your Google account in Settings, refresh the inbox, then try again."
+
+
+def _log_ai_turn_failure(run_id: str, error: object) -> None:
+    """把前端可见失败码写入 stderr，同时避免日志记录模型正文或凭据。"""
+    detail = " ".join(str(error or "unknown error").split())[:300]
+    # LLM JSON 解析错误有时附带模型原文 preview/excerpt，不能写入后端日志。
+    if any(marker in detail.casefold() for marker in ("preview=", "excerpt=", "authorization:")):
+        detail = type(error).__name__
+    log(f"ai_turn failed: run_id={run_id[:80]} error={detail}")
 
 
 def _public_ai_turn_state(run_id: str) -> dict[str, Any]:
@@ -214,15 +223,19 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
             scan = outcome["scan_result"]
             result_data["search_summary"] = str(scan.get("summary") or "")[:500]
 
+        run_error = str(outcome.get("error") or "") if kind == "error" else ""
+        if run_error:
+            _log_ai_turn_failure(run_id, run_error)
         MAIL_AGENT_RUNS[run_id].update({
             "status": "done" if kind != "error" else "failed",
             "stage": "done" if kind != "error" else "failed",
             "updated_at": beijing_now(),
             "result": result_data,
-            "error": str(outcome.get("error") or "") if kind == "error" else "",
+            "error": run_error,
         })
         _save_run_checkpoint(run_id)
     except Exception as exc:
+        _log_ai_turn_failure(run_id, exc)
         MAIL_AGENT_RUNS[run_id].update({
             "status": "failed",
             "stage": "failed",

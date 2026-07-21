@@ -133,7 +133,7 @@ export function ComposeView({
     setExitWithoutSavingConfirmation(false);
   }, [initialDraft, open]);
 
-  // 恢复草稿图片预览 URL（stage 文件 → loopback）
+  // 恢复草稿图片预览 URL（local stage 或 APS Files）
   useEffect(() => {
     if (!open || !mailbox) return;
     let cancelled = false;
@@ -229,11 +229,12 @@ export function ComposeView({
         if (!begun.ok || !begun.upload_url || !begun.attachment_id || !begun.storage_key) {
           throw new Error(begun.error || "Failed to stage attachment");
         }
-        await putFileToUploadUrl(begun.upload_url, file, (ratio) => {
+         await putFileToUploadUrl(begun.upload_url, file, begun.upload_headers || {}, (ratio) => {
           setAttachments((current) =>
             current.map((item) => (item.id === tempId ? { ...item, progress: ratio } : item)),
           );
-        });
+         });
+         await actions.completeStageOutgoingAttachment(mailbox, begun.storage_key, file.size, file.type || "application/octet-stream");
         runningTotal += file.size;
         setAttachments((current) =>
           current.map((item) =>

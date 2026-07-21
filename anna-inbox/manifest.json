@@ -8,6 +8,7 @@
   ],
   "host_capabilities": [
     "llm.sample",
+    "llm.complete",
     "aps.kv",
     "aps.scope.user.read",
     "aps.scope.user.write"
@@ -15,12 +16,12 @@
   "required_executas": [
     {
       "tool_id": "bundled:inbox-executa",
-      "min_version": "2.2.2",
+      "min_version": "2.2.3",
       "version": "latest"
     }
   ],
   "optional_executas": [],
-  "system_prompt_addendum": "Anna Inbox is a Gmail workspace with inbox sync, thread actions, drafts, attachments, Brief workflows, and mailbox search. Credentials are supplied by Anna authorization or the Executa credential context; never ask the user to paste API keys or OAuth tokens.",
+  "system_prompt_addendum": "Anna Inbox is a Gmail workspace with inbox sync, thread actions, drafts, attachments, AI sidebar search/organize, and mailbox search. Credentials are supplied by Anna authorization or the Executa credential context; never ask the user to paste API keys or OAuth tokens.",
   "tags": [
     "email",
     "gmail",
