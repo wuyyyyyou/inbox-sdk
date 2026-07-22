@@ -8,7 +8,7 @@ export type AgentTurnResult = {
 };
 
 export function stripTerminalDoneMarker(text: string): string {
-  return text.replace(/(?:^|\n)\s*\[DONE\]\s*$/i, "").trimEnd();
+  return text.replace(/^[ \t]*\[DONE\][ \t]*$/gim, "").trimEnd();
 }
 
 type AgentSessionHandle = {

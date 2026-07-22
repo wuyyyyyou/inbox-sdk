@@ -146,7 +146,7 @@ function splitTextParagraphs(text: string) {
     .filter(Boolean);
 }
 
-export function SafeEmailHtml({ html, className = "" }: { html: string; className?: string; scaleToFit?: boolean }) {
+export function SafeEmailHtml({ html, className = "", onRendered }: { html: string; className?: string; scaleToFit?: boolean; onRendered?: () => void }) {
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const [frameHeight, setFrameHeight] = useState(160);
   const [documentRevision, setDocumentRevision] = useState(0);
@@ -161,11 +161,14 @@ export function SafeEmailHtml({ html, className = "" }: { html: string; classNam
     normalizeLinks(value as DocumentFragment);
     const container = document.createElement("div");
     container.appendChild(value as DocumentFragment);
+    // DOMPurify 是主防线；这里再做一次最终节点级过滤，避免异常 HTML 变体进入 srcdoc。
+    container.querySelectorAll("script, iframe, object, embed, form").forEach((node) => node.remove());
+    container.querySelectorAll('img[src^="cid:"]').forEach((node) => node.removeAttribute("src"));
     normalizeDocumentMarkup(container);
     return container.innerHTML;
   }, [html]);
   const srcDoc = useMemo(() => `<!doctype html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>html,body{margin:0;padding:0}img{max-width:100%;height:auto}</style></head><body>${sanitized}</body></html>`, [sanitized]);
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>html,body{margin:0;padding:0;font-family:Arial,"Helvetica Neue",Helvetica,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}img{max-width:100%;height:auto}</style></head><body>${sanitized}</body></html>`, [sanitized]);
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -222,7 +225,10 @@ export function SafeEmailHtml({ html, className = "" }: { html: string; classNam
       sandbox="allow-same-origin allow-popups"
       title="Email content"
       style={{ height: frameHeight }}
-      onLoad={() => setDocumentRevision((current) => current + 1)}
+      onLoad={() => {
+        setDocumentRevision((current) => current + 1);
+        onRendered?.();
+      }}
     />
   );
 }

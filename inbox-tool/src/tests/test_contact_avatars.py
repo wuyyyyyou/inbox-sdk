@@ -35,18 +35,11 @@ def main() -> None:
             return {"otherContacts": []}
         raise AssertionError(f"unexpected People API path: {path}")
 
-    def fake_gravatar(email: str) -> str:
-        normalized = email.lower()
-        if normalized == "grav@example.com":
-            return adapter._gravatar_avatar_url(normalized)
-        return ""
-
     reset_avatar_state()
     with (
         patch.object(adapter, "get_access_token", return_value="token"),
         patch.object(adapter, "_people_api_get", side_effect=fake_people_get),
         patch.object(adapter, "get_account_avatar_url", return_value=""),
-        patch.object(adapter, "_resolve_gravatar_avatar_url", side_effect=fake_gravatar),
     ):
         result = adapter.resolve_contact_avatar_urls(
             "owner@example.com",
@@ -55,7 +48,6 @@ def main() -> None:
 
     assert result["permission_required"] is False
     assert result["avatars"]["contact@example.com"] == "https://people.example/avatar.jpg"
-    assert result["avatars"]["grav@example.com"].startswith("https://www.gravatar.com/avatar/")
     assert "missing@example.com" not in result["avatars"]
 
     reset_avatar_state()
@@ -63,12 +55,11 @@ def main() -> None:
     with (
         patch.object(adapter, "get_access_token", return_value="token"),
         patch.object(adapter, "_people_api_get", side_effect=http_403),
-        patch.object(adapter, "_resolve_gravatar_avatar_url", side_effect=fake_gravatar),
     ):
         denied = adapter.resolve_contact_avatar_urls("owner@example.com", ["grav@example.com"])
 
     assert denied["permission_required"] is True
-    assert denied["avatars"]["grav@example.com"].startswith("https://www.gravatar.com/avatar/")
+    assert "grav@example.com" not in denied["avatars"]
     print("PASS contact avatar tests")
 
 

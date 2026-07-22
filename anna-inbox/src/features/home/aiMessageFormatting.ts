@@ -90,6 +90,11 @@ function normalizeMarkdownTables(text: string): string {
   return result.join('\n');
 }
 
+function normalizeInlineHeadings(text: string): string {
+  // 模型偶尔会把标题紧接在上一句后面，先补行再交给块级 Markdown 解析。
+  return text.replace(/([^\n])\s+(#{1,4}\s+)/g, "$1\n\n$2");
+}
+
 function normalizePipedRanking(text: string): string {
   return text.replace(/^([^\n]*?(?:排序|优先级|Priority|Ranking)[^\n]*\|[^\n]*)$/gim, (line) => {
     const cells = line.split("|").map((cell) => cell.trim()).filter(Boolean);
@@ -150,8 +155,18 @@ export function parseAiMessageInline(text: string): AiMessageInline[] {
   return nodes;
 }
 
+function parseMetadataInline(text: string): AiMessageInline[] {
+  const value = text.trim();
+  // 部分模型会给邮件元数据加上未闭合的前置 **，避免把标记直接显示给用户。
+  if (value.startsWith("**") && !value.slice(2).includes("**")) {
+    const boldValue = value.slice(2).trim();
+    return boldValue ? [{ type: "bold", value: boldValue }] : [];
+  }
+  return parseAiMessageInline(value);
+}
+
 export function parseAiMessageMarkdown(text: string): AiMessageBlock[] {
-  const lines = normalizeMarkdownTables(normalizePipedRanking(text)).replace(/\r\n?/g, "\n").split("\n");
+  const lines = normalizeInlineHeadings(normalizeMarkdownTables(normalizePipedRanking(text))).replace(/\r\n?/g, "\n").split("\n");
   const blocks: AiMessageBlock[] = [];
   let index = 0;
 
@@ -166,7 +181,7 @@ export function parseAiMessageMarkdown(text: string): AiMessageBlock[] {
       for (const row of metadataRows) {
         const threadRefs = row.value.match(/\[THREAD_REF_[^\]\s]+\]/g) || [];
         const value = row.value.replace(/\s*\|?\s*\[THREAD_REF_[^\]\s]+\]\s*/g, "").trim();
-        if (value) blocks.push({ type: "metadata", label: row.label, content: parseAiMessageInline(value) });
+        if (value) blocks.push({ type: "metadata", label: row.label, content: parseMetadataInline(value) });
         for (const threadRef of threadRefs) {
           blocks.push({ type: "metadata", label: "", content: parseAiMessageInline(threadRef) });
         }

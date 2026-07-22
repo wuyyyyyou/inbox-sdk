@@ -13,6 +13,7 @@ import { useApp } from "../../app/AppContext";
 import type {
   AiChatMessage,
   AiComposeContextRef,
+  AiInboxListContext,
   AiMailContextRef,
   AiRoutingIntent,
   AskMailLink,
@@ -2444,6 +2445,7 @@ function AiSidebar({
   onToggle,
   currentMailContext,
   selectedThreads,
+  inboxListContext,
   onUseArtifact,
   onUseComposeArtifact,
   onOpenMail,
@@ -2460,6 +2462,7 @@ function AiSidebar({
     thread_id: string;
     subject?: string;
   }>;
+  inboxListContext: AiInboxListContext;
   onUseArtifact: (
     artifact: DraftReplyArtifact,
     mode: "append" | "replace",
@@ -2586,6 +2589,7 @@ function AiSidebar({
     void actions.sendAiChatMessage({
       currentMailContext,
       selectedThreads: selectedThreads?.length ? selectedThreads : undefined,
+      inboxListContext,
     });
   };
 
@@ -3478,6 +3482,16 @@ export function HomeView() {
       cancelled = true;
     };
   }, [contactAvatarsKey, flagsKey, mailbox]);
+
+  // 刷新邮箱缓存可能在当前邮箱内完成，需同步读取控制器预热的头像缓存。
+  useEffect(() => {
+    if (!mailbox || !state.inboxUpdatedAt) return;
+    void getContactAvatarCache(mailbox, contactAvatarsKey).then((cached) => {
+      if (!cached) return;
+      setContactAvatars(cached.avatars && typeof cached.avatars === "object" ? cached.avatars : {});
+      avatarMisses.current = new Set(Array.isArray(cached.missing) ? cached.missing : []);
+    });
+  }, [contactAvatarsKey, mailbox, state.inboxUpdatedAt]);
 
   useEffect(() => {
     try {
@@ -4630,6 +4644,40 @@ export function HomeView() {
     pinnedImportantMessages,
     state.inboxSettings,
   ]);
+
+  const aiInboxListContext = useMemo<AiInboxListContext>(() => {
+    const customCategory = filter.startsWith("category:")
+      ? (state.inboxSettings.custom_categories || []).find(
+          (category) => category.id === filter.slice("category:".length),
+        )
+      : undefined;
+    const doneIds = new Set(flags.done);
+    for (const message of sourceMessages) {
+      if (isDoneMessage(message, flags)) doneIds.add(message.id);
+    }
+    for (const id of flags.doneRemoved) doneIds.delete(id);
+    const compactIds = (ids: Iterable<string>) => Array.from(new Set(ids))
+      .map(String)
+      .filter(Boolean)
+      .slice(0, 500);
+    return {
+      mailbox_view: mailboxView,
+      inbox_group: filter,
+      search_input: search.slice(0, 500),
+      active_search: activeSearch.slice(0, 500),
+      todo_message_ids: compactIds(flags.todos),
+      done_message_ids: compactIds(doneIds),
+      snoozed_message_ids: compactIds(flags.snoozed),
+      ...(customCategory ? {
+        custom_category: {
+          id: customCategory.id,
+          name: customCategory.name,
+          query: customCategory.query,
+          bundling_behavior: customCategory.bundling_behavior,
+        },
+      } : {}),
+    };
+  }, [activeSearch, filter, flags, mailboxView, search, sourceMessages, state.inboxSettings.custom_categories]);
 
   const selectedMessage = useMemo(() => {
     if (!selectedId) return null;
@@ -5952,6 +6000,7 @@ export function HomeView() {
         onToggle={() => setSidebarCollapsed((value) => !value)}
         currentMailContext={sidebarMailContext}
         selectedThreads={aiSelectedThreads}
+        inboxListContext={aiInboxListContext}
         onUseArtifact={applyDraftReplyArtifact}
         onApplyScanQuery={applySearch}
         onUseComposeArtifact={(artifact, sourceContext) => {

@@ -53,6 +53,13 @@ describe("parseAiMessageMarkdown", () => {
     ]);
   });
 
+  it("recognizes a heading appended to the previous sentence", () => {
+    expect(parseAiMessageMarkdown("说明已补齐。 ## 邮件线索总结")).toEqual([
+      { type: "paragraph", content: [{ type: "text", value: "说明已补齐。" }] },
+      { type: "heading", level: 2, content: [{ type: "text", value: "邮件线索总结" }] },
+    ]);
+  });
+
   it("parses Shortwave-compatible non-table Markdown blocks", () => {
     expect(parseAiMessageMarkdown("#### Note\n\n*italic* ~~old~~ `code`\n\n> Quote\n\n---\n\n```txt\nexample\n```"))
       .toEqual([
@@ -79,6 +86,13 @@ describe("parseAiMessageMarkdown", () => {
       { type: "metadata", label: "主题", content: [{ type: "text", value: "Re: Collaboration invite" }] },
       { type: "metadata", label: "时间", content: [{ type: "text", value: "7月20日" }] },
       { type: "metadata", label: "", content: [{ type: "thread_ref", threadId: "thread-1" }] },
+    ]);
+  });
+
+  it("renders an unclosed leading bold marker in email metadata as bold text", () => {
+    expect(parseAiMessageMarkdown("发件人： ** Tony (SaneBox)\n主题： ** Kate, Book your SaneBox walkthrough call today!")).toEqual([
+      { type: "metadata", label: "发件人", content: [{ type: "bold", value: "Tony (SaneBox)" }] },
+      { type: "metadata", label: "主题", content: [{ type: "bold", value: "Kate, Book your SaneBox walkthrough call today!" }] },
     ]);
   });
 

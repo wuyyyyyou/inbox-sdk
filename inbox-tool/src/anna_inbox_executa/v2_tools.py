@@ -5,11 +5,15 @@ from html import escape as html_escape
 
 from anna_inbox_executa.common import *
 from anna_inbox_executa.card_tools import _handle_generate_draft_background, _handle_summarize_background, _serialize_card_for_frontend
-from anna_inbox_executa.gmail_tools import _dedup_body, _sanitize_email_html
+from anna_inbox_executa.gmail_tools import _dedup_body, _resolve_cid_images, _sanitize_email_html
 from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.storage_tools import *
 
 INLINE_ATTACHMENT_DIRECT_MAX_BYTES = 4 * 1024 * 1024
+# APS / Host reverse-RPC 单次协商超时：需明显短于前端 tools.invoke 60s，
+# 以便失败时仍能返回可读错误，而不是被宿主整调用超时淹没。
+APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS = 20.0
+HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS = 20.0
 _DOWNLOAD_SERVER_LOCK = threading.Lock()
 _DOWNLOAD_SERVER: Any | None = None
 _DOWNLOAD_SERVER_THREAD: threading.Thread | None = None
@@ -124,7 +128,9 @@ def _strip_quoted_reply_html(html: str) -> str:
 
         def handle_data(self, data: str) -> None:
             if not self.done and not self.skip_depth:
-                self.parts.append(_html_escape(data, quote=False))
+                # 清理纯文本引用前缀，避免详情页把历史引用显示成连续 >>。
+                normalized = _re.sub(r"(?m)^[ \t]*>{2,}[ \t]?", "", data)
+                self.parts.append(_html_escape(normalized, quote=False))
 
         def handle_entityref(self, name: str) -> None:
             if not self.done and not self.skip_depth:
@@ -241,16 +247,72 @@ with urllib.request.urlopen(request, timeout=float(payload["timeout"])) as respo
 
 
 async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
-    """将收件附件写入 APS Files，并返回短期下载地址。
+    """将收件附件上传到可访问的短期 URL。
 
-    Cloud Agent 中前端和 Executa 不在同一台机器，附件不再经过 localhost
-    或 Host transient upload；稳定 object path 只作为返回元数据，URL 不持久化。
+    优先 Host transient upload（与 KV 后端选择无关，响应始终可路由）；
+    Host 不可用时回退 APS Files。稳定 object path 仅作元数据，URL 不持久化。
+    Cloud Agent 不可使用 loopback：浏览器与 Executa 不在同一台机器。
     """
     from mail_agent.mail_providers.gmail.adapter import sanitize_mailbox_id
 
     filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
     mime_type = _normalized_attachment_mime_type(attachment)
+    meta = {
+        "mailbox": mailbox,
+        "card_id": card_id,
+        "message_id": str(attachment.get("message_id") or ""),
+        "filename": filename,
+        "artifact_kind": "email_attachment",
+    }
 
+    # 1) Host transient upload（历史可用路径；不依赖 storage_provider）
+    host_presign_started = False
+    host_unavailable_error = ""
+    try:
+        negotiated = await host_upload.negotiate(
+            filename=filename,
+            mime_type=mime_type,
+            size_bytes=len(content),
+            purpose="user_artifact",
+            metadata=meta,
+            timeout=HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS,
+        )
+        host_presign_started = True
+        put_url = str(negotiated.get("put_url") or "")
+        r2_key = str(negotiated.get("r2_key") or "")
+        if not put_url or not r2_key:
+            raise RuntimeError("Host upload did not return a presigned upload target.")
+        put_error: Exception | None = None
+        try:
+            await asyncio.to_thread(
+                _put_presigned_url_sync,
+                put_url,
+                negotiated.get("headers") or {},
+                content,
+                mime_type,
+            )
+        except Exception as exc:
+            put_error = exc
+            log(f"host attachment presigned PUT returned error before confirm: {type(exc).__name__}: {exc}")
+        if put_error is None:
+            result = await host_upload.confirm(r2_key=r2_key, timeout=HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS)
+        else:
+            try:
+                result = await host_upload.confirm(r2_key=r2_key, timeout=HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS)
+            except Exception as confirm_exc:
+                raise RuntimeError(
+                    f"Temporary attachment upload failed after presigned PUT error: {put_error}"
+                ) from confirm_exc
+        result["storage_key"] = r2_key
+        return result
+    except Exception as host_exc:
+        # 已开始 PUT 的失败不再吞掉；仅「协商阶段不可用」时继续 APS 回退。
+        if host_presign_started:
+            raise
+        host_unavailable_error = f"{type(host_exc).__name__}: {host_exc}"
+        log(f"host attachment upload unavailable: {host_unavailable_error}")
+
+    # 2) APS Files 回退
     path = (
         f"anna-inbox/mailbox/{sanitize_mailbox_id(mailbox)}/attachments/"
         f"{_safe_attachment_filename(card_id)}/{_safe_attachment_filename(str(attachment.get('id') or 'attachment'))}/{filename}"
@@ -266,12 +328,14 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
             "filename": filename,
         },
         scope="user",
+        timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
     )
     put_url = str(begin.get("put_url") or begin.get("presigned_url") or "")
     if not put_url:
-        raise RuntimeError("Anna Files did not return an upload URL.")
+        detail = f" Host upload failed first: {host_unavailable_error}" if host_unavailable_error else ""
+        raise RuntimeError(f"Anna Files did not return an upload URL.{detail}")
     upload_headers = begin.get("headers") or begin.get("fields") or {}
-    put_error: Exception | None = None
+    put_error = None
     etag = ""
     try:
         etag = await asyncio.to_thread(_put_presigned_url_sync, put_url, upload_headers, content, mime_type)
@@ -285,12 +349,18 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
             size_bytes=len(content),
             content_type=mime_type,
             scope="user",
+            timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
         )
     except Exception as complete_exc:
         if put_error is not None:
             raise RuntimeError(f"Attachment file upload failed after presigned PUT error: {put_error}") from complete_exc
         raise
-    result = await _aps_files.download_url(path=path, expires_in=900, scope="user")
+    result = await _aps_files.download_url(
+        path=path,
+        expires_in=900,
+        scope="user",
+        timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
+    )
     result["storage_key"] = path
     return result
 
@@ -323,7 +393,12 @@ async def _load_outgoing_attachments_for_send(mailbox: str, items: list[dict[str
         storage_key = str(item.get("storage_key") or "").strip()
         if not storage_key:
             continue
-        access = await _aps_files.download_url(path=storage_key, expires_in=300, scope="user")
+        access = await _aps_files.download_url(
+            path=storage_key,
+            expires_in=300,
+            scope="user",
+            timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
+        )
         url = str(access.get("url") or access.get("download_url") or "")
         if not url:
             raise RuntimeError("APS Files did not return a download URL for outgoing attachment.")
@@ -349,7 +424,11 @@ async def _delete_outgoing_attachments(mailbox: str, items: list[dict[str, Any]]
         return
     for item in items or []:
         if isinstance(item, dict) and str(item.get("storage_key") or "").strip():
-            await _aps_files.delete(path=str(item["storage_key"]), scope="user")
+            await _aps_files.delete(
+                path=str(item["storage_key"]),
+                scope="user",
+                timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
+            )
 
 
 def _inline_attachment_download_payload(attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
@@ -926,10 +1005,13 @@ def _display_body_payload(
     """构造线程页的小型正文预览，绝不把 CID 二进制内联进 JSON-RPC。"""
     from mail_agent.actions.service import _strip_quoted_reply
 
-    raw_html, raw_text, _payload = source or _display_body_source(message)
+    raw_html, raw_text, payload = source or _display_body_source(message)
 
     if prefer_html and raw_html.strip():
-        sanitized_html = _sanitize_email_html(_strip_quoted_reply_html(raw_html))
+        sanitized_html = _resolve_cid_images(
+            _sanitize_email_html(_strip_quoted_reply_html(raw_html)),
+            payload,
+        )
         # CID 图片转 data URI 会让几 KB HTML 膨胀为数 MB。线程页只给不含
         # CID 的完整 HTML；含 CID 的邮件交由单封 URL 正文链路加载。
         if not _CID_IMAGE_RE.search(sanitized_html) and len(sanitized_html) <= limit:
@@ -1000,7 +1082,10 @@ def _build_inbox_message_display_response(mailbox: str, message: dict[str, Any])
     }
     raw_html, raw_text, payload = _display_body_source(message)
     if raw_html.strip():
-        sanitized_html = _sanitize_email_html(_strip_quoted_reply_html(raw_html))
+        sanitized_html = _resolve_cid_images(
+            _sanitize_email_html(_strip_quoted_reply_html(raw_html)),
+            payload,
+        )
         # 只有不含 CID 的小 HTML 才直走 JSON-RPC。其余 HTML 一律通过本地
         # loopback 读取，确保在序列化响应之前就停止正文的协议膨胀。
         inline_data = {**base, "body_html": sanitized_html, "body_truncated": False}
@@ -1106,7 +1191,24 @@ def _load_thread_messages(mailbox: str, thread_id: str, *, force_refresh: bool =
     )
     # 仅当该线程所有 index 消息都有完整缓存时才跳过 Gmail；长线程在只缓存
     # 部分正文时必须刷新，否则“加载更早邮件”会被错误地截断。
-    if cached_messages and len(cached_messages) == expected_count and not force_refresh:
+    summaries_by_id = {
+        str(item.get("id") or ""): item
+        for item in list_messages(normalized_mailbox)
+        if isinstance(item, dict) and item.get("id")
+    }
+    cached_by_id = {str(item.get("id") or ""): item for item in cached_messages}
+
+    def _attachment_count(item: dict[str, Any] | None) -> int:
+        if not isinstance(item, dict):
+            return 0
+        attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
+        return max(len(attachments), int(item.get("attachment_count") or 0), 1 if item.get("has_attachment") else 0)
+
+    attachment_metadata_complete = all(
+        _attachment_count(cached_by_id.get(message_id)) >= _attachment_count(summary)
+        for message_id, summary in summaries_by_id.items()
+    )
+    if cached_messages and len(cached_messages) == expected_count and attachment_metadata_complete and not force_refresh:
         try:
             # 完整详情可能在更早一次按需读取中补齐附件；回填目录摘要后，
             # 当前线程关闭或下次加载列表时即可正确显示附件图标。
@@ -2811,6 +2913,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             )
             attachment_id = uuid.uuid4().hex
             if _should_use_aps_files():
+                # 平台附件始终走 APS Files 预签名 PUT；begin 只协商 URL，不传文件字节。
                 storage_key = _aps_outgoing_attachment_path(mailbox, attachment_id, meta["filename"])
                 begin = await _aps_files.upload_begin(
                     path=storage_key,
@@ -2818,6 +2921,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                     content_type=meta["mime_type"],
                     metadata={"mailbox": mailbox, "attachment_id": attachment_id, "draft_scope": draft_scope, "draft_key": draft_key},
                     scope="user",
+                    timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
                 )
                 upload_url = str(begin.get("put_url") or begin.get("presigned_url") or "")
                 if not upload_url:
@@ -2876,6 +2980,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 size_bytes=size,
                 content_type=str(arguments.get("mime_type") or "application/octet-stream"),
                 scope="user",
+                timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
             )
             return {"ok": True, "storage_key": storage_key, **result}
         return {"ok": True, "storage_key": storage_key}
@@ -2891,14 +2996,18 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             expected_prefix = f"anna-inbox/mailbox/{sanitize_mailbox_id(mailbox)}/outgoing/"
             if not storage_key.startswith(expected_prefix):
                 return {"ok": False, "error": "Invalid APS attachment object path"}
-            result = await _aps_files.delete(path=storage_key, scope="user")
+            result = await _aps_files.delete(
+                path=storage_key,
+                scope="user",
+                timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
+            )
             return {"ok": True, **result}
         from mail_agent.mail_providers.gmail.outgoing_attachments import delete_staged_attachment
         deleted = delete_staged_attachment(mailbox, storage_key)
         return {"ok": True, "deleted": deleted}
 
     if tool == "prepare_staged_outgoing_attachment_access":
-        # 草稿恢复后给图片预览用的短期 loopback URL。
+        # 草稿恢复后给图片预览用的短期 URL（APS）或本地 loopback。
         if not mailbox:
             return {"error": "mailbox is required"}
         storage_key = str(arguments.get("storage_key") or "").strip()
@@ -2912,7 +3021,12 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 expected_prefix = f"anna-inbox/mailbox/{sanitize_mailbox_id(mailbox)}/outgoing/"
                 if not storage_key.startswith(expected_prefix):
                     return {"ok": False, "error": "Invalid APS attachment object path"}
-                access = await _aps_files.download_url(path=storage_key, expires_in=900, scope="user")
+                access = await _aps_files.download_url(
+                    path=storage_key,
+                    expires_in=900,
+                    scope="user",
+                    timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
+                )
                 preview_url = str(access.get("url") or access.get("download_url") or "")
                 payload = {"ok": True, "delivery": "url", "filename": filename, "mime_type": mime_type, "preview_url": preview_url, "download_url": preview_url, "expires_at": access.get("expires_at") or ""}
             else:

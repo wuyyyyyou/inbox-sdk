@@ -163,13 +163,16 @@ def main() -> None:
         ],
     })
     cid_display = tools._build_inbox_message_display_response("user@example.com", cid_message)
-    assert cid_display.get("body_url")
-    with urlopen(str(cid_display["body_url"])) as response:
-        rendered_cid_html = response.read().decode("utf-8")
-    assert "cid:newsletter-logo" not in rendered_cid_html
-    cid_url = rendered_cid_html.split('src="', 1)[1].split('"', 1)[0]
-    with urlopen(cid_url) as response:
-        assert response.read() == b"png-bytes"
+    if cid_display.get("body_url"):
+        with urlopen(str(cid_display["body_url"])) as response:
+            rendered_cid_html = response.read().decode("utf-8")
+        assert "cid:newsletter-logo" not in rendered_cid_html
+        cid_url = rendered_cid_html.split('src="', 1)[1].split('"', 1)[0]
+        with urlopen(cid_url) as response:
+            assert response.read() == b"png-bytes"
+    else:
+        assert "cid:newsletter-logo" not in str(cid_display.get("body_html") or "")
+        assert "data:image/png;base64," in str(cid_display.get("body_html") or "")
 
     with patch(
         "mail_agent.mail_providers.gmail.adapter.decode_body_for_display",

@@ -84,6 +84,9 @@ def main() -> None:
     chinese_prose_cleaned = _strip_quoted_reply_html(chinese_prose)
     check("keeps non-email chinese quote prose", "学而时习之" in chinese_prose_cleaned, chinese_prose_cleaned)
 
+    prefixed_quotes = _strip_quoted_reply_html("<div>&gt;&gt; Old quoted line<br>&gt;&gt; Another quoted line</div>")
+    check("removes repeated quote prefixes", ">>" not in prefixed_quotes, prefixed_quotes)
+
     print("PASS latest body quote cleanup tests")
 
 

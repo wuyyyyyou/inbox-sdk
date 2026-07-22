@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.2.4",
+  "version": "2.2.5",
   "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Ask / AI sidebar, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
@@ -1894,18 +1894,18 @@
     },
     {
       "name": "search_email",
-      "description": "Search LOCAL inbox cache only (never live Gmail, never list_cached_emails). Use for any inbox-wide claim. Query language: is:inbox AND is:todo, from:, subject:, -term. Default fields ONLY: date, participants, subject, bodySnippet (+ THREAD_REF). Never returns bodyFull — call read_email for full body. Cap 6 searches / 45 hits per conversation. If cache empty, tell user to refresh inbox.",
+      "description": "Search live Gmail with standard Gmail query syntax; never falls back to local cache. Use for any inbox-wide claim. Local workflow filters is:todo, is:done, is:snoozed are supported with AND only. Default fields ONLY: date, participants, subject, bodySnippet (+ THREAD_REF). Never returns bodyFull — call read_email for full body. Each call returns at most 20 hits; repeated searches are allowed. If Gmail fails, explain the failure to the user and try another non-cache approach.",
       "parameters": [
         {
           "name": "about",
           "type": "string",
-          "description": "Local keywords/fields, e.g. urgent OR from:alice.",
+          "description": "Gmail query keywords/fields, e.g. newer_than:7d from:alice.",
           "required": false
         },
         {
           "name": "filter",
           "type": "string",
-          "description": "Local filter, e.g. is:inbox AND is:unread.",
+          "description": "Additional Gmail or local workflow filter, e.g. is:important AND is:todo.",
           "required": false
         },
         {
@@ -1917,19 +1917,31 @@
         {
           "name": "ui_context",
           "type": "object",
-          "description": "Read-only UI facts; copy mailbox + conversation_id.",
+          "description": "Read-only UI facts; copy mailbox.",
           "required": false
         },
         {
-          "name": "conversation_id",
-          "type": "string",
-          "description": "Sidebar conversation id (quota key).",
+          "name": "todo_message_ids",
+          "type": "array",
+          "description": "Copy ui_context ids when using is:todo.",
+          "required": false
+        },
+        {
+          "name": "done_message_ids",
+          "type": "array",
+          "description": "Copy ui_context ids when using is:done.",
+          "required": false
+        },
+        {
+          "name": "snoozed_message_ids",
+          "type": "array",
+          "description": "Copy ui_context ids when using is:snoozed.",
           "required": false
         },
         {
           "name": "limit",
           "type": "integer",
-          "description": "Max hits this call (default 12, hard cap remaining budget).",
+          "description": "Max hits this call (default 12, hard cap 20).",
           "required": false
         },
         {

@@ -74,6 +74,8 @@ def _strip_quoted_reply(text: str) -> str:
         kept.append(line.rstrip())
 
     cleaned = "\n".join(kept).strip()
+    # 部分客户端把引用正文序列化为每行的 >> 前缀，而不是 Gmail 的 > 前缀。
+    cleaned = re.sub(r"(?m)^[ \t]*>{2,}[ \t]?", "", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned
 
@@ -227,16 +229,19 @@ THREAD_SUMMARY_SYSTEM = """You are Anna's thread context summarizer. Help the us
 Output JSON only:
 {
   "thread_kind": "single_short | single_normal | multi_thread | long_thread",
-  "headline": "one concise sentence",
-  "what_happened": ["only for multi-message threads"],
-  "open_questions": ["explicit unresolved points only"],
-  "reply_focus": "what the reply should cover, not a repeat of headline",
-  "related_context": ["relevant contact-memory context only"],
+  "headline": "the main point in a short phrase",
+  "what_happened": ["one brief outcome, only for multi-message threads"],
+  "open_questions": ["one explicit unresolved point, if any"],
+  "reply_focus": "the most important reply action, not a repeat of headline",
+  "related_context": ["one relevant contact-memory fact, if useful"],
   "should_show": true,
   "confidence": "high | medium | low"
 }
 
 Rules:
+- The combined human-readable text in headline, what_happened, open_questions, reply_focus, and related_context MUST be 30 words or fewer. JSON keys and enum values do not count.
+- Count whitespace-delimited words before responding; shorten or omit lower-priority fields until the total is at most 30 words.
+- Prefer one short phrase per field and leave optional arrays empty when they add no essential information.
 - Do not repeat the same fact across fields.
 - For single-message threads, do not explain current progress.
 - For short single-message threads, only summarize if contact memory adds useful context.

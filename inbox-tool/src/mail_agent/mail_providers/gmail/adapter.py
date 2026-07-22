@@ -141,7 +141,6 @@ _display_name_cache: dict[str, str] = {}
 _avatar_url_cache: dict[str, str] = {}
 _contact_avatar_cache: dict[str, dict[str, str]] = {}
 _contact_avatar_loaded: set[str] = set()
-GRAVATAR_AVATAR_BASE = "https://www.gravatar.com/avatar"
 
 
 def _avatar_debug(message: str, **fields: Any) -> None:
@@ -1377,56 +1376,6 @@ def _cache_people_photo_urls(cached: dict[str, str], people: list[Any]) -> None:
                 )
 
 
-def _gravatar_avatar_url(email: str) -> str:
-    normalized = str(email or "").strip().lower()
-    if not _looks_like_email(normalized):
-        _avatar_debug("gravatar_url_skipped", reason="invalid_email")
-        return ""
-    digest = hashlib.md5(normalized.encode("utf-8")).hexdigest()
-    url = f"{GRAVATAR_AVATAR_BASE}/{digest}?s=96&d=404"
-    _avatar_debug("gravatar_url_generated", email_hash=digest[:8], url_present=bool(url), url_host="www.gravatar.com")
-    return url
-
-
-def _gravatar_avatar_exists(url: str) -> bool:
-    if not url:
-        _avatar_debug("gravatar_head_skipped", reason="empty_url")
-        return False
-    request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Anna-Inbox/2.0"})
-    try:
-        with urllib.request.urlopen(request, timeout=8) as response:
-            exists = 200 <= int(response.status) < 400
-            _avatar_debug("gravatar_head_result", status=int(response.status), exists=exists)
-            return exists
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            _avatar_debug("gravatar_head_result", status=404, exists=False)
-            return False
-        _avatar_debug("gravatar_head_error", status=exc.code)
-        raise
-
-
-def _resolve_gravatar_avatar_url(email: str) -> str:
-    url = _gravatar_avatar_url(email)
-    if not url:
-        return ""
-    try:
-        return url if _gravatar_avatar_exists(url) else ""
-    except Exception as exc:
-        _avatar_debug("gravatar_resolve_failed", error=type(exc).__name__)
-        return ""
-
-
-def _cache_gravatar_photo_urls(cached: dict[str, str], requested: set[str]) -> None:
-    for email in sorted(requested):
-        if email in cached:
-            continue
-        gravatar_url = _resolve_gravatar_avatar_url(email)
-        if gravatar_url:
-            cached[email] = gravatar_url
-            _avatar_debug("gravatar_cached", email_hash=hashlib.md5(email.encode("utf-8")).hexdigest()[:8])
-
-
 def _http_error_json(exc: urllib.error.HTTPError) -> dict[str, Any]:
     try:
         body = exc.read().decode("utf-8")
@@ -1436,7 +1385,7 @@ def _http_error_json(exc: urllib.error.HTTPError) -> dict[str, Any]:
 
 
 def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, Any]:
-    """Resolve Google Contact photos, then Gravatar photos, for a bounded email set."""
+    """查询 Google 联系人头像并返回结果；无头像时由前端显示字母占位。"""
     normalized_mailbox = normalize_mailbox(mailbox)
     requested = {
         str(email or "").strip().lower()
@@ -1508,7 +1457,6 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
             )
             if service_disabled:
                 metadata = service_disabled.get("metadata") if isinstance(service_disabled.get("metadata"), dict) else {}
-                _cache_gravatar_photo_urls(cached, requested)
                 result_count = len([email for email in requested if email in cached])
                 _avatar_debug("adapter_return", path="service_disabled", returned=result_count)
                 return {
@@ -1520,7 +1468,6 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
                     "warning": str(((error_payload.get("error") or {}).get("message") or "People API is disabled.")),
                 }
             if exc.code in (401, 403):
-                _cache_gravatar_photo_urls(cached, requested)
                 result_count = len([email for email in requested if email in cached])
                 _avatar_debug("adapter_return", path="permission_required", returned=result_count)
                 return {
@@ -1533,7 +1480,6 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
                 }
             raise ValueError(f"Google People API request failed: HTTP {exc.code}") from exc
         except Exception as exc:
-            _cache_gravatar_photo_urls(cached, requested)
             result_count = len([email for email in requested if email in cached])
             _avatar_debug("adapter_return", path="warning", returned=result_count, error=type(exc).__name__)
             return {"avatars": {email: cached[email] for email in requested if email in cached}, "warning": str(exc)}
@@ -1541,7 +1487,6 @@ def resolve_contact_avatar_urls(mailbox: str, emails: list[str]) -> dict[str, An
     own_avatar = get_account_avatar_url(normalized_mailbox)
     if own_avatar:
         cached[normalized_mailbox] = own_avatar
-    _cache_gravatar_photo_urls(cached, requested)
     result_count = len([email for email in requested if email in cached])
     _avatar_debug("adapter_return", path="ok", returned=result_count, cached=len(cached))
     return {
@@ -2054,12 +1999,29 @@ def _decode_body(message: dict[str, Any]) -> str:
 
 
 def _extract_attachments(part: dict[str, Any]) -> list[dict[str, Any]]:
+    """提取真正的下载附件，排除正文中的 inline/CID 资源。
+
+    Gmail 的 inline 图片也可能带 filename（例如 icon.png），不能仅凭
+    filename 判断附件。Content-Disposition 是邮件客户端显示附件与否的
+    主要语义；没有该头时，带 Content-ID 的图片也按正文资源处理。
+    """
     attachments: list[dict[str, Any]] = []
 
     def walk(node: dict[str, Any]) -> None:
         filename = str(node.get("filename") or "")
         body = node.get("body") if isinstance(node.get("body"), dict) else {}
-        if filename:
+        headers = node.get("headers") if isinstance(node.get("headers"), list) else []
+        header_map = {
+            str(item.get("name") or "").strip().lower(): str(item.get("value") or "").strip()
+            for item in headers
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        }
+        disposition = header_map.get("content-disposition", "").split(";", 1)[0].strip().lower()
+        content_id = header_map.get("content-id", "").strip()
+        is_inline_resource = disposition == "inline" or (
+            not disposition and content_id and str(node.get("mimeType") or "").lower().startswith("image/")
+        )
+        if filename and not is_inline_resource:
             attachments.append({
                 "filename": filename,
                 "mimeType": node.get("mimeType"),
@@ -2112,8 +2074,9 @@ def search_gmail(
     max_results: int = 100,
     *,
     access_token: str | None = None,
+    strict: bool = False,
 ) -> list[str]:
-    """Search Gmail with a query string, return list of message IDs."""
+    """使用 Gmail 查询语法检索消息 ID；严格模式将认证和网络错误交给调用方处理。"""
     target = max(1, min(int(max_results or 100), 500))
     message_ids: list[str] = []
     page_token = ""
@@ -2130,6 +2093,8 @@ def search_gmail(
         try:
             payload = gmail_request(mailbox, "/users/me/messages", params, access_token=access_token)
         except ValueError as exc:
+            if strict:
+                raise RuntimeError("Gmail search request failed") from exc
             logging.getLogger("mail_agent.gmail").warning("search_gmail failed for %s: %s", mailbox, exc)
             return message_ids
         refs = payload.get("messages") if isinstance(payload, dict) else []
@@ -2293,8 +2258,10 @@ def live_search_metadata_and_cache(
     max_results: int = 100,
     *,
     access_token: str | None = None,
+    force_refresh: bool = False,
+    strict: bool = False,
 ) -> list[str]:
-    """Search Gmail and cache compact summaries, leaving full bodies on demand."""
+    """实时检索 Gmail 并缓存轻量摘要；严格模式不把 Gmail 失败伪装成空结果。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     # 正式环境的 getToken 是 Host 反向 RPC。首页最多并发拉取数百封摘要，
@@ -2304,7 +2271,7 @@ def live_search_metadata_and_cache(
     with _gmail_request_token_scope(access_token, mailbox=mailbox):
         # 使用 ContextVar 而不是给公开 helper 新增必填参数；线程池任务通过 copy_context
         # 显式继承本次 token，既避免凭据 RPC 风暴，也不影响其他并发 mailbox 请求。
-        msg_ids = search_gmail(mailbox, query, max_results)
+        msg_ids = search_gmail(mailbox, query, max_results, strict=strict)
         if not msg_ids:
             return []
 
@@ -2318,7 +2285,8 @@ def live_search_metadata_and_cache(
         missing_ids = [
             message_id
             for message_id in msg_ids
-            if message_id not in existing_by_id
+            if force_refresh
+            or message_id not in existing_by_id
             or (not existing_by_id[message_id].get("from") and not existing_by_id[message_id].get("headers_complete"))
             or int(existing_by_id[message_id].get("attachment_scan_version") or 0) < ATTACHMENT_SCAN_VERSION
             or int(existing_by_id[message_id].get("metadata_refreshed_at") or 0) <= refresh_before
@@ -2327,14 +2295,24 @@ def live_search_metadata_and_cache(
             worker_context = copy_context()
             with ThreadPoolExecutor(max_workers=SUMMARY_FETCH_MAX_WORKERS) as pool:
                 futures = {
-                    pool.submit(worker_context.copy().run, fetch_message_summary, mailbox, message_id): message_id
+                    pool.submit(
+                        worker_context.copy().run,
+                        fetch_message_summary,
+                        mailbox,
+                        message_id,
+                        strict=strict,
+                    ): message_id
                     for message_id in missing_ids
                 }
                 for future in as_completed(futures):
                     try:
                         summary = future.result()
-                    except Exception:
+                    except Exception as exc:
+                        if strict:
+                            raise RuntimeError("Gmail message metadata request failed") from exc
                         summary = None
+                    if strict and not summary:
+                        raise RuntimeError("Gmail message metadata request returned no data")
                     if summary:
                         existing_by_id[str(summary.get("id") or futures[future])] = summary
 

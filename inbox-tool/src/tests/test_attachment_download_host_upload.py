@@ -156,10 +156,39 @@ async def main_async() -> None:
     check("presigned helper sends body", PutHandler.received_body == b"helper-bytes")
 
     original_aps_files = v2_tools._aps_files
+    original_host_upload = v2_tools.host_upload
     original_put = v2_tools._put_presigned_url_sync
     fake_aps_files = FakeApsFiles()
     v2_tools._aps_files = fake_aps_files
     v2_tools._put_presigned_url_sync = lambda *args, **kwargs: "etag-1"
+
+    # Host 优先：协商成功时不应落到 APS Files。
+    fake_host = FakeInlineOnlyHostUpload()
+    v2_tools.host_upload = fake_host
+    try:
+        host_result = await v2_tools._upload_attachment_for_download(
+            "user@example.com",
+            "card-1",
+            {
+                "filename": "invoice.pdf",
+                "mime_type": "application/pdf",
+                "message_id": "msg-1",
+            },
+            b"pdf-bytes",
+        )
+    finally:
+        v2_tools.host_upload = original_host_upload
+    check("host preferred returns download url", host_result["download_url"].startswith("https://files.example.test/"))
+    check("host preferred negotiates once", len(fake_host.negotiate_calls) == 1)
+    check("host preferred confirms once", fake_host.confirmed is True)
+    check("host preferred skips APS begin", len(fake_aps_files.begin_calls) == 0)
+
+    # Host 协商不可用时回退 APS Files。
+    class _HostUnavailable:
+        async def negotiate(self, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("host upload disabled in test")
+
+    v2_tools.host_upload = _HostUnavailable()
     try:
         result = await v2_tools._upload_attachment_for_download(
             "user@example.com",
@@ -173,10 +202,11 @@ async def main_async() -> None:
         )
     finally:
         v2_tools._aps_files = original_aps_files
+        v2_tools.host_upload = original_host_upload
         v2_tools._put_presigned_url_sync = original_put
 
-    check("download url comes from APS Files", result["url"].startswith("https://files.example.test/"))
-    check("APS upload begins once", len(fake_aps_files.begin_calls) == 1)
+    check("download url comes from APS Files fallback", result["url"].startswith("https://files.example.test/"))
+    check("APS upload begins once after host fail", len(fake_aps_files.begin_calls) == 1)
     check("APS upload carries declared bytes", fake_aps_files.begin_calls[0]["size_bytes"] == len(b"pdf-bytes"))
     check("APS upload completes once", len(fake_aps_files.complete_calls) == 1)
     check("content bytes stay out of JSON result", "content" not in result and "content_b64" not in result)

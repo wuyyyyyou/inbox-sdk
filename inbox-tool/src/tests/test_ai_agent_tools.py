@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from anna_inbox_executa.ai_agent_tools_flow import (
     AI_AGENT_TOOL_NAMES,
     _merge_ui_context,
-    _reserve_search_budget,
+    _reserve_search_limit,
+    _search_email,
+    _split_gmail_and_local_workflow_query,
 )
+from mail_agent.domain.types import MessageLite
 
 
 def test_host_agent_tool_whitelist_excludes_mutations() -> None:
@@ -89,31 +94,55 @@ def test_public_outcome_strips_internal_fields() -> None:
     print("[PASS] test_public_outcome_strips_internal_fields")
 
 
-def test_search_budget_caps_calls_and_candidates_per_conversation() -> None:
-    """多轮 Host 调用也不能超过 6 次搜索和 45 个候选额度。"""
-    context = {"mailbox": "budget@example.com", "conversation_id": "budget-test"}
-    used = []
-    for _ in range(6):
-        limit, budget = _reserve_search_budget({}, context, 7)
-        used.append(limit)
-    assert used == [7, 7, 7, 7, 7, 7]
-    assert budget["searches_used"] == 6
-    assert budget["candidates_reserved"] == 42
+def test_search_limit_applies_per_call_only() -> None:
+    """每次搜索独立限制返回量，同一会话可以持续发起新搜索。"""
+    assert [_reserve_search_limit(7) for _ in range(10)] == [7] * 10
+    assert _reserve_search_limit(999) == 20
+    assert _reserve_search_limit(None) == 12
+    assert _reserve_search_limit(0) == 12
+    print("[PASS] test_search_limit_applies_per_call_only")
+
+
+def test_search_query_keeps_gmail_syntax_and_separates_workflow_filters() -> None:
+    """Gmail 条件保持原样，本地工作流条件不发送给 Gmail。"""
+    gmail_query, local_query = _split_gmail_and_local_workflow_query(
+        "newer_than:7d from:alice AND is:todo",
+    )
+    assert gmail_query == "newer_than:7d from:alice"
+    assert local_query == "is:todo"
     try:
-        _reserve_search_budget({}, context, 1)
+        _split_gmail_and_local_workflow_query("from:alice OR is:todo")
     except ValueError as exc:
-        assert "budget exhausted" in str(exc)
+        assert "AND" in str(exc)
     else:
-        raise AssertionError("seventh search must be rejected")
-    full_context = {"mailbox": "budget@example.com", "conversation_id": "candidate-cap-test"}
-    assert [_reserve_search_budget({}, full_context, 12)[0] for _ in range(4)] == [12, 12, 12, 9]
-    try:
-        _reserve_search_budget({}, full_context, 1)
-    except ValueError as exc:
-        assert "budget exhausted" in str(exc)
-    else:
-        raise AssertionError("forty-sixth candidate must be rejected")
-    print("[PASS] test_search_budget_caps_calls_and_candidates_per_conversation")
+        raise AssertionError("mixed OR query should be rejected")
+    print("[PASS] test_search_query_keeps_gmail_syntax_and_separates_workflow_filters")
+
+
+def test_search_email_uses_live_gmail_and_workflow_ids() -> None:
+    """search_email 必须实时调用 Gmail，并只在实时命中集上筛选前端 Todo 标记。"""
+    messages = [
+        MessageLite("todo-1", "thread-1", "Alice <alice@example.com>", "me@example.com", subject="Todo"),
+        MessageLite("other-1", "thread-2", "Alice <alice@example.com>", "me@example.com", subject="Other"),
+    ]
+    with patch(
+        "mail_agent.mail_providers.gmail.adapter.live_search_metadata_and_cache",
+        return_value=["todo-1", "other-1"],
+    ) as live_search, patch(
+        "mail_agent.mail_providers.gmail.adapter.get_messages_lite",
+        return_value=messages,
+    ):
+        result = _search_email(
+            {"mailbox": "me@example.com", "about": "from:alice", "filter": "is:todo", "limit": 10},
+            {"todo_message_ids": ["todo-1"]},
+        )
+    assert live_search.call_args.args[:3] == ("me@example.com", "from:alice", 50)
+    assert live_search.call_args.kwargs == {"force_refresh": True, "strict": True}
+    assert result["scan_source"] == "gmail"
+    assert result["gmail_query"] == "from:alice"
+    assert result["local_workflow_query"] == "is:todo"
+    assert [row["message_id"] for row in result["results"]] == ["todo-1"]
+    print("[PASS] test_search_email_uses_live_gmail_and_workflow_ids")
 
 
 if __name__ == "__main__":
@@ -121,5 +150,7 @@ if __name__ == "__main__":
     test_flat_thread_fields_merge_into_readonly_context()
     test_host_agent_tool_schemas_are_decision_compact()
     test_public_outcome_strips_internal_fields()
-    test_search_budget_caps_calls_and_candidates_per_conversation()
+    test_search_limit_applies_per_call_only()
+    test_search_query_keeps_gmail_syntax_and_separates_workflow_filters()
+    test_search_email_uses_live_gmail_and_workflow_ids()
     print("[ALL TESTS PASSED]")

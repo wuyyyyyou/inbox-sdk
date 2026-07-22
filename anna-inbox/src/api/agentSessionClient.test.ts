@@ -17,8 +17,8 @@ describe("AI sidebar Host Agent contract", () => {
     expect(agentClientSource).toContain("systemPrompt: AI_SIDEBAR_SYSTEM_PROMPT");
     expect(AI_SIDEBAR_SYSTEM_PROMPT.length).toBeLessThanOrEqual(4000);
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never use Markdown tables");
-    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("6 searches and 45 candidates");
-    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("local inbox cache only");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("each search call returns at most 20 candidates");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("live Gmail only");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never call start_ai_turn");
     expect(agentClientSource).toContain("tool_end");
   });
@@ -29,7 +29,7 @@ describe("AI sidebar Host Agent contract", () => {
     expect(names.has("read_email")).toBe(true);
     expect(names.has("propose_inbox_actions")).toBe(true);
     const search = (toolManifest.tools || []).find((tool) => tool.name === "search_email");
-    expect(String(search?.description || "")).toMatch(/bodySnippet|LOCAL inbox cache/i);
+    expect(String(search?.description || "")).toMatch(/bodySnippet|live Gmail/i);
     expect(String(search?.description || "")).not.toMatch(/bodyFull.*default/i);
   });
 
@@ -52,6 +52,7 @@ describe("AI sidebar Host Agent contract", () => {
 
   it("removes only a terminal standalone DONE marker", () => {
     expect(stripTerminalDoneMarker("Answer\n[DONE]")).toBe("Answer");
+    expect(stripTerminalDoneMarker("Answer\n[DONE]\nMore detail")).toBe("Answer\n\nMore detail");
     expect(stripTerminalDoneMarker("[DONE] means complete.")).toBe("[DONE] means complete.");
   });
 

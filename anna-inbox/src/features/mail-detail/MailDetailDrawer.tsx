@@ -576,26 +576,15 @@ async function hydrateCachedThreadPageBodies(mailbox: string, page: InboxThreadP
     : { ...visiblePage, messages };
 }
 
-function scrollToLatestMessage(
-  container: HTMLDivElement | null,
-  latestMessageId: string,
-  behavior: ScrollBehavior = "auto",
-) {
-  if (!container || !latestMessageId) return;
-  const target = Array.from(container.querySelectorAll<HTMLElement>("[data-message-id]"))
-    .find((element) => element.dataset.messageId === latestMessageId);
-  if (!target) return;
-  // 只滚详情 context，避免 scrollIntoView 带动外层 / 浏览器滚动条
-  const containerRect = container.getBoundingClientRect();
-  const targetRect = target.getBoundingClientRect();
-  const nextTop = container.scrollTop + (targetRect.top - containerRect.top);
-  container.scrollTo({ top: Math.max(0, nextTop), behavior });
-}
-
-function scrollTargetForPage(page: InboxThreadPagePayload, fallbackMessageId: string) {
-  return page.messages.some((item) => item.id === page.latest_message_id)
-    ? page.latest_message_id
-    : fallbackMessageId;
+function scrollToThreadBottom(container: HTMLDivElement | null, behavior: ScrollBehavior = "auto") {
+  if (!container) return;
+  const bottom = Math.max(0, container.scrollHeight - container.clientHeight);
+  if (behavior === "smooth") {
+    container.scrollTo({ top: bottom, behavior });
+  } else {
+    // 直接写入 scrollTop，兼容嵌入式 WebView 在 layout 尚未稳定时的 scrollTo 时序。
+    container.scrollTop = bottom;
+  }
 }
 
 const TEXT_PREVIEW_MAX_BYTES = 256 * 1024;
@@ -852,7 +841,6 @@ export function MailDetailDrawer({
   const renderedPreviewKeysRef = useRef<Set<string>>(new Set());
   const previewRenderWaitersRef = useRef<Map<string, () => void>>(new Map());
   const attachmentDownloadsRef = useRef<Set<string>>(new Set());
-  const pendingThreadScrollTargetRef = useRef("");
   const draftLoadKeyRef = useRef("");
   const composerContextHeightRef = useRef<number | null>(null);
   const draftLoadSequenceRef = useRef(0);
@@ -932,10 +920,6 @@ export function MailDetailDrawer({
   };
 
   const notifyPreviewCacheChanged = () => setPreviewCacheRevision((value) => value + 1);
-
-  const queueThreadScroll = (nextPage: InboxThreadPagePayload, fallbackMessageId: string) => {
-    pendingThreadScrollTargetRef.current = scrollTargetForPage(nextPage, fallbackMessageId);
-  };
 
   const clearEmptyForwardDraft = () => {
     if (stripForwardedMessageBlock(composerDrafts.forward.body).trim()) return;
@@ -1051,11 +1035,14 @@ export function MailDetailDrawer({
   );
 
   useLayoutEffect(() => {
-    const targetMessageId = pendingThreadScrollTargetRef.current;
-    if (!targetMessageId) return;
-    pendingThreadScrollTargetRef.current = "";
-    scrollToLatestMessage(scrollRef.current, targetMessageId, "smooth");
-  }, [page]);
+    if (!open || !page) return;
+    const frame = window.requestAnimationFrame(() => {
+      scrollToThreadBottom(scrollRef.current);
+      // HTML 邮件 iframe 可能在首帧后才完成尺寸测量，再补一帧确保滚到底部。
+      window.requestAnimationFrame(() => scrollToThreadBottom(scrollRef.current));
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [open, page, displayBodyLoaded]);
 
   useLayoutEffect(() => {
     if (!open || !showQuickReplies) return;
@@ -1082,7 +1069,13 @@ export function MailDetailDrawer({
       timer = window.setTimeout(() => {
         const currentHeight = scroller.clientHeight;
         const heightDelta = previousHeight - currentHeight;
-        if (heightDelta) scroller.scrollTop += heightDelta;
+        const wasAtBottom = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop <= 4;
+        if (wasAtBottom) {
+          // 内容渲染或详情布局变化时，已经在底部就继续锁定底部，避免先到底再跳回顶部。
+          scroller.scrollTop = Math.max(0, scroller.scrollHeight - currentHeight);
+        } else if (heightDelta) {
+          scroller.scrollTop += heightDelta;
+        }
         previousHeight = currentHeight;
         composerContextHeightRef.current = currentHeight;
       }, 0);
@@ -1122,6 +1115,7 @@ export function MailDetailDrawer({
   useEffect(() => {
     if (!open || !message || !mailbox || !messageId) return;
     let cancelled = false;
+    let networkPageLoaded = false;
     const anchorMessage = message;
     setPage(null);
     setLoading(true);
@@ -1186,7 +1180,6 @@ export function MailDetailDrawer({
           if (cancelled) return;
           if (cachedPage) {
             const visibleCachedPage = withoutGmailDraftThreadMessages(cachedPage);
-            queueThreadScroll(visibleCachedPage, messageId);
             setPage(visibleCachedPage);
             requestAssist(visibleCachedPage.latest_message_id || messageId);
             // 先展示缓存；若缺附件元数据/线程上下文，或需要刷新，继续走网络。
@@ -1197,9 +1190,9 @@ export function MailDetailDrawer({
             ) {
               void hydrateCachedThreadPageBodies(mailbox, visibleCachedPage)
                 .then((hydratedPage) => {
-                  if (cancelled) return;
+                  // 网络页已经到达后，不能让较慢的缓存 hydration 把新页面覆盖回去。
+                  if (cancelled || networkPageLoaded) return;
                   if (hydratedPage !== visibleCachedPage) {
-                    queueThreadScroll(hydratedPage, messageId);
                     setPage(hydratedPage);
                   }
                   loadFullAnchorMessage(hydratedPage);
@@ -1212,8 +1205,8 @@ export function MailDetailDrawer({
           }
           const nextPage = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: messageId, limit: 5, includeDisplayBody: true });
           if (cancelled) return;
+          networkPageLoaded = true;
           const visiblePage = withoutGmailDraftThreadMessages(nextPage);
-          queueThreadScroll(visiblePage, messageId);
           setPage(visiblePage);
           void cacheThreadPage(mailbox, visiblePage);
           loadFullAnchorMessage(visiblePage);
@@ -1580,7 +1573,6 @@ export function MailDetailDrawer({
     try {
       const refreshed = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: messageId, limit: 5, includeDisplayBody: true, forceRefresh: true });
       const visiblePage = withoutGmailDraftThreadMessages(refreshed);
-      queueThreadScroll(visiblePage, messageId);
       setPage(visiblePage);
       void cacheThreadPage(mailbox, visiblePage);
       if (visiblePage.latest_message_id) {
@@ -2334,7 +2326,7 @@ export function MailDetailDrawer({
                 </div>
                 <time>{formatAbsoluteDateTime(item.internal_date)}</time>
               </div>
-              {waitForFullBody ? <MailThreadBodyLoading /> : item.body_html ? <SafeEmailHtml className="mail-thread-message-body is-html" html={item.body_html} scaleToFit /> : <SafeEmailText className="mail-thread-message-body" text={item.body_text || ""} />}
+              {waitForFullBody ? <MailThreadBodyLoading /> : item.body_html ? <SafeEmailHtml className="mail-thread-message-body is-html" html={item.body_html} scaleToFit onRendered={() => scrollToThreadBottom(scrollRef.current)} /> : <SafeEmailText className="mail-thread-message-body" text={item.body_text || ""} />}
               {item.body_truncated && !waitForFullBody ? (
                 <p className="mail-thread-message-notice">
                   <span>{displayBodyLoaded.has(item.id) ? "This message exceeds the safe display limit." : "This message is too large to display completely."}</span>

@@ -21,13 +21,17 @@ import {
   cacheMailboxes,
   clearMailboxCacheData,
   clearMailboxDatabase,
+  getContactAvatarCache,
   migrateSelectedMailboxFromLocalStorage,
   setSelectedMailbox,
+  setContactAvatarCache,
 } from "../shared/browserStorage";
+import { senderParts, splitAddresses } from "../shared/mailIdentity";
 import type {
   ActiveCardsPayload,
   AiClarificationPayload,
   AiChatMessage,
+  AiInboxListContext,
   AiMailContextRef,
   AppState,
   AskHistoryEntry,
@@ -320,6 +324,7 @@ function buildAiTurnUiContext(args: {
   savedPromptId?: string;
   selectedThreads?: SendAiMessageOptions["selectedThreads"];
   routingIntent?: SendAiMessageOptions["routingIntent"];
+  inboxListContext?: AiInboxListContext;
 }) {
   const mailbox = selectedOrPrimary(args.selectedMailboxes, args.mailbox);
   const plan = normalizeScanPlan(args.scanPlan);
@@ -367,6 +372,7 @@ function buildAiTurnUiContext(args: {
       thread_id: String(item.thread_id || item.message_id || ""),
       subject: String(item.subject || "").slice(0, 200),
     }));
+  const listContext = args.inboxListContext;
   return {
     conversation_id: args.conversationId,
     mailbox,
@@ -383,8 +389,15 @@ function buildAiTurnUiContext(args: {
     saved_prompt_id: args.savedPromptId || "",
     language_hint: args.languageHint || "",
     routing_intent: args.routingIntent || "",
-    // 与主列表 Todos 标记对齐；仅 message_id 列表，不含邮件正文
-    todo_message_ids: readTodoMessageIds(mailbox),
+    // 工作流状态只传 message_id，不传邮件正文；详情/旧入口未给列表快照时保留 Todo 兼容读取。
+    todo_message_ids: listContext?.todo_message_ids || readTodoMessageIds(mailbox),
+    done_message_ids: listContext?.done_message_ids || [],
+    snoozed_message_ids: listContext?.snoozed_message_ids || [],
+    mailbox_view: listContext?.mailbox_view || "",
+    inbox_group: listContext?.inbox_group || "",
+    search_input: listContext?.search_input || "",
+    active_search: listContext?.active_search || "",
+    custom_category: listContext?.custom_category,
   };
 }
 
@@ -447,7 +460,9 @@ function agentOutcomePayload(outcomes: AgentToolOutcome[], finalText: string): R
     || latest.kind
     || (scanQuery ? "chat" : "chat"),
   );
-  const assistantFromRun = String(runResult?.assistant_text || runResult?.summary || "").trim();
+  const assistantFromRun = stripTerminalDoneMarker(
+    String(runResult?.assistant_text || runResult?.summary || "").trim(),
+  );
   return {
     ...latest,
     ...(runResult || {}),
@@ -1045,6 +1060,38 @@ export function useAppController() {
     return payload;
   }, [client]);
 
+  // 刷新邮件缓存后预热当前快照中的联系人头像，避免详情页再次访问 Gmail。
+  const preloadContactAvatars = useCallback(async (mailbox: string, messages: InboxMessage[]) => {
+    const normalized = normalizedMailbox(mailbox);
+    if (!normalized || normalized === "all" || !messages.length) return;
+    const legacyKey = `anna-inbox:contact-avatars:${normalized}`;
+    const cached = await getContactAvatarCache(normalized, legacyKey);
+    const known = cached?.avatars && typeof cached.avatars === "object" ? cached.avatars : {};
+    const missing = new Set(Array.isArray(cached?.missing) ? cached.missing : []);
+    const emails = [...new Set(messages.flatMap((message) =>
+      [message.from, message.to]
+        .flatMap(splitAddresses)
+        .map((value) => senderParts(value).email.trim().toLowerCase())
+        .filter((email) => email.includes("@")),
+    ))].filter((email) => !known[email] && !missing.has(email)).slice(0, 200);
+    if (!emails.length) return;
+    try {
+      const result = await client.resolveContactAvatars(normalized, emails);
+      const avatars = result.avatars && typeof result.avatars === "object" ? result.avatars : {};
+      const unresolved = result.permission_required || result.service_disabled
+        ? []
+        : emails.filter((email) => !avatars[email]);
+      await setContactAvatarCache(normalized, {
+        avatars: { ...known, ...avatars },
+        missing: [...missing, ...unresolved],
+        avatarsUpdatedAt: Date.now(),
+        missingUpdatedAt: Date.now(),
+      });
+    } catch {
+      // 头像预热失败不能阻断邮件缓存刷新，详情页仍可按需重试。
+    }
+  }, [client]);
+
   /**
    * 从本地 All mail 缓存（必要时回源 Gmail）加载快照。
    * soft=true：合并进现有列表并在结束后裁剪窗口内已删除项，不整表清空。
@@ -1058,6 +1105,7 @@ export function useAppController() {
     const soft = Boolean(options.soft);
     const skipLiveGmail = Boolean(options.skipLiveGmail);
     const keepIds = soft ? new Set<string>() : null;
+    const collectedMessages: InboxMessage[] = [];
     const noteIds = (messages: InboxMessage[]) => {
       if (!keepIds) return;
       for (const message of messages) {
@@ -1065,6 +1113,7 @@ export function useAppController() {
       }
     };
     const applyPage = (payload: InboxFeedPayload, firstPage: boolean) => {
+      if (Array.isArray(payload.messages)) collectedMessages.push(...payload.messages);
       if (soft) {
         noteIds(Array.isArray(payload.messages) ? payload.messages : []);
         applyInboxSnapshotPayload(payload, { merge: true });
@@ -1105,7 +1154,7 @@ export function useAppController() {
         if (!pageCount) break;
       }
       finishSoftPrune();
-      return { ok: true, count: nextOffset, source: "cache" as const };
+      return { ok: true, count: nextOffset, source: "cache" as const, messages: collectedMessages };
     }
 
     // 其他邮箱正在 Brief/Ask 扫描时，先跳过 live Gmail，避免与扫描并发抢 getToken。
@@ -1148,7 +1197,7 @@ export function useAppController() {
       if (!pageCount) break;
     }
     finishSoftPrune();
-    return { ok: true, count: nextOffset, source: "gmail" as const };
+    return { ok: true, count: nextOffset, source: "gmail" as const, messages: collectedMessages };
   }, [applyInboxSnapshotPayload, client, loadInboxThreadDrafts]);
 
   const preloadMailboxSnapshot = useCallback(async (
@@ -1177,6 +1226,7 @@ export function useAppController() {
         const result = await loadMailboxSnapshotFromCache(mailbox, days, mailbox, { soft, skipLiveGmail });
         if (snapshotRequestMailbox.current !== mailbox) return false;
         if (!result.ok) return false;
+        await preloadContactAvatars(mailbox, result.messages || []);
         console.info(`[inbox-startup] mailbox=${mailbox} days=${days} source=${result.source || "cache"} messages=${result.count} soft=${soft} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
         return result.count > 0;
       } catch (error) {
@@ -1197,7 +1247,7 @@ export function useAppController() {
       if (snapshotRequestMailbox.current === mailbox) snapshotPromise.current = null;
     });
     return snapshotPromise.current;
-  }, [client, loadMailboxSnapshotFromCache, state.mailbox, state.selectedMailboxes]);
+  }, [client, loadMailboxSnapshotFromCache, preloadContactAvatars, state.mailbox, state.selectedMailboxes]);
 
   /** History 增量同步 + 静默合并快照（自动同步 / 手动 Refresh / 切换邮箱后台同步共用） */
   const silentSyncInbox = useCallback(async (days?: number, mailboxOverride?: string) => {
@@ -1224,6 +1274,7 @@ export function useAppController() {
       }
       const loaded = await loadMailboxSnapshotFromCache(mailbox, rangeDays, requestKey, { soft: true });
       if (snapshotRequestMailbox.current !== requestKey) return false;
+      await preloadContactAvatars(mailbox, loaded.messages || []);
       setState((s) => ({
         ...s,
         inboxSnapshotLoading: false,
@@ -1248,7 +1299,7 @@ export function useAppController() {
         setState((s) => ({ ...s, inboxSnapshotLoading: false }));
       }
     }
-  }, [client, loadMailboxSnapshotFromCache, state.inboxSettings.display_range_days, state.mailbox, state.selectedMailboxes]);
+  }, [client, loadMailboxSnapshotFromCache, preloadContactAvatars, state.inboxSettings.display_range_days, state.mailbox, state.selectedMailboxes]);
 
   // 第三方 Gmail 客户端变更只在前台、当前邮箱稳定且没有 AI/列表重任务时同步。
   // 使用递归 timeout 而不是 interval，避免平台较慢时堆叠多个 History invoke。
@@ -1481,6 +1532,7 @@ export function useAppController() {
       const payload = await client.listInboxEmails(mailbox, days, ALL_MAIL_CACHE_FETCH_LIMIT, "all", true);
       if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
       applyInboxSnapshotPayload(payload);
+      const refreshedMessages: InboxMessage[] = Array.isArray(payload.messages) ? [...payload.messages] : [];
       setState((s) => ({ ...s, inboxSnapshotLoading: false, inboxLoading: false }));
       let nextOffset = Number(payload.next_offset ?? (Array.isArray(payload.messages) ? payload.messages.length : 0));
       let hasMore = Boolean(payload.has_more);
@@ -1490,11 +1542,13 @@ export function useAppController() {
         const cached = await client.listCachedEmails(mailbox, days, 100, "all", nextOffset);
         if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
         applyInboxSnapshotPayload(cached, { append: true });
+        if (Array.isArray(cached.messages)) refreshedMessages.push(...cached.messages);
         const pageCount = Array.isArray(cached.messages) ? cached.messages.length : 0;
         nextOffset = Number(cached.next_offset ?? nextOffset + pageCount);
         hasMore = Boolean(cached.has_more) && pageCount > 0;
         if (!pageCount) break;
       }
+      await preloadContactAvatars(mailbox, refreshedMessages);
       inboxFeedCache.current.set(`${mailbox}|all|${days}`, { payload, loadedAt: Date.now() });
       const count = nextOffset;
       showToast(days > 7
@@ -1519,7 +1573,7 @@ export function useAppController() {
       }
     }
     return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
-  }, [applyInboxSnapshotPayload, client, silentSyncInbox, state.mailbox, state.selectedMailboxes]);
+  }, [applyInboxSnapshotPayload, client, preloadContactAvatars, silentSyncInbox, state.mailbox, state.selectedMailboxes]);
 
   const clearInboxCacheAndReload = useCallback(async (days?: number) => {
     const rangeDays = Math.max(0, Number(days ?? state.inboxSettings.display_range_days) || 30);
@@ -4233,6 +4287,7 @@ export function useAppController() {
           savedPromptId: options.savedPromptId,
           selectedThreads: options.selectedThreads,
           routingIntent: options.routingIntent,
+          inboxListContext: options.inboxListContext,
         });
         let streamed = "";
         const agentTurn = await runAiAgentTurn(
@@ -4366,7 +4421,9 @@ export function useAppController() {
         }
         const payload = (completed.result || {}) as Record<string, unknown>;
         const kind = String(payload.kind || "chat");
-        const assistantText = String(payload.assistant_text || payload.summary || "").trim()
+        const assistantText = stripTerminalDoneMarker(
+          String(payload.assistant_text || payload.summary || "").trim(),
+        )
           || "";
         const { scanQuery, scanSource } = payloadScanQuery(payload);
         // 仅真实检索过才写入消息，驱动 Thinking 后可点 query chip

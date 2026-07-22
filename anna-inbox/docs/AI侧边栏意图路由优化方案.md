@@ -1,6 +1,6 @@
 # AI 侧边栏意图路由
 
-## 状态：历史实现；侧栏主路径已迁移 Host Agent Session（App 2.1.4 / Tool 2.2.4）
+## 状态：历史实现；侧栏主路径已迁移 Host Agent Session（App 2.1.5 / Tool 2.2.5）
 
 侧栏**不再**使用前端正则业务路由（原 `decideAiRoute` → `chat | scan | mail_context`）。
 

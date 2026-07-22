@@ -52,6 +52,17 @@ def test_parse_and_exclude_and_todo() -> None:
     print("[PASS] test_parse_and_exclude_and_todo")
 
 
+def test_workflow_status_ids_override_gmail_labels() -> None:
+    """实时 Gmail 命中可按前端工作流快照筛选，不依赖 Gmail 中不存在的标签。"""
+    done = parse_local_query("is:done")
+    snoozed = parse_local_query("is:snoozed")
+    assert match_local_query(_msg(message_id="done-1"), done, done_ids=["done-1"])
+    assert not match_local_query(_msg(message_id="done-1"), done, done_ids=[])
+    assert match_local_query(_msg(message_id="snoozed-1"), snoozed, snoozed_ids=["snoozed-1"])
+    assert not match_local_query(_msg(message_id="snoozed-1"), snoozed, snoozed_ids=[])
+    print("[PASS] test_workflow_status_ids_override_gmail_labels")
+
+
 def test_normalize_gmail_fragments() -> None:
     assert "is:inbox" in normalize_to_local_query("in:inbox newer_than:7d is:unread")
     assert not parse_local_query(normalize_to_local_query("in:inbox is:unread")).error
@@ -90,6 +101,7 @@ def test_build_local_query_from_plan() -> None:
 
 if __name__ == "__main__":
     test_parse_and_exclude_and_todo()
+    test_workflow_status_ids_override_gmail_labels()
     test_normalize_gmail_fragments()
     test_filter_cached_messages()
     test_build_local_query_from_plan()

@@ -1,6 +1,6 @@
 # AI 对话本地 Router 与白名单工具设计
 
-> 历史实现文档：App `2.1.4` / Tool `2.2.4` 起，AI 侧栏主路径改由 Host Agent Session 选型并调用显式白名单工具。本文件保留本地 Router 的安全约束、工具边界和兼容路径说明；当前主路径以 [AI 侧栏 Sampling → Sessions 改造方案](AI侧栏Sampling转Sessions改造方案.md) 为准。
+> 历史实现文档：App `2.1.5` / Tool `2.2.5` 起，AI 侧栏主路径改由 Host Agent Session 选型并调用显式白名单工具。本文件保留本地 Router 的安全约束、工具边界和兼容路径说明；当前主路径以 [AI 侧栏 Sampling → Sessions 改造方案](AI侧栏Sampling转Sessions改造方案.md) 为准。
 
 ## 1. 背景与结论
 

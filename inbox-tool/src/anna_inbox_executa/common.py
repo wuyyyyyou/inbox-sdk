@@ -76,21 +76,23 @@ CONNECTIVITY_GMAIL_ACCOUNT_TIMEOUT_SECONDS = 3.0
 AI_AGENT_DEFAULT_TOOLS = [
     {
         "name": "search_email",
-        # when: 收件箱范围检索；默认只返回轻量字段，禁止正文
+        # when: 收件箱范围检索；实时 Gmail 搜索只返回轻量字段，禁止正文
         "description": (
-            "Search LOCAL inbox cache only (never live Gmail, never list_cached_emails). "
-            "Use for any inbox-wide claim. Query language: is:inbox AND is:todo, from:, subject:, -term. "
+            "Search live Gmail with standard Gmail query syntax; never falls back to local cache. "
+            "Use for any inbox-wide claim. Local workflow filters is:todo, is:done, is:snoozed are supported with AND only. "
             "Default fields ONLY: date, participants, subject, bodySnippet (+ THREAD_REF). "
-            "Never returns bodyFull — call read_email for full body. Cap 6 searches / 45 hits per conversation. "
-            "If cache empty, tell user to refresh inbox."
+            "Never returns bodyFull — call read_email for full body. Each call returns at most 20 hits; repeated searches are allowed. "
+            "If Gmail fails, explain the failure to the user and try another non-cache approach."
         ),
         "parameters": [
-            {"name": "about", "type": "string", "description": "Local keywords/fields, e.g. urgent OR from:alice.", "required": False},
-            {"name": "filter", "type": "string", "description": "Local filter, e.g. is:inbox AND is:unread.", "required": False},
+            {"name": "about", "type": "string", "description": "Gmail query keywords/fields, e.g. newer_than:7d from:alice.", "required": False},
+            {"name": "filter", "type": "string", "description": "Additional Gmail or local workflow filter, e.g. is:important AND is:todo.", "required": False},
             {"name": "mailbox", "type": "string", "description": "Active mailbox from ui_context.", "required": False},
-            {"name": "ui_context", "type": "object", "description": "Read-only UI facts; copy mailbox + conversation_id.", "required": False},
-            {"name": "conversation_id", "type": "string", "description": "Sidebar conversation id (quota key).", "required": False},
-            {"name": "limit", "type": "integer", "description": "Max hits this call (default 12, hard cap remaining budget).", "required": False},
+            {"name": "ui_context", "type": "object", "description": "Read-only UI facts; copy mailbox.", "required": False},
+            {"name": "todo_message_ids", "type": "array", "description": "Copy ui_context ids when using is:todo.", "required": False},
+            {"name": "done_message_ids", "type": "array", "description": "Copy ui_context ids when using is:done.", "required": False},
+            {"name": "snoozed_message_ids", "type": "array", "description": "Copy ui_context ids when using is:snoozed.", "required": False},
+            {"name": "limit", "type": "integer", "description": "Max hits this call (default 12, hard cap 20).", "required": False},
             {
                 "name": "readMask",
                 "type": "array",
@@ -1725,6 +1727,14 @@ def _run_storage_query(coro: Any, timeout: float = 60.0) -> Any:
 
 
 def dispatch_storage_response(message: dict[str, Any]) -> bool:
+    """分发 APS storage/files 反向 RPC 响应。
+
+    即使当前 KV 后端被前端切到 local-json，平台附件仍会走 ``_aps_files``
+    （``_should_use_aps_files``）。因此 APS reverse-RPC 响应必须始终可路由，
+    否则 ``files/upload_begin`` 等会挂到超时，表现为 tools.invoke 60s timeout。
+    """
+    if _aps_route_storage_response(message):
+        return True
     return _route_storage_response(message)
 
 

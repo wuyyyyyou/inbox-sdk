@@ -192,6 +192,8 @@ def _match_term(
     term: LocalQueryTerm,
     *,
     todo_ids: set[str],
+    done_ids: set[str] | None,
+    snoozed_ids: set[str] | None,
 ) -> bool:
     hit = False
     if term.field == "subject":
@@ -213,6 +215,10 @@ def _match_term(
         labels = _label_set(message)
         if term.value == "todo":
             hit = _field(message, "id") in todo_ids
+        elif term.value == "done" and done_ids is not None:
+            hit = _field(message, "id") in done_ids
+        elif term.value == "snoozed" and snoozed_ids is not None:
+            hit = _field(message, "id") in snoozed_ids
         elif term.value == "all":
             hit = True
         elif term.value == "unread":
@@ -266,13 +272,27 @@ def _match_node(
     node: LocalQueryNode,
     *,
     todo_ids: set[str],
+    done_ids: set[str] | None,
+    snoozed_ids: set[str] | None,
 ) -> bool:
     if node.kind == "term" and node.term is not None:
-        return _match_term(message, node.term, todo_ids=todo_ids)
+        return _match_term(
+            message,
+            node.term,
+            todo_ids=todo_ids,
+            done_ids=done_ids,
+            snoozed_ids=snoozed_ids,
+        )
     if node.kind == "and":
-        return all(_match_node(message, child, todo_ids=todo_ids) for child in node.children)
+        return all(
+            _match_node(message, child, todo_ids=todo_ids, done_ids=done_ids, snoozed_ids=snoozed_ids)
+            for child in node.children
+        )
     if node.kind == "or":
-        return any(_match_node(message, child, todo_ids=todo_ids) for child in node.children)
+        return any(
+            _match_node(message, child, todo_ids=todo_ids, done_ids=done_ids, snoozed_ids=snoozed_ids)
+            for child in node.children
+        )
     return False
 
 
@@ -281,12 +301,22 @@ def match_local_query(
     parsed: ParsedLocalQuery,
     *,
     todo_ids: Iterable[str] | None = None,
+    done_ids: Iterable[str] | None = None,
+    snoozed_ids: Iterable[str] | None = None,
 ) -> bool:
     """语法有效且命中时返回 True。"""
     if not parsed.expression or parsed.error:
         return False
     ids = {str(item) for item in (todo_ids or []) if str(item)}
-    return _match_node(message, parsed.expression, todo_ids=ids)
+    done = None if done_ids is None else {str(item) for item in done_ids if str(item)}
+    snoozed = None if snoozed_ids is None else {str(item) for item in snoozed_ids if str(item)}
+    return _match_node(
+        message,
+        parsed.expression,
+        todo_ids=ids,
+        done_ids=done,
+        snoozed_ids=snoozed,
+    )
 
 
 def normalize_to_local_query(raw: str) -> str:
@@ -428,6 +458,8 @@ def filter_cached_messages(
     query_text: str,
     *,
     todo_ids: Iterable[str] | None = None,
+    done_ids: Iterable[str] | None = None,
+    snoozed_ids: Iterable[str] | None = None,
     limit: int = 45,
 ) -> tuple[list[MessageLite], ParsedLocalQuery]:
     """按本地 query 过滤缓存消息；返回 (命中列表, 解析结果)。"""
@@ -442,7 +474,13 @@ def filter_cached_messages(
         cap = 45
     hits: list[MessageLite] = []
     for message in messages:
-        if match_local_query(message, parsed, todo_ids=todo_ids):
+        if match_local_query(
+            message,
+            parsed,
+            todo_ids=todo_ids,
+            done_ids=done_ids,
+            snoozed_ids=snoozed_ids,
+        ):
             hits.append(message)
             if len(hits) >= cap:
                 break

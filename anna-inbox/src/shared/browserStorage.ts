@@ -426,8 +426,12 @@ function normalizeFlags(value: Partial<BrowserMailUiFlags> | null | undefined): 
 }
 
 function normalizeAvatarCache(value: Partial<ContactAvatarCache> | null | undefined): ContactAvatarCache {
+  const rawAvatars = value?.avatars && typeof value.avatars === "object" ? value.avatars : {};
+  const avatars = Object.fromEntries(
+    Object.entries(rawAvatars).filter(([, url]) => !/https?:\/\/(?:www\.)?gravatar\.com\//i.test(String(url || ""))),
+  );
   return {
-    avatars: value?.avatars && typeof value.avatars === "object" ? value.avatars : {},
+    avatars,
     missing: Array.isArray(value?.missing) ? value.missing : [],
     avatarsUpdatedAt: Number(value?.avatarsUpdatedAt || (value as { updatedAt?: number } | undefined)?.updatedAt || 0),
     missingUpdatedAt: Number(value?.missingUpdatedAt || 0),

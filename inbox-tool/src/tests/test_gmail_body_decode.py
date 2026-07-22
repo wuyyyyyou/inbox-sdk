@@ -95,6 +95,24 @@ def main() -> None:
     found = adapter.find_attachment_for_token(attachment_msg, attachments[0]["id"])
     check("attachment token resolves to gmail attachment id", found["gmail_attachment_id"] == "att-1")
 
+    inline_image = {
+        "mimeType": "image/png",
+        "filename": "icon.png",
+        "headers": [
+            {"name": "Content-ID", "value": "<icon@example.com>"},
+            {"name": "Content-Disposition", "value": "inline; filename=icon.png"},
+        ],
+        "body": {"attachmentId": "inline-image", "size": 5600},
+    }
+    explicit_attachment = {
+        "mimeType": "image/png",
+        "filename": "photo.png",
+        "headers": [{"name": "Content-Disposition", "value": "attachment; filename=photo.png"}],
+        "body": {"attachmentId": "photo-attachment", "size": 1200},
+    }
+    extracted = adapter._extract_attachments({"parts": [inline_image, explicit_attachment]})
+    check("inline CID image is not listed as attachment", [item["filename"] for item in extracted] == ["photo.png"])
+
     placeholder_plain = _message([
         _part("text/plain", "View this email in your browser."),
         _part("text/html", "<html><body><p>Security alert for your account.</p></body></html>"),

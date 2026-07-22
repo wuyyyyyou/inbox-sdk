@@ -26,11 +26,9 @@ AI_AGENT_TOOL_NAMES = frozenset({
     "ai_remember_preference",
 })
 
-_SEARCH_MAX_CALLS = 6
-_SEARCH_MAX_CANDIDATES = 45
-_SEARCH_SESSION_TTL_SECONDS = 30 * 60
-_SEARCH_BUDGETS: dict[str, dict[str, Any]] = {}
-_SEARCH_BUDGET_LOCK = threading.Lock()
+_SEARCH_CALL_MAX_RESULTS = 20
+_THREAD_REF_TTL_SECONDS = 30 * 60
+_THREAD_REF_LOCK = threading.Lock()
 _THREAD_REF_MESSAGES: dict[str, tuple[str, float]] = {}
 
 
@@ -94,44 +92,13 @@ def _user_text(arguments: dict[str, Any]) -> str:
     ).strip()
 
 
-def _search_budget_key(arguments: dict[str, Any], ui_context: dict[str, Any]) -> str:
-    """以匿名 conversation_id 隔离每个侧栏会话的检索额度，不写入持久存储。"""
-    conversation_id = str(arguments.get("conversation_id") or ui_context.get("conversation_id") or "").strip()
-    mailbox = str(arguments.get("mailbox") or ui_context.get("mailbox") or "").strip().lower()
-    if not conversation_id or not mailbox:
-        return ""
-    return f"{mailbox}|{conversation_id[:160]}"
-
-
-def _reserve_search_budget(arguments: dict[str, Any], ui_context: dict[str, Any], requested_limit: Any) -> tuple[int, dict[str, int]]:
-    """原子预留一次搜索与候选额度，防止 Host 多轮工具调用扩大扫描范围。"""
-    key = _search_budget_key(arguments, ui_context)
-    if not key:
-        raise ValueError("search_email requires mailbox and conversation_id from ui_context")
+def _reserve_search_limit(requested_limit: Any) -> int:
+    """限制单次搜索返回量；不同搜索调用之间不共享额度。"""
     try:
         requested = int(requested_limit or 12)
     except (TypeError, ValueError):
         requested = 12
-    now = time.monotonic()
-    with _SEARCH_BUDGET_LOCK:
-        expired = [item for item, value in _SEARCH_BUDGETS.items() if now - float(value.get("updated_at") or 0) > _SEARCH_SESSION_TTL_SECONDS]
-        for item in expired:
-            _SEARCH_BUDGETS.pop(item, None)
-        budget = _SEARCH_BUDGETS.setdefault(key, {"calls": 0, "candidates": 0, "updated_at": now})
-        remaining_calls = max(0, _SEARCH_MAX_CALLS - int(budget["calls"]))
-        remaining_candidates = max(0, _SEARCH_MAX_CANDIDATES - int(budget["candidates"]))
-        if remaining_calls <= 0 or remaining_candidates <= 0:
-            raise ValueError("search_email budget exhausted for this conversation")
-        limit = max(1, min(requested, remaining_candidates, _SEARCH_MAX_CANDIDATES))
-        budget["calls"] += 1
-        budget["candidates"] += limit
-        budget["updated_at"] = now
-        return limit, {
-            "searches_used": int(budget["calls"]),
-            "searches_remaining": max(0, _SEARCH_MAX_CALLS - int(budget["calls"])),
-            "candidates_reserved": int(budget["candidates"]),
-            "candidates_remaining": max(0, _SEARCH_MAX_CANDIDATES - int(budget["candidates"])),
-        }
+    return max(1, min(requested, _SEARCH_CALL_MAX_RESULTS))
 
 
 def _thread_ref(thread_id: str) -> str:
@@ -144,8 +111,8 @@ def _remember_thread_ref(mailbox: str, thread_id: str, message_id: str) -> None:
     if not mailbox or not thread_id or not message_id:
         return
     now = time.monotonic()
-    with _SEARCH_BUDGET_LOCK:
-        expired = [key for key, value in _THREAD_REF_MESSAGES.items() if now - value[1] > _SEARCH_SESSION_TTL_SECONDS]
+    with _THREAD_REF_LOCK:
+        expired = [key for key, value in _THREAD_REF_MESSAGES.items() if now - value[1] > _THREAD_REF_TTL_SECONDS]
         for key in expired:
             _THREAD_REF_MESSAGES.pop(key, None)
         _THREAD_REF_MESSAGES[f"{mailbox}|{thread_id}"] = (message_id, now)
@@ -153,7 +120,7 @@ def _remember_thread_ref(mailbox: str, thread_id: str, message_id: str) -> None:
 
 def _message_id_for_thread_ref(mailbox: str, thread_id: str) -> str:
     """读取短映射；过期/未知时回退原值，兼容直接传 message_id 的调用。"""
-    with _SEARCH_BUDGET_LOCK:
+    with _THREAD_REF_LOCK:
         mapped = _THREAD_REF_MESSAGES.get(f"{mailbox}|{thread_id}")
     return str(mapped[0]) if mapped else thread_id
 
@@ -169,11 +136,12 @@ def _search_query(arguments: dict[str, Any]) -> str:
 
 _SEARCH_DEFAULT_MASK = ("date", "participants", "subject", "bodySnippet")
 _SEARCH_ALLOWED_MASK = frozenset(_SEARCH_DEFAULT_MASK)
-# 单次最多扫这么多索引条，避免大邮箱把 RPC/CPU 拖到数十秒
-_SEARCH_INDEX_SCAN_CAP = 120
+# 单次最多拉取这么多 Gmail 摘要，给本地工作流状态筛选保留余量。
+_SEARCH_GMAIL_CANDIDATE_CAP = 120
 _SEARCH_SNIPPET_CHARS = 140
 _SEARCH_SUBJECT_CHARS = 120
 _SEARCH_FROM_CHARS = 100
+_LOCAL_WORKFLOW_TERM = re.compile(r"^-?is:(todo|done|snoozed)$", re.IGNORECASE)
 
 
 def _search_read_mask(arguments: dict[str, Any]) -> list[str]:
@@ -183,15 +151,48 @@ def _search_read_mask(arguments: dict[str, Any]) -> list[str]:
     return mask or list(_SEARCH_DEFAULT_MASK)
 
 
-def _search_email(arguments: dict[str, Any], ui_context: dict[str, Any]) -> dict[str, Any]:
-    """只扫本地索引缓存（不调用 Gmail、不读 bodyFull），返回轻量字段 + scan_query。
+def _split_gmail_and_local_workflow_query(raw_query: str) -> tuple[str, str]:
+    """拆出 Gmail 不认识的本地工作流条件，避免把它们直接发送给 Gmail。
 
-    默认字段：date / participants / subject / bodySnippet。
-    缓存为空时返回 0 结果并提示刷新。
+    Gmail 条件与本地工作流条件可以用 AND 组合。若混入 OR，简单移除本地条件会改变
+    逻辑含义，因此明确拒绝而不返回可能遗漏的结果。
     """
-    from mail_agent.local_query import filter_cached_messages, normalize_to_local_query
+    tokens = str(raw_query or "").split()
+    local_indexes = [index for index, token in enumerate(tokens) if _LOCAL_WORKFLOW_TERM.fullmatch(token)]
+    if not local_indexes:
+        return " ".join(tokens), ""
+    if any(token.upper() == "OR" for token in tokens):
+        raise ValueError("Local workflow conditions is:todo, is:done, and is:snoozed only support AND combinations.")
+    local_terms = [tokens[index] for index in local_indexes]
+    removed = set(local_indexes)
+    # 同时移除紧邻的 AND，保留其他 Gmail 条件原有的空格语义。
+    for index in local_indexes:
+        if index > 0 and tokens[index - 1].upper() == "AND":
+            removed.add(index - 1)
+        elif index + 1 < len(tokens) and tokens[index + 1].upper() == "AND":
+            removed.add(index + 1)
+    gmail_query = " ".join(token for index, token in enumerate(tokens) if index not in removed).strip()
+    return gmail_query or "in:anywhere", " AND ".join(local_terms)
+
+
+def _workflow_message_ids(
+    arguments: dict[str, Any],
+    ui_context: dict[str, Any],
+    field: str,
+) -> list[str]:
+    """读取前端列表快照中的工作流 ID；空列表也是有效的已知状态。"""
+    raw = ui_context.get(field) if isinstance(ui_context, dict) else None
+    if not isinstance(raw, list):
+        raw = arguments.get(field) if isinstance(arguments.get(field), list) else []
+    return [str(item) for item in raw if str(item).strip()][:500]
+
+
+def _search_email(arguments: dict[str, Any], ui_context: dict[str, Any]) -> dict[str, Any]:
+    """实时检索 Gmail 并返回轻量摘要；缓存只接收本次结果，不作为查询或回退来源。"""
+    from mail_agent.local_query import filter_cached_messages
     from mail_agent.mail_providers.gmail.adapter import (
-        list_cached_messages_lite,
+        get_messages_lite,
+        live_search_metadata_and_cache,
         normalize_mailbox,
     )
 
@@ -200,43 +201,34 @@ def _search_email(arguments: dict[str, Any], ui_context: dict[str, Any]) -> dict
     requested_limit = arguments.get("limit")
     if requested_limit is None or requested_limit == "":
         requested_limit = 12
-    limit, budget = _reserve_search_budget(arguments, ui_context, requested_limit)
-    limit = max(1, min(limit, 20))
+    limit = _reserve_search_limit(requested_limit)
     raw_query = _search_query(arguments)
-    scan_query = normalize_to_local_query(raw_query)
+    gmail_query, local_workflow_query = _split_gmail_and_local_workflow_query(raw_query)
     mask = _search_read_mask(arguments)
-    # 前端 workflow 标记：is:todo 依赖 todo_message_ids，不在 Gmail label 中。
-    todo_raw = ui_context.get("todo_message_ids") if isinstance(ui_context, dict) else None
-    if not isinstance(todo_raw, list):
-        todo_raw = arguments.get("todo_message_ids") if isinstance(arguments.get("todo_message_ids"), list) else []
-    todo_ids = [str(item) for item in todo_raw if str(item).strip()]
-
-    # 只读索引摘要（MessageLite），不拉全文缓存文件
-    scan_pool = min(_SEARCH_INDEX_SCAN_CAP, max(limit * 5, 40))
-    cached = list_cached_messages_lite(mailbox, scan_pool)
-    if not cached:
-        return {
-            "kind": "search",
-            "mailbox": mailbox,
-            "query": scan_query,
-            "scan_query": scan_query,
-            "scan_source": "cache",
-            "cache_empty": True,
-            "readMask": mask,
-            "results": [],
-            "count": 0,
-            "budget": budget,
-            "assistant_text": (
-                "Local inbox cache is empty. Refresh the inbox first, then try again."
-            ),
-        }
-
-    hits, parsed = filter_cached_messages(
-        cached,
-        scan_query,
-        todo_ids=todo_ids,
-        limit=limit,
+    # 本地状态筛选可能淘汰前几条命中，实时多拉少量候选再截断返回量。
+    candidate_limit = min(_SEARCH_GMAIL_CANDIDATE_CAP, max(limit * 5, 40))
+    message_ids = live_search_metadata_and_cache(
+        mailbox,
+        gmail_query,
+        candidate_limit,
+        force_refresh=True,
+        strict=True,
     )
+    messages = get_messages_lite(mailbox, message_ids)
+    todo_ids = _workflow_message_ids(arguments, ui_context, "todo_message_ids")
+    done_ids = _workflow_message_ids(arguments, ui_context, "done_message_ids")
+    snoozed_ids = _workflow_message_ids(arguments, ui_context, "snoozed_message_ids")
+    if local_workflow_query:
+        hits, _ = filter_cached_messages(
+            messages,
+            local_workflow_query,
+            todo_ids=todo_ids,
+            done_ids=done_ids,
+            snoozed_ids=snoozed_ids,
+            limit=limit,
+        )
+    else:
+        hits = messages[:limit]
     results: list[dict[str, Any]] = []
     for message in hits:
         message_id = str(message.message_id or "")
@@ -262,18 +254,18 @@ def _search_email(arguments: dict[str, Any], ui_context: dict[str, Any]) -> dict
         if "bodySnippet" in mask:
             row["bodySnippet"] = str(message.snippet or "")[:_SEARCH_SNIPPET_CHARS]
         results.append(row)
-    display_query = parsed.display or scan_query
     return {
         "kind": "search",
         "mailbox": mailbox,
-        "query": display_query,
-        "scan_query": display_query,
-        "scan_source": "cache",
+        "query": raw_query,
+        "scan_query": raw_query,
+        "gmail_query": gmail_query,
+        "local_workflow_query": local_workflow_query,
+        "scan_source": "gmail",
         "cache_empty": False,
         "readMask": mask,
         "results": results,
         "count": len(results),
-        "budget": budget,
     }
 
 

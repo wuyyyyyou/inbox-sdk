@@ -1022,6 +1022,23 @@ export interface AiSelectedThreadRef {
   subject?: string;
 }
 
+/** AI 侧栏提交时附带的只读收件箱列表状态。 */
+export interface AiInboxListContext {
+  mailbox_view: string;
+  inbox_group: string;
+  search_input: string;
+  active_search: string;
+  todo_message_ids: string[];
+  done_message_ids: string[];
+  snoozed_message_ids: string[];
+  custom_category?: {
+    id: string;
+    name: string;
+    query: string;
+    bundling_behavior: "default" | "by_sender" | "none";
+  };
+}
+
 export interface SendAiMessageOptions {
   currentMailContext?: AiMailContextRef | null;
   prompt?: string;
@@ -1036,5 +1053,7 @@ export interface SendAiMessageOptions {
   selectedThreads?: AiSelectedThreadRef[];
   /** Router 无法判断时由用户明确选择的范围。 */
   routingIntent?: AiRoutingIntent;
+  /** 侧栏当前列表范围，仅作为 Host Agent 的只读事实。 */
+  inboxListContext?: AiInboxListContext;
 }
 
