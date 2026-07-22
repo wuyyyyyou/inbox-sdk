@@ -137,7 +137,8 @@ def _search_query(arguments: dict[str, Any]) -> str:
 _SEARCH_DEFAULT_MASK = ("date", "participants", "subject", "bodySnippet")
 _SEARCH_ALLOWED_MASK = frozenset(_SEARCH_DEFAULT_MASK)
 # 单次最多拉取这么多 Gmail 摘要，给本地工作流状态筛选保留余量。
-_SEARCH_GMAIL_CANDIDATE_CAP = 120
+_SEARCH_GMAIL_WORKFLOW_CANDIDATE_CAP = 60
+_SEARCH_GMAIL_REQUEST_TIMEOUT_SECONDS = 12.0
 _SEARCH_SNIPPET_CHARS = 140
 _SEARCH_SUBJECT_CHARS = 120
 _SEARCH_FROM_CHARS = 100
@@ -205,14 +206,20 @@ def _search_email(arguments: dict[str, Any], ui_context: dict[str, Any]) -> dict
     raw_query = _search_query(arguments)
     gmail_query, local_workflow_query = _split_gmail_and_local_workflow_query(raw_query)
     mask = _search_read_mask(arguments)
-    # 本地状态筛选可能淘汰前几条命中，实时多拉少量候选再截断返回量。
-    candidate_limit = min(_SEARCH_GMAIL_CANDIDATE_CAP, max(limit * 5, 40))
+    # Gmail 消息列表本身是实时来源。普通搜索只补齐实际返回条数的摘要，避免把一次
+    # 工具调用放大为数十次 metadata 请求；本地工作流筛选才额外拉取少量候选。
+    candidate_limit = (
+        min(_SEARCH_GMAIL_WORKFLOW_CANDIDATE_CAP, max(limit * 3, 20))
+        if local_workflow_query
+        else limit
+    )
     message_ids = live_search_metadata_and_cache(
         mailbox,
         gmail_query,
         candidate_limit,
-        force_refresh=True,
+        force_refresh=False,
         strict=True,
+        request_timeout_seconds=_SEARCH_GMAIL_REQUEST_TIMEOUT_SECONDS,
     )
     messages = get_messages_lite(mailbox, message_ids)
     todo_ids = _workflow_message_ids(arguments, ui_context, "todo_message_ids")

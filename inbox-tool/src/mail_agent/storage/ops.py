@@ -282,6 +282,108 @@ def _inbox_settings_key(mailbox: str) -> str:
     return f"{_mailbox_prefix(mailbox)}/inbox_settings"
 
 
+def _inbox_workflow_state_key(mailbox: str) -> str:
+    """构造按邮箱隔离的 Todo/Done/Snoozed 状态 key。"""
+    return f"{_mailbox_prefix(mailbox)}/inbox_workflow_state"
+
+
+def _ask_history_key(mailbox: str) -> str:
+    """构造按邮箱隔离的 AI Ask 会话历史 key。"""
+    return f"{_mailbox_prefix(mailbox)}/ask_history"
+
+
+def _normalize_message_ids(value: Any, *, limit: int = 500) -> list[str]:
+    """规范化 Gmail message_id 列表，去重并限制单邮箱工作流状态体积。"""
+    if not isinstance(value, list):
+        return []
+    seen: set[str] = set()
+    ids: list[str] = []
+    for item in value:
+        message_id = str(item or "").strip()
+        if not message_id or message_id in seen:
+            continue
+        seen.add(message_id)
+        ids.append(message_id[:256])
+        if len(ids) >= limit:
+            break
+    return ids
+
+
+def _normalize_inbox_workflow_state(value: Any) -> dict[str, Any]:
+    """规范化互斥工作流状态，Todo 优先级高于 Done，避免同一邮件出现在两个分组。"""
+    raw = value if isinstance(value, dict) else {}
+    todos = _normalize_message_ids(raw.get("todos"))
+    done = [item for item in _normalize_message_ids(raw.get("done")) if item not in set(todos)]
+    snoozed = [item for item in _normalize_message_ids(raw.get("snoozed")) if item not in set(todos) and item not in set(done)]
+    until_raw = raw.get("snoozedUntil") if isinstance(raw.get("snoozedUntil"), dict) else {}
+    snoozed_until = {
+        message_id: str(until_raw.get(message_id) or "")[:64]
+        for message_id in snoozed
+        if str(until_raw.get(message_id) or "").strip()
+    }
+    return {
+        "todos": todos,
+        "done": done,
+        "snoozed": snoozed,
+        "snoozedUntil": snoozed_until,
+        "version": 1,
+        "updated_at": _now(),
+    }
+
+
+async def get_inbox_workflow_state(mailbox: str) -> dict[str, Any]:
+    """读取邮箱级工作流状态；不存在时返回空状态和空 etag。"""
+    result = await get_storage().get(_inbox_workflow_state_key(mailbox), scope=default_scope())
+    raw = result.get("value") if result.get("exists") and isinstance(result.get("value"), dict) else {}
+    return {
+        "exists": bool(result.get("exists")),
+        "state": _normalize_inbox_workflow_state(raw),
+        "etag": str(result.get("etag") or ""),
+    }
+
+
+async def set_inbox_workflow_state(
+    mailbox: str,
+    state: dict[str, Any],
+    *,
+    if_match: str | None = None,
+) -> dict[str, Any]:
+    """保存完整工作流状态；调用方必须传递最新 etag 以避免跨端覆盖。"""
+    normalized = _normalize_inbox_workflow_state(state)
+    result = await get_storage().set(
+        _inbox_workflow_state_key(mailbox),
+        normalized,
+        scope=default_scope(),
+        if_match=if_match,
+    )
+    return {"state": normalized, "etag": str(result.get("etag") or "")}
+
+
+async def get_ai_ask_history(mailbox: str) -> dict[str, Any]:
+    """读取按邮箱保存的 AI Ask 会话索引，不返回其他邮箱历史。"""
+    result = await get_storage().get(_ask_history_key(mailbox), scope=default_scope())
+    raw = result.get("value") if result.get("exists") and isinstance(result.get("value"), dict) else {}
+    entries = raw.get("entries") if isinstance(raw.get("entries"), list) else []
+    return {
+        "exists": bool(result.get("exists")),
+        "entries": entries[:30],
+        "etag": str(result.get("etag") or ""),
+    }
+
+
+async def set_ai_ask_history(
+    mailbox: str,
+    entries: list[dict[str, Any]],
+    *,
+    if_match: str | None = None,
+) -> dict[str, Any]:
+    """保存按邮箱隔离的 AI Ask 会话索引，保留最多 30 条由前端裁剪后的记录。"""
+    safe_entries = [item for item in entries if isinstance(item, dict)][:30]
+    payload = {"entries": safe_entries, "updated_at": _now(), "version": 1}
+    result = await get_storage().set(_ask_history_key(mailbox), payload, scope=default_scope(), if_match=if_match)
+    return {"entries": safe_entries, "etag": str(result.get("etag") or "")}
+
+
 def _normalize_inbox_custom_categories(value: Any) -> list[InboxCustomCategory]:
     """规范化 Split 列表，防止非法条目、重复 ID 或超长输入进入邮箱设置。"""
     if not isinstance(value, list):

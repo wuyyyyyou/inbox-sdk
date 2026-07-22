@@ -1518,6 +1518,7 @@ def gmail_request(
     query: dict[str, Any] | None = None,
     *,
     access_token: str | None = None,
+    request_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """向 Gmail REST API 发起 GET。
 
@@ -1527,13 +1528,22 @@ def gmail_request(
     """
     # 调用方可在一个受限业务请求内复用已取得的短期 token，减少平台
     # credentials/getToken 的反向 RPC 数量；未传入时保留原有按请求解析行为。
+    try:
+        request_timeout = min(60.0, max(0.1, float(request_timeout_seconds)))
+    except (TypeError, ValueError):
+        request_timeout = 60.0
     retried_auth = False
     endpoint = _gmail_endpoint_kind(path)
     normalized_mailbox = str(mailbox or "").strip().lower()
     while True:
         # 仅在活跃 scope 且邮箱匹配时复用；401 重试时强制换票。
         scoped_token = None if retried_auth else _scoped_gmail_token_for_mailbox(normalized_mailbox)
-        token = access_token or scoped_token or get_access_token(mailbox, force_refresh=retried_auth)
+        token = access_token or scoped_token or get_access_token(
+            mailbox,
+            force_refresh=retried_auth,
+            platform_token_timeout_seconds=request_timeout,
+            token_refresh_timeout_seconds=request_timeout,
+        )
         # 第一个 Gmail 请求取得 token 后写入当前受限上下文，后续同批请求及复制出的
         # 摘要 worker 都可复用；外层 scope 退出时会恢复，不会残留在进程全局状态。
         # 401 自愈成功后也要写回，避免同批后续请求继续使用失效票。
@@ -1550,7 +1560,7 @@ def gmail_request(
         )
         started = time.monotonic()
         try:
-            with urllib.request.urlopen(req, timeout=60) as response:
+            with urllib.request.urlopen(req, timeout=request_timeout) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             try:
@@ -2075,6 +2085,7 @@ def search_gmail(
     *,
     access_token: str | None = None,
     strict: bool = False,
+    request_timeout_seconds: float | None = None,
 ) -> list[str]:
     """使用 Gmail 查询语法检索消息 ID；严格模式将认证和网络错误交给调用方处理。"""
     target = max(1, min(int(max_results or 100), 500))
@@ -2091,7 +2102,10 @@ def search_gmail(
         if page_token:
             params["pageToken"] = page_token
         try:
-            payload = gmail_request(mailbox, "/users/me/messages", params, access_token=access_token)
+            request_kwargs: dict[str, Any] = {"access_token": access_token}
+            if request_timeout_seconds is not None:
+                request_kwargs["request_timeout_seconds"] = request_timeout_seconds
+            payload = gmail_request(mailbox, "/users/me/messages", params, **request_kwargs)
         except ValueError as exc:
             if strict:
                 raise RuntimeError("Gmail search request failed") from exc
@@ -2192,9 +2206,13 @@ def fetch_message_summary(
     *,
     access_token: str | None = None,
     strict: bool = False,
+    request_timeout_seconds: float | None = None,
 ) -> dict[str, Any] | None:
     """首次同步时读取信头与附件元数据，不下载正文或附件字节。"""
     try:
+        request_kwargs: dict[str, Any] = {"access_token": access_token}
+        if request_timeout_seconds is not None:
+            request_kwargs["request_timeout_seconds"] = request_timeout_seconds
         payload = gmail_request(
             mailbox,
             f"/users/me/messages/{urllib.parse.quote(message_id, safe='')}",
@@ -2207,7 +2225,7 @@ def fetch_message_summary(
                     f"{_summary_mime_fields()}"
                 ),
             },
-            access_token=access_token,
+            **request_kwargs,
         )
     except GmailApiError as exc:
         if strict:
@@ -2260,6 +2278,7 @@ def live_search_metadata_and_cache(
     access_token: str | None = None,
     force_refresh: bool = False,
     strict: bool = False,
+    request_timeout_seconds: float | None = None,
 ) -> list[str]:
     """实时检索 Gmail 并缓存轻量摘要；严格模式不把 Gmail 失败伪装成空结果。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2271,7 +2290,10 @@ def live_search_metadata_and_cache(
     with _gmail_request_token_scope(access_token, mailbox=mailbox):
         # 使用 ContextVar 而不是给公开 helper 新增必填参数；线程池任务通过 copy_context
         # 显式继承本次 token，既避免凭据 RPC 风暴，也不影响其他并发 mailbox 请求。
-        msg_ids = search_gmail(mailbox, query, max_results, strict=strict)
+        search_kwargs: dict[str, Any] = {"strict": strict}
+        if request_timeout_seconds is not None:
+            search_kwargs["request_timeout_seconds"] = request_timeout_seconds
+        msg_ids = search_gmail(mailbox, query, max_results, **search_kwargs)
         if not msg_ids:
             return []
 
@@ -2293,6 +2315,11 @@ def live_search_metadata_and_cache(
         ]
         if missing_ids:
             worker_context = copy_context()
+            summary_kwargs: dict[str, Any] = {}
+            if strict:
+                summary_kwargs["strict"] = True
+            if request_timeout_seconds is not None:
+                summary_kwargs["request_timeout_seconds"] = request_timeout_seconds
             with ThreadPoolExecutor(max_workers=SUMMARY_FETCH_MAX_WORKERS) as pool:
                 futures = {
                     pool.submit(
@@ -2300,7 +2327,7 @@ def live_search_metadata_and_cache(
                         fetch_message_summary,
                         mailbox,
                         message_id,
-                        strict=strict,
+                        **summary_kwargs,
                     ): message_id
                     for message_id in missing_ids
                 }

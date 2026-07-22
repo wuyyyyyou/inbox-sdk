@@ -1938,6 +1938,10 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         set_scan_plan,
         get_inbox_settings,
         set_inbox_settings,
+        get_inbox_workflow_state,
+        set_inbox_workflow_state,
+        get_ai_ask_history,
+        set_ai_ask_history,
         update_card_status,
         add_snooze_sender,
         add_snooze_thread,
@@ -2026,6 +2030,40 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         settings = payload["settings"].__dict__.copy()
         settings["custom_categories"] = [category.__dict__ for category in payload["settings"].custom_categories]
         return {"ok": True, "mailbox": mailbox, "settings": settings, "etag": payload["etag"]}
+
+    if tool == "get_inbox_workflow_state":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        payload = await get_inbox_workflow_state(mailbox)
+        return {"mailbox": mailbox, **payload}
+
+    if tool == "save_inbox_workflow_state":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        state = arguments.get("state") if isinstance(arguments.get("state"), dict) else {}
+        payload = await set_inbox_workflow_state(
+            mailbox,
+            state,
+            if_match=str(arguments.get("if_match") or "") or None,
+        )
+        return {"ok": True, "mailbox": mailbox, **payload}
+
+    if tool == "get_ai_ask_history":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        payload = await get_ai_ask_history(mailbox)
+        return {"mailbox": mailbox, **payload}
+
+    if tool == "save_ai_ask_history":
+        if not mailbox:
+            return {"error": "mailbox is required"}
+        entries = arguments.get("entries") if isinstance(arguments.get("entries"), list) else []
+        payload = await set_ai_ask_history(
+            mailbox,
+            entries,
+            if_match=str(arguments.get("if_match") or "") or None,
+        )
+        return {"ok": True, "mailbox": mailbox, **payload}
 
     if tool == "get_inbox_thread_page":
         if not mailbox:

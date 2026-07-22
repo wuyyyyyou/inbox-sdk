@@ -22,24 +22,24 @@
 
 ## 项目基线
 
-- **App（前端）**：`2.1.5` — 位于 `anna-inbox/`
-- **Tool（Executa）**：`2.2.5` — 位于 `inbox-tool/`
+- **App（前端）**：`2.1.6` — 位于 `anna-inbox/`
+- **Tool（Executa）**：`2.2.6` — 位于 `inbox-tool/`
 
 - 唯一智能入口：Inbox Workspace + AI 侧栏（`start_ai_turn`）；Brief 产品面下线。
 - AI生成内容过程中，滚动条自动滑动到底部。
-- `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表；侧栏提交透传只读 `inboxListContext`（视图/筛选/搜索与 todo/done/snoozed ids）；Router 澄清弹层支持范围选择；详情打开期间列表短暂丢消息不关抽屉。
+- `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表；侧栏提交透传只读 `inboxListContext`（视图/筛选/搜索与 todo/done/snoozed ids）；列表「加载更多 / 扩大范围」在后台 refresh 时仍可点，同步中按钮文案为 Syncing；Router 澄清弹层支持范围选择；详情打开期间列表短暂丢消息不关抽屉。
 - `anna-inbox/src/features/mail-detail/`：线程详情、正文、富文本草稿（`RichTextEditor`）和附件预览；详情打开后固定滚到线程底部；同线程同步刷新不清附件预览。
 - `anna-inbox/src/app/useAppController.ts`：主要状态与工作流控制；AI 侧栏默认 Host Agent Session，支持流式工具结果、取消与会话清理；邮件缓存刷新后预热联系人头像；详情页协助统一走 `start_ai_turn`；soft prune 保留 `mailDetailMessageId`。
 - `anna-inbox/src/api/agentSessionClient.ts`：Host Agent Session 创建、流式帧解析、工具结果消费、run 取消和会话清理。
 - `anna-inbox/src/api/mailAgentClient.ts`：所有 Executa 工具调用的统一 facade。
 - `anna-inbox/manifest.json`、`inbox-tool/src/anna_inbox_executa/common.py` 与 `mailbox_tools.py`：Google Connected accounts 声明、多账号发现状态和安全错误提示；APS Files reverse-RPC 响应始终可路由。
 - `inbox-tool/src/anna_inbox_executa/`：JSON-RPC 入口与工具分发（含 Agent 细粒度白名单工具、`start_ai_turn`、整理确认与 Saved prompts / Memory）；Sampling 预算快照与短 wait 建 run；Brief 主路径工具已移除。
-- `inbox-tool/src/anna_inbox_executa/ai_agent_tools_flow.py`、`inbox-tool/src/mail_agent/local_query.py`：Agent 工具白名单执行；`search_email` 实时 Gmail 搜索（不回退本地缓存），本地工作流 `is:todo/done/snoozed` 仅 AND；单次命中上限 20，线程引用短映射。
+- `inbox-tool/src/anna_inbox_executa/ai_agent_tools_flow.py`、`inbox-tool/src/mail_agent/local_query.py`：Agent 工具白名单执行；`search_email` 实时 Gmail 搜索（不回退本地缓存），普通搜索只拉返回条数摘要、工作流筛选候选上限 60，请求超时 12s；本地工作流 `is:todo/done/snoozed` 仅 AND；单次命中上限 20，线程引用短映射。
 - `inbox-tool/src/mail_agent/ai_turn/`：详情/兼容路径使用的本地 Router 与白名单 Runner；侧栏主路径已迁移到 Host Agent Session。
-- `inbox-tool/src/mail_agent/mail_providers/gmail/adapter.py`：Gmail API、OAuth、本地缓存和正文解码；联系人头像仅 People API（无 Gravatar 回退）；inline/CID 不计入下载附件。
+- `inbox-tool/src/mail_agent/mail_providers/gmail/adapter.py`：Gmail API、OAuth、本地缓存和正文解码；Gmail HTTP / token 请求支持可配置超时；联系人头像仅 People API（无 Gravatar 回退）；inline/CID 不计入下载附件。
 - `inbox-tool/src/mail_agent/mail_providers/gmail/outgoing_html.py`：外发富文本白名单净化。
-- `inbox-tool/src/anna_inbox_executa/v2_tools.py`：收件附件优先 Host transient upload，失败回退 APS Files；反向 RPC 超时 20s。
-- `inbox-tool/src/mail_agent/storage/`：APS/local storage 的统一 async 层。
+- `inbox-tool/src/anna_inbox_executa/v2_tools.py`：收件附件优先 Host transient upload，失败回退 APS Files；反向 RPC 超时 20s；邮箱级 workflow state 与 AI Ask history 读写工具。
+- `inbox-tool/src/mail_agent/storage/`：APS/local storage 的统一 async 层；`inbox_workflow_state` 与 `ask_history` 按邮箱隔离，乐观并发 etag。
 - `inbox-tool/src/mail_agent/ask/`：Ask 规划、搜索和回答（条数解析、预算分配、截断 JSON 不伪装成功）。
 - `inbox-tool/src/mail_agent/core/`：custom scan 等残留；Brief Phase1 管线已删除。
 - 连通性检测：反向 RPC 响应必须由 stdin 线程直接路由；LLM / Gmail 检测共用 12 秒后端总预算，避免与业务 worker 或正常邮箱操作互相阻塞。
@@ -96,7 +96,7 @@ App 与 Tool **版本号解耦，互不强制对齐**：
 
 - 只改前端 / App 发布：只 bump **App** 版本（`anna-inbox/app.json`），**不要**改 Tool 版本。
 - 只改后端 / Executa 发布：只 bump **Tool** 版本；平台若报「同版本已发布且内容不同」，必须再 bump Tool（不可覆盖已发布版本）。
-- Tool 线自 `2.1.1` 起独立演进，现进入 `2.2.x`；App 线自 `2.1.1` 起。当前基线：App `2.1.5` / Tool `2.2.5`。
+- Tool 线自 `2.1.1` 起独立演进，现进入 `2.2.x`；App 线自 `2.1.1` 起。当前基线：App `2.1.6` / Tool `2.2.6`。
 - `min_version` 跟随 **Tool** 版本，不跟随 App 版本。
 - 提交前审核时，若未说明只升哪一端，先与我确认，再改版本号。
 

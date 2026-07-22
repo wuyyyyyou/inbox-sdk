@@ -136,13 +136,34 @@ def test_search_email_uses_live_gmail_and_workflow_ids() -> None:
             {"mailbox": "me@example.com", "about": "from:alice", "filter": "is:todo", "limit": 10},
             {"todo_message_ids": ["todo-1"]},
         )
-    assert live_search.call_args.args[:3] == ("me@example.com", "from:alice", 50)
-    assert live_search.call_args.kwargs == {"force_refresh": True, "strict": True}
+    assert live_search.call_args.args[:3] == ("me@example.com", "from:alice", 30)
+    assert live_search.call_args.kwargs == {
+        "force_refresh": False,
+        "strict": True,
+        "request_timeout_seconds": 12.0,
+    }
     assert result["scan_source"] == "gmail"
     assert result["gmail_query"] == "from:alice"
     assert result["local_workflow_query"] == "is:todo"
     assert [row["message_id"] for row in result["results"]] == ["todo-1"]
     print("[PASS] test_search_email_uses_live_gmail_and_workflow_ids")
+
+
+def test_plain_search_only_fetches_requested_candidates() -> None:
+    """没有本地状态筛选时，不得为默认搜索额外拉取数十条 Gmail 摘要。"""
+    with patch(
+        "mail_agent.mail_providers.gmail.adapter.live_search_metadata_and_cache",
+        return_value=[],
+    ) as live_search, patch(
+        "mail_agent.mail_providers.gmail.adapter.get_messages_lite",
+        return_value=[],
+    ):
+        _search_email(
+            {"mailbox": "me@example.com", "about": "from:alice", "limit": 7},
+            {},
+        )
+    assert live_search.call_args.args[:3] == ("me@example.com", "from:alice", 7)
+    print("[PASS] test_plain_search_only_fetches_requested_candidates")
 
 
 if __name__ == "__main__":
@@ -153,4 +174,5 @@ if __name__ == "__main__":
     test_search_limit_applies_per_call_only()
     test_search_query_keeps_gmail_syntax_and_separates_workflow_filters()
     test_search_email_uses_live_gmail_and_workflow_ids()
+    test_plain_search_only_fetches_requested_candidates()
     print("[ALL TESTS PASSED]")

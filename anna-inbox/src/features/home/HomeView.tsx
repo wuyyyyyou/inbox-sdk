@@ -4478,8 +4478,7 @@ export function HomeView() {
     nextRangeDays !== null &&
     !state.inboxError &&
     !state.inboxLoading &&
-    !isInboxSyncing &&
-    feedAction === null;
+    (feedAction === null || feedAction === "refresh");
   // Show more：先抬高展示上限；本地不够时再续拉 All mail 缓存/Gmail
   const canShowMoreEmails =
     mailboxView !== "drafts" &&
@@ -4487,7 +4486,7 @@ export function HomeView() {
     (feedWindow.localLimit < visible.length ||
       (isExpandableMailboxView(mailboxView) && feedWindow.hasMore)) &&
     !state.inboxError &&
-    feedAction === null;
+    (feedAction === null || feedAction === "refresh");
   const showMoreEmails = useCallback(async () => {
     const step = state.inboxSettings.initial_list_size || INBOX_FEED_PAGE_SIZE;
     const nextLimit = feedWindow.localLimit + step;
@@ -6700,10 +6699,10 @@ export function HomeView() {
               className="older-mail-btn"
               type="button"
               onClick={() => void showMoreEmails()}
-              disabled={feedAction !== null}
+              disabled={isInboxSyncing || feedAction !== null}
             >
-              {feedAction === "more"
-                ? "Loading more in this period..."
+              {isInboxSyncing
+                ? "Syncing..."
                 : moreInPeriodButtonLabel(days)}
             </button>
           ) : null}
@@ -6713,8 +6712,8 @@ export function HomeView() {
               onClick={() => void expandFeedRange()}
               disabled={isInboxSyncing || feedAction !== null}
             >
-              {feedAction === "more"
-                ? "Loading older emails..."
+              {isInboxSyncing
+                ? "Syncing..."
                 : olderRangeButtonLabel(days, nextRangeDays)}
             </button>
           ) : null}

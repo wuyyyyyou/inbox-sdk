@@ -498,6 +498,38 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            "name": "get_inbox_workflow_state",
+            "description": "Get mailbox-scoped Todo, Done, and Snoozed application state.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+            ],
+        },
+        {
+            "name": "save_inbox_workflow_state",
+            "description": "Save mailbox-scoped Todo, Done, and Snoozed application state using optimistic concurrency.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "state", "type": "object", "description": "Workflow state with todos, done, snoozed, and snoozedUntil.", "required": True},
+                {"name": "if_match", "type": "string", "description": "Current workflow-state etag.", "required": False},
+            ],
+        },
+        {
+            "name": "get_ai_ask_history",
+            "description": "Get mailbox-scoped AI Ask conversation history.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+            ],
+        },
+        {
+            "name": "save_ai_ask_history",
+            "description": "Save mailbox-scoped AI Ask conversation history using optimistic concurrency.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "entries", "type": "array", "description": "Pruned AI Ask conversation entries.", "required": True},
+                {"name": "if_match", "type": "string", "description": "Current Ask-history etag.", "required": False},
+            ],
+        },
+        {
             "name": "delete_staged_outgoing_attachment",
             "description": "Delete one staged outgoing attachment from APS Files or local stage.",
             "parameters": [
