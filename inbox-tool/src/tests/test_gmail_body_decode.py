@@ -97,10 +97,10 @@ def main() -> None:
 
     inline_image = {
         "mimeType": "image/png",
-        "filename": "icon.png",
+        "filename": "delivery-warning.png",
         "headers": [
             {"name": "Content-ID", "value": "<icon@example.com>"},
-            {"name": "Content-Disposition", "value": "inline; filename=icon.png"},
+            {"name": "Content-Disposition", "value": "attachment; filename=delivery-warning.png"},
         ],
         "body": {"attachmentId": "inline-image", "size": 5600},
     }
@@ -111,7 +111,17 @@ def main() -> None:
         "body": {"attachmentId": "photo-attachment", "size": 1200},
     }
     extracted = adapter._extract_attachments({"parts": [inline_image, explicit_attachment]})
-    check("inline CID image is not listed as attachment", [item["filename"] for item in extracted] == ["photo.png"])
+    check("CID delivery warning image is not listed as attachment", [item["filename"] for item in extracted] == ["photo.png"])
+
+    summary_fields = adapter._summary_mime_fields()
+    check(
+        "summary MIME fields retain nested part headers",
+        "parts(mimeType,filename,headers(name,value),body(attachmentId,size)" in summary_fields,
+    )
+
+    from anna_inbox_executa.gmail_tools import extract_attachments
+    legacy_extracted = extract_attachments({"parts": [inline_image, explicit_attachment]})
+    check("legacy MIME extraction also excludes inline CID image", [item["filename"] for item in legacy_extracted] == ["photo.png"])
 
     placeholder_plain = _message([
         _part("text/plain", "View this email in your browser."),

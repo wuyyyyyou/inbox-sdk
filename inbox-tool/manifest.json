@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.2.6",
+  "version": "2.2.7",
   "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Ask / AI sidebar, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
@@ -1969,8 +1969,39 @@
       "timeout": 600
     },
     {
+      "name": "query_mail_evidence",
+      "description": "Run Scope → one QueryPlan → deterministic local-cache Evidence for a mailbox question. Use before any read-only answer; returns evidence, sync boundary, active scope, and a template answer for exact facts. Never calls Gmail.",
+      "parameters": [
+        {
+          "name": "user_text",
+          "type": "string",
+          "description": "The user's mailbox question.",
+          "required": true
+        },
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Active mailbox.",
+          "required": false
+        },
+        {
+          "name": "ui_context",
+          "type": "object",
+          "description": "Read-only current thread, selection, and list context.",
+          "required": false
+        },
+        {
+          "name": "conversation_id",
+          "type": "string",
+          "description": "Sidebar conversation id for structured active scope.",
+          "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
       "name": "search_email",
-      "description": "Search live Gmail with standard Gmail query syntax; never falls back to local cache. Use for any inbox-wide claim. Local workflow filters is:todo, is:done, is:snoozed are supported with AND only. Default fields ONLY: date, participants, subject, bodySnippet (+ THREAD_REF). Never returns bodyFull — call read_email for full body. Each call returns at most 20 hits; repeated searches are allowed. If Gmail fails, explain the failure to the user and try another non-cache approach.",
+      "description": "Search the mailbox's local synced cache for inbox-wide claims; never calls Gmail. Local filters is:todo/done/snoozed with AND only. Returns date, participants, subject, bodySnippet, attachmentFilenames (+ THREAD_REF); never bodyFull. Use order=oldest/newest for temporal extremes; at most 20 hits plus sync-boundary facts. Display range does not limit the cache search. If the target predates indexed coverage, explain that presence cannot be determined.",
       "parameters": [
         {
           "name": "about",
@@ -1988,6 +2019,12 @@
           "name": "mailbox",
           "type": "string",
           "description": "Active mailbox from ui_context.",
+          "required": false
+        },
+        {
+          "name": "display_range_days",
+          "type": "integer",
+          "description": "Current Inbox range: 7, 30, or 60 days.",
           "required": false
         },
         {
@@ -2021,6 +2058,12 @@
           "required": false
         },
         {
+          "name": "order",
+          "type": "string",
+          "description": "newest (default) or oldest; use oldest for earliest email/time.",
+          "required": false
+        },
+        {
           "name": "readMask",
           "type": "array",
           "description": "Optional subset of date,participants,subject,bodySnippet. bodyFull is rejected; use read_email.",
@@ -2031,7 +2074,7 @@
     },
     {
       "name": "read_email",
-      "description": "Read ONE searched email by thread_ref. Default readMask: date, participants, subject, bodySnippet. Request bodyFull ONLY when snippet is insufficient for the answer.",
+      "description": "Read ONE searched email by thread_ref. Default readMask: date, participants, subject, bodySnippet; also returns attachmentFilenames when known. Request bodyFull ONLY when snippet is insufficient for the answer.",
       "parameters": [
         {
           "name": "thread_ref",
@@ -2099,7 +2142,7 @@
     },
     {
       "name": "ai_draft_reply",
-      "description": "Draft a reply for the open thread. Never sends.",
+      "description": "Draft a reply for a thread. Prefer open current_thread; otherwise pass thread_ref or message_id/thread_id from search_email. Never sends.",
       "parameters": [
         {
           "name": "user_text",
@@ -2116,7 +2159,25 @@
         {
           "name": "ui_context",
           "type": "object",
-          "description": "Must include current_thread.",
+          "description": "May include current_thread.",
+          "required": false
+        },
+        {
+          "name": "thread_ref",
+          "type": "string",
+          "description": "THREAD_REF from search_email when drawer is closed.",
+          "required": false
+        },
+        {
+          "name": "message_id",
+          "type": "string",
+          "description": "Target message id.",
+          "required": false
+        },
+        {
+          "name": "thread_id",
+          "type": "string",
+          "description": "Target thread id.",
           "required": false
         }
       ],

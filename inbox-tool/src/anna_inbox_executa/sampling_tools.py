@@ -258,6 +258,8 @@ def _build_sampling_for_run(arguments: dict[str, Any], invoke_id: str) -> Any:
 async def _check_sampling_status(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
     started = time.time()
     req_id = uuid.uuid4().hex[:12]
+    # 附带侧栏默认模式，便于前端在连通性探测时同步后端 env，无需单独 health 调用。
+    sidebar_mode = get_ai_sidebar_mode()
     try:
         result = await sampling.create_message(
             messages=[{"role": "user", "content": {"type": "text", "text": "Reply exactly OK."}}],
@@ -281,6 +283,7 @@ async def _check_sampling_status(arguments: dict[str, Any], invoke_id: str) -> d
             "invoke_id": invoke_id,
             "test_req_id": req_id,
             "text": text[:16],
+            "ai_sidebar_mode": sidebar_mode,
         }
     except SamplingError as exc:
         return {
@@ -292,6 +295,7 @@ async def _check_sampling_status(arguments: dict[str, Any], invoke_id: str) -> d
             "elapsed_ms": int((time.time() - started) * 1000),
             "invoke_id": invoke_id,
             "test_req_id": req_id,
+            "ai_sidebar_mode": sidebar_mode,
         }
     except Exception as exc:
         return {
@@ -302,6 +306,7 @@ async def _check_sampling_status(arguments: dict[str, Any], invoke_id: str) -> d
             "elapsed_ms": int((time.time() - started) * 1000),
             "invoke_id": invoke_id,
             "test_req_id": req_id,
+            "ai_sidebar_mode": sidebar_mode,
         }
 
 

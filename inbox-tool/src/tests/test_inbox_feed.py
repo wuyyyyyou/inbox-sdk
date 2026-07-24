@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import json
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -40,6 +41,14 @@ def main() -> None:
     )
 
     captured: dict[str, object] = {}
+    now_ms = int(time.time() * 1000)
+    sync_tick = {"priority": {"initial_sync_complete": False}, "boundary": {"cache_total": 2}}
+    sync_boundary = {
+        "cache_total": 2,
+        "initial_sync_complete": False,
+        "backfill_complete": False,
+        "priority_days": 180,
+    }
 
     def fake_search(mailbox: str, query: str, limit: int) -> list[str]:
         captured.update(mailbox=mailbox, query=query, limit=limit)
@@ -47,11 +56,11 @@ def main() -> None:
 
     messages = [
         {
-            "id": "old", "thread_id": "t-old", "internal_date": "1", "from": "Old <old@example.com>",
+            "id": "old", "thread_id": "t-old", "internal_date": str(now_ms - 1_000), "from": "Old <old@example.com>",
             "subject": "Old", "snippet": "Earlier", "label_ids": ["INBOX"], "attachments": [],
         },
         {
-            "id": "new", "thread_id": "t-new", "internal_date": "2", "from": "New <new@example.com>",
+            "id": "new", "thread_id": "t-new", "internal_date": str(now_ms), "from": "New <new@example.com>",
             "to": "User <user@example.com>", "subject": "Important", "snippet": "Newest", "body_preview": "Preview", "label_ids": ["INBOX", "UNREAD", "IMPORTANT"],
             "attachments": [{"filename": "brief.pdf"}],
         },
@@ -61,15 +70,17 @@ def main() -> None:
         patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
         patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"emailAddress": "user@example.com"}),
         patch("mail_agent.mail_providers.gmail.adapter.clear_mailbox_cache", return_value={"mailbox": "user@example.com"}) as clear_cache,
-        patch("mail_agent.mail_providers.gmail.adapter.live_search_metadata_and_cache", side_effect=fake_search),
         patch("mail_agent.mail_providers.gmail.adapter.list_messages", return_value=messages),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.run_mailbox_sync_tick", return_value=sync_tick),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.schedule_background_sync", return_value=False),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.get_mailbox_sync_boundary", return_value=sync_boundary),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.reset_mailbox_sync_state", return_value={}),
     ):
         result = list_inbox_emails("USER@example.com", 7, 100)
         starred = list_inbox_emails("USER@example.com", 30, 50, "starred")
         all_mail = list_inbox_emails("USER@example.com", 7, 500, "all", True)
 
-    # 刷新固定走 All mail query（含 days 窗口），与请求 category 无关
-    assert captured == {"mailbox": "user@example.com", "query": "in:anywhere -in:chats newer_than:7d", "limit": 500}
+    # 列表按 days 投影缓存；后台同步状态随响应返回。
     assert [item["id"] for item in result["messages"]] == ["new", "old"]
     assert result["messages"][0]["unread"] is True
     assert result["messages"][0]["important"] is True
@@ -85,6 +96,8 @@ def main() -> None:
     assert "has_more" in result
     assert "next_offset" in result
     assert result["cached_total"] == 2
+    assert result["sync"] == sync_tick
+    assert result["sync_boundary"] == sync_boundary
     clear_cache.assert_called_once_with("user@example.com")
 
     default_query: dict[str, object] = {}
@@ -96,19 +109,21 @@ def main() -> None:
     with (
         patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
         patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"emailAddress": "user@example.com"}),
-        patch("mail_agent.mail_providers.gmail.adapter.live_search_metadata_and_cache", side_effect=capture_default_query),
         patch("mail_agent.mail_providers.gmail.adapter.list_messages", return_value=messages),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.run_mailbox_sync_tick", return_value=sync_tick),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.schedule_background_sync", return_value=False),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.get_mailbox_sync_boundary", return_value=sync_boundary),
     ):
         default_feed = list_inbox_emails("USER@example.com")
     assert default_feed["days"] == 30
-    assert default_query == {"mailbox": "user@example.com", "query": "in:anywhere -in:chats newer_than:30d", "limit": 100}
+    assert default_feed["query"] == "in:anywhere -in:chats newer_than:30d"
 
     # list_inbox_emails 响应帧必须受 48KiB 预算约束（缓存仍可写入更多）
     oversized_messages = [
         {
             "id": f"big-{index}",
             "thread_id": f"thread-{index}",
-            "internal_date": str(1_720_000_000_000 - index),
+            "internal_date": str(now_ms - index),
             "from": f"Sender {index} <sender-{index}@example.com> " + ("f" * 400),
             "to": "recipient@example.com " + ("t" * 400),
             "subject": "s" * 500,
@@ -123,8 +138,10 @@ def main() -> None:
     with (
         patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
         patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"emailAddress": "user@example.com"}),
-        patch("mail_agent.mail_providers.gmail.adapter.live_search_metadata_and_cache", return_value=oversized_ids),
         patch("mail_agent.mail_providers.gmail.adapter.list_messages", return_value=oversized_messages),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.run_mailbox_sync_tick", return_value=sync_tick),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.schedule_background_sync", return_value=False),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.get_mailbox_sync_boundary", return_value=sync_boundary),
     ):
         bounded_feed = list_inbox_emails("USER@example.com", 30, 100, "all")
     assert 0 < bounded_feed["count"] < 100
@@ -136,7 +153,7 @@ def main() -> None:
         {
             "id": "thread-original",
             "thread_id": "thread-title",
-            "internal_date": "10",
+            "internal_date": str(now_ms - 1_000),
             "from": "User <user@example.com>",
             "subject": "Original invite title",
             "snippet": "Original",
@@ -146,7 +163,7 @@ def main() -> None:
         {
             "id": "thread-latest",
             "thread_id": "thread-title",
-            "internal_date": "20",
+            "internal_date": str(now_ms),
             "from": "Sender <sender@example.com>",
             "subject": "Changed latest title",
             "snippet": "Latest",
@@ -159,8 +176,10 @@ def main() -> None:
     with (
         patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
         patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"emailAddress": "user@example.com"}),
-        patch("mail_agent.mail_providers.gmail.adapter.live_search_metadata_and_cache", return_value=["thread-latest"]),
         patch("mail_agent.mail_providers.gmail.adapter.list_messages", return_value=thread_subject_messages),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.run_mailbox_sync_tick", return_value=sync_tick),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.schedule_background_sync", return_value=False),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.get_mailbox_sync_boundary", return_value=sync_boundary),
     ):
         thread_title_feed = list_inbox_emails("USER@example.com", 7, 100)
     assert thread_title_feed["messages"][0]["subject"] == "Original invite title"
@@ -173,7 +192,7 @@ def main() -> None:
         {
             "id": "thread-att-old",
             "thread_id": "thread-att",
-            "internal_date": "10",
+            "internal_date": str(now_ms - 1_000),
             "from": "Sender <sender@example.com>",
             "subject": "Invoice",
             "snippet": "See attached",
@@ -183,7 +202,7 @@ def main() -> None:
         {
             "id": "thread-att-new",
             "thread_id": "thread-att",
-            "internal_date": "20",
+            "internal_date": str(now_ms),
             "from": "User <user@example.com>",
             "subject": "Re: Invoice",
             "snippet": "Thanks",
@@ -194,8 +213,10 @@ def main() -> None:
     with (
         patch("mail_agent.mail_providers.gmail.adapter.normalize_mailbox", return_value="user@example.com"),
         patch("mail_agent.mail_providers.gmail.adapter.gmail_request", return_value={"emailAddress": "user@example.com"}),
-        patch("mail_agent.mail_providers.gmail.adapter.live_search_metadata_and_cache", return_value=["thread-att-new"]),
         patch("mail_agent.mail_providers.gmail.adapter.list_messages", return_value=thread_attachment_messages),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.run_mailbox_sync_tick", return_value=sync_tick),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.schedule_background_sync", return_value=False),
+        patch("mail_agent.mail_providers.gmail.mailbox_sync.get_mailbox_sync_boundary", return_value=sync_boundary),
     ):
         thread_attachment_feed = list_inbox_emails("USER@example.com", 7, 100)
     assert thread_attachment_feed["messages"][0]["id"] == "thread-att-new"

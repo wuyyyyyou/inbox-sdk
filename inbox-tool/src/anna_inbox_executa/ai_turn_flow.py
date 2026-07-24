@@ -5,7 +5,7 @@ from __future__ import annotations
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any
 
-from anna_inbox_executa.common import log
+from anna_inbox_executa.common import get_ai_sidebar_mode, log
 from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.diagnostics import activate_trace, current_trace, deactivate_trace, snapshot
 
@@ -75,6 +75,7 @@ def start_ai_turn(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
     """启动一次 AI turn：阻塞至 wait_timeout，超时后返回可轮询状态。
 
     与 start_custom_scan 相同，保持 invoke 存活以便 Sampling 反向 RPC。
+    本地侧栏开关开启时，前端会改走本入口而非 Host Agent Session。
     """
     run_id = str(arguments.get("run_id") or "").strip()
     if not run_id or len(run_id) < 8:
@@ -83,6 +84,15 @@ def start_ai_turn(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
     if existing:
         # 同一 run_id 重试必须复用后台任务，避免重复 LLM / Gmail 调用。
         return _public_ai_turn_state(run_id)
+
+    # 仅 stderr 日志：标明入口；sidebar_local 走与 Host 同工具的本地 Agent 环。
+    sidebar_mode = get_ai_sidebar_mode()
+    source = str(arguments.get("source") or arguments.get("entry") or "start_ai_turn").strip()[:64]
+    path = "local_agent_session" if source == "sidebar_local" else "local_router"
+    log(
+        f"ai_sidebar path={path} mode={sidebar_mode} "
+        f"source={source or 'start_ai_turn'} run_id={run_id[:80]}"
+    )
 
     MAIL_AGENT_RUNS[run_id] = {
         "run_id": run_id,
@@ -123,7 +133,11 @@ def start_ai_turn(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
 
 
 async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id: str) -> None:
-    """异步执行 Router + 白名单工具。"""
+    """异步执行 AI turn。
+
+    - ``source=sidebar_local``：本地 Agent 环 + Host 同款 ``ai_*`` 工具（侧栏本地开关）。
+    - 其它：详情/兼容路径，本地 Router + 阶段 C 白名单工具。
+    """
     from mail_agent.ai_turn.runner import run_ai_turn
 
     trace_token = activate_trace((MAIL_AGENT_RUNS.get(run_id) or {}).get("diagnostics"))
@@ -139,6 +153,7 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
             MAIL_AGENT_RUNS[run_id]["sampling"] = sampling_snapshot()
         user_text = str(arguments.get("user_text") or arguments.get("user_request") or "").strip()
         ui_context = arguments.get("ui_context") if isinstance(arguments.get("ui_context"), dict) else {}
+        source = str(arguments.get("source") or arguments.get("entry") or "").strip()
 
         def _update_progress(stage: str, progress: dict[str, Any] | None = None) -> None:
             progress = dict(progress or {})
@@ -152,13 +167,25 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
             MAIL_AGENT_RUNS[run_id]["updated_at"] = beijing_now()
             _save_run_checkpoint(run_id)
 
-        outcome = await run_ai_turn(
-            user_text,
-            ui_context,
-            arguments,
-            sampling_create_message=sampling,
-            progress_callback=_update_progress,
-        )
+        if source == "sidebar_local":
+            from anna_inbox_executa.local_agent_session import run_local_agent_session
+
+            outcome = await run_local_agent_session(
+                user_text,
+                ui_context,
+                arguments,
+                sampling_create_message=sampling,
+                progress_callback=_update_progress,
+                invoke_id=invoke_id,
+            )
+        else:
+            outcome = await run_ai_turn(
+                user_text,
+                ui_context,
+                arguments,
+                sampling_create_message=sampling,
+                progress_callback=_update_progress,
+            )
 
         kind = str(outcome.get("kind") or "chat")
         scan_result = outcome.get("scan_result") if isinstance(outcome.get("scan_result"), dict) else None

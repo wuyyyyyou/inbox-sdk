@@ -2,7 +2,7 @@
 
 Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；AI 侧栏是唯一智能入口。Brief 产品面已下线，不再代表 2.0 主路径。
 
-当前发布基线：App `2.1.6` / Tool `2.2.6`。本版本重点：`search_email` 降低摘要拉取放大与 12s 请求超时、邮箱级 workflow state / AI Ask history 持久化工具、列表加载更多在后台 refresh 时不阻塞，以及继承 2.2.5 的实时 Gmail 搜索、附件 Host upload 与详情滚底等能力。
+当前发布基线：App `2.1.7` / Tool `2.2.7`。本版本重点：邮箱 **180 天 metadata 优先 + 无硬顶 backfill** 的缓存同步与 `sync_boundary`；侧栏只读主路径改为一次 `query_mail_evidence`（全量本地索引，非列表 7/30/60 窗）；`search_email`/`read_email` 改为 cache-only；后台正文/附件预处理（含 PDF）；侧栏 local 调试路径与 Host 共用工具白名单；草稿产物可编辑插入。
 
 ## Language
 
@@ -24,7 +24,15 @@ Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 或 All 
 
 **Anna AI Sidebar**
 
-主界面左侧的对话入口。默认创建 Host Agent Session，由 Host 在显式白名单中选型并调用搜索、阅读、总结、写/改稿、整理建议和记忆工具；前端透传只读屏上上下文并消费流式文本与工具结果。侧栏支持取消当前 run、复用会话继续对话和清理会话；整理类仅产出确认卡片，须用户确认后 mutation。`start_ai_turn` 保留给详情协助和兼容路径。
+主界面左侧的对话入口。默认创建 Host Agent Session，由 Host 在显式白名单中选型并调用 `query_mail_evidence`、写/改稿、整理建议和记忆工具；前端透传只读屏上上下文（不含把展示时间窗当检索边界）并消费流式文本与工具结果。本地可用 `ANNA_INBOX_AI_SIDEBAR_MODE=local` 或 localStorage 覆盖，走 `start_ai_turn(source=sidebar_local)`（Sampling 选型 + 与 Host 相同工具执行）。侧栏支持取消当前 run、复用会话继续对话和清理会话；整理类仅产出确认卡片，须用户确认后 mutation。
+
+**sync_boundary**
+
+每个邮箱的本地索引边界元数据（最早/最晚索引时间、180 天 priority 与 backfill 完成态、History 游标等）。供 AI 与同步 UI 使用，不得直接当作用户最终答案原文。
+
+**query_mail_evidence**
+
+侧栏邮箱范围问答的复合只读工具：解析 scope、生成一条 QueryPlan、在本地缓存上确定性取证；仅当目标时间早于索引最早边界时才允许一次受限 Gmail 历史检索。
 
 **Saved prompts / AI Memory**
 
@@ -65,6 +73,7 @@ Brief 的扫描窗口、数量和行为偏好。
 - AI 侧栏底部展示 LLM 与 Gmail API 连通状态及延迟（ms）；点击各自手动重测，定时轮询并行刷新。检测请求去重，扫描或 AI turn 期间暂停轮询；后端反向 RPC 响应直通，Gmail 的账号、token 与 HTTP 请求共享 12 秒总预算。
 - 调用链诊断只返回随机 trace ID、阶段、耗时、稳定 endpoint 类别、HTTP 状态码、token 来源枚举和错误类型；禁止包含邮箱地址、邮件内容、查询参数、提示词、模型输出或凭据。
 - AI 侧栏 Ask 只检索 `ui_context.mailbox` 当前活动邮箱；`selected_mailboxes` 仅作界面上下文，不可扩大问答检索范围。
+- 列表展示时间窗不得被表述为 AI 检索范围；Evidence 的 `search_scope=all_indexed_cache` 表示整箱已索引缓存。
 - AI 侧栏回复先完整解析 Markdown 再按稳定结构揭示；指定联系人检索不得放宽 `from:`/`to:`；Replace draft 直接覆盖编辑栏，Discard 后禁止旧草稿自动回填。
 - 邮件发送、标记已读、标签变更、移至垃圾箱与整理确认必须来自明确用户操作。
 - 凭据不作为工具参数传递，也不得写入日志或持久化状态。

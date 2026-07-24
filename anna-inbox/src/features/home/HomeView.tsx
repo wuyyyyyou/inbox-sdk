@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -1628,6 +1629,76 @@ function AnimatedAssistantText({
   );
 }
 
+function DraftReplyArtifactCard({
+  artifact,
+  onUse,
+}: {
+  artifact: DraftReplyArtifact;
+  onUse: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
+}) {
+  const [draft, setDraft] = useState(artifact);
+  const isForward = draft.composer_mode === "forward";
+  return (
+    <div className="ai-draft-artifact">
+      <strong className="ai-draft-artifact-title">{isForward ? "Forward draft" : "Reply draft"}</strong>
+      <label className="ai-draft-artifact-field">
+        <span>To</span>
+        <input
+          value={(isForward ? (draft.recipients || []) : []).join(", ")}
+          placeholder={isForward ? "Add recipient" : "Reply recipient from thread"}
+          readOnly={!isForward}
+          onChange={(event) => setDraft((current) => ({
+            ...current,
+            recipients: event.target.value.split(",").map((value) => value.trim()).filter(Boolean),
+          }))}
+        />
+      </label>
+      <label className="ai-draft-artifact-field">
+        <span>Subject</span>
+        <input value={draft.subject || ""} placeholder="Thread subject" readOnly />
+      </label>
+      <label className="ai-draft-artifact-field">
+        <span>Message</span>
+        <textarea value={draft.body} onChange={(event) => setDraft((current) => ({ ...current, body: event.target.value }))} />
+      </label>
+      <div className="ai-draft-artifact-actions">
+        <button className="is-primary" onClick={() => onUse(draft, "replace")}>Insert into {isForward ? "forward" : "reply"}</button>
+        <button className="is-secondary" onClick={() => onUse(draft, "append")}>Append</button>
+      </div>
+    </div>
+  );
+}
+
+function ComposeDraftArtifactCard({
+  artifact,
+  onUse,
+}: {
+  artifact: ComposeDraftArtifact;
+  onUse: (artifact: ComposeDraftArtifact) => void;
+}) {
+  const [draft, setDraft] = useState(artifact);
+  return (
+    <div className="ai-draft-artifact">
+      <strong className="ai-draft-artifact-title">New email draft</strong>
+      <label className="ai-draft-artifact-field">
+        <span>To</span>
+        <input value={(draft.recipients || []).join(", ")} placeholder="Add recipient" onChange={(event) => setDraft((current) => ({ ...current, recipients: event.target.value.split(",").map((value) => value.trim()).filter(Boolean) }))} />
+      </label>
+      <label className="ai-draft-artifact-field">
+        <span>Subject</span>
+        <input value={draft.subject || ""} placeholder="Add subject" onChange={(event) => setDraft((current) => ({ ...current, subject: event.target.value }))} />
+      </label>
+      <label className="ai-draft-artifact-field">
+        <span>Message</span>
+        <textarea value={draft.body} onChange={(event) => setDraft((current) => ({ ...current, body: event.target.value }))} />
+      </label>
+      <div className="ai-draft-artifact-actions">
+        <button className="is-primary" onClick={() => onUse(draft)}>Insert into new email</button>
+      </div>
+    </div>
+  );
+}
+
 function AiAssistantMessage({
   message,
   currentMailContext,
@@ -2134,8 +2205,8 @@ function AiAssistantMessage({
                 ? [draftArtifact]
                 : [];
           if (!batchArtifacts.length || (animate && !assistantTextComplete)) return null;
-          return batchArtifacts.map((item, index) => {
-            const itemOpen = Boolean(
+            return batchArtifacts.map((item, index) => {
+              const itemOpen = Boolean(
               currentMailContext &&
               currentMailContext.kind === "gmail_thread" &&
               currentMailContext.mailbox.trim().toLowerCase() ===
@@ -2143,30 +2214,14 @@ function AiAssistantMessage({
               currentMailContext.thread_id === item.thread_id,
             );
             return (
-              <div className="ai-draft-artifact" key={`${item.thread_id}-${index}`}>
-                {item.subject || batchArtifacts.length > 1 ? (
-                  <strong className="ai-draft-artifact-title">
-                    {item.subject || item.thread_id || `Draft ${index + 1}`}
-                  </strong>
-                ) : null}
-                <pre>{item.body}</pre>
-                <div className="ai-draft-artifact-actions">
-                  {itemOpen ? (
-                    <>
-                      <button
-                        className="is-primary"
-                        onClick={() => onUseArtifact(item, "append")}
-                      >
-                        Append to draft reply
-                      </button>
-                      <button
-                        className="is-secondary"
-                        onClick={() => onUseArtifact(item, "replace")}
-                      >
-                        Replace draft reply
-                      </button>
-                    </>
-                  ) : (
+              <div key={`${item.thread_id}-${index}`}>
+                {itemOpen ? (
+                  <DraftReplyArtifactCard artifact={item} onUse={onUseArtifact} />
+                ) : (
+                  <div className="ai-draft-artifact">
+                    <strong className="ai-draft-artifact-title">{item.subject || item.thread_id || `Draft ${index + 1}`}</strong>
+                    <pre>{item.body}</pre>
+                    <div className="ai-draft-artifact-actions">
                     <button
                       className="is-primary"
                       onClick={() =>
@@ -2180,45 +2235,22 @@ function AiAssistantMessage({
                     >
                       Go to email
                     </button>
-                  )}
-                  <button
-                    className="is-secondary"
-                    onClick={() => void actions.copyDraft(item.body)}
-                  >
-                    Copy draft
-                  </button>
-                </div>
+                    <button className="is-secondary" onClick={() => void actions.copyDraft(item.body)}>Copy draft</button>
+                    </div>
+                  </div>
+                )}
               </div>
             );
           });
         })()}
         {composeArtifact ? (
-          <div className="ai-draft-artifact">
-            <pre>{composeArtifact.body}</pre>
-            <div className="ai-draft-artifact-actions">
-              <button
-                className="is-primary"
-                onClick={() =>
-                  onUseComposeArtifact(
-                    composeArtifact,
-                    message.mailContext?.kind === "compose"
-                      ? message.mailContext
-                      : null,
-                  )
-                }
-              >
-                {composeArtifact.mode === "replace"
-                  ? "Apply revised draft"
-                  : "Insert draft"}
-              </button>
-              <button
-                className="is-secondary"
-                onClick={() => void actions.copyDraft(composeArtifact.body)}
-              >
-                Copy draft
-              </button>
-            </div>
-          </div>
+          <ComposeDraftArtifactCard
+            artifact={composeArtifact}
+            onUse={(artifact) => onUseComposeArtifact(
+              artifact,
+              message.mailContext?.kind === "compose" ? message.mailContext : null,
+            )}
+          />
         ) : null}
         {sendPlan ? (
           <div className="ai-draft-artifact ai-send-plan">
@@ -3157,6 +3189,7 @@ export function HomeView() {
   const [searchFocused, setSearchFocused] = useState(false);
   const [searchSuggestionIndex, setSearchSuggestionIndex] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchCaretPositionRef = useRef<number | null>(null);
   const [activeSearch, setActiveSearch] = useState("");
   const [filterBeforeSearch, setFilterBeforeSearch] =
     useState<FeedFilter>("important");
@@ -3169,6 +3202,13 @@ export function HomeView() {
     () => parseInboxQuery(activeSearch),
     [activeSearch],
   );
+  useLayoutEffect(() => {
+    const position = searchCaretPositionRef.current;
+    const input = searchInputRef.current;
+    if (position === null || !input || document.activeElement !== input) return;
+    input.setSelectionRange(position, position);
+    searchCaretPositionRef.current = null;
+  }, [search]);
   const applySearch = useCallback(
     (value: string) => {
       const parsed = parseInboxQuery(value);
@@ -4251,7 +4291,7 @@ export function HomeView() {
           }
           return actions.silentSyncInbox(targetDays);
         }
-        // 硬刷新：清缓存后整表重载（设置页 / 换邮箱 / 改 display range）
+        // 硬刷新：仅显式刷新、换邮箱等操作才清缓存后整表重载。
         if (localCategory) {
           if (mailboxView === "drafts") {
             await actions.listInboxThreadDrafts(mailbox, 100);
@@ -4397,7 +4437,7 @@ export function HomeView() {
 
   const isInboxSyncing = state.inboxSnapshotLoading || feedAction === "refresh";
   const days = feedWindow.days;
-  // 仅在「设置 display_range」或「邮箱」真正变更时重置窗口并同步。
+  // 仅在「设置 display_range」或「邮箱」真正变更时重置窗口。
   // 故意不依赖 feedWindow.days：用户底部扩窗后不得被拉回设置值。
   // 启动时默认 state 为 30，存储 hydrate 到 7 时只对齐标签，禁止 clearCache 闪屏。
   const appliedDisplayRangeRef = useRef<{ mailbox: string; days: number } | null>(
@@ -4452,10 +4492,25 @@ export function HomeView() {
         settingsHydratedRef.current = true;
         return;
       }
-      // 用户在设置里改 display range
-      void syncInbox(configuredDays, true);
+      // display range 仅是列表渲染窗口：只从已有 All-mail 缓存重新投影，
+      // 不触发 Gmail History、priority/backfill 或清缓存重扫。
+      void (async () => {
+        const result = await actions.loadCachedInboxEmails("all", configuredDays, 0, false);
+        if (!result.ok) return;
+        setFeedWindow((current) => ({
+          ...current,
+          days: configuredDays,
+          nextOffset: result.nextOffset,
+          hasMore: result.hasMore,
+          localLimit: Math.max(current.localLimit, INBOX_FEED_PAGE_SIZE),
+          source: "cache",
+          gmailPageToken: "",
+          gmailPageOffset: 0,
+        }));
+      })();
     }
   }, [
+    actions,
     mailbox,
     state.inboxSettings.display_range_days,
     state.inboxSettingsEtag,
@@ -5370,6 +5425,22 @@ export function HomeView() {
           setSelectedId(known.id);
           return;
         }
+        // THREAD_REF 仅含 thread id。先打开可渲染占位详情，再异步解析真实锚点；
+        // 不让点击动作被完整线程/Gmail 刷新阻塞。
+        const openingPlaceholder: InboxMessage = {
+          id: target.message_id || target.thread_id,
+          thread_id: target.thread_id,
+          mailbox: targetMailbox,
+          internal_date: "",
+          from: "",
+          to: "",
+          subject: target.label || "Referenced email",
+          label_ids: [],
+          snippet: "",
+        };
+        setExternalDetailMessage(openingPlaceholder);
+        setSelectedId(openingPlaceholder.id);
+        setMailboxView("inbox");
         const page = await actions.loadInboxThreadPage(
           targetMailbox,
           target.thread_id,
@@ -6003,6 +6074,14 @@ export function HomeView() {
         onUseArtifact={applyDraftReplyArtifact}
         onApplyScanQuery={applySearch}
         onUseComposeArtifact={(artifact, sourceContext) => {
+          if (!sourceContext && !composeOpen) {
+            if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current);
+            setComposeClosing(false);
+            setComposeResumeDraft(null);
+            setComposeOpen(true);
+            setComposeInsertRequest({ nonce: crypto.randomUUID(), artifact });
+            return;
+          }
           if (
             !composeOpen ||
             !composeAiContext ||
@@ -6110,7 +6189,10 @@ export function HomeView() {
                 ref={searchInputRef}
                 value={search}
                 onChange={(event) => {
-                  setSearch(event.target.value);
+                  const next = event.target.value;
+                  // 高亮层重渲染后仍保留浏览器计算的输入位置，避免光标跳到开头。
+                  searchCaretPositionRef.current = event.target.selectionStart ?? next.length;
+                  setSearch(next);
                   setActiveSearch("");
                   setSearchFocused(true);
                   setSearchSuggestionIndex(0);

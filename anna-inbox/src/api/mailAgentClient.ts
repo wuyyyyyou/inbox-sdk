@@ -168,7 +168,13 @@ export class MailAgentClient {
   }
 
   checkSamplingStatus() {
-    return this.invoke<LlmStatus & { ok?: boolean; code?: string; provider?: string }>("check_sampling_status", {}, { timeoutMs: 15_000 });
+    return this.invoke<LlmStatus & {
+      ok?: boolean;
+      code?: string;
+      provider?: string;
+      /** 后端 env 默认侧栏路径；前端 localStorage 可覆盖 */
+      ai_sidebar_mode?: "host" | "local";
+    }>("check_sampling_status", {}, { timeoutMs: 15_000 });
   }
 
   checkGmailApiStatus(mailbox = "") {

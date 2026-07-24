@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyInboxQuerySuggestion, getInboxQueryHighlightTerms, getInboxQuerySuggestions, matchInboxQuery, parseInboxQuery } from "./inboxQuery";
+import { applyInboxQuerySuggestion, getInboxQueryHighlightTerms, getInboxQuerySuggestions, matchInboxQuery, parseInboxQuery, splitInboxQueryTokens } from "./inboxQuery";
 
 describe("Inbox query language", () => {
   it("parses AND before OR", () => {
@@ -39,6 +39,18 @@ describe("Inbox query language", () => {
     expect(matchInboxQuery(message, parseInboxQuery("body:PAID"))).toBe(true);
     expect(matchInboxQuery(message, parseInboxQuery("received"))).toBe(true);
     expect(matchInboxQuery({ ...message, body_preview: "", body_cached: false }, parseInboxQuery("body:paid"), "")).toBe(false);
+  });
+
+  it("keeps spaces inside field values and highlights the complete value", () => {
+    const query = "subject:Re: Collaboration: Meet Anna";
+    const parsed = parseInboxQuery(query);
+
+    expect(parsed.expression).toEqual({ kind: "term", field: "subject", value: "re: collaboration: meet anna" });
+    expect(matchInboxQuery({ id: "mail-phrase", subject: "Re: Collaboration: Meet Anna" }, parsed)).toBe(true);
+    expect(splitInboxQueryTokens(query)).toEqual([
+      { text: "subject:", kind: "field" },
+      { text: "Re: Collaboration: Meet Anna", kind: "value" },
+    ]);
   });
 
   it("reports invalid expressions and offers only operator suggestions", () => {

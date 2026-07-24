@@ -23,6 +23,11 @@ _STATUS_VALUES = frozenset({
     "important", "draft", "trash", "spam", "all",
 })
 _OPERATORS = frozenset({"AND", "OR"})
+_QUERY_OPERATOR_RE = re.compile(r"\b(AND|OR)\b", re.IGNORECASE)
+_GMAIL_CLAUSE_START_RE = re.compile(
+    r"^-?(?:in|newer_than|older_than|before|after|is|has|from|to|subject|body):",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -84,46 +89,53 @@ def _parse_term_token(token: str) -> tuple[LocalQueryTerm | None, str]:
     return LocalQueryTerm(field="any", value=raw.lower(), exclude=exclude), ""
 
 
+def _find_query_operators(text: str) -> list[tuple[int, str]]:
+    """只识别被空白包围的 AND/OR，避免主题值内的普通空格被拆成多个条件。"""
+    operators: list[tuple[int, str]] = []
+    for match in _QUERY_OPERATOR_RE.finditer(text):
+        start, end = match.span()
+        before = text[start - 1] if start else ""
+        after = text[end] if end < len(text) else ""
+        if (not before or before.isspace()) and (not after or after.isspace()):
+            operators.append((start, match.group(1).upper()))
+    return operators
+
+
 def parse_local_query(input_text: str) -> ParsedLocalQuery:
     """解析本地查询；语法错误时 expression 为 None 并带 error。"""
     raw = str(input_text or "").strip()
     if not raw:
         return ParsedLocalQuery(expression=None, error="", display="")
-    tokens = raw.split()
     groups: list[LocalQueryNode] = []
     and_terms: list[LocalQueryNode] = []
-    expecting_term = True
-    for token in tokens:
-        upper = token.upper()
-        if upper in _OPERATORS:
-            if expecting_term:
-                return ParsedLocalQuery(
-                    expression=None,
-                    error=f"The {upper} operator needs a term before and after it.",
-                    display=raw,
-                )
-            if upper == "OR":
-                groups.append(_join("and", and_terms))
-                and_terms = []
-            expecting_term = True
-            continue
-        if not expecting_term:
+    term_start = 0
+    for operator_index, operator in _find_query_operators(raw):
+        token = raw[term_start:operator_index].strip()
+        if not token:
             return ParsedLocalQuery(
                 expression=None,
-                error="Add an AND or OR operator between search terms.",
+                error=f"The {operator} operator needs a term before and after it.",
                 display=raw,
             )
         term, err = _parse_term_token(token)
         if term is None:
             return ParsedLocalQuery(expression=None, error=err, display=raw)
         and_terms.append(LocalQueryNode(kind="term", term=term))
-        expecting_term = False
-    if expecting_term:
+        if operator == "OR":
+            groups.append(_join("and", and_terms))
+            and_terms = []
+        term_start = operator_index + len(operator)
+    token = raw[term_start:].strip()
+    if not token:
         return ParsedLocalQuery(
             expression=None,
             error="The final operator needs a search term after it.",
             display=raw,
         )
+    term, err = _parse_term_token(token)
+    if term is None:
+        return ParsedLocalQuery(expression=None, error=err, display=raw)
+    and_terms.append(LocalQueryNode(kind="term", term=term))
     groups.append(_join("and", and_terms))
     return ParsedLocalQuery(expression=_join("or", groups), error="", display=raw)
 
@@ -319,20 +331,64 @@ def match_local_query(
     )
 
 
+def _split_gmail_query_clauses(text: str) -> list[str]:
+    """按已知 Gmail 条件起点切分，字段值中不以条件开头的单词始终保留在原条件内。"""
+    clauses: list[str] = []
+    current: list[str] = []
+    for word in text.split():
+        upper = word.upper()
+        if upper in _OPERATORS:
+            if current:
+                clauses.append(" ".join(current))
+                current = []
+            clauses.append(upper)
+            continue
+        if _GMAIL_CLAUSE_START_RE.match(word) and current:
+            clauses.append(" ".join(current))
+            current = []
+        current.append(word)
+    if current:
+        clauses.append(" ".join(current))
+    return clauses
+
+
+def _has_implicit_gmail_clause_boundary(clauses: list[str]) -> bool:
+    """判断相邻 Gmail 条件是否省略了 AND；本地语法有显式 AND 时不可重写字段值。"""
+    return any(
+        previous.upper() not in _OPERATORS and current.upper() not in _OPERATORS
+        for previous, current in zip(clauses, clauses[1:])
+    )
+
+
+def _has_unqualified_gmail_keywords(clauses: list[str]) -> bool:
+    """Gmail 的多个裸词默认是 AND；字段条件的多词值则不适用该兼容规则。"""
+    return any(
+        clause.upper() not in _OPERATORS
+        and not _GMAIL_CLAUSE_START_RE.match(clause)
+        and len(clause.split()) > 1
+        for clause in clauses
+    )
+
+
 def normalize_to_local_query(raw: str) -> str:
     """把 Host/Gmail 风格碎片尽量映射为本地语法展示与过滤串。
 
-    无法识别的 token 保留为裸词；空白分隔项用 AND 连接。
+    无法识别的条件保留为裸词；相邻 Gmail 字段映射为 AND，字段值内的空格不拆分。
     """
     text = " ".join(str(raw or "").split())
     if not text:
         return ""
-    # 已是合法本地语法则原样返回
-    if not parse_local_query(text).error:
+    clauses = _split_gmail_query_clauses(text)
+    # 已是合法本地语法且没有省略连接符的 Gmail 条件时原样返回，保留字段值空格。
+    if (
+        not _has_implicit_gmail_clause_boundary(clauses)
+        and not _has_unqualified_gmail_keywords(clauses)
+        and not parse_local_query(text).error
+    ):
         return text
 
     pieces: list[str] = []
-    for token in text.split():
+    for token in clauses:
         lower = token.lower()
         if lower in {"and", "or"}:
             pieces.append(token.upper())
@@ -340,6 +396,9 @@ def normalize_to_local_query(raw: str) -> str:
         # Gmail → 本地
         if lower.startswith("in:inbox"):
             pieces.append("is:inbox")
+        elif lower.startswith("in:anywhere"):
+            # 缓存已包含 All mail（含 trash/spam）；本地 is:all 不再施加类别过滤。
+            pieces.append("is:all")
         elif lower.startswith("in:sent"):
             pieces.append("is:sent")
         elif lower.startswith("in:trash"):
@@ -348,12 +407,18 @@ def normalize_to_local_query(raw: str) -> str:
             pieces.append("is:spam")
         elif lower.startswith("in:draft"):
             pieces.append("is:draft")
+        elif lower in {"-in:chats", "in:chats"}:
+            # Gmail chat 不会写入 Inbox 邮件缓存，保留该条件会导致本地解析失败。
+            continue
         elif re.fullmatch(r"newer_than:(\d+)d", lower):
             days = int(re.fullmatch(r"newer_than:(\d+)d", lower).group(1))  # type: ignore[union-attr]
             # 用 after: 近似；无精确时区时按 UTC 日切
             from datetime import timedelta
             day = (datetime.now(timezone.utc) - timedelta(days=max(0, days))).strftime("%Y-%m-%d")
             pieces.append(f"after:{day}")
+        elif match := re.fullmatch(r"(before|after):(\d{4})/(\d{1,2})/(\d{1,2})", lower):
+            # QueryPlan/Gmail 使用 YYYY/MM/DD；本地解析器统一使用 ISO 连字符日期。
+            pieces.append(f"{match.group(1)}:{int(match.group(2)):04d}-{int(match.group(3)):02d}-{int(match.group(4)):02d}")
         elif lower.startswith("is:") or lower.startswith("has:") or lower.startswith("from:") \
                 or lower.startswith("to:") or lower.startswith("subject:") or lower.startswith("body:") \
                 or lower.startswith("before:") or lower.startswith("after:") or lower.startswith("-"):
@@ -362,7 +427,8 @@ def normalize_to_local_query(raw: str) -> str:
             # 去掉 Gmail 大括号分组
             cleaned = token.strip("{}()")
             if cleaned:
-                pieces.append(cleaned)
+                # Gmail 裸词以空格隐式 AND；仅字段值中的空格应保留为一个条件。
+                pieces.extend(cleaned.split())
 
     # 在非操作符之间插入 AND
     joined: list[str] = []
@@ -423,12 +489,8 @@ def build_local_query_from_plan(plan: Any) -> str:
         for term in terms:
             text = str(term or "").strip()
             if text:
-                # 多词主题保留为单个 any term（空格会破坏解析）
-                pieces = text.split()
-                if len(pieces) == 1:
-                    parts.append(pieces[0])
-                else:
-                    parts.extend(pieces)
+                # 多词主题作为单个 any 条件，和前端搜索框的空格语义保持一致。
+                parts.append(text)
 
     timeframe = str(getattr(plan, "timeframe", None) or "").strip().lower()
     matched = re.fullmatch(r"(\d{1,3})d", timeframe)

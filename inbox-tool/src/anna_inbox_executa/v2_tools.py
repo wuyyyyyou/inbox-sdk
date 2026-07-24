@@ -627,7 +627,13 @@ def _loopback_attachment_download_payload(
     }
 
 
-def _write_loopback_email_body(html: str, payload: dict[str, Any]) -> str:
+def _write_loopback_email_body(
+    html: str,
+    payload: dict[str, Any],
+    *,
+    mailbox: str = "",
+    message_id: str = "",
+) -> str:
     """把超大邮件 HTML 与 CID 图片写入本地临时文件，避免经过 JSON-RPC stdout。
 
     正文和每个 CID 图片都使用同一个随机 token 保护；HTML 内的 cid: 引用被替换为
@@ -650,10 +656,22 @@ def _write_loopback_email_body(html: str, payload: dict[str, Any]) -> str:
                 break
         body = part.get("body") if isinstance(part.get("body"), dict) else {}
         encoded = body.get("data")
+        attachment_id = str(body.get("attachmentId") or "").strip()
         mime_type = str(part.get("mimeType") or "").lower()
-        if cid and mime_type.startswith("image/") and encoded:
+        if cid and mime_type.startswith("image/"):
             try:
-                raw = base64.urlsafe_b64decode(str(encoded) + "=" * (-len(str(encoded)) % 4))
+                if encoded:
+                    raw = base64.urlsafe_b64decode(str(encoded) + "=" * (-len(str(encoded)) % 4))
+                elif mailbox and message_id and attachment_id:
+                    # Gmail 对较大 inline 图片只返回 attachmentId。按需取回字节，
+                    # 再由同 token 的 loopback URL 提供给正文，避免 CID 在前端变为空白。
+                    from mail_agent.mail_providers.gmail.adapter import fetch_attachment_bytes
+
+                    raw = fetch_attachment_bytes(mailbox, message_id, attachment_id)
+                else:
+                    raw = b""
+                if not raw:
+                    raise ValueError("CID image has no readable body")
                 image_path = download_dir / f"{token}-cid-{len(cid_images)}"
                 image_path.write_bytes(raw)
                 cid_images[cid] = {"path": str(image_path), "mime_type": mime_type}
@@ -775,7 +793,8 @@ INBOX_PAGE_BODY_LIMIT_STEPS = (200000, 120000, 80000, 48000, 24000, 12000, 6000,
 # 一次送入 Sampling，容易挤占模型完成 JSON / Markdown 回答所需的上下文。
 INBOX_PROMPT_MESSAGE_LIMIT = 4
 INBOX_PROMPT_BODY_LIMIT = 600
-THREAD_ASSIST_CACHE_VERSION = 2
+# 3: needs_reply / no_reply_reason；快捷提示仅限 draft 相关
+THREAD_ASSIST_CACHE_VERSION = 3
 # 同一线程概览在缓存落盘前只允许一个后台 run，避免详情页重渲染或重试重复 Sampling。
 INBOX_THREAD_ASSIST_INFLIGHT: dict[str, str] = {}
 
@@ -825,10 +844,23 @@ def _sidebar_fallback_text(visible_prompt: str, kind: str) -> str:
 
 
 THREAD_ASSIST_SYSTEM = """Return JSON only:
-{"overview":"one complete factual sentence","quick_replies":[{"id":"short_id","label":"2-5 words","intent":"short grounded instruction"}]}
+{"overview":"one complete factual sentence","needs_reply":true|false,"no_reply_reason":"short reason when needs_reply is false else empty string","quick_replies":[{"id":"short_id","label":"2-5 words","intent":"Draft a reply ..."}]}
 
-Use the supplied thread only. overview: one complete sentence, <=24 words.
-Return exactly 2 quick_replies. Keep each intent <=12 words.
+Use the supplied thread only.
+overview: one complete factual sentence, <=24 words. Match the thread language.
+needs_reply: true only if the latest inbound message expects a user reply (question, request, decision, scheduling, confirmation, etc.).
+needs_reply: false for automated/no-reply senders, receipts, FYI notifications, newsletters, security alerts that only need awareness, pure status updates, or threads where the user already sent the last message and no further reply is expected.
+
+When needs_reply is false:
+- quick_replies MUST be []
+- no_reply_reason MUST be one short sentence explaining why no reply is needed (match thread language)
+
+When needs_reply is true:
+- Return exactly 2 quick_replies
+- Each item is a draft-reply shortcut only: how the user might draft a reply (agree, decline, ask for details, propose times, etc.)
+- label: 2-5 words; intent: <=12 words, must start with "Draft a reply" / "起草回复" (match thread language)
+- NEVER suggest non-draft actions: todo, done, snooze, archive, trash, delete, mark, star, label, move, open links, or any UI/workflow operation
+
 Never invent facts, commitments, or HTML. Never leave a sentence unfinished."""
 
 MAIL_PROMPT_SYSTEM = """You are Anna, an executive email assistant working with a Gmail thread.
@@ -945,7 +977,44 @@ def _thread_original_subject(messages: list[dict[str, Any]]) -> str:
     return "(no subject)"
 
 
+# 快捷提示词禁止出现的非 draft 操作语义（label/intent 命中则丢弃）
+_NON_DRAFT_QUICK_REPLY_RE = re.compile(
+    r"(?i)\b("
+    r"todo|snooze|archive|trash|delete|unsubscribe|"
+    r"mark\s+as|move\s+to|add\s+to\s+todo|set\s+reminder|"
+    r"标为|标记|归档|删除|稍后处理|待办|稍后提醒"
+    r")\b"
+)
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    """将模型返回的布尔字段规范为 True/False；无法识别时返回 None。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in {"true", "yes", "1"}:
+        return True
+    if text in {"false", "no", "0"}:
+        return False
+    return None
+
+
+def _ensure_draft_intent(intent: str, *, prefer_chinese: bool) -> str:
+    """保证 intent 明确指向「起草回复」，避免被当成其它操作指令。"""
+    text = re.sub(r"\s+", " ", str(intent or "")).strip()
+    if not text:
+        return ""
+    lower = text.lower()
+    if "draft" in lower or "reply" in lower or "起草" in text or "回复" in text:
+        return text
+    prefix = "起草回复：" if prefer_chinese else "Draft a reply: "
+    return f"{prefix}{text}"
+
+
 def _normalize_quick_replies(value: Any) -> list[dict[str, str]]:
+    """规范化快捷草稿提示；过滤空项、重复项与非 draft 操作类意图。"""
     if not isinstance(value, list):
         return []
     replies: list[dict[str, str]] = []
@@ -956,6 +1025,13 @@ def _normalize_quick_replies(value: Any) -> list[dict[str, str]]:
         label = re.sub(r"\s+", " ", str(item.get("label") or "")).strip()
         intent = re.sub(r"\s+", " ", str(item.get("intent") or "")).strip()
         if not label or not intent:
+            continue
+        # 操作类（todo/归档等）与 draft 无关，直接丢弃
+        if _NON_DRAFT_QUICK_REPLY_RE.search(label) or _NON_DRAFT_QUICK_REPLY_RE.search(intent):
+            continue
+        prefer_chinese = _uses_chinese_text(label) or _uses_chinese_text(intent)
+        intent = _ensure_draft_intent(intent, prefer_chinese=prefer_chinese)
+        if not intent:
             continue
         key = label.lower()
         if key in seen:
@@ -971,6 +1047,32 @@ def _normalize_quick_replies(value: Any) -> list[dict[str, str]]:
         if len(replies) >= 3:
             break
     return replies
+
+
+def _normalize_no_reply_reason(value: Any) -> str:
+    """规范化「无需回复」原因文案。"""
+    reason = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not reason:
+        return ""
+    # 单句、避免过长
+    return reason[:240]
+
+
+def _is_valid_thread_assist_cache(value: dict[str, Any]) -> bool:
+    """判断 thread assist 缓存是否可直接复用（含 needs_reply 两种分支）。"""
+    if value.get("format_version") != THREAD_ASSIST_CACHE_VERSION:
+        return False
+    if value.get("fallback_used"):
+        return False
+    if not str(value.get("overview") or "").strip():
+        return False
+    needs_reply = _coerce_bool(value.get("needs_reply"))
+    if needs_reply is True:
+        quick_replies = value.get("quick_replies")
+        return isinstance(quick_replies, list) and len(quick_replies) > 0
+    if needs_reply is False:
+        return bool(str(value.get("no_reply_reason") or "").strip())
+    return False
 
 
 def _compact_body_text(text: str, *, limit: int) -> tuple[str, bool]:
@@ -1031,7 +1133,8 @@ def _display_body_payload(
     compact_text, text_truncated = _compact_body_text(fallback_text, limit=limit)
     return {
         "body_text": compact_text,
-        "body_truncated": text_truncated or bool(raw_html.strip()),
+        # 只有摘要缓存时没有正文源；前端据此仅为当前锚点按需加载完整展示正文。
+        "body_truncated": text_truncated or bool(raw_html.strip()) or not fallback_text.strip(),
     }
 
 
@@ -1093,7 +1196,12 @@ def _build_inbox_message_display_response(mailbox: str, message: dict[str, Any])
             return inline_data
         return {
             **base,
-            "body_url": _write_loopback_email_body(sanitized_html, payload),
+            "body_url": _write_loopback_email_body(
+                sanitized_html,
+                payload,
+                mailbox=mailbox,
+                message_id=str(message.get("id") or ""),
+            ),
             "body_truncated": False,
         }
 
@@ -1114,7 +1222,12 @@ def _build_inbox_message_display_response(mailbox: str, message: dict[str, Any])
     )
     return {
         **base,
-        "body_url": _write_loopback_email_body(plain_html, payload),
+        "body_url": _write_loopback_email_body(
+            plain_html,
+            payload,
+            mailbox=mailbox,
+            message_id=str(message.get("id") or ""),
+        ),
         "body_truncated": False,
     }
 
@@ -1170,6 +1283,10 @@ def _read_cached_thread_messages(mailbox: str, thread_id: str) -> list[dict[str,
             cached = None
         if isinstance(cached, dict):
             messages.append(cached)
+        else:
+            # AI THREAD_REF 源自 index 摘要；详情对象尚未落盘时仍要先打开线程，
+            # 不能为此阻塞等待整线程 Gmail 刷新。
+            messages.append(dict(summary))
     messages.sort(key=_inbox_sort_key)
     return messages
 
@@ -1189,8 +1306,8 @@ def _load_thread_messages(mailbox: str, thread_id: str, *, force_refresh: bool =
         for summary in list_messages(normalized_mailbox)
         if str(summary.get("thread_id") or "") == str(thread_id or "")
     )
-    # 仅当该线程所有 index 消息都有完整缓存时才跳过 Gmail；长线程在只缓存
-    # 部分正文时必须刷新，否则“加载更早邮件”会被错误地截断。
+    # 打开详情先返回已有缓存，不能让缺一封正文的线程阻塞在 Gmail 刷新。
+    # 抽屉随后会对用户实际打开的锚点邮件按需读取完整展示正文。
     summaries_by_id = {
         str(item.get("id") or ""): item
         for item in list_messages(normalized_mailbox)
@@ -1208,11 +1325,11 @@ def _load_thread_messages(mailbox: str, thread_id: str, *, force_refresh: bool =
         _attachment_count(cached_by_id.get(message_id)) >= _attachment_count(summary)
         for message_id, summary in summaries_by_id.items()
     )
-    if cached_messages and len(cached_messages) == expected_count and attachment_metadata_complete and not force_refresh:
+    if cached_messages and not force_refresh:
         try:
-            # 完整详情可能在更早一次按需读取中补齐附件；回填目录摘要后，
-            # 当前线程关闭或下次加载列表时即可正确显示附件图标。
-            sync_cached_message_summaries(normalized_mailbox, cached_messages)
+            # 完整缓存时同步附件摘要；部分缓存只用于首屏展示，不阻塞详情打开。
+            if len(cached_messages) == expected_count and attachment_metadata_complete:
+                sync_cached_message_summaries(normalized_mailbox, cached_messages)
         except Exception as exc:
             # 摘要缓存更新失败不能影响用户打开邮件详情。
             log(f"thread summary cache sync failed for {thread_id}: {type(exc).__name__}: {exc}")
@@ -1495,12 +1612,31 @@ async def _generate_thread_assist_result(
     if not overview:
         raise RuntimeError("analysis_unavailable")
     quick_replies = _normalize_quick_replies(payload.get("quick_replies"))
+    # 与模型一并判断是否需要回复；缺失时根据是否产出 draft 快捷提示兜底
+    needs_reply = _coerce_bool(payload.get("needs_reply"))
+    if needs_reply is None:
+        needs_reply = len(quick_replies) > 0
+    no_reply_reason = _normalize_no_reply_reason(payload.get("no_reply_reason"))
+    if needs_reply:
+        # 需要回复：只保留 draft 快捷提示，不展示无需回复文案
+        no_reply_reason = ""
+    else:
+        # 不需要回复：清空 chip，并保证有可读原因
+        quick_replies = []
+        if not no_reply_reason:
+            no_reply_reason = (
+                "这封邮件不需要回复。"
+                if _uses_chinese_text(overview)
+                else "This email does not need a reply."
+            )
 
     return {
         "format_version": THREAD_ASSIST_CACHE_VERSION,
         "thread_id": thread_id,
         "latest_message_id": latest_message_id,
         "overview": overview,
+        "needs_reply": bool(needs_reply),
+        "no_reply_reason": no_reply_reason,
         "quick_replies": quick_replies,
         "summary": {},
         "related_context": [],
@@ -1833,16 +1969,8 @@ async def _handle_inbox_thread_assist_background(run_id: str, arguments: dict[st
     try:
         cached = await get_inbox_thread_assist(mailbox, thread_id, latest_message_id)
         cached_value = cached.get("value") if isinstance(cached.get("value"), dict) else {}
-        cached_quick_replies = cached_value.get("quick_replies") if isinstance(cached_value, dict) else None
-        if (
-            cached.get("exists")
-            and cached_value
-            and cached_value.get("format_version") == THREAD_ASSIST_CACHE_VERSION
-            and not cached_value.get("fallback_used")
-            and str(cached_value.get("overview") or "").strip()
-            and isinstance(cached_quick_replies, list)
-            and len(cached_quick_replies) > 0
-        ):
+        # 缓存命中条件：概览完整，且要么有 draft 快捷提示，要么有无需回复原因
+        if cached.get("exists") and isinstance(cached_value, dict) and _is_valid_thread_assist_cache(cached_value):
             MAIL_AGENT_RUNS[run_id].update(
                 status="done",
                 result={**cached_value, "cached": True},

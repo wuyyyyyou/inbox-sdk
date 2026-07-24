@@ -42,21 +42,31 @@ describe("AI scan invocation", () => {
     expect(controllerSource.match(/max_messages: scanScope\.max_messages/g)?.length || 0).toBeGreaterThanOrEqual(2);
     expect(controllerSource).toMatch(/max_messages: plan\.max_messages/);
     expect(controllerSource).toMatch(/display_range_days: rangeDays/);
+    expect(controllerSource).toMatch(/const \{ display_range_days: _displayRangeDays, \.\.\.sidebarUiContext \} = uiContext/);
+    expect(controllerSource).toMatch(/recent_conversation: recentConversation/);
+    expect(controllerSource).toMatch(/\.slice\(-4\)/);
   });
 
   it("uses the Inbox display range as the AI scan time range", () => {
     expect(controllerSource).toMatch(/scan_window_days: clampInt\(settings\.display_range_days, plan\.scan_window_days, 1, 90\)/);
   });
 
-  it("wires the Host Agent session path for the sidebar", () => {
+  it("wires Host Agent session with optional local start_ai_turn sidebar path", () => {
     expect(controllerSource).toMatch(/runAiAgentTurn\(/);
     expect(controllerSource).toMatch(/buildAiAgentContent\(/);
     expect(controllerSource).toMatch(/buildAiTurnUiContext\(/);
+    expect(controllerSource).toMatch(/resolveAiSidebarMode\(/);
     expect(controllerSource).toMatch(/selected_threads:/);
     const sidebarHandler = controllerSource.match(/async sendAiChatMessage\(options = \{\}\)[\s\S]*?retryAiMessage\(messageId\)/)?.[0] || "";
-    expect(sidebarHandler).not.toContain("client.startAiTurn(");
+    // 默认 host 走 session；local 开关下走 start_ai_turn 本地 Router。
+    expect(sidebarHandler).toContain("runAiAgentTurn(");
+    expect(sidebarHandler).toContain("client.startAiTurn(");
+    expect(sidebarHandler).toContain('sidebarMode === "local"');
+    expect(sidebarHandler).toContain("aiSidebarModeByConversationRef.current.get(conversationId)");
+    expect(sidebarHandler).toContain("aiSidebarModeByConversationRef.current.set(conversationId, sidebarMode)");
+    expect(sidebarHandler).toContain("messages: messagesWithUser");
+    expect(sidebarHandler).toContain("ui_context: sidebarUiContext");
     expect(controllerSource).not.toMatch(/decideAiRoute\(/);
-    expect(controllerSource).not.toMatch(/isAiTurnEnabled\(/);
   });
 
   it("routes thread detail prompts through the same unified AI turn", () => {
@@ -69,6 +79,7 @@ describe("AI scan invocation", () => {
   it("clears the Host session when a sidebar conversation is discarded", () => {
     expect(controllerSource).toMatch(/clearAiAgentSession\(previousConversationId\)/);
     expect(controllerSource).toMatch(/clearAiAgentSession\(entry\.conversationId \|\| ""\)/);
+    expect(controllerSource).toMatch(/aiSidebarModeByConversationRef\.current\.delete\(previousConversationId\)/);
   });
 
   it("stops the Host Agent run when the user presses Stop", () => {

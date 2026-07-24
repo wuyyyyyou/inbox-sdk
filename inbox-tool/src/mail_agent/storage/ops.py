@@ -46,6 +46,11 @@ def _mailbox_prefix(mailbox: str) -> str:
     return app_key(f"mailbox/{_sanitize(mailbox)}")
 
 
+def _conversation_state_key(mailbox: str, conversation_id: str) -> str:
+    """按邮箱与会话隔离 P3 active_scope/evidence 状态，禁止跨线程串线。"""
+    return f"{_mailbox_prefix(mailbox)}/conversation-state/{sanitize_key_part(conversation_id)}"
+
+
 # ── 邮箱注册表 ────────────────────────────────────────────────
 
 MAILBOX_REGISTRY_KEY = app_key("mailboxes/registry")
@@ -382,6 +387,43 @@ async def set_ai_ask_history(
     payload = {"entries": safe_entries, "updated_at": _now(), "version": 1}
     result = await get_storage().set(_ask_history_key(mailbox), payload, scope=default_scope(), if_match=if_match)
     return {"entries": safe_entries, "etag": str(result.get("etag") or "")}
+
+
+async def get_conversation_state(mailbox: str, conversation_id: str) -> dict[str, Any]:
+    """读取 P3 结构化会话状态；不存在时返回空 active_scope。"""
+    cid = str(conversation_id or "").strip()
+    if not cid:
+        return {"exists": False, "state": {}, "etag": ""}
+    result = await get_storage().get(_conversation_state_key(mailbox, cid), scope=default_scope())
+    value = result.get("value") if result.get("exists") else None
+    return {
+        "exists": bool(result.get("exists")),
+        "state": dict(value) if isinstance(value, dict) else {},
+        "etag": str(result.get("etag") or ""),
+    }
+
+
+async def set_conversation_state(
+    mailbox: str,
+    conversation_id: str,
+    state: dict[str, Any],
+    *,
+    if_match: str | None = None,
+) -> dict[str, Any]:
+    """保存 P3 会话 scope/evidence 指针；使用 etag 避免并发覆盖。"""
+    cid = str(conversation_id or "").strip()
+    if not cid:
+        return {"state": {}, "etag": ""}
+    safe = dict(state or {})
+    safe["version"] = 1
+    safe["updated_at"] = _now()
+    result = await get_storage().set(
+        _conversation_state_key(mailbox, cid),
+        safe,
+        scope=default_scope(),
+        if_match=if_match,
+    )
+    return {"state": safe, "etag": str(result.get("etag") or "")}
 
 
 def _normalize_inbox_custom_categories(value: Any) -> list[InboxCustomCategory]:

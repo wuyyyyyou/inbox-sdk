@@ -1,5 +1,37 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { PlusIcon, accountDisplayName, aiSearchStatus, aiThinkingElapsedLabel, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, inboxLastSyncedLabel, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+
+const homeViewSource = readFileSync(new URL("./HomeView.tsx", import.meta.url), "utf8");
+
+describe("display range switching", () => {
+  it("reprojects the cached inbox instead of triggering a Gmail rescan", () => {
+    expect(homeViewSource).toContain('actions.loadCachedInboxEmails("all", configuredDays, 0, false)');
+    expect(homeViewSource).not.toContain("// 用户在设置里改 display range\n      void syncInbox(configuredDays, true);");
+  });
+});
+
+describe("AI thread reference", () => {
+  it("opens a detail placeholder before resolving the referenced thread page", () => {
+    const handler = homeViewSource.match(/const openMailDetailFromAi = useCallback\([\s\S]*?const handleGmailThreadAction = useCallback/)?.[0] || "";
+    expect(handler).toContain("const openingPlaceholder: InboxMessage");
+    expect(handler.indexOf("setExternalDetailMessage(openingPlaceholder)")).toBeLessThan(
+      handler.indexOf("await actions.loadInboxThreadPage"),
+    );
+  });
+});
+
+describe("mail detail complete body", () => {
+  it("loads a THREAD_REF fallback message automatically instead of exposing a manual full-body prompt", () => {
+    const drawerSource = readFileSync(
+      new URL("../mail-detail/MailDetailDrawer.tsx", import.meta.url),
+      "utf8",
+    );
+    expect(drawerSource).toContain("|| visiblePage.messages.find((item) => item.id === visiblePage.latest_message_id)");
+    expect(drawerSource).not.toContain("This message is too large to display completely.");
+    expect(drawerSource).not.toContain("Load full message");
+  });
+});
 
 describe("nextFeedRangeDays", () => {
   it("steps 7 → 30 → 60 → all time", () => {

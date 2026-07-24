@@ -48,6 +48,7 @@ def main() -> None:
         with (
             patch.object(adapter, "cache_dir", return_value=Path(temp_dir)),
             patch.object(adapter, "gmail_request", return_value=history_page) as history_request,
+            patch.object(adapter, "get_access_token", return_value="test-token"),
             patch.object(adapter, "fetch_message_summary", side_effect=lambda _mailbox, message_id, **_kwargs: summaries[message_id]),
         ):
             adapter.write_index(mailbox, existing)
@@ -64,6 +65,42 @@ def main() -> None:
         check("advances cursor after cache write", state.get("history_id") == "20", str(state))
         params = history_request.call_args.args[2]
         check("uses stored cursor", params["startHistoryId"] == "10", str(params))
+
+    # 本地已有缓存但 cursor 丢失：锚定 profile.historyId，禁止全量 messages.list 重扫。
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with (
+            patch.object(adapter, "cache_dir", return_value=Path(temp_dir)),
+            patch.object(adapter, "gmail_request", return_value={"historyId": "99"}) as profile_request,
+            patch.object(adapter, "live_search_metadata_and_cache", return_value=[]) as catchup,
+        ):
+            adapter.write_index(mailbox, existing)
+            result = adapter.sync_cached_mailbox_history(mailbox)
+            state = adapter._read_history_sync_state(mailbox)
+
+        check("missing cursor seeds from profile", result.get("mode") == "history_cursor_seeded", str(result))
+        check("seeded cursor does not require resync", result.get("resync_required") is False, str(result))
+        check("seeded cursor persisted", state.get("history_id") == "99", str(state))
+        check("seeded cursor only hits profile", profile_request.call_count == 1, str(profile_request.call_count))
+        check("seeded cursor does short catch-up not full resync", catchup.call_count == 1, str(catchup.call_count))
+        catchup_query = str(catchup.call_args.args[1] if catchup.call_args and catchup.call_args.args else "")
+        check("seeded catch-up is recent window", "newer_than:2d" in catchup_query, catchup_query)
+
+    # 摘要读超时：软失败重试，不推进 cursor，不炸成 internal error。
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with (
+            patch.object(adapter, "cache_dir", return_value=Path(temp_dir)),
+            patch.object(adapter, "gmail_request", return_value=history_page),
+            patch.object(adapter, "get_access_token", return_value="test-token"),
+            patch.object(adapter, "fetch_message_summary", side_effect=TimeoutError("The read operation timed out")),
+        ):
+            adapter.write_index(mailbox, existing)
+            adapter.set_cached_mailbox_history_cursor(mailbox, "10", scope_days=30)
+            result = adapter.sync_cached_mailbox_history(mailbox)
+            state = adapter._read_history_sync_state(mailbox)
+
+        check("timeout returns history_retry", result.get("mode") == "history_retry", str(result))
+        check("timeout does not require full resync", result.get("resync_required") is False, str(result))
+        check("timeout keeps old cursor", state.get("history_id") == "10", str(state))
 
     # 旧摘要没有附件扫描版本时，自动同步应要求一次完整基线同步，不能等详情页补全。
     with tempfile.TemporaryDirectory() as temp_dir:

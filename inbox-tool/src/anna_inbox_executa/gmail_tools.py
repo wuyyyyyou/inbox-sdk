@@ -415,12 +415,27 @@ def _inline_remote_images(
 
 
 def extract_attachments(part: dict[str, Any]) -> list[dict[str, Any]]:
+    """提取可下载附件，排除正文使用的 inline/CID 图片资源。"""
     attachments: list[dict[str, Any]] = []
 
     def walk(node: dict[str, Any]) -> None:
         filename = str(node.get("filename") or "")
         body = node.get("body") if isinstance(node.get("body"), dict) else {}
-        if filename:
+        headers = node.get("headers") if isinstance(node.get("headers"), list) else []
+        header_values = {
+            str(item.get("name") or "").strip().lower(): str(item.get("value") or "").strip()
+            for item in headers
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        }
+        disposition = header_values.get("content-disposition", "").split(";", 1)[0].strip().lower()
+        content_id = header_values.get("content-id", "").strip()
+        # Gmail 会为正文 CID 图片补 filename；部分退信模板还会错误标记为
+        # attachment。图片型 Content-ID 仍是正文资源，必须优先排除，避免在
+        # 附件栏重复展示；非图片 CID 和无 CID 的普通文件不受影响。
+        is_inline_resource = disposition == "inline" or (
+            bool(content_id) and str(node.get("mimeType") or "").lower().startswith("image/")
+        )
+        if filename and not is_inline_resource:
             attachments.append({
                 "filename": filename,
                 "mimeType": node.get("mimeType"),
@@ -679,23 +694,28 @@ def list_inbox_emails(
     category_arg: Any = "inbox",
     clear_cache_arg: Any = False,
 ) -> dict[str, Any]:
-    """刷新/拉取首页邮件：始终按 All mail 写入统一本地缓存，再返回首屏快照。
+    """刷新/拉取首页邮件：180 天 metadata 优先，当前展示窗先返回，历史后台回填。
 
     策略（与前端分类投影对齐）：
     1. clear_cache=True 时先清空该邮箱 Gmail 缓存
-    2. 固定用 All mail query（含 trash/spam、排除 chats）从 Gmail 拉 metadata 并写入缓存
-    3. 缓存写入可用较高 limit；**RPC 响应**按 CACHED_FEED_RESPONSE_MAX_BYTES 截断，
-       避免单帧过大导致 host 杀进程（executa process exited）
-    4. 响应带 has_more / next_offset，前端用 list_cached_emails 继续读本地缓存
-    5. category 参数仅作诊断字段保留，不再驱动 Gmail query
+    2. 固定以 180 天 All-mail metadata 建立可检索优先工作集；展示 days 只影响返回列表
+    3. 优先工作集剩余页、更早历史由可续跑后台任务回填；无用户明确要求时不设硬顶
+    4. **RPC 响应**按 CACHED_FEED_RESPONSE_MAX_BYTES 截断，
+        避免单帧过大导致 host 杀进程（executa process exited）
+    5. 响应带 has_more / next_offset，前端用 list_cached_emails 继续读本地缓存
+    6. category 参数仅作诊断字段保留，不再驱动 Gmail query
     """
     from mail_agent.mail_providers.gmail.adapter import (
         clear_mailbox_cache,
-        live_search_metadata_and_cache,
         list_messages,
         gmail_request,
         normalize_mailbox as adapter_normalize_mailbox,
-        set_cached_mailbox_history_cursor,
+    )
+    from mail_agent.mail_providers.gmail.mailbox_sync import (
+        get_mailbox_sync_boundary,
+        reset_mailbox_sync_state,
+        run_mailbox_sync_tick,
+        schedule_background_sync,
     )
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
@@ -707,17 +727,23 @@ def list_inbox_emails(
         raise ValueError(f"Gmail credential mismatch: selected {mailbox}, authorized {authorized_email}")
     # 用户强制刷新时清空缓存，再重建 All mail 快照
     cache_reset = clear_mailbox_cache(mailbox) if clear_cache_arg is True else None
+    if cache_reset is not None:
+        reset_mailbox_sync_state(mailbox)
     days_input = 30 if days_arg in (None, "") else days_arg
     days = max(0, min(int(days_input), 3650))
-    # 缓存抓取上限；响应条数另受 48KiB 帧预算约束
+    # 响应条数另受 48KiB 帧预算约束；同步工作集固定为 180 天，不与 UI days 绑定。
     limit = max(1, min(int(limit_arg or 100), 500))
-    # 请求侧 category 仅记录意图；实际抓取固定为 all
+    # 请求侧 category 仅记录意图；实际缓存固定为 all
     category = _normalize_inbox_category(category_arg)
+    sync_tick = run_mailbox_sync_tick(
+        mailbox,
+        profile_history_id=str(profile.get("historyId") or ""),
+        run_priority=True,
+        run_backfill=True,
+        ensure_watch=True,
+    )
+    schedule_background_sync(mailbox, profile_history_id=str(profile.get("historyId") or ""))
     query = _inbox_category_query("all", days)
-    matched_ids = live_search_metadata_and_cache(mailbox, query, limit)
-    # All-mail 快照已写入缓存后才记录 cursor；快照写入失败不能把未建立的基线
-    # 伪装为可增量同步状态。
-    set_cached_mailbox_history_cursor(mailbox, str(profile.get("historyId") or ""), scope_days=days)
     by_id = {
         str(item.get("id") or ""): item
         for item in list_messages(mailbox)
@@ -728,13 +754,19 @@ def list_inbox_emails(
     # 用全量缓存汇总线程附件，避免仅最新回信无附件时列表丢回形针
     thread_attachments = _thread_attachment_index(cached_messages)
 
+    # display_range 仅投影 UI；缓存和 AI 都可继续使用范围外已同步 metadata。
+    cutoff = int((time.time() - days * 24 * 60 * 60) * 1000) if days > 0 else 0
     all_messages: list[dict[str, Any]] = []
-    for message_id in matched_ids:
-        item = by_id.get(str(message_id))
-        if not item:
+    for item in by_id.values():
+        try:
+            internal_date = int(item.get("internal_date") or 0)
+        except (TypeError, ValueError):
+            internal_date = 0
+        if cutoff and internal_date < cutoff:
             continue
         all_messages.append(_compact_inbox_message(item, mailbox, thread_subjects, thread_attachments))
     all_messages.sort(key=_inbox_message_sort_key)
+    sync_boundary = get_mailbox_sync_boundary(mailbox)
 
     # 按 JSON-RPC 帧预算截断返回条数（与 list_cached_emails 一致），缓存仍保留全量
     messages: list[dict[str, Any]] = []
@@ -755,6 +787,8 @@ def list_inbox_emails(
             "messages": candidate_messages,
             "updated_at": beijing_now(),
             "cache_reset": cache_reset,
+            "sync": sync_tick,
+            "sync_boundary": sync_boundary,
         }
         if messages and _cached_rpc_frame_size("list_inbox_emails", candidate_payload) > CACHED_FEED_RESPONSE_MAX_BYTES:
             break
@@ -775,6 +809,8 @@ def list_inbox_emails(
         "messages": messages,
         "updated_at": beijing_now(),
         "cache_reset": cache_reset,
+        "sync": sync_tick,
+        "sync_boundary": sync_boundary,
     }
 
 
@@ -883,11 +919,54 @@ def list_cached_emails(
 
 
 def sync_inbox_cache(mailbox_arg: str) -> dict[str, Any]:
-    """只读同步第三方 Gmail 客户端的变更到 All-mail 缓存。"""
-    from mail_agent.mail_providers.gmail.adapter import normalize_mailbox as adapter_normalize_mailbox, sync_cached_mailbox_history
+    """同步 Gmail History、续订 Watch，并推进可续跑的缓存基线/历史回填。"""
+    from mail_agent.mail_providers.gmail.adapter import (
+        gmail_request,
+        normalize_mailbox as adapter_normalize_mailbox,
+        sync_cached_mailbox_history,
+    )
+    from mail_agent.mail_providers.gmail.mailbox_sync import (
+        ensure_gmail_watch,
+        get_mailbox_sync_boundary,
+        run_mailbox_sync_tick,
+        schedule_background_sync,
+    )
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
-    return sync_cached_mailbox_history(mailbox)
+    result = sync_cached_mailbox_history(mailbox)
+    profile_history_id = ""
+    try:
+        profile = gmail_request(mailbox, "/users/me/profile", {"fields": "historyId"})
+        profile_history_id = str(profile.get("historyId") or "")
+    except Exception:
+        # History 结果仍原样返回；下轮可再建立 priority 基线。
+        profile_history_id = ""
+
+    bootstrap = None
+    if result.get("resync_required"):
+        # cursor 缺失/过期不再只报错等待 UI 清缓存：直接重新推进 180 天优先基线。
+        try:
+            bootstrap = run_mailbox_sync_tick(
+                mailbox,
+                profile_history_id=profile_history_id,
+                run_priority=True,
+                run_backfill=True,
+                ensure_watch=True,
+            )
+            schedule_background_sync(mailbox, profile_history_id=profile_history_id)
+        except Exception as exc:
+            result["bootstrap_error"] = type(exc).__name__
+    else:
+        try:
+            ensure_gmail_watch(mailbox)
+            schedule_background_sync(mailbox, profile_history_id=profile_history_id)
+        except Exception:
+            pass
+    return {
+        **result,
+        "bootstrap": bootstrap,
+        "sync_boundary": get_mailbox_sync_boundary(mailbox),
+    }
 
 
 def list_gmail_emails_page(

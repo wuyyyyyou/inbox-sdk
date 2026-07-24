@@ -581,6 +581,10 @@ export interface InboxThreadAssistPayload {
   thread_id: string;
   latest_message_id: string;
   overview: string;
+  /** 是否需要用户回复；false 时展示 no_reply_reason，不展示快捷 draft 提示 */
+  needs_reply?: boolean;
+  /** 无需回复时的原因说明（与 overview 同语言） */
+  no_reply_reason?: string;
   quick_replies: QuickReplySuggestion[];
   summary?: Record<string, unknown>;
   related_context?: string[];
@@ -617,6 +621,7 @@ export interface SubmitMailPromptRequest {
   draftToRevise?: string;
   baseMessages?: AiChatMessage[];
   retryUserMessage?: AiChatMessage;
+  draftComposerMode?: "reply" | "forward";
 }
 
 export interface DraftReplyArtifact {
@@ -625,9 +630,13 @@ export interface DraftReplyArtifact {
   thread_id: string;
   body: string;
   source_prompt: string;
+  /** 草稿要写入当前线程的回复或转发编辑器。 */
+  composer_mode?: "reply" | "forward";
+  /** 仅供草稿预览和转发编辑器使用；回复收件人由线程派生。 */
+  recipients?: string[];
+  subject?: string;
   /** 批量写稿时可选：来源 message / 主题，便于 UI 分行展示 */
   message_id?: string;
-  subject?: string;
 }
 
 export interface MailPromptRunResult {
@@ -671,6 +680,9 @@ export interface ComposeDraftArtifact {
   body: string;
   source_prompt: string;
   mode: "insert" | "replace";
+  recipients?: string[];
+  cc?: string[];
+  bcc?: string[];
   subject?: string;
 }
 

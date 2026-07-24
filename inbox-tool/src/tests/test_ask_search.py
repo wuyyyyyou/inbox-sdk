@@ -290,7 +290,7 @@ async def test_execute_search_uses_local_cache_only():
         live_search_and_cache=forbid_live,
         live_search_metadata_and_cache=forbid_live,
         get_messages_lite_async=lambda *_a, **_k: [],
-        list_cached_messages_lite=lambda *_a, **_k: cached,
+        list_all_cached_messages_lite=lambda *_a, **_k: cached,
     )
     meta: dict[str, str] = {}
     with patch.dict(sys.modules, {"mail_agent.mail_providers.gmail.adapter": fake_adapter}):
@@ -323,7 +323,7 @@ async def test_execute_search_empty_cache_does_not_call_gmail():
         live_search_and_cache=forbid_live,
         live_search_metadata_and_cache=forbid_live,
         get_messages_lite_async=lambda *_a, **_k: [],
-        list_cached_messages_lite=lambda *_a, **_k: [],
+        list_all_cached_messages_lite=lambda *_a, **_k: [],
     )
     meta: dict[str, str] = {}
     with patch.dict(sys.modules, {"mail_agent.mail_providers.gmail.adapter": fake_adapter}):
@@ -365,7 +365,7 @@ async def test_execute_search_filters_cache_with_local_query():
         ),
     ]
     fake_adapter = types.SimpleNamespace(
-        list_cached_messages_lite=lambda *_a, **_k: cached,
+        list_all_cached_messages_lite=lambda *_a, **_k: cached,
     )
     meta: dict[str, str] = {}
     with patch.dict(sys.modules, {"mail_agent.mail_providers.gmail.adapter": fake_adapter}):

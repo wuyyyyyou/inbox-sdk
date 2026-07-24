@@ -1854,7 +1854,9 @@ body.is-resizing-ai-sidebar {
   outline: 0;
   color: transparent;
   caret-color: #303447;
+  font: inherit;
   font-size: 14px;
+  line-height: normal;
   background: transparent;
 }
 .mail-search-highlight {
@@ -13493,6 +13495,25 @@ body,
   padding: 6px 0 2px;
 }
 
+.mail-detail-no-reply-notice {
+  margin: 10px 0 4px 42px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: #f4f6fa;
+  color: #5b6478;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.mail-detail-no-reply-notice p {
+  margin: 0;
+}
+
+.mail-detail-no-reply-notice strong {
+  color: #3d4659;
+  font-weight: 600;
+}
+
 .mail-detail-reply-toggle {
   justify-content: space-between;
   width: 100%;
@@ -14097,6 +14118,45 @@ body,
   white-space: pre-wrap;
   word-break: break-word;
   font: inherit;
+}
+
+.ai-draft-artifact-field {
+  display: grid;
+  gap: 5px;
+}
+
+.ai-draft-artifact-field > span {
+  color: #66708d;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.ai-draft-artifact-field input,
+.ai-draft-artifact-field textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid rgba(79, 109, 245, 0.2);
+  border-radius: 7px;
+  background: #fff;
+  color: #202947;
+  font: inherit;
+  line-height: 1.45;
+}
+
+.ai-draft-artifact-field input {
+  min-height: 34px;
+  padding: 6px 8px;
+}
+
+.ai-draft-artifact-field textarea {
+  min-height: 132px;
+  padding: 8px;
+  resize: vertical;
+}
+
+.ai-draft-artifact-field input[readonly] {
+  color: #5f6882;
+  background: rgba(255, 255, 255, 0.62);
 }
 
 .ai-draft-artifact-actions {

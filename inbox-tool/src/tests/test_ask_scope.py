@@ -80,37 +80,44 @@ def test_needs_reply_plan_uses_direction_all() -> None:
     print("[PASS] test_needs_reply_plan_uses_direction_all")
 
 
-async def test_execute_search_never_reads_more_than_passed_cap() -> None:
-    """多个查询合并后仍不得超过前端传入的最大邮件数。"""
+async def test_execute_search_scans_all_cache_but_caps_evidence() -> None:
+    """AI 必须扫描全量缓存，但只返回前端允许的 evidence 数。"""
     from mail_agent.ask.search import execute_search
+    from mail_agent.domain.types import MessageLite
 
-    calls: list[int] = []
+    calls: list[bool] = []
+    cached = [
+        MessageLite(
+            message_id=f"message-{index}",
+            thread_id=f"thread-{index}",
+            from_addr="sender@example.com",
+            to_addr="owner@example.com",
+            subject="Cached mail",
+            label_ids=["INBOX"],
+        )
+        for index in range(120)
+    ]
 
-    def fake_live_search(_mailbox: str, _query: str, limit: int) -> list[str]:
-        calls.append(limit)
-        return [f"message-{index}" for index in range(limit)]
-
-    async def fake_get_messages(_mailbox: str, message_ids: list[str]) -> list[str]:
-        return message_ids
+    def fake_all_cached(_mailbox: str) -> list[MessageLite]:
+        calls.append(True)
+        return cached
 
     fake_adapter = types.SimpleNamespace(
-        live_search_and_cache=fake_live_search,
-        get_messages_lite_async=fake_get_messages,
+        list_all_cached_messages_lite=fake_all_cached,
     )
     with patch.dict(sys.modules, {"mail_agent.mail_providers.gmail.adapter": fake_adapter}):
         messages = await execute_search(
             "owner@example.com",
             [
-                {"query": "newer_than:7d", "max_results": 100},
-                {"query": "newer_than:7d in:inbox", "max_results": 100},
+                {"query": "in:anywhere", "max_results": 100},
             ],
             max_messages=50,
             max_broaden_attempts=0,
         )
 
     assert len(messages) == 50
-    assert calls == [50]
-    print("[PASS] test_execute_search_never_reads_more_than_passed_cap")
+    assert calls == [True]
+    print("[PASS] test_execute_search_scans_all_cache_but_caps_evidence")
 
 
 async def main() -> None:
@@ -119,7 +126,7 @@ async def main() -> None:
     test_explicit_request_time_overrides_scan_plan()
     test_actionable_browse_plan_clears_search_terms()
     test_needs_reply_plan_uses_direction_all()
-    await test_execute_search_never_reads_more_than_passed_cap()
+    await test_execute_search_scans_all_cache_but_caps_evidence()
     print("[ALL TESTS PASSED]")
 
 

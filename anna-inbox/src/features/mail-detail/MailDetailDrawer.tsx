@@ -821,6 +821,8 @@ export function MailDetailDrawer({
   const [, setPreviewCacheRevision] = useState(0);
   const [resolvedAvatars, setResolvedAvatars] = useState<Record<string, string>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const preserveScrollOnPageUpdateRef = useRef(false);
+  const historicalBodyHydrationRef = useRef<Promise<void> | null>(null);
   const footerRef = useRef<HTMLElement | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
@@ -1008,17 +1010,30 @@ export function MailDetailDrawer({
     [mailbox, message, visibleThreadMessages],
   );
   const quickReplySuggestions = useMemo(() => {
+    // 仅在需要回复时展示 draft 快捷提示；无需回复时由后端清空 quick_replies
+    if (assist?.needs_reply === false) return [];
     const generated = (assist?.quick_replies || []).filter((item) => item.label && item.intent);
     return generated;
-  }, [assist?.quick_replies]);
+  }, [assist?.needs_reply, assist?.quick_replies]);
+  const noReplyReason = String(assist?.no_reply_reason || "").trim();
+  const showNoReplyNotice = Boolean(
+    context
+    && assist
+    && !assistLoading
+    && assist.needs_reply === false
+  );
   const showQuickReplies = Boolean(
     context
+    && assist?.needs_reply !== false
     && quickReplySuggestions.length
     && replyPromptTarget
   );
   const quickReplyRenderKey = quickReplySuggestions
     .map((item) => `${item.id}:${item.label}:${item.intent}`)
     .join("|");
+  const assistFooterKey = showNoReplyNotice
+    ? `no-reply:${noReplyReason}`
+    : quickReplyRenderKey;
   const fromAddress = useMemo(() => firstAddress(message?.from || undefined), [message?.from]);
   const toAddresses = useMemo(() => splitAddresses(message?.to).map(senderParts), [message?.to]);
   const fromAvatarUrl = fromAddress ? (resolvedAvatars[fromAddress.email.toLowerCase()] || contactAvatars?.[fromAddress.email.toLowerCase()]) : undefined;
@@ -1035,7 +1050,7 @@ export function MailDetailDrawer({
   );
 
   useLayoutEffect(() => {
-    if (!open || !page) return;
+    if (!open || !page || preserveScrollOnPageUpdateRef.current) return;
     const frame = window.requestAnimationFrame(() => {
       scrollToThreadBottom(scrollRef.current);
       // HTML 邮件 iframe 可能在首帧后才完成尺寸测量，再补一帧确保滚到底部。
@@ -1045,13 +1060,13 @@ export function MailDetailDrawer({
   }, [open, page, displayBodyLoaded]);
 
   useLayoutEffect(() => {
-    if (!open || !showQuickReplies) return;
+    if (!open || (!showQuickReplies && !showNoReplyNotice)) return;
     const scroller = scrollRef.current;
     if (!scroller) return;
-    // AI prompts arrive after the thread page. They are part of the detail's
-    // destination, so always reveal them even if the user scrolled elsewhere.
+    // AI prompts / no-reply notice arrive after the thread page. They are part
+    // of the detail's destination, so always reveal them even if the user scrolled.
     scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
-  }, [assistLoading, open, quickReplyRenderKey, showQuickReplies]);
+  }, [assistFooterKey, assistLoading, open, showNoReplyNotice, showQuickReplies]);
 
   // footer 展开/收缩会改变 context 高度；在动画帧内持续补偿 scrollTop，让正文随 footer 上下移
   useEffect(() => {
@@ -1117,6 +1132,7 @@ export function MailDetailDrawer({
     let cancelled = false;
     let networkPageLoaded = false;
     const anchorMessage = message;
+    preserveScrollOnPageUpdateRef.current = false;
     setPage(null);
     setLoading(true);
     setError("");
@@ -1169,8 +1185,11 @@ export function MailDetailDrawer({
     };
     const loadFullAnchorMessage = (visiblePage: InboxThreadPagePayload) => {
       // 首屏仍保持受限预览，选中邮件若被截断则立即经 body_url 加载完整正文。
-      // 仅加载用户打开的锚点邮件，避免打开长线程时并发请求全部历史正文。
-      const anchorItem = visiblePage.messages.find((item) => item.id === messageId);
+      // THREAD_REF 初始只有 thread id 时，回退到线程最新邮件；仍只加载一封，
+      // 避免打开长线程时并发请求全部历史正文。
+      const anchorItem = visiblePage.messages.find((item) => item.id === messageId)
+        || visiblePage.messages.find((item) => item.id === visiblePage.latest_message_id)
+        || visiblePage.messages.at(-1);
       if (anchorItem?.body_truncated) void loadFullDisplayBodyRef.current(anchorItem, true);
     };
     const load = async () => {
@@ -1526,7 +1545,7 @@ export function MailDetailDrawer({
       return;
     }
     onConsumeInsertRequest(nonce);
-    const targetMode = aiDraftModeRef.current;
+    const targetMode = artifact.composer_mode || aiDraftModeRef.current;
     setComposerMode(targetMode);
     setModeMenuOpen(false);
     if (mode === "replace") {
@@ -1542,6 +1561,9 @@ export function MailDetailDrawer({
           : artifact.body,
         bodyHtml: plainTextToEditorHtml(artifact.body),
         dirty: true,
+        recipients: targetMode === "forward" && artifact.recipients?.length
+          ? artifact.recipients
+          : current.recipients,
       }));
       requestAnimationFrame(() => bodyRef.current?.focus());
       return;
@@ -1561,8 +1583,11 @@ export function MailDetailDrawer({
         bodyHtml: plainTextToEditorHtml(targetMode === "forward"
           ? mergeDraftArtifactBody(stripForwardedMessageBlock(current.body), artifact.body, mode)
           : mergeDraftArtifactBody(current.body, artifact.body, mode)),
-      dirty: true,
-    }));
+        dirty: true,
+        recipients: targetMode === "forward" && artifact.recipients?.length
+          ? artifact.recipients
+          : current.recipients,
+      }));
     requestAnimationFrame(() => bodyRef.current?.focus());
   }, [composerDrafts.reply.body, draftStorageKey, insertRequest, mailbox, message, onConsumeInsertRequest, showToast, threadId]);
 
@@ -1601,6 +1626,8 @@ export function MailDetailDrawer({
     if (!page?.has_earlier || page.next_before_index === null || !threadId) return;
     const scroller = scrollRef.current;
     const previousHeight = scroller?.scrollHeight || 0;
+    // 历史消息插入当前视口上方后，后续 page/iframe 更新不能把用户带回线程底部。
+    preserveScrollOnPageUpdateRef.current = true;
     const older = await loadInboxThreadPageRef.current(mailbox, threadId, {
       anchorMessageId: message?.id,
       beforeIndex: page.next_before_index,
@@ -1671,6 +1698,25 @@ export function MailDetailDrawer({
     }
   };
   loadFullDisplayBodyRef.current = loadFullDisplayBody;
+
+  useEffect(() => {
+    if (!open || !page || historicalBodyHydrationRef.current) return;
+    const pendingMessage = page.messages.find((item) => (
+      item.body_truncated
+      && !item.body_html?.trim()
+      && !item.body_text?.trim()
+      && !displayBodyLoading.has(item.id)
+      && !displayBodyLoaded.has(item.id)
+      && !displayBodyErrors[item.id]
+    ));
+    if (!pendingMessage) return;
+
+    // 历史消息可能只有缓存摘要。逐封补全文，避免展开长线程时并发请求 Gmail。
+    const task = loadFullDisplayBody(pendingMessage).finally(() => {
+      historicalBodyHydrationRef.current = null;
+    });
+    historicalBodyHydrationRef.current = task;
+  }, [displayBodyErrors, displayBodyLoaded, displayBodyLoading, loadFullDisplayBody, open, page]);
 
   const prepareAttachmentAccess = async (item: PreviewAttachmentRef, mode: "preview" | "download") => {
     const messageId = String(item.messageId || item.attachment.message_id || "").trim();
@@ -1927,6 +1973,7 @@ export function MailDetailDrawer({
       expectedArtifact,
       contextTitle: page?.subject || message?.subject || "",
       forceNewConversation,
+      draftComposerMode: composerMode,
     });
   };
 
@@ -2299,7 +2346,8 @@ export function MailDetailDrawer({
           {loading && !page ? <MailDetailLoadingSkeleton /> : null}
           {error ? <div className="mail-detail-error">Thread failed to load. {error}</div> : null}
           {(visibleThreadMessages.length ? visibleThreadMessages : []).map((item) => {
-            const waitForFullBody = item.id === messageId
+            const hasDisplayBody = Boolean(item.body_html?.trim() || item.body_text?.trim());
+            const waitForFullBody = !hasDisplayBody
               && item.body_truncated
               && !displayBodyLoaded.has(item.id)
               && !displayBodyErrors[item.id];
@@ -2326,17 +2374,9 @@ export function MailDetailDrawer({
                 </div>
                 <time>{formatAbsoluteDateTime(item.internal_date)}</time>
               </div>
-              {waitForFullBody ? <MailThreadBodyLoading /> : item.body_html ? <SafeEmailHtml className="mail-thread-message-body is-html" html={item.body_html} scaleToFit onRendered={() => scrollToThreadBottom(scrollRef.current)} /> : <SafeEmailText className="mail-thread-message-body" text={item.body_text || ""} />}
-              {item.body_truncated && !waitForFullBody ? (
-                <p className="mail-thread-message-notice">
-                  <span>{displayBodyLoaded.has(item.id) ? "This message exceeds the safe display limit." : "This message is too large to display completely."}</span>
-                  {!displayBodyLoaded.has(item.id) ? (
-                    <button disabled={displayBodyLoading.has(item.id)} onClick={() => void loadFullDisplayBody(item)}>
-                      {displayBodyLoading.has(item.id) ? "Loading…" : "Load full message"}
-                    </button>
-                  ) : null}
-                </p>
-              ) : null}
+              {waitForFullBody ? <MailThreadBodyLoading /> : item.body_html ? <SafeEmailHtml className="mail-thread-message-body is-html" html={item.body_html} scaleToFit onRendered={() => {
+                if (!preserveScrollOnPageUpdateRef.current) scrollToThreadBottom(scrollRef.current);
+              }} /> : hasDisplayBody ? <SafeEmailText className="mail-thread-message-body" text={item.body_text || ""} /> : null}
               {displayBodyErrors[item.id] ? (
                 <p className="mail-thread-message-notice is-error">
                   <span>{displayBodyErrors[item.id]}</span>
@@ -2362,6 +2402,14 @@ export function MailDetailDrawer({
                   <span>{item.label}</span>
                 </button>
               ))}
+            </section>
+          ) : null}
+          {showNoReplyNotice ? (
+            <section className="mail-detail-no-reply-notice" aria-label="No reply needed">
+              <p>
+                <strong>No reply needed.</strong>
+                {noReplyReason ? ` ${noReplyReason}` : ""}
+              </p>
             </section>
           ) : null}
         </div>

@@ -56,12 +56,15 @@ async def test_thread_assist_retries_truncated_json_with_larger_budget() -> None
     async def truncated_then_complete_sampling(**kwargs: object) -> dict[str, object]:
         calls.append(kwargs)
         if len(calls) == 1:
-            return {"content": {"type": "text", "text": '{"overview":"The sender asks'}}
+            # 无 JSON 骨架：触发 max_attempts 重试（本地 salvage 无法恢复）
+            return {"content": {"type": "text", "text": "not a json object"}}
         return {
             "content": {
                 "type": "text",
                 "text": (
                     '{"overview":"The sender asks you to confirm the delivery date.",'
+                    '"needs_reply":true,'
+                    '"no_reply_reason":"",'
                     '"quick_replies":[{"id":"confirm","label":"Confirm date",'
                     '"intent":"Draft a reply confirming the delivery date."},'
                     '{"id":"ask","label":"Ask details",'
@@ -80,10 +83,45 @@ async def test_thread_assist_retries_truncated_json_with_larger_budget() -> None
         )
 
     assert result["overview"] == "The sender asks you to confirm the delivery date."
+    assert result["needs_reply"] is True
+    assert result["no_reply_reason"] == ""
     assert len(result["quick_replies"]) == 2
     assert [int(call["max_tokens"]) for call in calls] == [768, 1024]
     assert all(call["response_format"] == {"type": "json_object"} for call in calls)
     print("[PASS] test_thread_assist_retries_truncated_json_with_larger_budget")
+
+
+async def test_thread_assist_no_reply_clears_quick_replies() -> None:
+    """不需要回复时不应产出快捷 draft 提示，而应给出原因。"""
+    import anna_inbox_executa.v2_tools as tools
+
+    async def no_reply_sampling(**_kwargs: object) -> dict[str, object]:
+        return {
+            "content": {
+                "type": "text",
+                "text": (
+                    '{"overview":"Stripe sent a payment receipt for your subscription.",'
+                    '"needs_reply":false,'
+                    '"no_reply_reason":"Automated receipt with no request for a response.",'
+                    '"quick_replies":[{"id":"thanks","label":"Say thanks",'
+                    '"intent":"Draft a reply saying thanks."}]}'
+                ),
+            }
+        }
+
+    with patch.object(tools, "_load_thread_messages", return_value=[_message(1, body_text="Your receipt is attached.")]):
+        result = await tools._generate_thread_assist_result(
+            "user@example.com",
+            "thread-1",
+            "m1",
+            "m1",
+            no_reply_sampling,
+        )
+
+    assert result["needs_reply"] is False
+    assert result["quick_replies"] == []
+    assert "receipt" in result["no_reply_reason"].lower()
+    print("[PASS] test_thread_assist_no_reply_clears_quick_replies")
 
 
 def main() -> None:
@@ -244,10 +282,36 @@ def main() -> None:
         {"label": "Reply with timing", "intent": "Draft a reply that asks about timing."},
         {"label": "Reply with timing", "intent": "Duplicate label should be ignored."},
         {"id": "summarize_thread", "label": "Summarize", "intent": "Summarize the thread."},
+        {"label": "Archive it", "intent": "Archive this email."},
+        {"label": "Add todo", "intent": "Add this to todo."},
         {"label": "", "intent": "Ignore missing label."},
     ])
     assert [item["label"] for item in quick_replies] == ["Reply with timing", "Summarize"]
     assert quick_replies[0]["id"] == "reply_with_timing"
+    assert quick_replies[1]["intent"].lower().startswith("draft a reply")
+    assert tools._is_valid_thread_assist_cache({
+        "format_version": tools.THREAD_ASSIST_CACHE_VERSION,
+        "overview": "Sender asks for a meeting time.",
+        "needs_reply": True,
+        "quick_replies": [{"id": "a", "label": "Propose times", "intent": "Draft a reply with times."}],
+        "fallback_used": False,
+    })
+    assert tools._is_valid_thread_assist_cache({
+        "format_version": tools.THREAD_ASSIST_CACHE_VERSION,
+        "overview": "Payment receipt arrived.",
+        "needs_reply": False,
+        "no_reply_reason": "Automated receipt.",
+        "quick_replies": [],
+        "fallback_used": False,
+    })
+    assert not tools._is_valid_thread_assist_cache({
+        "format_version": tools.THREAD_ASSIST_CACHE_VERSION,
+        "overview": "Payment receipt arrived.",
+        "needs_reply": False,
+        "no_reply_reason": "",
+        "quick_replies": [],
+        "fallback_used": False,
+    })
 
     complete_overview = "Mitce has suspended your Basic service because an overdue payment remains outstanding."
     assert tools._one_line_overview(complete_overview) == complete_overview
@@ -313,6 +377,7 @@ def main() -> None:
 
     asyncio.run(test_thread_assist_refuses_raw_mail_fallback())
     asyncio.run(test_thread_assist_retries_truncated_json_with_larger_budget())
+    asyncio.run(test_thread_assist_no_reply_clears_quick_replies())
 
     print("PASS inbox thread response budget tests")
 

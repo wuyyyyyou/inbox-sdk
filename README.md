@@ -9,16 +9,15 @@ Anna Inbox 是运行在 Anna App 中的 Gmail 工作台。2.0 以完整收件箱
 - 星标、重要、Todo、Snooze、已读、完成和移至垃圾箱操作。
 - 线程详情、清洗后的文本或安全 HTML、AI overview、回复/转发/Compose 富文本草稿（`body_html`）、Cc·Bcc 与发送（10 秒可撤销）。
 - 收件附件预览/下载（优先 Host transient upload，回退 APS Files；本地 dev 保留 loopback）；回复与 Compose 外发附件（合计 ≤25MB）。
-- 多邮箱切换：立刻取消上一邮箱扫描，首屏读本地缓存，后台 History 静默同步；缓存刷新后预热联系人头像。
-- 可折叠、可调宽的 Anna AI 侧栏：通过 Host Agent Session 流式选型并调用显式白名单工具；透传只读列表上下文（视图/筛选/搜索与 todo/done/snoozed）；支持当前邮件上下文、搜索结果引用、可审阅 Compose 草稿，以及停止、恢复和会话清理。
+- 多邮箱切换：立刻取消上一邮箱扫描，首屏读本地缓存，后台 180 天 priority + History 静默同步；缓存刷新后预热联系人头像。
+- 可折叠、可调宽的 Anna AI 侧栏：默认 Host Agent Session，只读检索经 `query_mail_evidence` 一次取证；支持当前邮件上下文、可审阅草稿插入、停止/恢复与会话清理；本地可用 env/localStorage 走 `sidebar_local` 兼容路径。
 - Agent 工具仅执行只读检索、阅读、总结、草稿和整理建议；发送、删除、标签变更等状态修改仍须用户明确确认。
-- `search_email` 实时检索 Gmail（不回退本地缓存）；普通搜索只补齐返回条数摘要，工作流筛选候选上限 60 且请求超时 12s；本地工作流 `is:todo/is:done/is:snoozed` 仅 AND；单次最多 20 条轻量摘要，正文读取与索引检索分离。
-- 邮箱级 Todo/Done/Snoozed 与 AI Ask 历史经 APS KV 读写（`get/save_inbox_workflow_state`、`get/save_ai_ask_history`），乐观并发 etag。
+- AI 检索默认扫描**本地已索引缓存**（非列表 7/30/60 窗）；`search_email`/`read_email` cache-only；超出索引最早边界时 Evidence 可受限回源 Gmail 历史；`sync_boundary` 标明覆盖范围。
+- 后台正文/附件预处理（文本、Office、PDF；图片 OCR 待平台接口）。
+- 邮箱级 Todo/Done/Snoozed 与 AI Ask 历史经 APS KV 读写，乐观并发 etag。
 - 多 Gmail 账户发现与切换。
 - LLM 与 Gmail API 的真实连通性和延迟检测：反向 RPC 响应直通、12 秒统一总预算、检测去重，并在扫描或 AI turn 期间暂停轮询。
-- 平台超时安全诊断：AI run 与同步收件箱调用返回 Sampling、Connected accounts、Gmail HTTP 和 Executa 阶段耗时，前端失败消息仅展示经过格式校验的诊断摘要。
-- AI 侧栏 Ask 固定检索当前活动邮箱，不因多账户选择状态扩大 Gmail 搜索范围。
-- 后端保留 Brief 注意力卡片、Ask、自定义扫描和联系人记忆能力。
+- 平台超时安全诊断：阶段耗时与错误类型可反馈；禁止日志含邮箱、查询、邮件或凭据。
 
 设置入口在 2.0.1 前端中暂时隐藏；相关后端工具和状态结构仍然保留。
 
@@ -40,7 +39,7 @@ anna-inbox/
 inbox-tool/
   manifest.json                    Executa 身份、版本和工具契约
   src/anna_inbox_executa/          JSON-RPC 入口与工具分发
-  src/mail_agent/                  Gmail、Ask、Brief、存储和联系人记忆
+  src/mail_agent/                  Gmail、Ask、同步、Evidence、存储和联系人记忆
   src/tests/                       脚本式 Python 测试
 
 scripts/
@@ -99,12 +98,10 @@ npm run build
 ```sh
 cd inbox-tool/src
 uv run python tests/test_inbox_feed.py
-uv run python tests/test_inbox_thread_storage.py
-uv run python tests/test_attachment_download_host_upload.py
-uv run python tests/test_llm_json_repair.py
-uv run python tests/test_runtime_diagnostics.py
-uv run python tests/test_ai_turn_current_mailbox.py
-uv run python tests/test_storage_integration.py
+uv run python tests/test_gmail_history_sync.py
+uv run python tests/test_ai_agent_tools.py
+uv run python tests/test_local_query.py
+uv run python tests/test_inbox_thread_response_budget.py
 ```
 
 协议 smoke test：
@@ -120,8 +117,8 @@ App 与 Tool **版本解耦**（当前基线）：
 
 | 端 | 版本 | 权威文件 |
 | --- | --- | --- |
-| App | `2.1.6` | `anna-inbox/app.json` |
-| Tool | `2.2.6` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
+| App | `2.1.7` | `anna-inbox/app.json` |
+| Tool | `2.2.7` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
 
 Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Tool 版本后运行：
 
@@ -136,5 +133,6 @@ python scripts/sync/sync_executa_identity.py --check
 
 当前文档索引见 [`anna-inbox/docs/README.md`](anna-inbox/docs/README.md)。
 
-- [平台运行性能诊断与优化进度](anna-inbox/docs/平台运行性能诊断与优化进度.md)：正式环境性能差异、已完成优化、待验证指标和后续同步方案。
-- [平台超时诊断与反馈流程](anna-inbox/docs/平台超时诊断与反馈流程.md)：安全 trace、平台复现判定、报告与论坛帖模板。
+- [2.2.7 架构与发布基线](anna-inbox/docs/2.2.7架构与发布基线.md)
+- [邮箱同步 P0：缓存优先](anna-inbox/docs/邮箱同步P0缓存优先方案.md)
+- [平台超时诊断与反馈流程](anna-inbox/docs/平台超时诊断与反馈流程.md)

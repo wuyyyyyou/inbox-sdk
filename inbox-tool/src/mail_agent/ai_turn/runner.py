@@ -380,7 +380,7 @@ async def run_ai_turn(
             language=language,
             sampling_create_message=sampling_create_message,
             memory_summary=memory_summary,
-            mode="draft_reply",
+            mode=("draft_forward" if str(context.get("draft_composer_mode") or "") == "forward" else "draft_reply"),
         )
         outcome["route"] = {"execution": "thread_draft"}
         return outcome

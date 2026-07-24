@@ -50,6 +50,7 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
         if method == "describe":
             return make_response(request_id, result=MANIFEST)
         if method == "health":
+            # ai_sidebar_mode 供前端/调试读取后端默认路径；localStorage 可覆盖。
             return make_response(
                 request_id,
                 result={
@@ -57,6 +58,7 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
                     "timestamp": beijing_now(),
                     "version": VERSION,
                     "tools_count": len(MANIFEST["tools"]),
+                    "ai_sidebar_mode": get_ai_sidebar_mode(),
                 },
             )
         if method == "invoke":

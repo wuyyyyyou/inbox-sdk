@@ -17,20 +17,22 @@ describe("AI sidebar Host Agent contract", () => {
     expect(agentClientSource).toContain("systemPrompt: AI_SIDEBAR_SYSTEM_PROMPT");
     expect(AI_SIDEBAR_SYSTEM_PROMPT.length).toBeLessThanOrEqual(4000);
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never use Markdown tables");
-    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("each search call returns at most 20 candidates");
-    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("live Gmail only");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("call query_mail_evidence exactly once");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("creates one QueryPlan");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("recent_conversation is the recent visible transcript");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Do not replace a clear confirmation with a generic feature menu");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("base conclusions on bodyFull evidence");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never describe it as a 7/30/60-day search");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never call start_ai_turn");
     expect(agentClientSource).toContain("tool_end");
   });
 
-  it("exposes non-mutation search/read tools via Executa describe", () => {
+  it("exposes the composite read-only evidence tool via Executa describe", () => {
     const names = new Set((toolManifest.tools || []).map((tool) => String(tool.name || "")));
-    expect(names.has("search_email")).toBe(true);
-    expect(names.has("read_email")).toBe(true);
+    expect(names.has("query_mail_evidence")).toBe(true);
     expect(names.has("propose_inbox_actions")).toBe(true);
-    const search = (toolManifest.tools || []).find((tool) => tool.name === "search_email");
-    expect(String(search?.description || "")).toMatch(/bodySnippet|live Gmail/i);
-    expect(String(search?.description || "")).not.toMatch(/bodyFull.*default/i);
+    const evidence = (toolManifest.tools || []).find((tool) => tool.name === "query_mail_evidence");
+    expect(String(evidence?.description || "")).toMatch(/QueryPlan|cache/i);
   });
 
   it("declares the Host Agent tool whitelist with fully qualified Executa names", () => {
@@ -40,9 +42,10 @@ describe("AI sidebar Host Agent contract", () => {
     const tools = appManifest.ui?.host_api?.agent?.tools || [];
     const prefix = "tool_riazm4777_inbox_executa_dnsb9fqu__";
 
-    expect(tools).toHaveLength(9);
-    expect(tools).toContain(`${prefix}search_email`);
-    expect(tools).toContain(`${prefix}read_email`);
+    expect(tools).toHaveLength(7);
+    expect(tools).toContain(`${prefix}query_mail_evidence`);
+    expect(tools).not.toContain(`${prefix}search_email`);
+    expect(tools).not.toContain(`${prefix}read_email`);
     expect(tools).not.toContain(`${prefix}start_ai_turn`);
     expect(tools).not.toContain(`${prefix}get_mail_agent_run`);
     expect(tools).not.toContain(`${prefix}list_cached_emails`);

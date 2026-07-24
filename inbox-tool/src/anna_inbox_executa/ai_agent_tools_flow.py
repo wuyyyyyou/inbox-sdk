@@ -15,9 +15,21 @@ from anna_inbox_executa.sampling_tools import _build_sampling_for_run
 
 # Host agent.tools 白名单（与 manifest / App 声明对齐）
 AI_AGENT_TOOL_NAMES = frozenset({
+    "query_mail_evidence",
     "search_email",
     "read_email",
     "ai_summarize_thread",
+    "ai_draft_reply",
+    "ai_revise_draft",
+    "ai_compose_new",
+    "ai_batch_draft",
+    "propose_inbox_actions",
+    "ai_remember_preference",
+})
+
+# 侧栏主路径只暴露一个复合只读工具；写作与确认卡保留专用工具。
+AI_AGENT_SESSION_TOOL_NAMES = frozenset({
+    "query_mail_evidence",
     "ai_draft_reply",
     "ai_revise_draft",
     "ai_compose_new",
@@ -36,6 +48,28 @@ def _uses_chinese(text: str) -> bool:
     return bool(re.search(r"[\u3400-\u9fff]", text or ""))
 
 
+def _attachment_filenames(message: Any, *, limit: int = 6) -> list[str]:
+    """从 MessageLite / dict 提取附件文件名，供 Agent 回答发票等问题。"""
+    names: list[str] = []
+    raw_list: list[Any] = []
+    if hasattr(message, "attachments"):
+        raw_list = list(getattr(message, "attachments") or [])
+    elif isinstance(message, dict):
+        raw = message.get("attachments")
+        if isinstance(raw, list):
+            raw_list = raw
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("filename") or item.get("name") or "").strip()
+        if not name or name in names:
+            continue
+        names.append(name[:160])
+        if len(names) >= limit:
+            break
+    return names
+
+
 def _merge_ui_context(arguments: dict[str, Any]) -> dict[str, Any]:
     """合并 Host 传入的 ui_context 与扁平字段，便于模型少填嵌套对象。"""
     raw = arguments.get("ui_context")
@@ -45,6 +79,16 @@ def _merge_ui_context(arguments: dict[str, Any]) -> dict[str, Any]:
         context["mailbox"] = mailbox
     message_id = str(arguments.get("message_id") or "").strip()
     thread_id = str(arguments.get("thread_id") or "").strip()
+    # 允许模型用 search 命中的 THREAD_REF 直接写回复，不要求详情抽屉已打开
+    thread_ref = str(arguments.get("thread_ref") or "").strip()
+    if thread_ref:
+        ref_id = thread_ref.removeprefix("THREAD_REF_").strip()
+        if ref_id and not thread_id:
+            thread_id = ref_id
+        if ref_id and not message_id and mailbox:
+            mapped = _message_id_for_thread_ref(mailbox, ref_id)
+            if mapped:
+                message_id = mapped
     subject = str(arguments.get("subject") or "").strip()
     current = context.get("current_thread") if isinstance(context.get("current_thread"), dict) else {}
     if message_id or thread_id or subject:
@@ -176,6 +220,20 @@ def _split_gmail_and_local_workflow_query(raw_query: str) -> tuple[str, str]:
     return gmail_query or "in:anywhere", " AND ".join(local_terms)
 
 
+def _apply_display_range_default(gmail_query: str, ui_context: dict[str, Any]) -> str:
+    """未显式给出时间条件时，继承用户当前 7/30/60 天列表范围。"""
+    query = str(gmail_query or "").strip()
+    if re.search(r"\b(?:after|before|newer_than|older_than):", query, re.IGNORECASE):
+        return query
+    try:
+        days = int(ui_context.get("display_range_days") or 0)
+    except (TypeError, ValueError):
+        days = 0
+    if days not in {7, 30, 60}:
+        return query
+    return f"{query} newer_than:{days}d".strip()
+
+
 def _workflow_message_ids(
     arguments: dict[str, Any],
     ui_context: dict[str, Any],
@@ -189,12 +247,21 @@ def _workflow_message_ids(
 
 
 def _search_email(arguments: dict[str, Any], ui_context: dict[str, Any]) -> dict[str, Any]:
-    """实时检索 Gmail 并返回轻量摘要；缓存只接收本次结果，不作为查询或回退来源。"""
-    from mail_agent.local_query import filter_cached_messages
+    """仅检索本地邮件缓存并返回轻量摘要，不在 AI 问答路径实时访问 Gmail。
+
+    display_range_days 只约束 Inbox 列表展示，不隐式缩小 AI 的缓存检索范围；
+    用户给出的明确 before/after 条件仍由本地查询执行。缓存边界随结果返回，
+    让模型在范围外问题上说明「无法判断」而不是误答「没有」。
+    """
+    from mail_agent.local_query import filter_cached_messages, normalize_to_local_query
     from mail_agent.mail_providers.gmail.adapter import (
-        get_messages_lite,
-        live_search_metadata_and_cache,
+        _to_message_lite,
+        list_messages,
         normalize_mailbox,
+    )
+    from mail_agent.mail_providers.gmail.mailbox_sync import (
+        boundary_honesty_note,
+        get_mailbox_sync_boundary,
     )
 
     mailbox = normalize_mailbox(str(arguments.get("mailbox") or ui_context.get("mailbox") or ""))
@@ -206,36 +273,37 @@ def _search_email(arguments: dict[str, Any], ui_context: dict[str, Any]) -> dict
     raw_query = _search_query(arguments)
     gmail_query, local_workflow_query = _split_gmail_and_local_workflow_query(raw_query)
     mask = _search_read_mask(arguments)
-    # Gmail 消息列表本身是实时来源。普通搜索只补齐实际返回条数的摘要，避免把一次
-    # 工具调用放大为数十次 metadata 请求；本地工作流筛选才额外拉取少量候选。
-    candidate_limit = (
-        min(_SEARCH_GMAIL_WORKFLOW_CANDIDATE_CAP, max(limit * 3, 20))
-        if local_workflow_query
-        else limit
-    )
-    message_ids = live_search_metadata_and_cache(
-        mailbox,
-        gmail_query,
-        candidate_limit,
-        force_refresh=False,
-        strict=True,
-        request_timeout_seconds=_SEARCH_GMAIL_REQUEST_TIMEOUT_SECONDS,
-    )
-    messages = get_messages_lite(mailbox, message_ids)
+    raw_order = str(arguments.get("order") or "newest").strip().lower()
+    order = "oldest" if raw_order in {"oldest", "asc", "ascending"} else "newest"
+    # 全量缓存扫描：不受 display_range 或 500 条首页缓存 helper 的限制。
+    cached_rows = [item for item in list_messages(mailbox) if isinstance(item, dict)]
+    messages = [_to_message_lite(item) for item in cached_rows]
+    # 「最早/最晚」必须在完整已索引集上确定排序，再截取 evidence 上限；不能从
+    # 默认 newest 的前 20 条中猜最早日期。
+    def _message_date_key(message: Any) -> int:
+        try:
+            return int(message.internal_date or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    messages.sort(key=_message_date_key, reverse=order == "newest")
     todo_ids = _workflow_message_ids(arguments, ui_context, "todo_message_ids")
     done_ids = _workflow_message_ids(arguments, ui_context, "done_message_ids")
     snoozed_ids = _workflow_message_ids(arguments, ui_context, "snoozed_message_ids")
+    # Gmail 风格查询转为本地语法；工作流条件已经从 Gmail 查询中拆出，再与本地
+    # 条件组合，保证 Todo/Done/Snoozed 始终使用前端权威 id 快照。
+    query_parts = [normalize_to_local_query(gmail_query)]
     if local_workflow_query:
-        hits, _ = filter_cached_messages(
-            messages,
-            local_workflow_query,
-            todo_ids=todo_ids,
-            done_ids=done_ids,
-            snoozed_ids=snoozed_ids,
-            limit=limit,
-        )
-    else:
-        hits = messages[:limit]
+        query_parts.append(local_workflow_query)
+    local_query = " AND ".join(part for part in query_parts if part).strip() or "is:all"
+    hits, parsed_query = filter_cached_messages(
+        messages,
+        local_query,
+        todo_ids=todo_ids,
+        done_ids=done_ids,
+        snoozed_ids=snoozed_ids,
+        limit=limit,
+    )
     results: list[dict[str, Any]] = []
     for message in hits:
         message_id = str(message.message_id or "")
@@ -260,29 +328,42 @@ def _search_email(arguments: dict[str, Any], ui_context: dict[str, Any]) -> dict
             row["subject"] = str(message.subject or "")[:_SEARCH_SUBJECT_CHARS]
         if "bodySnippet" in mask:
             row["bodySnippet"] = str(message.snippet or "")[:_SEARCH_SNIPPET_CHARS]
+        # 附件文件名来自实时 metadata 缓存，便于回答发票/附件类问题
+        filenames = _attachment_filenames(message)
+        if filenames or bool(getattr(message, "has_attachment", False)):
+            row["hasAttachment"] = bool(filenames) or bool(getattr(message, "has_attachment", False))
+        if filenames:
+            row["attachmentFilenames"] = filenames
         results.append(row)
+    boundary = get_mailbox_sync_boundary(mailbox)
+    language = _language(arguments, _user_text(arguments))
     return {
         "kind": "search",
         "mailbox": mailbox,
         "query": raw_query,
-        "scan_query": raw_query,
+        "scan_query": local_query,
         "gmail_query": gmail_query,
+        "local_query": parsed_query.display or local_query,
         "local_workflow_query": local_workflow_query,
-        "scan_source": "gmail",
-        "cache_empty": False,
+        "scan_source": "cache",
+        "cache_empty": not cached_rows,
         "readMask": mask,
         "results": results,
         "count": len(results),
+        "cache_candidates_scanned": len(messages),
+        "order": order,
+        "result_limit": limit,
+        "truncated": len(results) >= limit,
+        "query_parse_error": parsed_query.error,
+        "sync_boundary": boundary,
+        "coverage_note": boundary_honesty_note(boundary, language),
     }
 
 
 def _read_email(arguments: dict[str, Any], ui_context: dict[str, Any]) -> dict[str, Any]:
     """按 readMask 返回字段；只有 bodyFull 触发 Gmail 正文读取。"""
-    from mail_agent.mail_providers.gmail.adapter import (
-        get_message_detail,
-        normalize_mailbox,
-        read_message,
-    )
+    from mail_agent.mail_providers.gmail.adapter import normalize_mailbox, read_message
+    from mail_agent.mail_providers.gmail.mailbox_sync import get_mailbox_sync_boundary
 
     mailbox = normalize_mailbox(str(arguments.get("mailbox") or ui_context.get("mailbox") or ""))
     raw_ref = str(arguments.get("thread_ref") or arguments.get("message_id") or "").strip()
@@ -318,12 +399,21 @@ def _read_email(arguments: dict[str, Any], ui_context: dict[str, Any]) -> dict[s
         result["subject"] = str(message.get("subject") or "")[:160]
     if "bodySnippet" in mask:
         result["bodySnippet"] = str(message.get("snippet") or "")[:280]
+    # 附件清单：优先缓存 metadata；读全文时再合并详情侧附件
+    filenames = _attachment_filenames(message)
     if "bodyFull" in mask:
-        detail = get_message_detail(mailbox, message_id)
-        if detail is None:
-            raise ValueError("email_not_found")
-        # 全文仍给 Host，但硬截断，避免单封长线程撑爆 session 上下文。
-        result["bodyFull"] = str(detail.body_text or "")[:3500]
+        # AI 路径只读缓存：正文未同步时明确返回 pending，不能隐式请求 Gmail。
+        body_text = str(message.get("body_text") or "")
+        if body_text:
+            result["bodyFull"] = body_text[:3500]
+        else:
+            result["body_pending"] = True
+            result["sync_boundary"] = get_mailbox_sync_boundary(mailbox)
+    if filenames:
+        result["attachmentFilenames"] = filenames[:8]
+        result["hasAttachment"] = True
+    elif bool(message.get("has_attachment") or message.get("attachments")):
+        result["hasAttachment"] = True
     return result
 
 
@@ -402,8 +492,19 @@ _PUBLIC_OUTCOME_KEYS = (
     "scan_source",
     "query",
     "results",
+    "nearby_results",
+    "nearby_query",
+    "match_status",
     "count",
     "cache_empty",
+    "query_plan",
+    "active_scope",
+    "scope_reset",
+    "sync_boundary",
+    "coverage_note",
+    "exact_count",
+    "search_scope",
+    "cache_total",
 )
 
 
@@ -419,6 +520,9 @@ def _public_outcome(outcome: dict[str, Any]) -> dict[str, Any]:
         if value is None:
             continue
         public[key] = value
+    if str(public.get("kind") or "").startswith("evidence"):
+        # P3 Evidence 只输出结构化 sync_boundary；旧范围文案不能成为模型最终回答。
+        public.pop("coverage_note", None)
     if "kind" not in public:
         public["kind"] = "error"
         public.setdefault("error", "invalid_outcome")
@@ -452,6 +556,22 @@ async def handle_ai_agent_tool(tool: str, arguments: dict[str, Any], invoke_id: 
 
     ui_context = _merge_ui_context(arguments)
     language = _language(arguments, user_text)
+
+    if tool == "query_mail_evidence":
+        from mail_agent.evidence_flow import query_mail_evidence
+
+        sampling = _build_sampling_for_run(arguments, invoke_id)
+        conversation_id = str(arguments.get("conversation_id") or ui_context.get("conversation_id") or "").strip()
+        try:
+            outcome = await query_mail_evidence(
+                user_text,
+                ui_context,
+                sampling_create_message=sampling,
+                conversation_id=conversation_id,
+            )
+            return {"success": True, "tool": tool, "data": _public_outcome(outcome)}
+        except Exception as exc:
+            return {"success": False, "tool": tool, "error": type(exc).__name__}
 
     # 搜索与按需读取是纯 Gmail I/O：不创建 Sampling 预算，也不传 max_tokens。
     if tool == "search_email":
@@ -566,5 +686,6 @@ AI_AGENT_COMMON_PARAMS = [
 __all__ = [
     "AI_AGENT_COMMON_PARAMS",
     "AI_AGENT_TOOL_NAMES",
+    "AI_AGENT_SESSION_TOOL_NAMES",
     "handle_ai_agent_tool",
 ]

@@ -72,6 +72,7 @@ import {
 } from "./constants";
 import { createInitialState, removeAskHistoryEntry } from "./state";
 import { buildRevisionPrompt } from "./aiRoute";
+import { resolveAiSidebarMode, type AiSidebarMode } from "./aiSidebarMode";
 import { connectedAccountsStatusMessage } from "./connectedAccounts";
 import { resolveMailboxSelection } from "./mailboxSelection";
 
@@ -373,6 +374,15 @@ function buildAiTurnUiContext(args: {
       subject: String(item.subject || "").slice(0, 200),
     }));
   const listContext = args.inboxListContext;
+  // Host Session 在重连或平台恢复后不保证保留完整 transcript；只回传近期已完成消息，
+  // 让“yes/继续/改短一点”等承接回复仍能定位上一轮待确认动作。
+  const recentConversation = (args.messages || [])
+    .filter((message) => !message.pending && message.kind !== "status" && String(message.content || "").trim())
+    .slice(-4)
+    .map((message) => ({
+      role: message.role,
+      content: String(message.content || "").trim().slice(0, 1200),
+    }));
   return {
     conversation_id: args.conversationId,
     mailbox,
@@ -389,6 +399,7 @@ function buildAiTurnUiContext(args: {
     saved_prompt_id: args.savedPromptId || "",
     language_hint: args.languageHint || "",
     routing_intent: args.routingIntent || "",
+    recent_conversation: recentConversation,
     // 工作流状态只传 message_id，不传邮件正文；详情/旧入口未给列表快照时保留 Todo 兼容读取。
     todo_message_ids: listContext?.todo_message_ids || readTodoMessageIds(mailbox),
     done_message_ids: listContext?.done_message_ids || [],
@@ -403,7 +414,9 @@ function buildAiTurnUiContext(args: {
 
 function buildAiAgentContent(userText: string, uiContext: Record<string, unknown>): string {
   // ui_context 是用户输入中的只读事实，不能覆盖 session 的 systemPrompt。
-  return `[ui_context]\n${JSON.stringify(uiContext)}\n\n[user]\n${userText}`;
+  // display_range_days 是 Inbox 渲染偏好，不是 AI 检索边界；不得让 Host 据此臆造时间范围。
+  const { display_range_days: _displayRangeDays, ...agentContext } = uiContext;
+  return `[ui_context]\n${JSON.stringify(agentContext)}\n\n[user]\n${userText}`;
 }
 
 function agentOutcomePayload(outcomes: AgentToolOutcome[], finalText: string): Record<string, unknown> {
@@ -948,6 +961,10 @@ export function useAppController() {
   const briefScanRunIdRef = useRef("");
   /** Ask/自定义扫描的 run_id，切换邮箱时一并取消。 */
   const activeBackgroundRunIdRef = useRef("");
+  /** 后端 env 默认侧栏路径（host/local）；localStorage 可覆盖。 */
+  const aiSidebarBackendModeRef = useRef<AiSidebarMode>("host");
+  /** 每个会话首轮固定 AI 执行路径，避免追问在 Host/local 间切换。 */
+  const aiSidebarModeByConversationRef = useRef(new Map<string, AiSidebarMode>());
 
   const getRuntime = useCallback(async () => {
     if (!runtimePromise.current) {
@@ -1962,6 +1979,9 @@ export function useAppController() {
     let next: AppState["llmStatus"];
     try {
       const result = await client.checkSamplingStatus();
+      if (result.ai_sidebar_mode === "local" || result.ai_sidebar_mode === "host") {
+        aiSidebarBackendModeRef.current = result.ai_sidebar_mode;
+      }
       const status = result.ok === false
         ? (result.status === "error" ? "error" : "unavailable")
         : (result.status || "connected");
@@ -3236,6 +3256,7 @@ export function useAppController() {
                   messages: messagesWithUser,
                 }),
                 requested_artifact: requestedArtifact,
+                draft_composer_mode: request.draftComposerMode || "reply",
               };
               return client.startAiTurn({
                 user_text: buildRevisionPrompt(request.visiblePrompt, request.draftToRevise),
@@ -4089,6 +4110,7 @@ export function useAppController() {
         aiGenerationRun.current = null;
       }
       if (previousConversationId) {
+        aiSidebarModeByConversationRef.current.delete(previousConversationId);
         void clearAiAgentSession(previousConversationId);
       }
       setState((s) => ({
@@ -4168,6 +4190,7 @@ export function useAppController() {
         }
         void clearAiAgentSession(entry.conversationId || "");
       }
+      if (entry.conversationId) aiSidebarModeByConversationRef.current.delete(entry.conversationId);
       setState((s) => {
         const nextHistory = removeAskHistoryEntry(s.askHistory, index);
         persistAskHistory(nextHistory);
@@ -4289,137 +4312,202 @@ export function useAppController() {
           routingIntent: options.routingIntent,
           inboxListContext: options.inboxListContext,
         });
-        let streamed = "";
-        const agentTurn = await runAiAgentTurn(
-          state.runtime.client,
-          conversationId,
-          buildAiAgentContent(userRequest, uiContext),
-          {
-            signal: generationRun.controller.signal,
-            onText: (piece) => {
-              if (!isCurrentGeneration()) return;
-              streamed += piece;
-              const snapshot = stripTerminalDoneMarker(streamed);
-              setState((s) => ({
-                ...s,
-                aiChatMessages: s.aiChatMessages.map((message) => message.id === pendingMessage.id
-                  ? { ...message, content: snapshot || "…", kind: "chat", pending: true }
-                  : message),
-                scanStatus: "Generating reply...",
-                customRunProgress: {
-                  runId: "agent_session",
-                  question: userRequest,
-                  status: "running",
-                  stage: "agent",
-                  stageKey: "answer",
-                  progress: {},
-                  partial: {},
-                  startedAt: thinkingStartedAt,
-                },
-              }));
-            },
-            onToolOutcome: (outcome) => {
-              if (!isCurrentGeneration()) return;
-              const bgRunId = String(outcome.run_id || "").trim();
-              if (bgRunId) runId = bgRunId;
-              const stage = String(outcome.stage || "");
-              const scanQ = String(
-                outcome.scan_query
-                || (outcome.progress && typeof outcome.progress === "object"
-                  ? (outcome.progress as Record<string, unknown>).scan_query
-                  : "")
-                || "",
-              ).trim();
-              if (stage || scanQ) {
-                setState((s) => ({
-                  ...s,
-                  scanStatus: stage ? `Working: ${stage}` : s.scanStatus,
-                  customRunProgress: {
-                    runId: bgRunId || s.customRunProgress?.runId || "agent_session",
-                    question: userRequest,
-                    status: "running",
-                    stage: stage || s.customRunProgress?.stage || "agent",
-                    stageKey: stage === "search" ? "search" : stage === "plan" ? "planning" : "answer",
-                    progress: {
-                      ...(typeof outcome.progress === "object" && outcome.progress ? outcome.progress as object : {}),
-                      ...(scanQ ? { scan_query: scanQ } : {}),
-                    },
-                    partial: {},
-                    startedAt: thinkingStartedAt,
-                  },
-                }));
-              }
-            },
-          },
-        );
-        // Host 若误调 start_ai_turn：工具只返回 running，需前端轮询 get_mail_agent_run 拿最终 result/scan_query。
-        let toolOutcomes = agentTurn.toolOutcomes;
-        const backgroundRunId = findBackgroundRunId(toolOutcomes) || runId;
-        if (backgroundRunId && client) {
-          runId = backgroundRunId;
-          let lastStatus: RunStatus | null = null;
-          for (let poll = 0; poll < 80; poll += 1) {
-            if (!isCurrentGeneration() || generationRun.controller.signal.aborted) break;
-            lastStatus = await client.getRun(backgroundRunId);
-            if (!isCurrentGeneration()) break;
-            const stage = String(lastStatus.stage || "");
-            const progress = (lastStatus.progress || {}) as Record<string, unknown>;
+        // local 兼容环也不能收到列表展示时间窗；复合 Evidence 始终扫描全量索引缓存。
+        const { display_range_days: _displayRangeDays, ...sidebarUiContext } = uiContext;
+        // local：本地 Router + Sampling；host：Host Agent Session。localStorage 覆盖后端默认。
+        const sidebarMode = aiSidebarModeByConversationRef.current.get(conversationId)
+          ?? resolveAiSidebarMode(aiSidebarBackendModeRef.current);
+        aiSidebarModeByConversationRef.current.set(conversationId, sidebarMode);
+        let payload: Record<string, unknown>;
+        if (sidebarMode === "local") {
+          const scanScope = await loadScanPlanForRun(scanMailbox);
+          if (!isCurrentGeneration()) return;
+          const started = await client.startAiTurn({
+            user_text: userRequest,
+            mailbox: scanMailbox,
+            ui_context: sidebarUiContext,
+            conversation_id: conversationId,
+            primary_count: scanScope.max_messages,
+            max_messages: scanScope.max_messages,
+            scan_window_days: scanScope.scan_window_days,
+            // 本地调试路径固定 Anna Sampling（与旧侧栏一致），不走 DashScope。
+            ai_provider: "anna-llm",
+            storage_provider: state.storageProvider,
+            run_id: generationRun.runId,
+            source: "sidebar_local",
+            wait_timeout_seconds: 5,
+          });
+          if (!isCurrentGeneration()) return;
+          runId = String(started.run_id || generationRun.runId || "").trim();
+          activeBackgroundRunIdRef.current = runId;
+          const applyLocalProgress = (status: RunStatus) => {
+            if (!isCurrentGeneration()) return;
+            const stage = String(status.stage || "");
+            const progress = (status.progress || {}) as Record<string, unknown>;
             const scanQ = String(progress.scan_query || "").trim();
             setState((s) => ({
               ...s,
               scanStatus: stage ? `Working: ${stage}` : s.scanStatus,
               customRunProgress: {
-                runId: backgroundRunId,
+                runId: runId || s.customRunProgress?.runId || "local_router",
                 question: userRequest,
-                status: String(lastStatus?.status || "running"),
-                stage: stage || "agent",
+                status: String(status.status || "running"),
+                stage: stage || "routing",
                 stageKey: stage === "search" ? "search" : stage === "plan" || stage === "routing" ? "planning" : "answer",
                 progress: { ...progress, ...(scanQ ? { scan_query: scanQ } : {}) },
-                partial: (lastStatus?.partial || {}) as Record<string, unknown>,
+                partial: (status.partial || {}) as Record<string, unknown>,
                 startedAt: thinkingStartedAt,
               },
             }));
-            if (
-              lastStatus.status === "done"
-              || lastStatus.status === "failed"
-              || lastStatus.needs_continue === false
-            ) {
-              break;
-            }
-            await abortableSleep(POLL_INTERVAL_MS, generationRun.controller.signal);
+          };
+          applyLocalProgress(started);
+          const completed = started.status === "done" && started.result
+            ? started
+            : await waitForToolRunResult(
+              client,
+              runId,
+              applyLocalProgress,
+              generationRun.controller.signal,
+            );
+          if (!isCurrentGeneration()) return;
+          if (completed.status === "failed" || completed.error) {
+            throw new Error(formatRunDiagnostics(completed, completed.error || "AI turn failed"));
           }
-          if (lastStatus?.status === "failed") {
-            throw new Error(formatRunDiagnostics(lastStatus, lastStatus.error || "AI turn failed"));
-          }
-          if (lastStatus?.result && typeof lastStatus.result === "object") {
-            toolOutcomes = [
-              ...toolOutcomes,
-              {
-                kind: String((lastStatus.result as Record<string, unknown>).kind || "scan"),
-                status: "done",
-                run_id: backgroundRunId,
-                result: lastStatus.result as Record<string, unknown>,
-                scan_query: String((lastStatus.result as Record<string, unknown>).scan_query || "").trim(),
-                scan_source: "cache",
-                assistant_text: String(
-                  (lastStatus.result as Record<string, unknown>).assistant_text
-                  || (lastStatus.result as Record<string, unknown>).summary
-                  || "",
-                ),
+          payload = (completed.result || {}) as Record<string, unknown>;
+        } else {
+          let streamed = "";
+          const agentTurn = await runAiAgentTurn(
+            state.runtime.client,
+            conversationId,
+            buildAiAgentContent(userRequest, sidebarUiContext),
+            {
+              signal: generationRun.controller.signal,
+              onText: (piece) => {
+                if (!isCurrentGeneration()) return;
+                streamed += piece;
+                const snapshot = stripTerminalDoneMarker(streamed);
+                setState((s) => ({
+                  ...s,
+                  aiChatMessages: s.aiChatMessages.map((message) => message.id === pendingMessage.id
+                    ? { ...message, content: snapshot || "…", kind: "chat", pending: true }
+                    : message),
+                  scanStatus: "Generating reply...",
+                  customRunProgress: {
+                    runId: "agent_session",
+                    question: userRequest,
+                    status: "running",
+                    stage: "agent",
+                    stageKey: "answer",
+                    progress: {},
+                    partial: {},
+                    startedAt: thinkingStartedAt,
+                  },
+                }));
               },
-            ];
+              onToolOutcome: (outcome) => {
+                if (!isCurrentGeneration()) return;
+                const bgRunId = String(outcome.run_id || "").trim();
+                if (bgRunId) runId = bgRunId;
+                const stage = String(outcome.stage || "");
+                const scanQ = String(
+                  outcome.scan_query
+                  || (outcome.progress && typeof outcome.progress === "object"
+                    ? (outcome.progress as Record<string, unknown>).scan_query
+                    : "")
+                  || "",
+                ).trim();
+                if (stage || scanQ) {
+                  setState((s) => ({
+                    ...s,
+                    scanStatus: stage ? `Working: ${stage}` : s.scanStatus,
+                    customRunProgress: {
+                      runId: bgRunId || s.customRunProgress?.runId || "agent_session",
+                      question: userRequest,
+                      status: "running",
+                      stage: stage || s.customRunProgress?.stage || "agent",
+                      stageKey: stage === "search" ? "search" : stage === "plan" ? "planning" : "answer",
+                      progress: {
+                        ...(typeof outcome.progress === "object" && outcome.progress ? outcome.progress as object : {}),
+                        ...(scanQ ? { scan_query: scanQ } : {}),
+                      },
+                      partial: {},
+                      startedAt: thinkingStartedAt,
+                    },
+                  }));
+                }
+              },
+            },
+          );
+          // Host 若误调 start_ai_turn：工具只返回 running，需前端轮询 get_mail_agent_run 拿最终 result/scan_query。
+          let toolOutcomes = agentTurn.toolOutcomes;
+          const backgroundRunId = findBackgroundRunId(toolOutcomes) || runId;
+          if (backgroundRunId && client) {
+            runId = backgroundRunId;
+            let lastStatus: RunStatus | null = null;
+            for (let poll = 0; poll < 80; poll += 1) {
+              if (!isCurrentGeneration() || generationRun.controller.signal.aborted) break;
+              lastStatus = await client.getRun(backgroundRunId);
+              if (!isCurrentGeneration()) break;
+              const stage = String(lastStatus.stage || "");
+              const progress = (lastStatus.progress || {}) as Record<string, unknown>;
+              const scanQ = String(progress.scan_query || "").trim();
+              setState((s) => ({
+                ...s,
+                scanStatus: stage ? `Working: ${stage}` : s.scanStatus,
+                customRunProgress: {
+                  runId: backgroundRunId,
+                  question: userRequest,
+                  status: String(lastStatus?.status || "running"),
+                  stage: stage || "agent",
+                  stageKey: stage === "search" ? "search" : stage === "plan" || stage === "routing" ? "planning" : "answer",
+                  progress: { ...progress, ...(scanQ ? { scan_query: scanQ } : {}) },
+                  partial: (lastStatus?.partial || {}) as Record<string, unknown>,
+                  startedAt: thinkingStartedAt,
+                },
+              }));
+              if (
+                lastStatus.status === "done"
+                || lastStatus.status === "failed"
+                || lastStatus.needs_continue === false
+              ) {
+                break;
+              }
+              await abortableSleep(POLL_INTERVAL_MS, generationRun.controller.signal);
+            }
+            if (lastStatus?.status === "failed") {
+              throw new Error(formatRunDiagnostics(lastStatus, lastStatus.error || "AI turn failed"));
+            }
+            if (lastStatus?.result && typeof lastStatus.result === "object") {
+              toolOutcomes = [
+                ...toolOutcomes,
+                {
+                  kind: String((lastStatus.result as Record<string, unknown>).kind || "scan"),
+                  status: "done",
+                  run_id: backgroundRunId,
+                  result: lastStatus.result as Record<string, unknown>,
+                  scan_query: String((lastStatus.result as Record<string, unknown>).scan_query || "").trim(),
+                  scan_source: "cache",
+                  assistant_text: String(
+                    (lastStatus.result as Record<string, unknown>).assistant_text
+                    || (lastStatus.result as Record<string, unknown>).summary
+                    || "",
+                  ),
+                },
+              ];
+            }
           }
+          const completed = {
+            status: "done",
+            error: "",
+            result: agentOutcomePayload(toolOutcomes, agentTurn.text || streamed),
+          } as Pick<RunStatus, "status" | "error" | "result">;
+          if (!isCurrentGeneration()) return;
+          if (completed.status === "failed" || completed.error) {
+            throw new Error(formatRunDiagnostics(completed, completed.error || "AI turn failed"));
+          }
+          payload = (completed.result || {}) as Record<string, unknown>;
         }
-        const completed = {
-          status: "done",
-          error: "",
-          result: agentOutcomePayload(toolOutcomes, agentTurn.text || streamed),
-        } as Pick<RunStatus, "status" | "error" | "result">;
         if (!isCurrentGeneration()) return;
-        if (completed.status === "failed" || completed.error) {
-          throw new Error(formatRunDiagnostics(completed, completed.error || "AI turn failed"));
-        }
-        const payload = (completed.result || {}) as Record<string, unknown>;
         const kind = String(payload.kind || "chat");
         const assistantText = stripTerminalDoneMarker(
           String(payload.assistant_text || payload.summary || "").trim(),
@@ -4457,6 +4545,10 @@ export function useAppController() {
             thread_id: String(art.thread_id || ""),
             body: String(art.body || ""),
             source_prompt: String(art.source_prompt || userRequest),
+            composer_mode: String(art.composer_mode || "") === "forward" ? "forward" : "reply",
+            recipients: Array.isArray(art.recipients)
+              ? art.recipients.map(String).filter(Boolean)
+              : undefined,
             message_id: String(art.message_id || "") || undefined,
             subject: String(art.subject || "") || undefined,
           };
@@ -4477,6 +4569,11 @@ export function useAppController() {
               body: String(art.body || ""),
               source_prompt: String(art.source_prompt || userRequest),
               mode: String(art.mode || "insert") === "replace" ? "replace" : "insert",
+              recipients: Array.isArray(art.recipients)
+                ? art.recipients.map(String).filter(Boolean)
+                : undefined,
+              cc: Array.isArray(art.cc) ? art.cc.map(String).filter(Boolean) : undefined,
+              bcc: Array.isArray(art.bcc) ? art.bcc.map(String).filter(Boolean) : undefined,
               subject: String(art.subject || "") || undefined,
             };
           }

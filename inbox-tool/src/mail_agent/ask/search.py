@@ -326,7 +326,7 @@ async def execute_search(
     缓存为空返回 []，由上层提示用户刷新收件箱。
     """
     from mail_agent.local_query import filter_cached_messages, normalize_to_local_query
-    from ..mail_providers.gmail.adapter import list_cached_messages_lite
+    from ..mail_providers.gmail.adapter import list_all_cached_messages_lite
 
     _ = max_broaden_attempts, allow_broadening  # 保留签名兼容；cache-only 不再放宽打 Gmail
     try:
@@ -347,7 +347,9 @@ async def execute_search(
         search_meta["scan_query"] = scan_query
 
     try:
-        cached = list_cached_messages_lite(mailbox, message_cap)
+        # 过滤前扫描整份已索引缓存；max_messages 仅限制最终 evidence 数，不得把
+        # UI/旧候选上限误当作邮箱数据边界。
+        cached = list_all_cached_messages_lite(mailbox)
     except Exception as exc:
         _logger.warning("list_cached_messages_lite failed: %s", type(exc).__name__)
         if search_meta is not None:

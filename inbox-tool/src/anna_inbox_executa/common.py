@@ -42,6 +42,20 @@ def _is_platform() -> bool:
     return False
 
 
+def get_ai_sidebar_mode() -> str:
+    """返回后端默认的 AI 侧栏路径模式。
+
+    - ``host``（默认）：侧栏走 Host Agent Session（生产主路径）。
+    - ``local``：侧栏应走 ``start_ai_turn`` 本地 Router + Anna Sampling，
+      便于本地调试且不依赖平台 Agent Session / 频繁上传 Tool。
+
+    环境变量：``ANNA_INBOX_AI_SIDEBAR_MODE=local|host``。
+    前端可用 localStorage ``anna-inbox-ai-sidebar-mode`` 覆盖本默认值。
+    """
+    raw = str(os.environ.get("ANNA_INBOX_AI_SIDEBAR_MODE") or "host").strip().lower()
+    return "local" if raw == "local" else "host"
+
+
 def data_root() -> Path:
     """返回统一的数据根目录。平台模式用 CWD/.data，本地 dev 用 src/.data。"""
     if _is_platform():
@@ -75,24 +89,41 @@ CONNECTIVITY_GMAIL_ACCOUNT_TIMEOUT_SECONDS = 3.0
 # mutation 不在此列表，必须由前端显式确认后调用。
 AI_AGENT_DEFAULT_TOOLS = [
     {
-        "name": "search_email",
-        # when: 收件箱范围检索；实时 Gmail 搜索只返回轻量字段，禁止正文
+        "name": "query_mail_evidence",
         "description": (
-            "Search live Gmail with standard Gmail query syntax; never falls back to local cache. "
-            "Use for any inbox-wide claim. Local workflow filters is:todo, is:done, is:snoozed are supported with AND only. "
-            "Default fields ONLY: date, participants, subject, bodySnippet (+ THREAD_REF). "
-            "Never returns bodyFull — call read_email for full body. Each call returns at most 20 hits; repeated searches are allowed. "
-            "If Gmail fails, explain the failure to the user and try another non-cache approach."
+            "Run Scope → one QueryPlan → deterministic local-cache Evidence for a mailbox question. "
+            "Use before any read-only answer; returns evidence, sync boundary, active scope, and a template answer for exact facts. Never calls Gmail."
+        ),
+        "parameters": [
+            {"name": "user_text", "type": "string", "description": "The user's mailbox question.", "required": True},
+            {"name": "mailbox", "type": "string", "description": "Active mailbox.", "required": False},
+            {"name": "ui_context", "type": "object", "description": "Read-only current thread, selection, and list context.", "required": False},
+            {"name": "conversation_id", "type": "string", "description": "Sidebar conversation id for structured active scope.", "required": False},
+        ],
+        "timeout": 120,
+    },
+    {
+        "name": "search_email",
+        # when: 收件箱范围检索；只读本地全量缓存，禁止正文
+        "description": (
+            "Search the mailbox's local synced cache for inbox-wide claims; never calls Gmail. "
+            "Local filters is:todo/done/snoozed with AND only. "
+            "Returns date, participants, subject, bodySnippet, attachmentFilenames (+ THREAD_REF); never bodyFull. "
+            "Use order=oldest/newest for temporal extremes; at most 20 hits plus sync-boundary facts. "
+            "Display range does not limit the cache search. "
+            "If the target predates indexed coverage, explain that presence cannot be determined."
         ),
         "parameters": [
             {"name": "about", "type": "string", "description": "Gmail query keywords/fields, e.g. newer_than:7d from:alice.", "required": False},
             {"name": "filter", "type": "string", "description": "Additional Gmail or local workflow filter, e.g. is:important AND is:todo.", "required": False},
             {"name": "mailbox", "type": "string", "description": "Active mailbox from ui_context.", "required": False},
+            {"name": "display_range_days", "type": "integer", "description": "Current Inbox range: 7, 30, or 60 days.", "required": False},
             {"name": "ui_context", "type": "object", "description": "Read-only UI facts; copy mailbox.", "required": False},
             {"name": "todo_message_ids", "type": "array", "description": "Copy ui_context ids when using is:todo.", "required": False},
             {"name": "done_message_ids", "type": "array", "description": "Copy ui_context ids when using is:done.", "required": False},
             {"name": "snoozed_message_ids", "type": "array", "description": "Copy ui_context ids when using is:snoozed.", "required": False},
             {"name": "limit", "type": "integer", "description": "Max hits this call (default 12, hard cap 20).", "required": False},
+            {"name": "order", "type": "string", "description": "newest (default) or oldest; use oldest for earliest email/time.", "required": False},
             {
                 "name": "readMask",
                 "type": "array",
@@ -107,7 +138,7 @@ AI_AGENT_DEFAULT_TOOLS = [
         # when: 已有 THREAD_REF 且 snippet 不够；默认不取全文
         "description": (
             "Read ONE searched email by thread_ref. "
-            "Default readMask: date, participants, subject, bodySnippet. "
+            "Default readMask: date, participants, subject, bodySnippet; also returns attachmentFilenames when known. "
             "Request bodyFull ONLY when snippet is insufficient for the answer."
         ),
         "parameters": [
@@ -133,12 +164,17 @@ AI_AGENT_DEFAULT_TOOLS = [
     },
     {
         "name": "ai_draft_reply",
-        # when: 为当前线程写回复草稿；永不发送
-        "description": "Draft a reply for the open thread. Never sends.",
+        # when: 为当前线程写回复草稿；也可传 search 命中的 thread_ref；永不发送
+        "description": (
+            "Draft a reply for a thread. Prefer open current_thread; otherwise pass thread_ref or message_id/thread_id from search_email. Never sends."
+        ),
         "parameters": [
             {"name": "user_text", "type": "string", "description": "Draft instruction.", "required": True},
             {"name": "mailbox", "type": "string", "description": "Active mailbox.", "required": False},
-            {"name": "ui_context", "type": "object", "description": "Must include current_thread.", "required": False},
+            {"name": "ui_context", "type": "object", "description": "May include current_thread.", "required": False},
+            {"name": "thread_ref", "type": "string", "description": "THREAD_REF from search_email when drawer is closed.", "required": False},
+            {"name": "message_id", "type": "string", "description": "Target message id.", "required": False},
+            {"name": "thread_id", "type": "string", "description": "Target thread id.", "required": False},
         ],
         "timeout": 300,
     },

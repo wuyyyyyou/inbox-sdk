@@ -16,7 +16,7 @@
   "required_executas": [
     {
       "tool_id": "bundled:inbox-executa",
-      "min_version": "2.2.6",
+      "min_version": "2.2.7",
       "version": "latest"
     }
   ],
@@ -81,9 +81,7 @@
       ],
       "agent": {
         "tools": [
-          "tool_riazm4777_inbox_executa_dnsb9fqu__search_email",
-          "tool_riazm4777_inbox_executa_dnsb9fqu__read_email",
-          "tool_riazm4777_inbox_executa_dnsb9fqu__ai_summarize_thread",
+          "tool_riazm4777_inbox_executa_dnsb9fqu__query_mail_evidence",
           "tool_riazm4777_inbox_executa_dnsb9fqu__ai_draft_reply",
           "tool_riazm4777_inbox_executa_dnsb9fqu__ai_revise_draft",
           "tool_riazm4777_inbox_executa_dnsb9fqu__ai_compose_new",

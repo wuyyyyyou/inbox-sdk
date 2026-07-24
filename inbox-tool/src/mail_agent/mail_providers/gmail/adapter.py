@@ -59,7 +59,7 @@ TOKEN_URI = "https://oauth2.googleapis.com/token"
 # 绑定邮箱可防止 worker 线程复用上一邮箱的凭据；scope 外既不读也不写，避免跨 invoke 泄漏。
 _gmail_request_token: ContextVar[tuple[str, str] | None] = ContextVar("gmail_request_token", default=None)
 _gmail_request_token_scope_active: ContextVar[bool] = ContextVar("gmail_request_token_scope_active", default=False)
-_history_sync_locks: dict[str, threading.Lock] = {}
+_history_sync_locks: dict[str, threading.RLock] = {}
 _history_sync_locks_guard = threading.Lock()
 
 
@@ -460,13 +460,13 @@ def clear_mailbox_cache(mailbox: str) -> dict[str, Any]:
     }
 
 
-def _history_sync_lock(mailbox: str) -> threading.Lock:
-    """同一 Executa 进程内串行化单邮箱增量同步，避免旧快照覆盖新标签。"""
+def _history_sync_lock(mailbox: str) -> threading.RLock:
+    """同一 Executa 进程内串行化单邮箱同步，允许同步内刷新边界状态重入。"""
     normalized = normalize_mailbox(mailbox)
     with _history_sync_locks_guard:
         lock = _history_sync_locks.get(normalized)
         if lock is None:
-            lock = threading.Lock()
+            lock = threading.RLock()
             _history_sync_locks[normalized] = lock
         return lock
 
@@ -489,13 +489,25 @@ def _read_history_sync_state(mailbox: str) -> dict[str, Any]:
 
 
 def _write_history_sync_state(mailbox: str, state: dict[str, Any], *, if_match: str | None = None) -> None:
-    """同步游标只在 index 成功写入后更新，失败时保留旧 cursor 以便安全重试。"""
+    """同步游标与边界字段写入；失败时保留旧 cursor 以便安全重试。
+
+    schema v2 起除 history_id/scope_days 外还持久化 earliest/latest、
+    initial_sync_complete、backfill、watch 等字段，供 AI 诚实说明数据范围。
+    """
+    # 浅拷贝并去掉内部 etag；禁止写入凭据类键
     payload = {
-        "schema_version": 1,
-        "history_id": str(state.get("history_id") or ""),
-        "scope_days": int(state.get("scope_days") or 30),
-        "updated_at": beijing_now(),
+        str(key): value
+        for key, value in dict(state or {}).items()
+        if key not in {"_etag", "access_token", "refresh_token", "credentials"}
     }
+    payload["schema_version"] = int(payload.get("schema_version") or 2)
+    payload["history_id"] = str(payload.get("history_id") or payload.get("last_history_id") or "")
+    payload["last_history_id"] = str(payload.get("last_history_id") or payload.get("history_id") or "")
+    try:
+        payload["scope_days"] = int(payload.get("scope_days") or 180)
+    except (TypeError, ValueError):
+        payload["scope_days"] = 180
+    payload["updated_at"] = beijing_now()
     if _storage_cache_enabled():
         from ...storage.client import get_storage, scope as default_scope
         from ...storage.sync_bridge import run as run_storage_sync
@@ -515,14 +527,18 @@ def _write_history_sync_state(mailbox: str, state: dict[str, Any], *, if_match: 
 
 
 def set_cached_mailbox_history_cursor(mailbox: str, history_id: str, *, scope_days: int) -> None:
-    """在 All-mail 全量快照完成后建立 Gmail History cursor。"""
+    """在 All-mail 基线完成后建立/刷新 Gmail History cursor，保留边界字段。"""
     if not str(history_id or "").strip():
         return
     with _history_sync_lock(mailbox):
         previous = _read_history_sync_state(mailbox)
+        merged = {k: v for k, v in previous.items() if k != "_etag"}
+        merged["history_id"] = str(history_id)
+        merged["last_history_id"] = str(history_id)
+        merged["scope_days"] = int(scope_days)
         _write_history_sync_state(
             mailbox,
-            {"history_id": history_id, "scope_days": scope_days},
+            merged,
             if_match=str(previous.get("_etag") or "") or None,
         )
 
@@ -674,6 +690,19 @@ def message_summary(message: dict[str, Any]) -> dict[str, Any]:
     summary["body_length"] = len(body_text)
     summary["raw_header_count"] = len(headers)
     summary["body_cached"] = bool(message.get("_body_cached", True))
+    analysis = message.get("content_analysis") if isinstance(message.get("content_analysis"), dict) else {}
+    attachment_analysis = analysis.get("attachment_analysis") if isinstance(analysis.get("attachment_analysis"), list) else []
+    # 索引只保存派生状态与少量附件事实，不复制正文/附件文本，避免首页缓存膨胀。
+    summary["content_analysis"] = {
+        "version": int(analysis.get("version") or 0),
+        "processed_at": str(analysis.get("processed_at") or ""),
+        "body_ready": bool(analysis.get("body") or not str(message.get("body_text") or "").strip()),
+        "attachment_statuses": [
+            str(item.get("status") or "")
+            for item in attachment_analysis
+            if isinstance(item, dict)
+        ][:12],
+    }
     # 完整邮件已包含完整 MIME 树，因此即使它来自详情按需读取，写回摘要时也可
     # 视为完成了当前版本的附件扫描，避免下一轮同步把旧摘要误判为未扫描。
     if isinstance(message.get("payload"), dict):
@@ -954,6 +983,11 @@ SUMMARY_METADATA_REFRESH_SECONDS = 30 * 60
 ATTACHMENT_SCAN_VERSION = 1
 SUMMARY_FETCH_MAX_WORKERS = 20
 GMAIL_PAGE_SUMMARY_FETCH_MAX_WORKERS = 20
+# History 增量：单次 invoke 最多拉取变更摘要数，避免串行全量式 metadata 拖垮 60s Host 超时。
+HISTORY_CHANGE_FETCH_BATCH = 40
+# 单封变更摘要 HTTP 预算；超时后本轮不推进 cursor，下一次从同一 cursor 重试。
+HISTORY_SUMMARY_TIMEOUT_SECONDS = 20.0
+HISTORY_LIST_TIMEOUT_SECONDS = 30.0
 CACHED_FEED_PAGE_SIZE = 100
 HOME_FEED_SNIPPET_MAX_CHARS = 120
 HOME_FEED_BODY_PREVIEW_MAX_CHARS = 120
@@ -1519,8 +1553,10 @@ def gmail_request(
     *,
     access_token: str | None = None,
     request_timeout_seconds: float | None = None,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """向 Gmail REST API 发起 GET。
+    """向 Gmail REST API 发起请求（默认 GET；Watch 等场景可 POST JSON body）。
 
     未显式传入 access_token 时，若收到 HTTP 401，会清空当前 ContextVar 中的短期
     token、force_refresh 换票后仅重试一次；调用方显式传入 token 时不自动换票。
@@ -1532,18 +1568,18 @@ def gmail_request(
         request_timeout = min(60.0, max(0.1, float(request_timeout_seconds)))
     except (TypeError, ValueError):
         request_timeout = 60.0
+    http_method = str(method or "GET").upper()
+    if http_method not in {"GET", "POST"}:
+        raise ValueError(f"Unsupported Gmail HTTP method: {http_method}")
     retried_auth = False
     endpoint = _gmail_endpoint_kind(path)
     normalized_mailbox = str(mailbox or "").strip().lower()
     while True:
         # 仅在活跃 scope 且邮箱匹配时复用；401 重试时强制换票。
         scoped_token = None if retried_auth else _scoped_gmail_token_for_mailbox(normalized_mailbox)
-        token = access_token or scoped_token or get_access_token(
-            mailbox,
-            force_refresh=retried_auth,
-            platform_token_timeout_seconds=request_timeout,
-            token_refresh_timeout_seconds=request_timeout,
-        )
+        # 搜索链的短预算仅约束 Gmail HTTP。Connected Accounts 的 getToken 是独立
+        # reverse-RPC，平台偶发排队会超过十秒；沿用其正常预算，不能误报 Gmail 搜索失败。
+        token = access_token or scoped_token or get_access_token(mailbox, force_refresh=retried_auth)
         # 第一个 Gmail 请求取得 token 后写入当前受限上下文，后续同批请求及复制出的
         # 摘要 worker 都可复用；外层 scope 退出时会恢复，不会残留在进程全局状态。
         # 401 自愈成功后也要写回，避免同批后续请求继续使用失效票。
@@ -1553,10 +1589,16 @@ def gmail_request(
         url = GMAIL_API_BASE + path
         if query:
             url += "?" + urllib.parse.urlencode(query, doseq=True)
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        data = None
+        if http_method == "POST":
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body or {}, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             url,
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-            method="GET",
+            data=data,
+            headers=headers,
+            method=http_method,
         )
         started = time.monotonic()
         try:
@@ -2011,9 +2053,9 @@ def _decode_body(message: dict[str, Any]) -> str:
 def _extract_attachments(part: dict[str, Any]) -> list[dict[str, Any]]:
     """提取真正的下载附件，排除正文中的 inline/CID 资源。
 
-    Gmail 的 inline 图片也可能带 filename（例如 icon.png），不能仅凭
-    filename 判断附件。Content-Disposition 是邮件客户端显示附件与否的
-    主要语义；没有该头时，带 Content-ID 的图片也按正文资源处理。
+    Gmail 的正文 CID 图片也可能带 filename，部分退信模板甚至将其标记为
+    Content-Disposition: attachment。图片型 Content-ID 用于 HTML 的 cid: 引用，
+    必须优先按正文资源处理，不能显示为下载附件。
     """
     attachments: list[dict[str, Any]] = []
 
@@ -2029,7 +2071,7 @@ def _extract_attachments(part: dict[str, Any]) -> list[dict[str, Any]]:
         disposition = header_map.get("content-disposition", "").split(";", 1)[0].strip().lower()
         content_id = header_map.get("content-id", "").strip()
         is_inline_resource = disposition == "inline" or (
-            not disposition and content_id and str(node.get("mimeType") or "").lower().startswith("image/")
+            bool(content_id) and str(node.get("mimeType") or "").lower().startswith("image/")
         )
         if filename and not is_inline_resource:
             attachments.append({
@@ -2049,7 +2091,7 @@ def _extract_attachments(part: dict[str, Any]) -> list[dict[str, Any]]:
 def _normalize_message(mailbox: str, message: dict[str, Any]) -> dict[str, Any]:
     headers = _header_map(message)
     payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
-    return {
+    normalized = {
         "id": message.get("id"),
         "thread_id": message.get("threadId"),
         "mailbox": mailbox,
@@ -2074,6 +2116,24 @@ def _normalize_message(mailbox: str, message: dict[str, Any]) -> dict[str, Any]:
         "payload": payload,
         "fetched_at": beijing_now(),
     }
+    # 完整邮件进入缓存时立即生成正文/引用/签名等派生字段；附件字节下载由
+    # 后台预处理任务处理，不能拖慢单封详情或线程刷新。
+    try:
+        from mail_agent.content_preprocess import preprocess_message
+
+        preprocess_message(normalized)
+    except Exception as exc:
+        normalized["content_analysis"] = {
+            "version": 1,
+            "status": f"preprocess_error:{type(exc).__name__}",
+            "body": str(normalized.get("body_text") or "")[:_BODY_TEXT_LIMIT],
+            "quoted_text": "",
+            "signature": "",
+            "contacts": [],
+            "body_invoice_facts": [],
+            "attachment_analysis": [],
+        }
+    return normalized
 
 
 # ── Gmail live search ─────────────────────────────────────────────
@@ -2091,7 +2151,9 @@ def search_gmail(
     target = max(1, min(int(max_results or 100), 500))
     message_ids: list[str] = []
     page_token = ""
+    page_number = 0
     while len(message_ids) < target:
+        page_number += 1
         params: dict[str, Any] = {
             "q": query,
             "maxResults": min(100, target - len(message_ids)),
@@ -2106,10 +2168,24 @@ def search_gmail(
             if request_timeout_seconds is not None:
                 request_kwargs["request_timeout_seconds"] = request_timeout_seconds
             payload = gmail_request(mailbox, "/users/me/messages", params, **request_kwargs)
-        except ValueError as exc:
+        except Exception as exc:
+            # 日志只保留可诊断的传输元数据，禁止记录邮箱、Gmail q、邮件内容或凭据。
+            status = exc.status_code if isinstance(exc, GmailApiError) else None
+            logging.getLogger("mail_agent.gmail").error(
+                "gmail_search_failed stage=messages_list error_type=%s http_status=%s "
+                "timeout_seconds=%s page=%s requested=%s received=%s has_page_token=%s",
+                type(exc).__name__,
+                status if status is not None else "none",
+                request_timeout_seconds if request_timeout_seconds is not None else 60,
+                page_number,
+                target,
+                len(message_ids),
+                bool(page_token),
+            )
             if strict:
-                raise RuntimeError("Gmail search request failed") from exc
-            logging.getLogger("mail_agent.gmail").warning("search_gmail failed for %s: %s", mailbox, exc)
+                status_code = status or 0
+                suffix = f" HTTP {status_code}" if status_code else f" {type(exc).__name__}"
+                raise RuntimeError(f"Gmail search request failed:{suffix}") from exc
             return message_ids
         refs = payload.get("messages") if isinstance(payload, dict) else []
         for ref in refs or []:
@@ -2153,12 +2229,14 @@ def list_threads_page(
 
 
 def fetch_thread_full(mailbox: str, thread_id: str) -> dict[str, Any]:
-    """Fetch the full Gmail thread with all messages."""
+    """读取完整 Gmail thread（含正文、附件 filename/MIME），供显式详情与回复取证。"""
     import urllib.parse as _up
     return gmail_request(
         mailbox,
         f"/users/me/threads/{_up.quote(str(thread_id), safe='')}",
-        {"format": "full", "fields": "messages(id,threadId,historyId,labelIds,internalDate,payload(parts,headers,body,mimeType),snippet)"},
+        # 不使用原先缺 filename 的 partial fields：线程刷新必须保留附件名，且这条
+        # 路径仅由用户显式打开/回复线程触发。
+        {"format": "full"},
     )
 
 
@@ -2186,6 +2264,79 @@ def fetch_and_cache_message(mailbox: str, message_id: str) -> dict[str, Any] | N
     return normalized
 
 
+def preprocess_cached_content_batch(mailbox: str, *, limit: int = 4) -> dict[str, Any]:
+    """后台补齐少量正文与附件派生内容，不把大附件字节写入缓存。
+
+    每次只处理有限邮件，供同步后台线程反复调用。未缓存全文的邮件先按需拉取
+    Gmail full message；随后正文清洗、签名联系人与受限附件解析写回 message 文件。
+    """
+    from mail_agent.content_preprocess import preprocess_message
+
+    normalized = normalize_mailbox(mailbox)
+    try:
+        cap = max(1, min(int(limit), 12))
+    except (TypeError, ValueError):
+        cap = 4
+    summaries = [item for item in list_messages(normalized) if isinstance(item, dict)]
+    processed = 0
+    skipped = 0
+    changed_summaries: dict[str, dict[str, Any]] = {}
+    for summary in summaries:
+        if processed >= cap:
+            break
+        message_id = str(summary.get("id") or "")
+        if not message_id:
+            continue
+        try:
+            message = read_message(normalized, message_id)
+        except Exception:
+            message = fetch_and_cache_message(normalized, message_id)
+        if not isinstance(message, dict):
+            skipped += 1
+            continue
+        existing = message.get("content_analysis") if isinstance(message.get("content_analysis"), dict) else {}
+        attachment_analysis = existing.get("attachment_analysis") if isinstance(existing.get("attachment_analysis"), list) else []
+        attachment_count = len(message.get("attachments") or []) if isinstance(message.get("attachments"), list) else 0
+        if existing.get("body") and attachment_count == len(attachment_analysis):
+            skipped += 1
+            continue
+
+        def _fetch(attachment_id: str) -> bytes:
+            return fetch_attachment_bytes(normalized, message_id, attachment_id)
+
+        preprocess_message(message, fetch_attachment=_fetch)
+        write_message(normalized, message)
+        changed_summaries[message_id] = message_summary(message)
+        processed += 1
+
+    if changed_summaries:
+        cache = read_cache(normalized)
+        merged = []
+        for item in cache.get("messages") or []:
+            if not isinstance(item, dict):
+                continue
+            merged.append(changed_summaries.get(str(item.get("id") or ""), item))
+        write_index(normalized, merged)
+    indexed = [item for item in list_messages(normalized) if isinstance(item, dict)]
+    pending = 0
+    attachment_pending = 0
+    for item in indexed:
+        analysis = item.get("content_analysis") if isinstance(item.get("content_analysis"), dict) else {}
+        if not bool(analysis.get("body_ready")):
+            pending += 1
+        statuses = analysis.get("attachment_statuses") if isinstance(analysis.get("attachment_statuses"), list) else []
+        attachment_count = len(item.get("attachments") or []) if isinstance(item.get("attachments"), list) else 0
+        if attachment_count and len(statuses) < attachment_count:
+            attachment_pending += 1
+    return {
+        "mailbox": normalized,
+        "processed": processed,
+        "skipped": skipped,
+        "body_pending": pending,
+        "attachment_pending": attachment_pending,
+    }
+
+
 def _summary_mime_fields() -> str:
     """构造首次扫描使用的有限层 MIME 字段选择，明确排除 body.data。
 
@@ -2194,9 +2345,11 @@ def _summary_mime_fields() -> str:
     不会把正文或附件字节放进同步响应。六层可覆盖常见的 mixed/alternative/related
     嵌套；真正的字节仍仅在用户预览或下载时按需获取。
     """
-    part_fields = "mimeType,filename,body(attachmentId,size)"
+    # CID 和 disposition 位于每个 MIME part 的 headers。首次同步若只读取根节点
+    # 信头，嵌套的正文图片会因丢失 inline 语义而被错误写入附件列表。
+    part_fields = "mimeType,filename,headers(name,value),body(attachmentId,size)"
     for _ in range(6):
-        part_fields = f"mimeType,filename,body(attachmentId,size),parts({part_fields})"
+        part_fields = f"mimeType,filename,headers(name,value),body(attachmentId,size),parts({part_fields})"
     return f"payload(headers(name,value),{part_fields})"
 
 
@@ -2359,19 +2512,178 @@ def _delete_cached_message(mailbox: str, message_id: str) -> None:
         path.unlink()
 
 
+def _history_record_message_ids(item: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """从单条 History 记录提取变更/删除 message id。"""
+    changed_ids: set[str] = set()
+    deleted_ids: set[str] = set()
+    for key in ("messagesAdded", "labelsAdded", "labelsRemoved"):
+        for entry in item.get(key) or []:
+            message = entry.get("message") if isinstance(entry, dict) else {}
+            message_id = str(message.get("id") or "") if isinstance(message, dict) else ""
+            if message_id:
+                changed_ids.add(message_id)
+    for entry in item.get("messagesDeleted") or []:
+        message = entry.get("message") if isinstance(entry, dict) else {}
+        message_id = str(message.get("id") or "") if isinstance(message, dict) else ""
+        if message_id:
+            deleted_ids.add(message_id)
+    # 同条记录内删除优先于变更（Gmail 可能同时出现，以删除为准）
+    changed_ids -= deleted_ids
+    return changed_ids, deleted_ids
+
+
+def _merge_history_message_summary(existing: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
+    """合并 Gmail 权威 metadata，保留本地更完整的附件/正文/原主题字段。"""
+    merged = {**existing, **summary}
+    existing_atts = existing.get("attachments") if isinstance(existing.get("attachments"), list) else []
+    summary_atts = summary.get("attachments") if isinstance(summary.get("attachments"), list) else []
+    if existing_atts and (not summary_atts or len(existing_atts) > len(summary_atts)):
+        merged["attachments"] = existing_atts
+    if existing.get("body_cached") and not summary.get("body_cached"):
+        merged["body_cached"] = True
+    if existing.get("original_subject") and not summary.get("original_subject"):
+        merged["original_subject"] = existing.get("original_subject")
+    return merged
+
+
+def _fetch_history_message_summary(
+    mailbox: str,
+    message_id: str,
+    *,
+    access_token: str | None = None,
+) -> dict[str, Any] | None:
+    """拉取单封 History 变更摘要；网络超时重试一次，404 返回 None。"""
+    last_error: BaseException | None = None
+    for attempt in range(2):
+        try:
+            return fetch_message_summary(
+                mailbox,
+                message_id,
+                access_token=access_token,
+                strict=True,
+                request_timeout_seconds=HISTORY_SUMMARY_TIMEOUT_SECONDS,
+            )
+        except GmailApiError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        except (TimeoutError, OSError, urllib.error.URLError) as exc:
+            last_error = exc
+            logging.getLogger("mail_agent.gmail").warning(
+                "history summary timeout/network error attempt=%s error_type=%s",
+                attempt + 1,
+                type(exc).__name__,
+            )
+            continue
+    if last_error is not None:
+        raise last_error
+    return None
+
+
 def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
     """用 Gmail History API 增量合并第三方客户端产生的邮件状态变化。
 
-    此函数只读取 Gmail 并更新本邮箱缓存。任意 History 或 metadata 请求失败时
-    不写新 cursor，下一次会从同一个已确认 cursor 重试，不能把半同步状态标为成功。
+    此函数只读取 Gmail 并更新本邮箱缓存。History 列表或变更摘要失败时不写新
+    cursor，下一次从同一已确认 cursor 重试。变更量大时按 history 记录顺序分批
+    处理（每批最多 HISTORY_CHANGE_FETCH_BATCH 封），成功批推进到最后完整处理的
+    history 记录 id，避免一次 invoke 串行拉完全部变更而触发 Host/HTTP 超时。
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     normalized = normalize_mailbox(mailbox)
     with _history_sync_lock(normalized):
         state = _read_history_sync_state(normalized)
-        start_history_id = str(state.get("history_id") or "")
+        start_history_id = str(state.get("history_id") or state.get("last_history_id") or "")
         cache = read_cache(normalized)
         cached_messages = cache.get("messages") if isinstance(cache.get("messages"), list) else []
-        if not start_history_id or not cached_messages:
+        if not cached_messages:
+            return {
+                "mailbox": normalized,
+                "mode": "baseline_required",
+                "added": 0,
+                "updated": 0,
+                "deleted": 0,
+                "cache_total": 0,
+                "resync_required": True,
+                "resync_reason": "cursor_missing",
+                "updated_at": beijing_now(),
+            }
+        # 本地已有 180 天基线但 cursor 丢失时：用 profile.historyId 重新锚定，
+        # 禁止再走 messages.list 全量扫描（会像「重新同步全部 Gmail」）。
+        if not start_history_id:
+            try:
+                profile = gmail_request(
+                    normalized,
+                    "/users/me/profile",
+                    {"fields": "historyId"},
+                    request_timeout_seconds=HISTORY_LIST_TIMEOUT_SECONDS,
+                )
+                seeded = str(profile.get("historyId") or "")
+            except (GmailApiError, TimeoutError, OSError, urllib.error.URLError, ValueError) as exc:
+                logging.getLogger("mail_agent.gmail").warning(
+                    "history cursor seed failed error_type=%s",
+                    type(exc).__name__,
+                )
+                seeded = ""
+            if seeded:
+                # 锚定当前 historyId 会丢掉「cursor 丢失窗口」内的变更；仅补最近 2 天
+                # metadata，避免 messages.list 扫完整 180 天。
+                catchup_ids: list[str] = []
+                try:
+                    catchup_ids = live_search_metadata_and_cache(
+                        normalized,
+                        "in:anywhere -in:chats newer_than:2d",
+                        max_results=80,
+                        request_timeout_seconds=HISTORY_SUMMARY_TIMEOUT_SECONDS,
+                    )
+                except Exception as exc:
+                    logging.getLogger("mail_agent.gmail").warning(
+                        "history cursor seed catch-up failed error_type=%s",
+                        type(exc).__name__,
+                    )
+                try:
+                    from .mailbox_sync import refresh_boundary_from_cache
+
+                    refresh_boundary_from_cache(
+                        normalized,
+                        extra={
+                            "history_id": seeded,
+                            "last_history_id": seeded,
+                            "scope_days": int(state.get("scope_days") or 180),
+                            "initial_sync_complete": bool(state.get("initial_sync_complete", True)),
+                            "backfill_complete": bool(state.get("backfill_complete")),
+                            "body_sync_complete": bool(state.get("body_sync_complete")),
+                            "attachment_sync_complete": bool(state.get("attachment_sync_complete")),
+                            "configured_sync_range": state.get("configured_sync_range"),
+                            "watch_status": state.get("watch_status"),
+                            "watch_expiration": state.get("watch_expiration"),
+                            "watch_resource_id": state.get("watch_resource_id"),
+                        },
+                    )
+                except Exception:
+                    _write_history_sync_state(
+                        normalized,
+                        {
+                            **{k: v for k, v in state.items() if k != "_etag"},
+                            "history_id": seeded,
+                            "last_history_id": seeded,
+                            "scope_days": int(state.get("scope_days") or 180),
+                        },
+                        if_match=str(state.get("_etag") or "") or None,
+                    )
+                refreshed = read_cache(normalized)
+                refreshed_messages = refreshed.get("messages") if isinstance(refreshed.get("messages"), list) else cached_messages
+                return {
+                    "mailbox": normalized,
+                    "mode": "history_cursor_seeded",
+                    "history_id": seeded,
+                    "added": 0,
+                    "updated": len(catchup_ids),
+                    "deleted": 0,
+                    "cache_total": len(refreshed_messages),
+                    "resync_required": False,
+                    "updated_at": beijing_now(),
+                }
             return {
                 "mailbox": normalized,
                 "mode": "baseline_required",
@@ -2406,8 +2718,10 @@ def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
         changed_ids: set[str] = set()
         deleted_ids: set[str] = set()
         page_token = ""
-        final_history_id = ""
+        mailbox_history_id = ""
+        last_processed_history_id = ""
         pages = 0
+        truncated = False
         try:
             while True:
                 pages += 1
@@ -2420,27 +2734,43 @@ def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
                 }
                 if page_token:
                     params["pageToken"] = page_token
-                payload = gmail_request(normalized, "/users/me/history", params)
-                final_history_id = str(payload.get("historyId") or final_history_id)
+                payload = gmail_request(
+                    normalized,
+                    "/users/me/history",
+                    params,
+                    request_timeout_seconds=HISTORY_LIST_TIMEOUT_SECONDS,
+                )
+                mailbox_history_id = str(payload.get("historyId") or mailbox_history_id)
                 history_items = payload.get("history") if isinstance(payload.get("history"), list) else []
+                stop_page = False
                 for item in history_items:
                     if not isinstance(item, dict):
                         continue
-                    for key in ("messagesAdded", "labelsAdded", "labelsRemoved"):
-                        for entry in item.get(key) or []:
-                            message = entry.get("message") if isinstance(entry, dict) else {}
-                            message_id = str(message.get("id") or "") if isinstance(message, dict) else ""
-                            if message_id:
-                                changed_ids.add(message_id)
-                                deleted_ids.discard(message_id)
-                    for entry in item.get("messagesDeleted") or []:
-                        message = entry.get("message") if isinstance(entry, dict) else {}
-                        message_id = str(message.get("id") or "") if isinstance(message, dict) else ""
-                        if message_id:
-                            deleted_ids.add(message_id)
-                            changed_ids.discard(message_id)
+                    record_id = str(item.get("id") or "")
+                    rec_changed, rec_deleted = _history_record_message_ids(item)
+                    # 预估并入后的待拉摘要规模；已有待处理变更且会超批则本记录留给下轮
+                    projected_changed = set(changed_ids)
+                    projected_deleted = set(deleted_ids)
+                    projected_changed |= rec_changed
+                    projected_changed -= rec_deleted
+                    projected_deleted |= rec_deleted
+                    projected_deleted -= rec_changed
+                    if changed_ids and len(projected_changed) > HISTORY_CHANGE_FETCH_BATCH:
+                        truncated = True
+                        stop_page = True
+                        break
+                    changed_ids = projected_changed
+                    deleted_ids = projected_deleted
+                    if record_id:
+                        last_processed_history_id = record_id
+                if stop_page:
+                    break
                 page_token = str(payload.get("nextPageToken") or "")
                 if not page_token:
+                    break
+                # 本批摘要已达上限时不再继续翻页，cursor 停在已完整处理的记录
+                if len(changed_ids) >= HISTORY_CHANGE_FETCH_BATCH:
+                    truncated = True
                     break
         except GmailApiError as exc:
             if exc.status_code == 404:
@@ -2456,6 +2786,23 @@ def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
                     "updated_at": beijing_now(),
                 }
             raise
+        except (TimeoutError, OSError, urllib.error.URLError) as exc:
+            # 网络抖动不应炸成 internal error，也不推进 cursor。
+            logging.getLogger("mail_agent.gmail").warning(
+                "history.list network failure error_type=%s",
+                type(exc).__name__,
+            )
+            return {
+                "mailbox": normalized,
+                "mode": "history_retry",
+                "added": 0,
+                "updated": 0,
+                "deleted": 0,
+                "cache_total": len(cached_messages),
+                "resync_required": False,
+                "retry_reason": type(exc).__name__,
+                "updated_at": beijing_now(),
+            }
 
         by_id = {
             str(item.get("id") or ""): dict(item)
@@ -2464,34 +2811,67 @@ def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
         }
         added = 0
         updated = 0
-        for message_id in sorted(changed_ids):
+        if changed_ids:
+            # 一批变更共用一次 Connected Accounts token，并行拉摘要（与 priority 基线一致）
+            access_token = get_access_token(normalized)
+            summaries_by_id: dict[str, dict[str, Any]] = {}
+            vanished_ids: set[str] = set()
             try:
-                summary = fetch_message_summary(normalized, message_id, strict=True)
-            except GmailApiError as exc:
-                if exc.status_code == 404:
-                    deleted_ids.add(message_id)
-                    continue
-                raise
-            if not summary:
-                raise RuntimeError(f"Gmail returned no metadata for changed message {message_id}")
-            if message_id in by_id:
-                # 合并 Gmail 权威 metadata，但不得用更浅的附件列表覆盖更完整缓存，
-                # 也不得把已有 body_cached 误标成 False（正文可能仍在 message cache 中）。
-                existing = by_id[message_id]
-                merged = {**existing, **summary}
-                existing_atts = existing.get("attachments") if isinstance(existing.get("attachments"), list) else []
-                summary_atts = summary.get("attachments") if isinstance(summary.get("attachments"), list) else []
-                if existing_atts and (not summary_atts or len(existing_atts) > len(summary_atts)):
-                    merged["attachments"] = existing_atts
-                if existing.get("body_cached") and not summary.get("body_cached"):
-                    merged["body_cached"] = True
-                if existing.get("original_subject") and not summary.get("original_subject"):
-                    merged["original_subject"] = existing.get("original_subject")
-                by_id[message_id] = merged
-                updated += 1
-            else:
-                by_id[message_id] = summary
-                added += 1
+                with _gmail_request_token_scope(access_token, mailbox=normalized):
+                    worker_context = copy_context()
+                    with ThreadPoolExecutor(
+                        max_workers=min(SUMMARY_FETCH_MAX_WORKERS, max(1, len(changed_ids)))
+                    ) as pool:
+                        futures = {
+                            pool.submit(
+                                worker_context.copy().run,
+                                _fetch_history_message_summary,
+                                normalized,
+                                message_id,
+                                access_token=access_token,
+                            ): message_id
+                            for message_id in sorted(changed_ids)
+                        }
+                        for future in as_completed(futures):
+                            message_id = futures[future]
+                            try:
+                                summary = future.result()
+                            except GmailApiError as exc:
+                                if exc.status_code == 404:
+                                    vanished_ids.add(message_id)
+                                    continue
+                                raise
+                            if summary is None:
+                                vanished_ids.add(message_id)
+                                continue
+                            summaries_by_id[str(summary.get("id") or message_id)] = summary
+            except (TimeoutError, OSError, urllib.error.URLError, RuntimeError) as exc:
+                logging.getLogger("mail_agent.gmail").warning(
+                    "history summary batch failed error_type=%s changed=%s",
+                    type(exc).__name__,
+                    len(changed_ids),
+                )
+                return {
+                    "mailbox": normalized,
+                    "mode": "history_retry",
+                    "added": 0,
+                    "updated": 0,
+                    "deleted": 0,
+                    "cache_total": len(cached_messages),
+                    "resync_required": False,
+                    "retry_reason": type(exc).__name__,
+                    "pending_changes": len(changed_ids),
+                    "updated_at": beijing_now(),
+                }
+
+            deleted_ids |= vanished_ids
+            for message_id, summary in summaries_by_id.items():
+                if message_id in by_id:
+                    by_id[message_id] = _merge_history_message_summary(by_id[message_id], summary)
+                    updated += 1
+                else:
+                    by_id[message_id] = summary
+                    added += 1
 
         for message_id in deleted_ids:
             by_id.pop(message_id, None)
@@ -2502,20 +2882,59 @@ def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
         write_index(normalized, merged)
         if len(_aps_cache_errors) != cache_error_count:
             raise RuntimeError("Gmail cache index write failed; History cursor was not advanced")
-        _write_history_sync_state(normalized, {
-            "history_id": final_history_id or start_history_id,
-            "scope_days": int(state.get("scope_days") or 30),
-        }, if_match=str(state.get("_etag") or "") or None)
+        # 未截断：推进到邮箱当前 historyId；截断：仅推进到本批完整处理的最后一条记录 id
+        if truncated and last_processed_history_id:
+            next_history_id = last_processed_history_id
+            mode = "history_partial"
+        else:
+            next_history_id = mailbox_history_id or last_processed_history_id or start_history_id
+            mode = "history"
+        # History 成功后刷新 cursor，并重算 earliest/latest 边界（保留其它同步字段）
+        try:
+            from .mailbox_sync import refresh_boundary_from_cache
+
+            refresh_boundary_from_cache(
+                normalized,
+                extra={
+                    "history_id": next_history_id,
+                    "last_history_id": next_history_id,
+                    "scope_days": int(state.get("scope_days") or 180),
+                    "initial_sync_complete": bool(state.get("initial_sync_complete", True)),
+                    "backfill_complete": bool(state.get("backfill_complete")),
+                    "body_sync_complete": bool(state.get("body_sync_complete")),
+                    "attachment_sync_complete": bool(state.get("attachment_sync_complete")),
+                    "configured_sync_range": state.get("configured_sync_range"),
+                    "watch_status": state.get("watch_status"),
+                    "watch_expiration": state.get("watch_expiration"),
+                    "watch_resource_id": state.get("watch_resource_id"),
+                },
+            )
+        except Exception:
+            _write_history_sync_state(normalized, {
+                **{k: v for k, v in state.items() if k != "_etag"},
+                "history_id": next_history_id,
+                "last_history_id": next_history_id,
+                "scope_days": int(state.get("scope_days") or 180),
+            }, if_match=str(state.get("_etag") or "") or None)
+        boundary: dict[str, Any] = {}
+        try:
+            from .mailbox_sync import get_mailbox_sync_boundary
+
+            boundary = get_mailbox_sync_boundary(normalized)
+        except Exception:
+            boundary = {}
         return {
             "mailbox": normalized,
-            "mode": "history",
-            "history_id": final_history_id or start_history_id,
+            "mode": mode,
+            "history_id": next_history_id,
             "added": added,
             "updated": updated,
             "deleted": len(deleted_ids),
             "cache_total": len(merged),
             "resync_required": False,
+            "has_more": truncated,
             "updated_at": beijing_now(),
+            "boundary": boundary,
         }
 
 
@@ -2527,6 +2946,19 @@ def refresh_thread_cache(mailbox: str, thread_id: str) -> list[dict[str, Any]]:
     normalized_msgs: list[dict[str, Any]] = []
     for msg in raw_msgs:
         n = _normalize_message(normalized_mailbox, msg)
+        # 用户显式打开/回复整个线程时，同步补齐该线程附件的派生文本与事实；附件
+        # 字节不会持久化，超限/待平台 OCR 会在 analysis.status 中保留真实状态。
+        try:
+            from mail_agent.content_preprocess import preprocess_message
+
+            current_message_id = str(n.get("id") or "")
+
+            def _fetch(attachment_id: str) -> bytes:
+                return fetch_attachment_bytes(normalized_mailbox, current_message_id, attachment_id)
+
+            preprocess_message(n, fetch_attachment=_fetch)
+        except Exception:
+            pass
         write_message(normalized_mailbox, n)
         normalized_msgs.append(n)
 
@@ -2777,6 +3209,17 @@ def list_cached_messages_lite(mailbox: str, limit: int = 200) -> list[MessageLit
     messages = list_messages(mailbox)
     messages.sort(key=lambda item: int(item.get("internal_date") or 0), reverse=True)
     return [_to_message_lite(message) for message in messages[:bounded_limit] if isinstance(message, dict)]
+
+
+def list_all_cached_messages_lite(mailbox: str) -> list[MessageLite]:
+    """读取某邮箱全部缓存摘要，不触发 Gmail API，也不施加展示/候选条数上限。
+
+    AI 的本地取证必须扫描完整已索引集；调用方仍应在过滤后的 evidence 输出端
+    施加自己的结果上限，避免把整份邮箱内容传给模型。
+    """
+    messages = [item for item in list_messages(mailbox) if isinstance(item, dict)]
+    messages.sort(key=lambda item: int(item.get("internal_date") or 0), reverse=True)
+    return [_to_message_lite(message) for message in messages]
 
 
 async def get_messages_lite_async(mailbox: str, message_ids: list[str]) -> list[MessageLite]:

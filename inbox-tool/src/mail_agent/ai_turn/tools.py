@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any
@@ -20,6 +21,8 @@ _BODY_LIMIT = 2000
 _DRAFT_LIMIT = 8000
 # 批量写稿上限：控制 Sampling 次数与前端展示体积
 _BATCH_MAX_THREADS = 5
+_THREAD_EVIDENCE_LIMIT = 32_000
+_THREAD_MESSAGE_BODY_LIMIT = 5_000
 
 
 def _uses_chinese(text: str) -> bool:
@@ -37,32 +40,92 @@ def _last_draft_body(ui_context: dict[str, Any]) -> str:
 
 
 async def _load_thread_excerpt(mailbox: str, message_id: str, thread_id: str) -> dict[str, Any]:
-    """读取线程摘录供写稿使用。"""
-    from mail_agent.mail_providers.gmail.adapter import get_message_detail, normalize_mailbox
+    """读取完整线程证据供写稿；显式回复操作允许刷新 Gmail thread。
+
+    不再只拿当前邮件或最近四封。每封邮件优先使用后台已清洗的 ``content_analysis``
+    正文，并附带附件解析事实。超过模型输入预算时显式标记 partial，避免声称已读完。
+    """
+    from mail_agent.mail_providers.gmail.adapter import (
+        list_messages,
+        normalize_mailbox,
+        read_message,
+        refresh_thread_cache,
+    )
 
     mailbox = normalize_mailbox(mailbox)
-    subject = ""
-    snippet = ""
-    body = ""
-    from_addr = ""
-    if message_id:
+    resolved_thread_id = thread_id or message_id
+    refresh_error = ""
+    if resolved_thread_id:
         try:
-            detail = get_message_detail(mailbox, message_id)
-            if detail:
-                subject = str(getattr(detail, "subject", "") or "")
-                snippet = str(getattr(detail, "snippet", "") or "")
-                body = (getattr(detail, "body_text", "") or "")[:_BODY_LIMIT]
-                from_addr = str(getattr(detail, "from_addr", "") or getattr(detail, "from", "") or "")
+            await asyncio.to_thread(refresh_thread_cache, mailbox, resolved_thread_id)
+        except Exception as exc:
+            # 已缓存邮件仍可作为证据，但必须把刷新失败状态带给最终提示。
+            refresh_error = type(exc).__name__
+
+    rows = [
+        item for item in list_messages(mailbox)
+        if isinstance(item, dict) and str(item.get("thread_id") or "") == resolved_thread_id
+    ]
+    rows.sort(key=lambda item: int(item.get("internal_date") or 0))
+    subject = ""
+    from_addr = ""
+    snippet = ""
+    parts: list[str] = []
+    included = 0
+    total_chars = 0
+    partial = False
+    for index, row in enumerate(rows, start=1):
+        cached = row
+        try:
+            cached = read_message(mailbox, str(row.get("id") or ""))
         except Exception:
             pass
+        analysis = cached.get("content_analysis") if isinstance(cached.get("content_analysis"), dict) else {}
+        clean_body = str(analysis.get("body") or cached.get("body_text") or cached.get("snippet") or "").strip()
+        clean_body = clean_body[:_THREAD_MESSAGE_BODY_LIMIT]
+        attachment_facts = analysis.get("attachment_analysis") if isinstance(analysis.get("attachment_analysis"), list) else []
+        attachment_lines = []
+        for attachment in attachment_facts[:6]:
+            if not isinstance(attachment, dict):
+                continue
+            filename = str(attachment.get("filename") or "attachment")[:160]
+            facts = attachment.get("facts") if isinstance(attachment.get("facts"), list) else []
+            if facts:
+                attachment_lines.append(f"Attachment {filename}: {facts}")
+        block = (
+            f"[Message {index}]\n"
+            f"Date: {str(cached.get('date') or cached.get('internal_date') or '')[:80]}\n"
+            f"From: {str(cached.get('from') or '')[:180]}\n"
+            f"To: {str(cached.get('to') or '')[:180]}\n"
+            f"Subject: {str(cached.get('subject') or '')[:180]}\n"
+            f"Body:\n{clean_body or '(no cached body)'}"
+        )
+        if attachment_lines:
+            block += "\n" + "\n".join(attachment_lines)
+        if total_chars + len(block) > _THREAD_EVIDENCE_LIMIT:
+            remaining = max(0, _THREAD_EVIDENCE_LIMIT - total_chars)
+            if remaining > 300:
+                parts.append(block[:remaining] + "\n[thread evidence truncated]")
+            partial = True
+            break
+        parts.append(block)
+        total_chars += len(block)
+        included += 1
+        subject = str(cached.get("subject") or subject)
+        from_addr = str(cached.get("from") or from_addr)
+        snippet = str(cached.get("snippet") or snippet)
     return {
         "mailbox": mailbox,
         "message_id": message_id,
-        "thread_id": thread_id or message_id,
+        "thread_id": resolved_thread_id,
         "subject": subject,
         "snippet": snippet,
-        "body": body,
+        "body": "\n\n---\n\n".join(parts),
         "from_addr": from_addr,
+        "thread_message_count": len(rows),
+        "thread_messages_included": included,
+        "thread_evidence_partial": partial,
+        "thread_refresh_error": refresh_error,
     }
 
 
@@ -92,6 +155,7 @@ async def tool_draft_reply(
     subject = excerpt["subject"] or str(current.get("subject") or "")
     body = excerpt["body"] or str(current.get("snippet") or "")
     summarize_first = mode == "summarize_then_draft"
+    composer_mode = "forward" if mode == "draft_forward" else "reply"
 
     fallback_text = (
         f"已根据「{subject or '当前邮件'}」准备草稿，请核对后发送。"
@@ -113,6 +177,8 @@ async def tool_draft_reply(
                 "thread_id": thread_id,
                 "body": draft_body,
                 "source_prompt": user_text,
+                "composer_mode": composer_mode,
+                "subject": subject,
             },
             "mail_context": {
                 "kind": "thread",
@@ -131,7 +197,9 @@ async def tool_draft_reply(
         f"Mode: {mode}\n"
         f"Subject: {subject}\n"
         f"From: {excerpt.get('from_addr') or ''}\n"
-        f"Body excerpt:\n{body or '(empty)'}\n"
+        f"Thread coverage: {excerpt.get('thread_messages_included', 0)}/{excerpt.get('thread_message_count', 0)} messages; "
+        f"partial={bool(excerpt.get('thread_evidence_partial'))}; refresh_error={excerpt.get('thread_refresh_error') or 'none'}\n"
+        f"Thread evidence (chronological):\n{body or '(empty)'}\n"
     )
     if memory_summary:
         user_message += f"\n{memory_summary}\n"
@@ -172,6 +240,8 @@ async def tool_draft_reply(
             "thread_id": thread_id,
             "body": draft_body,
             "source_prompt": user_text,
+            "composer_mode": composer_mode,
+            "subject": subject,
         },
         "mail_context": {
             "kind": "thread",
@@ -327,7 +397,7 @@ async def tool_compose_new(
         sampling_create_message,
         system_prompt=system,
         user_message=user_message,
-        fallback={"assistant_text": fallback_text, "subject": "", "draft_body": ""},
+        fallback={"assistant_text": fallback_text, "recipients": [], "subject": "", "draft_body": ""},
         temperature=0.3,
         max_tokens=2000,
         timeout=90.0,
@@ -339,6 +409,11 @@ async def tool_compose_new(
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
     draft_body = str(payload.get("draft_body") or "").strip()[:_DRAFT_LIMIT]
     subject = str(payload.get("subject") or "").strip()[:200]
+    recipients = [
+        str(item).strip()
+        for item in (payload.get("recipients") if isinstance(payload.get("recipients"), list) else [])
+        if str(item).strip()
+    ][:50]
     assistant_text = str(payload.get("assistant_text") or fallback_text).strip()
     if not draft_body:
         return {
@@ -359,6 +434,7 @@ async def tool_compose_new(
             "source_prompt": user_text,
             "mode": "insert",
             "subject": subject,
+            "recipients": recipients,
         },
         "fallback_used": bool(result.get("fallback_used")),
     }

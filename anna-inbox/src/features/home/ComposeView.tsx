@@ -167,8 +167,15 @@ export function ComposeView({
 
   useEffect(() => {
     if (!insertRequest || !open) return;
-    setBody(insertRequest.artifact.body);
-    setBodyHtml(plainTextToEditorHtml(insertRequest.artifact.body));
+    const artifact = insertRequest.artifact;
+    setRecipients(artifact.recipients || []);
+    setCc(artifact.cc || []);
+    setBcc(artifact.bcc || []);
+    setCcOpen(Boolean(artifact.cc?.length));
+    setBccOpen(Boolean(artifact.bcc?.length));
+    setSubject(artifact.subject || "");
+    setBody(artifact.body);
+    setBodyHtml(plainTextToEditorHtml(artifact.body));
     onConsumeInsertRequest?.(insertRequest.nonce);
   }, [insertRequest, onConsumeInsertRequest, open]);
 
