@@ -88,7 +88,7 @@ export function mergeInboxMessagesById(
 
 /**
  * Soft reload 收尾：删除「当前同步窗口内」且不在 keepIds 的邮件。
- * 窗口外（Show more / 扩时间窗）的旧邮件予以保留，避免静默刷新误清。
+  * 窗口外（触底续页 / 扩时间窗）的旧邮件予以保留，避免静默刷新误清。
  */
 export function pruneInboxMessagesToCacheWindow(
   messages: InboxMessage[],

@@ -394,9 +394,6 @@ export interface CustomRunResultItem {
 export type LlmStatusPollSeconds = 0 | 30 | 60 | 120 | 300;
 export type InboxAutoSyncSeconds = 0 | 15 | 30 | 60 | 120;
 
-/** 列表首屏展示条数（列表行）；超出显示 Show more */
-export type InitialListSize = 100 | 200 | 400;
-
 export interface InboxSettings {
   mailbox: string;
   display_range_days: 7 | 30 | 60;
@@ -407,8 +404,6 @@ export interface InboxSettings {
   todos_limit: number;
   llm_status_poll_seconds: LlmStatusPollSeconds;
   auto_sync_seconds: InboxAutoSyncSeconds;
-  /** 首屏最多展示的邮件数；更大窗口仍可预拉取到本地 */
-  initial_list_size: InitialListSize;
   custom_categories: InboxCustomCategory[];
   updated_at?: string;
 }

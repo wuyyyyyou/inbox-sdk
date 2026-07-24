@@ -2,7 +2,7 @@
 
 Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；AI 侧栏是唯一智能入口。Brief 产品面已下线，不再代表 2.0 主路径。
 
-当前发布基线：App `2.1.7` / Tool `2.2.7`。本版本重点：邮箱 **180 天 metadata 优先 + 无硬顶 backfill** 的缓存同步与 `sync_boundary`；侧栏只读主路径改为一次 `query_mail_evidence`（全量本地索引，非列表 7/30/60 窗）；`search_email`/`read_email` 改为 cache-only；后台正文/附件预处理（含 PDF）；侧栏 local 调试路径与 Host 共用工具白名单；草稿产物可编辑插入。
+当前发布基线：App `2.1.8` / Tool `2.2.8`。本版本重点：列表固定首屏 100 + **触底自动加载**（移除 Initial list size / Show more 按钮）；标签角标 `99+`；分页仅前端。继承：邮箱 **180 天 metadata 优先 + 无硬顶 backfill** 与 `sync_boundary`；侧栏 `query_mail_evidence`；`search_email`/`read_email` cache-only；正文/附件预处理；草稿产物可编辑插入。
 
 ## Language
 

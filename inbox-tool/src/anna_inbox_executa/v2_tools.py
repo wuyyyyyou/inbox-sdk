@@ -2151,7 +2151,6 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             "todos_limit",
             "llm_status_poll_seconds",
             "auto_sync_seconds",
-            "initial_list_size",
             "custom_categories",
         )
         payload = await set_inbox_settings(mailbox, {name: arguments[name] for name in fields if name in arguments}, if_match=str(arguments.get("if_match") or "") or None)

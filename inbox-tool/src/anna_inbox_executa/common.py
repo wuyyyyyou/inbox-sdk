@@ -436,7 +436,6 @@ DEFAULT_MANIFEST = {
                 {"name": "todos_limit", "type": "integer", "description": "Todo thread limit.", "required": False},
                 {"name": "llm_status_poll_seconds", "type": "integer", "description": "LLM connectivity poll interval in seconds: 0, 30, 60, 120, or 300.", "required": False},
                 {"name": "auto_sync_seconds", "type": "integer", "description": "Gmail History automatic refresh interval in seconds: 0, 15, 30, 60, or 120.", "required": False},
-                {"name": "initial_list_size", "type": "integer", "description": "Initial list thread count: 100, 200, or 400.", "required": False},
                 {"name": "custom_categories", "type": "array", "description": "Saved local Inbox Splits with id, name, query, hide_when_empty, and bundling_behavior.", "required": False},
             ],
         },

@@ -6,9 +6,6 @@ import { senderParts } from "../../shared/mailIdentity";
 export const LLM_STATUS_POLL_OPTIONS = [0, 30, 60, 120, 300] as const;
 export const AUTO_SYNC_OPTIONS = [0, 15, 30, 60, 120] as const;
 
-/** 列表首屏展示条数选项 */
-export const INITIAL_LIST_SIZE_OPTIONS = [100, 200, 400] as const;
-
 export const DEFAULT_INBOX_SETTINGS: InboxSettings = {
   mailbox: "",
   display_range_days: 30,
@@ -19,7 +16,6 @@ export const DEFAULT_INBOX_SETTINGS: InboxSettings = {
   todos_limit: 10,
   llm_status_poll_seconds: 60,
   auto_sync_seconds: 15,
-  initial_list_size: 100,
   custom_categories: [],
 };
 
@@ -75,9 +71,6 @@ export function clampInboxSettings(
     auto_sync_seconds: (AUTO_SYNC_OPTIONS as readonly number[]).includes(Number(input.auto_sync_seconds))
       ? (Number(input.auto_sync_seconds) as InboxSettings["auto_sync_seconds"])
       : DEFAULT_INBOX_SETTINGS.auto_sync_seconds,
-    initial_list_size: (INITIAL_LIST_SIZE_OPTIONS as readonly number[]).includes(Number(input.initial_list_size))
-      ? (Number(input.initial_list_size) as InboxSettings["initial_list_size"])
-      : DEFAULT_INBOX_SETTINGS.initial_list_size,
     custom_categories: Array.isArray(input.custom_categories) ? input.custom_categories
       .filter((category) => category && typeof category.id === "string" && typeof category.name === "string" && typeof category.query === "string")
       .map((category) => {

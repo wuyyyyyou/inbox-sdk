@@ -126,6 +126,25 @@ const DEFAULT_INBOX_FEED_WINDOW: InboxFeedWindow = {
   gmailPageOffset: 0,
 };
 const INBOX_FEED_PAGE_SIZE = 100;
+/** 列表触底自动加载更多：距底部 ≤ 该像素视为已到底 */
+const MAIL_FEED_LOAD_MORE_THRESHOLD_PX = 80;
+
+/** Inbox 标签/Split 角标：超过 99 显示 99+（纯前端展示，不截断真实列表） */
+export function formatInboxTabCount(count: number): string {
+  const n = Math.max(0, Math.floor(Number(count) || 0));
+  return n > 99 ? "99+" : String(n);
+}
+
+/** 邮件列表是否已滚到接近底部（用于触底自动分页） */
+export function isMailFeedNearBottom(
+  scroller: Pick<HTMLElement, "scrollHeight" | "scrollTop" | "clientHeight">,
+  thresholdPx = MAIL_FEED_LOAD_MORE_THRESHOLD_PX,
+) {
+  return (
+    scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <=
+    thresholdPx
+  );
+}
 
 /** 下一个更大时间窗；已是 All time 则返回 null */
 export function nextFeedRangeDays(currentDays: number): number | null {
@@ -671,12 +690,6 @@ function olderRangeButtonLabel(currentDays: number, nextDays: number | null) {
   if (nextDays === INBOX_ALL_TIME_DAYS) return "Show all older emails";
   if (currentDays <= 0) return `Show emails from the last ${nextDays} days`;
   return `Show emails older than ${currentDays} days (last ${nextDays} days)`;
-}
-
-/** 当前时间窗内继续展示更多（非扩窗） */
-function moreInPeriodButtonLabel(currentDays: number) {
-  if (currentDays === INBOX_ALL_TIME_DAYS) return "Show more in this period";
-  return `Show more from the last ${currentDays} days`;
 }
 
 export function inboxLastSyncedLabel(value?: string) {
@@ -4516,15 +4529,6 @@ export function HomeView() {
     state.inboxSettingsEtag,
     syncInbox,
   ]);
-  // 设置变更首屏条数时同步 localLimit（不低于当前已展开值时可回落到设置）
-  useEffect(() => {
-    const size = state.inboxSettings.initial_list_size || INBOX_FEED_PAGE_SIZE;
-    setFeedWindow((current) =>
-      current.localLimit === size
-        ? current
-        : { ...current, localLimit: Math.max(size, current.localLimit) },
-    );
-  }, [state.inboxSettings.initial_list_size]);
   const lastSyncedLabel = inboxLastSyncedLabel(state.inboxUpdatedAt);
   const nextRangeDays = nextFeedRangeDays(days);
   const canExpandFeedRange =
@@ -4534,29 +4538,31 @@ export function HomeView() {
     !state.inboxError &&
     !state.inboxLoading &&
     (feedAction === null || feedAction === "refresh");
-  // Show more：先抬高展示上限；本地不够时再续拉 All mail 缓存/Gmail
+  // 触底自动加载：所有分类（含 Inbox 下 Important/Other/自定义 Split、本地 Todos 等）统一 localLimit 分页
   const canShowMoreEmails =
     mailboxView !== "drafts" &&
     filter !== "search" &&
     (feedWindow.localLimit < visible.length ||
       (isExpandableMailboxView(mailboxView) && feedWindow.hasMore)) &&
     !state.inboxError &&
-    (feedAction === null || feedAction === "refresh");
+    !state.inboxLoading &&
+    !isInboxSyncing &&
+    feedAction === null;
   const showMoreEmails = useCallback(async () => {
-    const step = state.inboxSettings.initial_list_size || INBOX_FEED_PAGE_SIZE;
-    const nextLimit = feedWindow.localLimit + step;
+    if (pageLoadInFlight.current) return;
+    pageLoadInFlight.current = true;
+    const nextLimit = feedWindow.localLimit + INBOX_FEED_PAGE_SIZE;
     setFeedWindow((current) => ({
       ...current,
       localLimit: nextLimit,
     }));
-    // 快照已够展示则只抬上限；否则续读缓存并写入快照
+    // 快照已够展示则只抬上限；否则续读缓存并写入快照（本地分类仅抬 localLimit）
     const snapshotCount =
       state.inboxSnapshotMessages.length || state.inboxMessages.length;
     if (snapshotCount >= nextLimit || !isExpandableMailboxView(mailboxView)) {
+      pageLoadInFlight.current = false;
       return;
     }
-    if (pageLoadInFlight.current) return;
-    pageLoadInFlight.current = true;
     setFeedAction("more");
     try {
       const result = await actions.loadCachedInboxEmails(
@@ -4611,8 +4617,23 @@ export function HomeView() {
     feedWindow.nextOffset,
     mailboxView,
     state.inboxMessages,
-    state.inboxSettings.initial_list_size,
     state.inboxSnapshotMessages,
+  ]);
+  // 列表触底或内容不足以填满视口时自动续页（不展示 Show more 按钮）
+  const tryAutoLoadMoreEmails = useCallback(() => {
+    if (!canShowMoreEmails || pageLoadInFlight.current) return;
+    const scroller = mailFeedRef.current;
+    if (!scroller || !isMailFeedNearBottom(scroller)) return;
+    void showMoreEmails();
+  }, [canShowMoreEmails, showMoreEmails]);
+  useEffect(() => {
+    tryAutoLoadMoreEmails();
+  }, [
+    tryAutoLoadMoreEmails,
+    displayedVisible.length,
+    feedWindow.localLimit,
+    feedWindow.hasMore,
+    feedAction,
   ]);
   const refreshDrafts = useCallback(async () => {
     if (mailboxView !== "drafts" || pageLoadInFlight.current) return;
@@ -5872,11 +5893,10 @@ export function HomeView() {
       feedWindow.days ||
       state.inboxSettings.display_range_days ||
       INBOX_LAST_MONTH_DAYS;
-    const listCap = state.inboxSettings.initial_list_size || INBOX_FEED_PAGE_SIZE;
     setFeedWindow((current) => ({
       ...current,
       days: targetDays,
-      localLimit: listCap,
+      localLimit: INBOX_FEED_PAGE_SIZE,
     }));
     if (next === "done") {
       if (!snapshotCount) {
@@ -6378,10 +6398,20 @@ export function HomeView() {
               <button
                 key={key}
                 className={filter === key ? "is-active" : ""}
-                onClick={() => setFilter(key)}
+                onClick={() => {
+                  // 切换 Inbox 标签/Split 时重置首屏分页，触底自动加载对该分类重新生效
+                  if (key !== filter) {
+                    skipEnterAnimRef.current = true;
+                    setFeedWindow((current) => ({
+                      ...current,
+                      localLimit: INBOX_FEED_PAGE_SIZE,
+                    }));
+                  }
+                  setFilter(key);
+                }}
               >
                 {label}
-                <span>{count}</span>
+                <span>{formatInboxTabCount(count)}</span>
               </button>
             ))}
             <button
@@ -6410,6 +6440,7 @@ export function HomeView() {
           className={`mail-feed ${mailboxView === "trash" ? "is-trash-view" : ""}`}
           aria-live="polite"
           ref={mailFeedRef}
+          onScroll={() => tryAutoLoadMoreEmails()}
         >
           {(mailboxView === "inbox" || mailboxView === "drafts") &&
           selectedListKeys.size > 0 ? (
@@ -6775,19 +6806,7 @@ export function HomeView() {
               </div>
             ))
           )}
-          {/* 优先：当前时间段内更多；其下才是扩时间窗 */}
-          {canShowMoreEmails ? (
-            <button
-              className="older-mail-btn"
-              type="button"
-              onClick={() => void showMoreEmails()}
-              disabled={isInboxSyncing || feedAction !== null}
-            >
-              {isInboxSyncing
-                ? "Syncing..."
-                : moreInPeriodButtonLabel(days)}
-            </button>
-          ) : null}
+          {/* 当前时间窗内更多由触底自动加载；底部仅保留扩时间窗 / Drafts */}
           {canExpandFeedRange ? (
             <button
               className="older-mail-btn"

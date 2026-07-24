@@ -488,9 +488,6 @@ async def set_inbox_settings(
     # 前台 Gmail History 增量同步频率；低于 15 秒会放大平台 Reverse RPC 压力。
     if values.get("auto_sync_seconds") in (0, 15, 30, 60, 120):
         settings.auto_sync_seconds = int(values["auto_sync_seconds"])
-    # 首屏列表条数
-    if values.get("initial_list_size") in (100, 200, 400):
-        settings.initial_list_size = int(values["initial_list_size"])
     for field_name in ("stars_enabled", "todos_enabled"):
         if isinstance(values.get(field_name), bool):
             setattr(settings, field_name, values[field_name])

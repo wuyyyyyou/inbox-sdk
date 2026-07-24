@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { PlusIcon, accountDisplayName, aiSearchStatus, aiThinkingElapsedLabel, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, inboxLastSyncedLabel, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+import { PlusIcon, accountDisplayName, aiSearchStatus, aiThinkingElapsedLabel, formatInboxTabCount, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, inboxLastSyncedLabel, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isMailFeedNearBottom, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
 
 const homeViewSource = readFileSync(new URL("./HomeView.tsx", import.meta.url), "utf8");
 
@@ -33,8 +33,36 @@ describe("mail detail complete body", () => {
   });
 });
 
+describe("formatInboxTabCount", () => {
+  it("caps tab badges at 99+", () => {
+    expect(formatInboxTabCount(0)).toBe("0");
+    expect(formatInboxTabCount(99)).toBe("99");
+    expect(formatInboxTabCount(100)).toBe("99+");
+    expect(formatInboxTabCount(150)).toBe("99+");
+  });
+});
+
+describe("list pagination", () => {
+  it("uses fixed page size and auto-loads more on feed scroll bottom", () => {
+    expect(homeViewSource).toContain("const INBOX_FEED_PAGE_SIZE = 100");
+    expect(homeViewSource).toContain("feedWindow.localLimit + INBOX_FEED_PAGE_SIZE");
+    expect(homeViewSource).toContain("tryAutoLoadMoreEmails");
+    expect(homeViewSource).toContain("onScroll={() => tryAutoLoadMoreEmails()}");
+    expect(homeViewSource).toContain("formatInboxTabCount(count)");
+    expect(homeViewSource).not.toContain("initial_list_size");
+    expect(homeViewSource).not.toContain("moreInPeriodButtonLabel");
+  });
+});
+
+describe("isMailFeedNearBottom", () => {
+  it("detects when the mail feed is near the bottom edge", () => {
+    expect(isMailFeedNearBottom({ scrollHeight: 1000, scrollTop: 930, clientHeight: 600 }, 80)).toBe(true);
+    expect(isMailFeedNearBottom({ scrollHeight: 1000, scrollTop: 200, clientHeight: 600 }, 80)).toBe(false);
+  });
+});
+
 describe("nextFeedRangeDays", () => {
-  it("steps 7 → 30 → 60 → all time", () => {
+  it("advances along the fixed range ladder", () => {
     expect(nextFeedRangeDays(7)).toBe(30);
     expect(nextFeedRangeDays(30)).toBe(60);
     expect(nextFeedRangeDays(60)).toBe(0);

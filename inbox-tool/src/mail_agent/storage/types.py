@@ -109,8 +109,6 @@ class InboxSettings:
     llm_status_poll_seconds: int = 60
     # Gmail History 自动刷新间隔（秒）；0 表示只在用户手动刷新时同步，默认 15
     auto_sync_seconds: int = 15
-    # 列表首屏展示 thread 数：100 / 200 / 400
-    initial_list_size: int = 100
     custom_categories: list[InboxCustomCategory] = field(default_factory=list)
     updated_at: str = field(default_factory=_now)
 
