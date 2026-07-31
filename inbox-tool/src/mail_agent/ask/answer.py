@@ -771,7 +771,7 @@ async def _generate_answer(
             ask_sampling_tokens(
                 sampling_create_message,
                 "answer",
-                reserve_for=("answer_retry", "json_repair"),
+                reserve_for=("answer_retry",),
             ),
             output_cap,
         )
@@ -779,11 +779,10 @@ async def _generate_answer(
             ask_sampling_tokens(
                 sampling_create_message,
                 "answer_retry",
-                reserve_for=("json_repair",),
+                reserve_for=(),
             ),
             output_cap,
         )
-        json_repair_tokens = ask_sampling_tokens(sampling_create_message, "json_repair")
         result = await call_llm_json_safe(
             sampling_create_message,
             system_prompt=system_prompt,
@@ -800,13 +799,10 @@ async def _generate_answer(
             response_format={"type": "json_object"},
             on_unsupported="text",
             allow_fallback=True,
-            # 纯散文没有 JSON 骨架时，短重试会附带解析失败提示；已有 JSON 骨架但
-            # 语法损坏时优先使用独立 repair 额度，避免再次执行邮件分析任务。
+            # 解析失败仅由本地 salvage 或主请求重试处理，禁止再次 Sampling repair。
             allow_sampling_provider_fallback=False,
-            allow_json_repair=True,
             max_attempts=2,
             retry_max_tokens=retry_tokens,
-            json_repair_max_tokens=json_repair_tokens,
         )
         if result and result.get("fallback_used"):
             last_error = str(result.get("fallback_reason") or "Anna sampling failed")

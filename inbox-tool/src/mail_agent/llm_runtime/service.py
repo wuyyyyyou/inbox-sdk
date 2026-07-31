@@ -48,12 +48,8 @@ DASHSCOPE_DEFAULT_MODEL = "qwen3-max"
 DASHSCOPE_CHAT_COMPLETIONS_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 MAX_RETRIES = 2
 BASE_DELAY = 1.2
-JSON_REPAIR_BAD_TEXT_LIMIT = 12_000
-JSON_REPAIR_SHAPE_LIMIT = 4_000
-JSON_REPAIR_SYSTEM_PROMPT = (
-    "You are a JSON repair function. Repair invalid JSON text into one valid JSON object. "
-    "Do not add facts, do not change field meanings, and do not include markdown or explanations."
-)
+# JSON 解析失败时落盘/诊断的原文上限；便于区分格式问题与混入无关内容，同时避免日志爆炸。
+JSON_PARSE_ERROR_LOG_LIMIT = 12_000
 
 
 class TruncatedJsonResponse(ValueError):
@@ -112,8 +108,113 @@ def _sanitize_value(obj: Any) -> Any:
     return obj
 
 
+def _fix_json_string_escapes(text: str) -> str:
+    """修复字符串内非法或截断的 \\u 转义，避免 Invalid \\uXXXX escape。
+
+    常见来源：
+    1. max_tokens 截断落在 `\\uXXXX` 中间（尾部 `\\u` / `\\u4e`）；
+    2. 模型把中文错误写成非法转义（如 `\\u606v`，息应为 `\\u606f`）。
+
+    策略：合法完整 `\\uXXXX` 原样保留；尾部不完整转义直接丢弃以便闭合；
+    中段非法则把反斜杠再转义为 `\\\\`，保留字面内容，不编造码点。
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            i += 1
+            continue
+        if ch == '"':
+            out.append(ch)
+            in_string = False
+            i += 1
+            continue
+        if ch == "\\":
+            if i + 1 >= n:
+                # 尾部悬挂反斜杠：丢弃，后续由闭合逻辑补引号。
+                break
+            nxt = text[i + 1]
+            if nxt == "u":
+                hexpart = text[i + 2 : i + 6]
+                if len(hexpart) == 4 and all(c in "0123456789abcdefABCDEF" for c in hexpart):
+                    out.append(text[i : i + 6])
+                    i += 6
+                    continue
+                # 截断在输入末尾：丢掉残缺 \\u…，避免闭合后仍 Invalid escape。
+                if len(hexpart) < 4 and (i + 2 + len(hexpart)) >= n:
+                    break
+                # 中段非法（如 \\u606v）：\\ → \\\\，保留后面的 u…
+                out.append("\\\\")
+                out.append("u")
+                i += 2
+                continue
+            # 其它转义对原样保留（含 \" \\ \/ \n 以及未知双字符转义）。
+            out.append(ch)
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _escape_raw_quotes_inside_strings(text: str) -> str:
+    """把字符串值内部未转义的双引号改成 \\"，不改 key/字段边界上的合法引号。
+
+    QueryPlan 常见坏例：
+      {"query": "urgent OR "asap" OR "important""}
+    模型把 Gmail 短语引号原样塞进 JSON 字符串，导致 Expecting ',' delimiter。
+    判定：字符串内的 `"` 若后面不是合法结束符（, : } ] 或 EOF，允许空白），则视为内容引号。
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            i += 1
+            continue
+        # 已在字符串内
+        if ch == "\\" and i + 1 < n:
+            # 保留已有转义对（含 \"）
+            out.append(ch)
+            out.append(text[i + 1])
+            i += 2
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            # 合法结束：后接结构分隔符或文本结束（对象/数组/字段边界）
+            if j >= n or text[j] in ",:}]":
+                out.append('"')
+                in_string = False
+                i += 1
+                continue
+            # 内容中的裸引号 → 转义
+            out.append('\\"')
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _repair_json(text: str) -> str:
     """Fix common LLM JSON mistakes so json.loads has a better chance."""
+
+    # ── Step 0: 字符串内非法/截断 \\u 转义（须尽早，否则后续扫描会踩 Invalid escape）──
+    text = _fix_json_string_escapes(text)
 
     # ── Step 1: Single-quote JSON → double-quote ──
     # Some models output Python-style {'key': 'value'} which is invalid JSON.
@@ -124,9 +225,17 @@ def _repair_json(text: str) -> str:
         # Single-quoted top-level string values: : 'value' → : "value"
         text = re.sub(r":\s*'([^']*)'", r': "\1"', text)
 
-    # ── Step 2: Comma / bracket fixes ──
+    # ── Step 2: Comma / bracket / colon fixes（必须先于裸引号转义）──
+    # 否则 `"a":"b"\n"c":1` 会把 b 的结束引号误判为内容引号。
     # Trailing comma before ] or }  (e.g. {"a": 1,} → {"a": 1})
     text = re.sub(r",\s*([}\]])", r"\1", text)
+    # 对象字段漏冒号：{"action" "final"} → {"action": "final"}
+    # 要求第二个字符串后接 , } ]，且 key 前为 { 或 ,；避免 ["a" "b"] 被改成冒号。
+    text = re.sub(
+        r'([{\,]\s*)"((?:[^"\\]|\\.)*)"\s+"((?:[^"\\]|\\.)*)"(?=\s*[,}\]])',
+        r'\1"\2": "\3"',
+        text,
+    )
     # Missing comma: "value"\n  "next_key"  →  "value",\n  "next_key"
     text = re.sub(r'"\s*\n\s*"', '",\n"', text)
     # Anna sampling 偶尔会在同一行的下一个 key 前漏逗号。
@@ -148,6 +257,10 @@ def _repair_json(text: str) -> str:
     text = re.sub(r'\b(true|false|null)\s+(?="[^"\r\n]{1,80}"\s*:)', r'\1, ', text)
     # Ask answer 的 mail_links 数组里对象之间常漏逗号且夹杂换行缩进。
     text = re.sub(r'}\s*\n\s*{', '},\n{', text)
+
+    # ── Step 3: 字符串值内未转义双引号（QueryPlan query 短语引号）──
+    # 在补逗号之后执行，避免把“下一字段 key 的引号”误当成内容。
+    text = _escape_raw_quotes_inside_strings(text)
     return text
 
 
@@ -179,9 +292,8 @@ def _strip_markdown_json_fence(text: str) -> str:
 
 def _close_truncated_json(fragment: str) -> str:
     """闭合半截 JSON：补齐未闭合字符串与括号，不新增业务字段。"""
-    s = str(fragment or "").rstrip()
-    if s.endswith("\\"):
-        s = s[:-1]
+    # 先清掉尾部残缺 \\u，否则补上引号后仍会 Invalid \\uXXXX escape。
+    s = _fix_json_string_escapes(str(fragment or ""))
     in_string = False
     escape = False
     stack: list[str] = []
@@ -203,9 +315,16 @@ def _close_truncated_json(fragment: str) -> str:
         elif ch in ("}", "]"):
             if stack and stack[-1] == ch:
                 stack.pop()
+    # 未闭合字符串内的尾部空格是内容，不能 rstrip；结构外才去掉尾部空白。
     if in_string:
+        if s.endswith("\\"):
+            s = s[:-1]
         s += '"'
-    s = re.sub(r",\s*$", "", s)
+    else:
+        s = s.rstrip()
+        if s.endswith("\\"):
+            s = s[:-1]
+        s = re.sub(r",\s*$", "", s)
     while stack:
         s += stack.pop()
     return s
@@ -249,6 +368,12 @@ def salvage_truncated_json(text: str) -> dict[str, Any] | None:
 
 def parse_json_response(text: str) -> dict[str, Any]:
     """Extract JSON object from LLM response text (handles markdown fences and common LLM errors)."""
+    payload, _ = _parse_json_response_with_kind(text)
+    return payload
+
+
+def _parse_json_response_with_kind(text: str) -> tuple[dict[str, Any], str]:
+    """解析 JSON 并标记 exact、syntax_repair 或 truncation_salvage。"""
     text = _normalize_json_delimiters(_strip_markdown_json_fence(text))
     start = text.find("{")
     end = text.rfind("}")
@@ -262,7 +387,7 @@ def parse_json_response(text: str) -> dict[str, Any]:
     if end <= start:
         salvaged = salvage_truncated_json(text)
         if salvaged is not None:
-            return salvaged
+            return salvaged, "truncation_salvage"
         raise TruncatedJsonResponse("LLM response ended before its JSON object was complete")
     candidate = text[start : end + 1]
     # 仅修复缺逗号等局部语法问题；失败再尝试闭合截断。
@@ -272,12 +397,12 @@ def parse_json_response(text: str) -> dict[str, Any]:
         try:
             payload = json.loads(attempt)
             if isinstance(payload, dict):
-                return payload
+                return payload, "exact" if attempt == candidate else "syntax_repair"
         except json.JSONDecodeError as exc:
             last_error = exc
     salvaged = salvage_truncated_json(text)
     if salvaged is not None:
-        return salvaged
+        return salvaged, "truncation_salvage"
     assert last_error is not None
     start_excerpt = max(0, last_error.pos - 140)
     end_excerpt = min(len(attempts[-1]), last_error.pos + 140)
@@ -286,6 +411,23 @@ def parse_json_response(text: str) -> dict[str, Any]:
         f"{last_error.msg}: line {last_error.lineno} column {last_error.colno} "
         f"(char {last_error.pos}); excerpt={excerpt}"
     ) from last_error
+
+
+def _sampling_stop_reason_is_length(result: Any) -> bool:
+    """兼容 Host 常见的大小写及嵌套 stopReason/finishReason 写法。"""
+    if isinstance(result, dict):
+        for key, value in result.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+            if normalized in {"stopreason", "finishreason"}:
+                if isinstance(value, str):
+                    reason = re.sub(r"[^a-z0-9]", "", value.casefold())
+                    if reason in {"length", "maxtokens"}:
+                        return True
+            if _sampling_stop_reason_is_length(value):
+                return True
+    elif isinstance(result, list):
+        return any(_sampling_stop_reason_is_length(item) for item in result)
+    return False
 
 
 def _build_sampling_json_user_message(system_prompt: str, user_message: str, retry_note: str = "") -> str:
@@ -302,120 +444,130 @@ def _build_sampling_json_user_message(system_prompt: str, user_message: str, ret
     return prompt
 
 
-def _build_json_repair_user_message(*, bad_text: str, parse_error: str, expected_shape: str = "") -> str:
-    """构建只修复 JSON 格式的二次 sampling 提示词。"""
-    shape = (expected_shape or "Preserve the JSON object shape implied by the invalid text.").strip()
-    if len(shape) > JSON_REPAIR_SHAPE_LIMIT:
-        shape = shape[:JSON_REPAIR_SHAPE_LIMIT] + "\n...[expected shape truncated]"
-
-    invalid_text = (bad_text or "").strip()
-    if len(invalid_text) > JSON_REPAIR_BAD_TEXT_LIMIT:
-        invalid_text = invalid_text[:JSON_REPAIR_BAD_TEXT_LIMIT] + "\n...[invalid text truncated]"
-
-    return f"""The text below was intended to be a JSON object but failed parsing.
-
-Rules:
-- Return ONLY one valid JSON object.
-- Preserve the original meaning and values.
-- Do not add new facts.
-- Do not perform the original business task again.
-- If a field is missing and cannot be recovered, use an empty string, false, [], or null as appropriate.
-- Do not include markdown fences, prose, analysis, or code comments.
-
-Expected shape or constraints:
-{shape}
-
-Parser error:
-{parse_error}
-
-Invalid text:
-{invalid_text}"""
+def _classify_json_parse_failure(text: str, exc: BaseException) -> str:
+    """把 JSON 解析失败粗分为便于检索的错误类别。"""
+    if isinstance(exc, TruncatedJsonResponse):
+        return "truncated_json"
+    if "{" not in text and "\uff5b" not in text:
+        return "no_json_object"
+    return "invalid_json"
 
 
-def _build_json_repair_expected_shape(system_prompt: str, user_message: str) -> str:
-    """从原提示词中提取输出格式约束，避免把邮件正文再次传给 repair。"""
-    parts: list[str] = []
-    if system_prompt:
-        parts.append(system_prompt.strip())
-
-    output_markers = (
-        "## Output format",
-        "## Output",
-        "Required Output",
-        "Return EXACTLY",
-        "Output exactly this JSON shape",
-    )
-    stop_markers = (
-        "\n## Email",
-        "\n## Emails",
-        "\n## Headers",
-        "\n## Candidates",
-        "\nCandidate:",
-    )
-    start_indexes = [user_message.find(marker) for marker in output_markers if marker in user_message]
-    if start_indexes:
-        start = min(index for index in start_indexes if index >= 0)
-        end = len(user_message)
-        for marker in stop_markers:
-            marker_index = user_message.find(marker, start + 1)
-            if marker_index >= 0:
-                end = min(end, marker_index)
-        parts.append(user_message[start:end].strip())
-
-    return "\n\n".join(part for part in parts if part).strip()
+def _safe_log_tool_slug(tool_name: str) -> str:
+    """把 tool 名压成适合文件名的短标识。"""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(tool_name or "unknown")).strip("._-")
+    return (slug or "unknown")[:80]
 
 
-async def repair_json_with_sampling(
-    sampling_create_message: Any,
+def _write_json_parse_failure_dump(
+    tool_name: str,
+    content: str,
     *,
-    bad_text: str,
-    parse_error: str,
-    expected_shape: str = "",
-    max_tokens: int = 1024,
-    timeout: float = 60.0,
-    metadata: dict[str, str] | None = None,
+    error: str,
+    error_kind: str,
+    model: str = "",
+    shape: str = "",
+    attempt: int | None = None,
+    content_chars: int = 0,
 ) -> str:
-    """使用 Anna sampling 对非标准 JSON 做一次格式修复。"""
-    if sampling_create_message is None:
-        raise ValueError("sampling_create_message is required for JSON repair")
-    if not isinstance(bad_text, str) or not bad_text.strip():
-        raise ValueError("bad_text is empty; JSON repair requires a non-empty response")
+    """把解析失败的模型原文单独写成可读 txt，返回相对路径或空串。
 
-    metadata_payload = {str(key): str(value) for key, value in (metadata or {}).items()}
-    original_tool = metadata_payload.get("tool", "unknown")
-    metadata_payload["tool"] = "json_repair"
-    metadata_payload["repair_for"] = original_tool
+    目录：`.data/llm_logs/json_parse_failed/`，便于直接打开查看完整生成内容，
+    而不必从 jsonl 里再抽 content 字段。
+    """
+    log_dir = _llm_log_dir()
+    if not log_dir:
+        return ""
+    dump_dir = log_dir / "json_parse_failed"
+    try:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return ""
+    now = datetime.now(_BEIJING_TZ)
+    stamp = now.strftime("%Y%m%d_%H%M%S_%f")[:21]
+    path = dump_dir / f"{stamp}_{_safe_log_tool_slug(tool_name)}.txt"
+    header_lines = [
+        f"ts={now.strftime('%Y-%m-%dT%H:%M:%S.%f')[:23]}",
+        f"tool={tool_name}",
+        f"error={error_kind}",
+        f"error_detail={_sanitize_str(error)[:500]}",
+        f"content_chars={content_chars}",
+        f"model={model}",
+        f"shape={shape}",
+        f"attempt={attempt if attempt is not None else ''}",
+        "----- BEGIN MODEL OUTPUT -----",
+    ]
+    body = "\n".join(header_lines) + "\n" + content + "\n----- END MODEL OUTPUT -----\n"
+    try:
+        path.write_text(body, encoding="utf-8")
+    except OSError:
+        return ""
+    # 返回相对 llm_logs 的路径，方便 stderr 与 jsonl 引用。
+    try:
+        return str(path.relative_to(log_dir)).replace("\\", "/")
+    except ValueError:
+        return str(path)
 
-    request = {
-        "messages": [
-            {
-                "role": "user",
-                "content": {
-                    "type": "text",
-                    "text": _ascii_escape_for_host_transport(
-                        _build_json_repair_user_message(
-                            bad_text=bad_text,
-                            parse_error=parse_error,
-                            expected_shape=expected_shape,
-                        )
-                    ),
-                },
-            }
-        ],
-        "system_prompt": _ascii_escape_for_host_transport(JSON_REPAIR_SYSTEM_PROMPT),
-        "temperature": 0.0,
-        "include_context": "none",
-        "metadata": {str(key): _ascii_escape_for_host_transport(str(value)) for key, value in metadata_payload.items()},
-        "timeout": timeout,
+
+def _log_json_parse_failure(
+    tool_name: str,
+    text: str,
+    *,
+    error: str,
+    error_kind: str,
+    model: str = "",
+    shape: str = "",
+    attempt: int | None = None,
+) -> None:
+    """JSON 解析失败时落盘模型原文，并在 stderr 打摘要，便于区分格式问题与内容混入。
+
+    不再做二次 sampling repair；失败后由调用方 fallback 或直接抛错。
+    完整生成内容会额外写入 `json_parse_failed/*.txt` 独立文件。
+    """
+    raw_chars = len(text or "")
+    content = _sanitize_str(text or "")
+    if len(content) > JSON_PARSE_ERROR_LOG_LIMIT:
+        content = content[:JSON_PARSE_ERROR_LOG_LIMIT] + "\n...[json parse error text truncated]"
+    dump_rel = _write_json_parse_failure_dump(
+        tool_name,
+        content,
+        error=error,
+        error_kind=error_kind,
+        model=model,
+        shape=shape,
+        attempt=attempt,
+        content_chars=raw_chars,
+    )
+    extra: dict[str, str] = {
+        "error": error_kind,
+        "error_detail": _sanitize_str(error)[:500],
+        "content_chars": str(raw_chars),
+        "has_json_brace": str("{" in (text or "") or "\uff5b" in (text or "")),
     }
-    # 修复调用也必须使用调用方已分配的预算，不能继续把 512 写死，
-    # 否则比例预算虽然计算成功，实际 Host 请求仍会偏离分配策略。
-    request["max_tokens"] = max(1, int(max_tokens))
-    result = await sampling_create_message(**request)
-    repaired_text = extract_sampling_text(result)
-    if not isinstance(repaired_text, str) or not repaired_text.strip():
-        raise ValueError(f"empty Anna JSON repair response ({_sampling_result_shape(result)})")
-    return _sanitize_str(repaired_text)
+    if model:
+        extra["model"] = model
+    if shape:
+        extra["shape"] = shape
+    if attempt is not None:
+        extra["attempt"] = str(attempt)
+    if dump_rel:
+        extra["dump_file"] = dump_rel
+    # jsonl 仍保留短摘要，完整正文以独立 txt 为准。
+    _write_llm_log(tool_name, "output_error", content[:4000], extra)
+    # 平台侧只能看 stderr；完整原文在本地 llm_logs/json_parse_failed/。
+    preview = content[:240].replace("\n", "\\n")
+    try:
+        import sys
+
+        dump_part = f" dump={dump_rel}" if dump_rel else ""
+        sys.stderr.write(
+            f"[llm_runtime] json_parse_failed tool={tool_name} error={error_kind} "
+            f"content_chars={raw_chars} has_json_brace={extra['has_json_brace']}"
+            f"{dump_part} preview={preview!r}\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def _coerce_sampling_text_value(value: Any) -> str:
@@ -659,12 +811,11 @@ async def call_llm_json(
     on_unsupported: str | None = None,
     max_attempts: int | None = None,
     retry_max_tokens: int | None = None,
-    json_repair_max_tokens: int | None = None,
-    allow_json_repair: bool = True,
 ) -> dict[str, Any]:
     """Call the selected LLM and return parsed JSON payload.
 
     Returns: {"payload": {...}, "text": "...", "model": "...", "usage": {...}}
+    解析失败时仅本地 salvage（缺逗号/截断闭合等），不再二次 sampling json_repair。
     """
     tool_name = (metadata or {}).get("tool", "unknown") if metadata else "unknown"
 
@@ -697,6 +848,9 @@ async def call_llm_json(
                     str(key): _ascii_escape_for_host_transport(str(value))
                     for key, value in (metadata or {}).items()
                 }
+                # 保留调用方的业务阶段，同时给每一次主 Sampling 标记尝试序号。
+                metadata_payload.setdefault("sampling_stage", "primary")
+                metadata_payload["sampling_attempt"] = str(attempt + 1)
                 request = {
                     "messages": [
                         {
@@ -726,65 +880,45 @@ async def call_llm_json(
                 text = _sanitize_str(text)
                 last_text = text
                 try:
-                    payload = parse_json_response(text)
-                    repaired_text = ""
-                except TruncatedJsonResponse:
-                    # parse 内已尝试本地闭合；仍失败则不再二次 Sampling repair/重试。
-                    _write_llm_log(
+                    payload, parse_kind = _parse_json_response_with_kind(text)
+                    # Host 已报告达到输出上限，或仅靠闭合半截结构才解析成功时，
+                    # 表面合法的 payload 也不能作为完整回答返回。
+                    if _sampling_stop_reason_is_length(result) or parse_kind == "truncation_salvage":
+                        raise TruncatedJsonResponse(
+                            "LLM response was truncated before its JSON object was complete"
+                        )
+                except Exception as parse_exc:
+                    # 本地 salvage 已在 parse_json_response 内尝试；失败则落盘完整原文后抛错。
+                    # 不再调用二次 sampling json_repair。
+                    error_kind = _classify_json_parse_failure(text, parse_exc)
+                    _log_json_parse_failure(
                         tool_name,
-                        "output_error",
-                        text[:4000],
-                        {
-                            "model": str(result.get("model") or ""),
-                            "error": "truncated_json",
-                            "shape": _sampling_result_shape(result),
-                        },
+                        text,
+                        error=str(parse_exc),
+                        error_kind=error_kind,
+                        model=str(result.get("model") or ""),
+                        shape=_sampling_result_shape(result),
+                        attempt=attempt + 1,
                     )
                     raise
-                except Exception as parse_exc:
-                    # 纯散文/推理文本没有 JSON 骨架时，格式修复只会浪费 call 预算。
-                    if "{" not in text and "\uff5b" not in text:
-                        _write_llm_log(
-                            tool_name,
-                            "output_error",
-                            text[:4000],
-                            {
-                                "model": str(result.get("model") or ""),
-                                "error": "no_json_object",
-                                "shape": _sampling_result_shape(result),
-                            },
-                        )
-                        raise
-                    # 允许关闭二次 Sampling repair（Ask Answer 单次策略）。
-                    if not allow_json_repair:
-                        raise
-                    repaired_text = await repair_json_with_sampling(
-                        sampling_create_message,
-                        bad_text=text,
-                        parse_error=str(parse_exc),
-                        expected_shape=_build_json_repair_expected_shape(system_prompt, user_message),
-                        # 完整但语法无效的 JSON 只需格式修复额度，不能占用
-                        # 回答或截断重试的输出预算。
-                        max_tokens=(
-                            json_repair_max_tokens
-                            if json_repair_max_tokens is not None
-                            else 512
-                        ),
-                        timeout=timeout,
-                        metadata=metadata_payload,
-                    )
-                    payload = parse_json_response(repaired_text)
                 result_obj = {
                     "payload": _sanitize_value(payload),
-                    "text": repaired_text or text,
+                    "text": text,
                     "raw_text": text,
                     "model": result.get("model"),
                     "usage": result.get("usage"),
                     "provider": "anna-sampling",
-                    "json_repair_used": bool(repaired_text),
+                    "json_repair_used": False,
+                    # 明确标记成功响应，调用方不能把内部 fallback 状态猜成正常文本。
+                    "truncated": False,
+                    "fallback_kind": "",
                 }
-                _write_llm_log(tool_name, "output", (repaired_text or text)[:4000],
-                               {"model": str(result.get("model") or ""), "json_repair": str(bool(repaired_text))})
+                _write_llm_log(
+                    tool_name,
+                    "output",
+                    text[:4000],
+                    {"model": str(result.get("model") or ""), "json_repair": "False"},
+                )
                 return result_obj
             except Exception as exc:
                 last_error = exc
@@ -841,8 +975,6 @@ async def call_llm_json_safe(
     on_unsupported: str | None = None,
     max_attempts: int | None = None,
     retry_max_tokens: int | None = None,
-    json_repair_max_tokens: int | None = None,
-    allow_json_repair: bool = True,
 ) -> dict[str, Any]:
     """Call LLM with fallback on failure."""
     try:
@@ -860,8 +992,6 @@ async def call_llm_json_safe(
             on_unsupported=on_unsupported,
             max_attempts=max_attempts,
             retry_max_tokens=retry_max_tokens,
-            json_repair_max_tokens=json_repair_max_tokens,
-            allow_json_repair=allow_json_repair,
         )
         result["fallback_used"] = False
         return result
@@ -875,4 +1005,7 @@ async def call_llm_json_safe(
             "usage": None,
             "fallback_used": True,
             "fallback_reason": str(exc),
+            # 保留失败类别供需要基于证据兜底的调用方判断，避免展示半截答案。
+            "truncated": isinstance(exc, TruncatedJsonResponse),
+            "fallback_kind": "truncated_json" if isinstance(exc, TruncatedJsonResponse) else "llm_error",
         }

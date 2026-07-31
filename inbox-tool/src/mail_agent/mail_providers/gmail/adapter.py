@@ -2278,6 +2278,25 @@ def preprocess_cached_content_batch(mailbox: str, *, limit: int = 4) -> dict[str
     except (TypeError, ValueError):
         cap = 4
     summaries = [item for item in list_messages(normalized) if isinstance(item, dict)]
+
+    def _preprocess_priority(summary: dict[str, Any]) -> tuple[int, int]:
+        """后台正文预热先补账单/收据，确保金额问答不长期只有 metadata。"""
+        text = " ".join(
+            str(summary.get(field) or "")
+            for field in ("subject", "snippet", "from")
+        ).lower()
+        has_attachment = bool(summary.get("attachments"))
+        billing = has_attachment and any(token in text for token in (
+            "invoice", "receipt", "bill", "statement", "付款", "账单", "收据", "发票",
+        ))
+        try:
+            internal_date = int(summary.get("internal_date") or 0)
+        except (TypeError, ValueError):
+            internal_date = 0
+        # 账单/收据优先，其余按最新邮件优先，避免每轮在很早的 metadata 上空转。
+        return (0 if billing else 1, -internal_date)
+
+    summaries.sort(key=_preprocess_priority)
     processed = 0
     skipped = 0
     changed_summaries: dict[str, dict[str, Any]] = {}
@@ -2290,6 +2309,10 @@ def preprocess_cached_content_batch(mailbox: str, *, limit: int = 4) -> dict[str
         try:
             message = read_message(normalized, message_id)
         except Exception:
+            message = None
+        # metadata 同步会创建可检索占位记录；读到该记录不代表正文已缓存。
+        # 仅后台预处理允许补齐这个命中邮件的 Gmail full 内容，AI Evidence 本身仍 cache-only。
+        if not isinstance(message, dict) or not str(message.get("body_text") or "").strip():
             message = fetch_and_cache_message(normalized, message_id)
         if not isinstance(message, dict):
             skipped += 1
@@ -2606,6 +2629,21 @@ def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
                 "cache_total": 0,
                 "resync_required": True,
                 "resync_reason": "cursor_missing",
+                "updated_at": beijing_now(),
+            }
+        # 缓存中已有部分邮件不代表 180 天优先基线已经完成。若同步状态明确表明
+        # 基线未完成，必须让上层重新进入 messages.list 分页扫描；不能只锚定当前
+        # historyId，否则历史窗口内尚未进入缓存的邮件会永久漏检。
+        if not bool(state.get("initial_sync_complete")):
+            return {
+                "mailbox": normalized,
+                "mode": "baseline_required",
+                "added": 0,
+                "updated": 0,
+                "deleted": 0,
+                "cache_total": len(cached_messages),
+                "resync_required": True,
+                "resync_reason": "priority_sync_incomplete",
                 "updated_at": beijing_now(),
             }
         # 本地已有 180 天基线但 cursor 丢失时：用 profile.historyId 重新锚定，
@@ -3074,6 +3112,7 @@ def live_search_and_cache(
     max_results: int = 100,
     *,
     stop_at_internal_date: str = "",
+    request_timeout_seconds: float | None = None,
 ) -> list[str]:
     """Search Gmail, fetch+cache new messages, return list of message IDs.
 
@@ -3083,7 +3122,10 @@ def live_search_and_cache(
 
     # 全文拉取与搜索共用同一 scope，确保 worker 仅复用本邮箱 token，退出即清除。
     with _gmail_request_token_scope(mailbox=mailbox):
-        msg_ids = search_gmail(mailbox, query, max_results)
+        msg_ids = search_gmail(
+            mailbox, query, max_results,
+            request_timeout_seconds=request_timeout_seconds,
+        )
         if not msg_ids:
             return []
 

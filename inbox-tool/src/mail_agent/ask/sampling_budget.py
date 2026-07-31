@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-# Ask 的输出长度随 Host 下发的 maxTokensTotal 调整。比例之和为 100%，
-# 其中重试与 JSON 修复只在对应失败分支发生，未使用的额度不会被预先占用。
+# Ask 的输出长度随 Host 下发的 maxTokensTotal 调整。主回答失败时只重试原请求，
+# 未使用的重试额度不会被预先占用。
 ASK_SAMPLING_PHASE_WEIGHTS = {
     "planner": 0.10,
-    "answer": 0.60,
-    "answer_retry": 0.25,
-    "json_repair": 0.05,
+    "answer": 0.70,
+    "answer_retry": 0.30,
 }
 
 # 没有 Anna sampler 的本地/第三方 provider 也沿用同一比例模型，避免调用方
@@ -17,13 +16,11 @@ ASK_SAMPLING_PHASE_WEIGHTS = {
 _COMPATIBILITY_TOTAL_TOKENS = 32_000
 _HOST_SINGLE_CALL_MAX_TOKENS = 8_192
 # Ask Answer 需要在较长证据、模型 reasoning 或结构化重试后仍有足够余量闭合 JSON。
-# 首次回答与一次格式重试都固定允许 4096，仍低于平台单次 8192 上限；JSON repair
-# 仅修复已有结构，因此继续使用较小独立额度，避免重新执行完整邮件分析。
+# 首次回答与一次格式重试都固定允许 4096，仍低于平台单次 8192 上限。
 _ASK_PHASE_TOKEN_CAPS = {
     "planner": 600,
     "answer": 4096,
     "answer_retry": 4096,
-    "json_repair": 800,
 }
 
 

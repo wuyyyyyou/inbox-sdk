@@ -1,7 +1,7 @@
-"""Host Agent 可选细粒度工具：选型在 Host，执行仍在本 Executa。
+"""本地 Agent 会话的细粒度工具：选型和执行均在 Executa 内完成。
 
-侧栏 App 通过 anna.agent.session + systemPrompt 让 Host 选型；
-本模块只实现白名单工具，不含 apply/send 等 mutation。
+侧栏 App 通过本地 Sampling 会话完成选型；本模块只实现受限工具，
+不含 apply/send 等 mutation。
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any
 
 from anna_inbox_executa.sampling_tools import _build_sampling_for_run
 
-# Host agent.tools 白名单（与 manifest / App 声明对齐）
+# 本地会话可调用工具白名单。
 AI_AGENT_TOOL_NAMES = frozenset({
     "query_mail_evidence",
     "search_email",
@@ -38,7 +38,8 @@ AI_AGENT_SESSION_TOOL_NAMES = frozenset({
     "ai_remember_preference",
 })
 
-_SEARCH_CALL_MAX_RESULTS = 20
+# 普通 Evidence 仍默认 limit=20；计数/时间窗列举可显式提高到 200，避免 3/7/30 天都截断成相同数量。
+_SEARCH_CALL_MAX_RESULTS = 200
 _THREAD_REF_TTL_SECONDS = 30 * 60
 _THREAD_REF_LOCK = threading.Lock()
 _THREAD_REF_MESSAGES: dict[str, tuple[str, float]] = {}
@@ -258,6 +259,7 @@ def _search_email(arguments: dict[str, Any], ui_context: dict[str, Any]) -> dict
         _to_message_lite,
         list_messages,
         normalize_mailbox,
+        read_message,
     )
     from mail_agent.mail_providers.gmail.mailbox_sync import (
         boundary_honesty_note,
@@ -296,14 +298,47 @@ def _search_email(arguments: dict[str, Any], ui_context: dict[str, Any]) -> dict
     if local_workflow_query:
         query_parts.append(local_workflow_query)
     local_query = " AND ".join(part for part in query_parts if part).strip() or "is:all"
+    # C 路径传入的候选只来自 SQLite FTS5。这里仍执行结构化时间/工作流过滤，
+    # 再按 FTS 返回顺序组装轻量 evidence，不能改用普通缓存命中替代索引结果。
+    raw_candidate_ids = arguments.get("candidate_message_ids")
+    candidate_ids = [str(item) for item in raw_candidate_ids if str(item)] if isinstance(raw_candidate_ids, list) else []
+    candidate_ids = candidate_ids[:100]
+    filter_limit = 200 if candidate_ids else limit
     hits, parsed_query = filter_cached_messages(
         messages,
         local_query,
         todo_ids=todo_ids,
         done_ids=done_ids,
         snoozed_ids=snoozed_ids,
-        limit=limit,
+        limit=filter_limit,
     )
+    if not hits and re.search(r"(?:^|\s)-?body:", local_query, re.IGNORECASE):
+        # MessageLite 只带摘要，不能据此否定正文中的精确短语。仅在显式 body: 条件
+        # 且摘要初筛无结果时，逐封读取已缓存正文并复用同一过滤器；绝不回源 Gmail，
+        # 且正文只在进程内用于匹配，不会进入工具结果或模型上下文。
+        body_search_messages = []
+        for item in cached_rows:
+            message = _to_message_lite(item)
+            try:
+                cached = read_message(mailbox, message.message_id)
+            except Exception:
+                cached = None
+            if isinstance(cached, dict):
+                analysis = cached.get("content_analysis") if isinstance(cached.get("content_analysis"), dict) else {}
+                body = str(analysis.get("body") or cached.get("body_text") or message.snippet or "")
+                message.snippet = body
+            body_search_messages.append(message)
+        hits, parsed_query = filter_cached_messages(
+            body_search_messages,
+            local_query,
+            todo_ids=todo_ids,
+            done_ids=done_ids,
+            snoozed_ids=snoozed_ids,
+            limit=filter_limit,
+        )
+    if candidate_ids:
+        allowed_by_id = {str(message.message_id or ""): message for message in hits}
+        hits = [allowed_by_id[message_id] for message_id in candidate_ids if message_id in allowed_by_id][:limit]
     results: list[dict[str, Any]] = []
     for message in hits:
         message_id = str(message.message_id or "")
@@ -505,6 +540,13 @@ _PUBLIC_OUTCOME_KEYS = (
     "exact_count",
     "search_scope",
     "cache_total",
+    "allow_full_email_text",
+    "evaluation_path",
+    "evaluation_metrics",
+    # B12/C02：域名矛盾备注须透传给 local final，否则只能依赖模型自行察觉。
+    "domain_warning_note",
+    "time_span_note",
+    "domain_warning_threads",
 )
 
 
@@ -562,12 +604,15 @@ async def handle_ai_agent_tool(tool: str, arguments: dict[str, Any], invoke_id: 
 
         sampling = _build_sampling_for_run(arguments, invoke_id)
         conversation_id = str(arguments.get("conversation_id") or ui_context.get("conversation_id") or "").strip()
+        query_plan = arguments.get("query_plan") if isinstance(arguments.get("query_plan"), dict) else None
         try:
             outcome = await query_mail_evidence(
                 user_text,
                 ui_context,
                 sampling_create_message=sampling,
                 conversation_id=conversation_id,
+                query_plan=query_plan,
+                scope_kind=str(arguments.get("scope_kind") or ""),
             )
             return {"success": True, "tool": tool, "data": _public_outcome(outcome)}
         except Exception as exc:

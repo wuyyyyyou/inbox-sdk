@@ -43,4 +43,11 @@ anna-inbox/docs/superpowers/
 
 # design reference screenshots (local)
 example/
+
+# local OpenCode / agent config (may contain keys)
+config.json
+opencode.json
+opencode.jsonc
+
+# P0 local harness: track scripts/fixtures, ignore run artifacts
 tests/

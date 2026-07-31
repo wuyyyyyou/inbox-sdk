@@ -1,6 +1,6 @@
 export const MAILBOX_STORAGE_KEY = "anna-inbox-mailbox";
 export const DEFAULT_MODE = "default_secretary";
-export const POLL_INTERVAL_MS = 2500;
+export const POLL_INTERVAL_MS = 1000;
 export const POLL_LIMIT = 240;
 export const CUSTOM_SCAN_MESSAGE_LIMIT = 50;
 

@@ -10,7 +10,7 @@ import json
 import uuid
 from typing import Any, Sequence
 
-from .client import get_storage, get_files, scope as default_scope
+from .client import backend as storage_backend, get_aps_storage, get_files, get_storage, scope as default_scope
 from .types import (
     ActiveCards,
     CardAction,
@@ -292,6 +292,11 @@ def _inbox_workflow_state_key(mailbox: str) -> str:
     return f"{_mailbox_prefix(mailbox)}/inbox_workflow_state"
 
 
+def _inbox_workflow_sync_key(mailbox: str) -> str:
+    """构造 Todo/Done/Snoozed 共用的 APS 工作流同步键。"""
+    return f"{_mailbox_prefix(mailbox)}/inbox_workflow_sync"
+
+
 def _ask_history_key(mailbox: str) -> str:
     """构造按邮箱隔离的 AI Ask 会话历史 key。"""
     return f"{_mailbox_prefix(mailbox)}/ask_history"
@@ -337,13 +342,25 @@ def _normalize_inbox_workflow_state(value: Any) -> dict[str, Any]:
 
 
 async def get_inbox_workflow_state(mailbox: str) -> dict[str, Any]:
-    """读取邮箱级工作流状态；不存在时返回空状态和空 etag。"""
+    """读取完整本地状态，并在 APS 模式合入跨端工作流分类数据。
+
+    返回的 etag 在选择性模式下来自 APS 同步副本，调用方继续使用既有乐观
+    并发协议即可避免跨端覆盖。
+    """
     result = await get_storage().get(_inbox_workflow_state_key(mailbox), scope=default_scope())
     raw = result.get("value") if result.get("exists") and isinstance(result.get("value"), dict) else {}
+    remote_result: dict[str, Any] = {}
+    if storage_backend() == "selective":
+        remote_result = await get_aps_storage().get(_inbox_workflow_sync_key(mailbox), scope=default_scope())
+        remote = remote_result.get("value") if remote_result.get("exists") and isinstance(remote_result.get("value"), dict) else {}
+        # APS 拥有三种互斥分类；保留其余本地元数据。
+        for field in ("todos", "done", "snoozed", "snoozedUntil"):
+            if field in remote:
+                raw[field] = remote[field]
     return {
-        "exists": bool(result.get("exists")),
+        "exists": bool(result.get("exists") or remote_result.get("exists")),
         "state": _normalize_inbox_workflow_state(raw),
-        "etag": str(result.get("etag") or ""),
+        "etag": str((remote_result if storage_backend() == "selective" else result).get("etag") or ""),
     }
 
 
@@ -353,14 +370,29 @@ async def set_inbox_workflow_state(
     *,
     if_match: str | None = None,
 ) -> dict[str, Any]:
-    """保存完整工作流状态；调用方必须传递最新 etag 以避免跨端覆盖。"""
+    """保存完整本地工作流状态，并将三种分类写入 APS 白名单。"""
     normalized = _normalize_inbox_workflow_state(state)
-    result = await get_storage().set(
-        _inbox_workflow_state_key(mailbox),
-        normalized,
-        scope=default_scope(),
-        if_match=if_match,
-    )
+    if storage_backend() == "selective":
+        # 先条件写 APS。失败时不更新本地副本，避免本地界面误以为跨端保存成功。
+        sync_payload = {
+            field: normalized[field]
+            for field in ("todos", "done", "snoozed", "snoozedUntil", "version", "updated_at")
+        }
+        result = await get_aps_storage().set(
+            _inbox_workflow_sync_key(mailbox),
+            sync_payload,
+            scope=default_scope(),
+            if_match=if_match,
+        )
+        # 本地保留完整副本，支持离线读取与 APS 同步后的状态恢复。
+        await get_storage().set(_inbox_workflow_state_key(mailbox), normalized, scope=default_scope())
+    else:
+        result = await get_storage().set(
+            _inbox_workflow_state_key(mailbox),
+            normalized,
+            scope=default_scope(),
+            if_match=if_match,
+        )
     return {"state": normalized, "etag": str(result.get("etag") or "")}
 
 

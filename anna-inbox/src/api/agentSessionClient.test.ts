@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { AI_SIDEBAR_SYSTEM_PROMPT } from "../app/aiAgentSystemPrompt";
-import { stripTerminalDoneMarker } from "./agentSessionClient";
+import { runAiAgentTurn, stripTerminalDoneMarker } from "./agentSessionClient";
 
 const agentClientSource = readFileSync(
   new URL("./agentSessionClient.ts", import.meta.url),
@@ -24,6 +24,8 @@ describe("AI sidebar Host Agent contract", () => {
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("base conclusions on bodyFull evidence");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never describe it as a 7/30/60-day search");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never call start_ai_turn");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("each confirmed email must be its own list item");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never add a detached reference list");
     expect(agentClientSource).toContain("tool_end");
   });
 
@@ -57,6 +59,40 @@ describe("AI sidebar Host Agent contract", () => {
     expect(stripTerminalDoneMarker("Answer\n[DONE]")).toBe("Answer");
     expect(stripTerminalDoneMarker("Answer\n[DONE]\nMore detail")).toBe("Answer\n\nMore detail");
     expect(stripTerminalDoneMarker("[DONE] means complete.")).toBe("[DONE] means complete.");
+  });
+
+  it("keeps confirmed evidence from a JSON-encoded tool_end output", async () => {
+    const result = await runAiAgentTurn(
+      {
+        agent: {
+          session: async () => ({
+            run: () => [{
+              choices: [{
+                delta: {
+                  tool_end: {
+                    name: "query_mail_evidence",
+                    output: JSON.stringify({
+                      success: true,
+                      data: {
+                        match_status: "confirmed",
+                        results: [{ thread_id: "thread-123" }],
+                      },
+                    }),
+                  },
+                },
+              }],
+            }],
+          }),
+        },
+      },
+      "conversation-1",
+      "Find the invoice email",
+    );
+
+    expect(result.toolOutcomes).toContainEqual(expect.objectContaining({
+      match_status: "confirmed",
+      results: [{ thread_id: "thread-123" }],
+    }));
   });
 
   it("cancels the active Host Agent run on stop, not only AbortController", () => {

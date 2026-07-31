@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ensureConfirmedThreadReference } from "./aiThreadReferences";
 import {
   cancelAiAgentTurn,
   clearAiAgentSession,
@@ -325,6 +326,7 @@ function buildAiTurnUiContext(args: {
   savedPromptId?: string;
   selectedThreads?: SendAiMessageOptions["selectedThreads"];
   routingIntent?: SendAiMessageOptions["routingIntent"];
+  searchField?: SendAiMessageOptions["searchField"];
   inboxListContext?: AiInboxListContext;
 }) {
   const mailbox = selectedOrPrimary(args.selectedMailboxes, args.mailbox);
@@ -399,6 +401,7 @@ function buildAiTurnUiContext(args: {
     saved_prompt_id: args.savedPromptId || "",
     language_hint: args.languageHint || "",
     routing_intent: args.routingIntent || "",
+    search_field: args.searchField || "",
     recent_conversation: recentConversation,
     // 工作流状态只传 message_id，不传邮件正文；详情/旧入口未给列表快照时保留 Todo 兼容读取。
     todo_message_ids: listContext?.todo_message_ids || readTodoMessageIds(mailbox),
@@ -476,13 +479,92 @@ function agentOutcomePayload(outcomes: AgentToolOutcome[], finalText: string): R
   const assistantFromRun = stripTerminalDoneMarker(
     String(runResult?.assistant_text || runResult?.summary || "").trim(),
   );
+  const evidenceThreadIds = confirmedEvidenceThreadIdsFromOutcomes(outcomes);
+  const evidenceThreadLabels = confirmedEvidenceThreadLabelsFromOutcomes(outcomes);
   return {
     ...latest,
     ...(runResult || {}),
     kind,
     assistant_text: finalText || assistantFromRun || String(latest.assistant_text || ""),
+    ...(evidenceThreadIds.length ? { evidence_thread_ids: evidenceThreadIds } : {}),
+    ...(Object.keys(evidenceThreadLabels).length ? { evidence_thread_labels: evidenceThreadLabels } : {}),
     ...(scanQuery ? { scan_query: scanQuery, scan_source: scanSource || "cache" } : {}),
   };
+}
+
+function threadIdsFromEvidence(value: unknown): string[] {
+  if (!value || typeof value !== "object") return [];
+  const evidence = value as Record<string, unknown>;
+  if (String(evidence.match_status || "") !== "confirmed") return [];
+  const rows = Array.isArray(evidence.results) ? evidence.results : [];
+  return rows.flatMap((row) => {
+    if (!row || typeof row !== "object") return [];
+    const item = row as Record<string, unknown>;
+    const threadId = String(item.thread_id || item.thread_ref || "")
+      .trim()
+      .replace(/^THREAD_REF_/, "");
+    return threadId ? [threadId] : [];
+  });
+}
+
+function threadLabelsFromEvidence(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object") return {};
+  const evidence = value as Record<string, unknown>;
+  if (String(evidence.match_status || "") !== "confirmed") return {};
+  const rows = Array.isArray(evidence.results) ? evidence.results : [];
+  const labels: Record<string, string> = {};
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const item = row as Record<string, unknown>;
+    const threadId = String(item.thread_id || item.thread_ref || "").trim().replace(/^THREAD_REF_/, "");
+    const subject = String(item.subject || "").replace(/\s+/g, " ").trim().slice(0, 160);
+    if (threadId && subject && !labels[threadId]) labels[threadId] = subject;
+  }
+  return labels;
+}
+
+function confirmedEvidenceThreadIdsFromOutcomes(outcomes: AgentToolOutcome[]): string[] {
+  const threadIds = new Set<string>();
+  for (const outcome of outcomes) {
+    for (const candidate of [outcome, outcome.data, outcome.result]) {
+      for (const threadId of threadIdsFromEvidence(candidate)) threadIds.add(threadId);
+    }
+  }
+  return [...threadIds];
+}
+
+function confirmedEvidenceThreadLabelsFromOutcomes(outcomes: AgentToolOutcome[]): Record<string, string> {
+  const labels: Record<string, string> = {};
+  for (const outcome of outcomes) {
+    for (const candidate of [outcome, outcome.data, outcome.result]) {
+      Object.assign(labels, threadLabelsFromEvidence(candidate));
+    }
+  }
+  return labels;
+}
+
+function confirmedEvidenceThreadIds(payload: Record<string, unknown>): Set<string> {
+  // 邮件链接只能来自当前查询的确认命中，避免模型将已关闭详情或相近结果伪装成可打开邮件。
+  const threadIds = new Set(threadIdsFromEvidence(payload));
+  const explicitIds = Array.isArray(payload.evidence_thread_ids) ? payload.evidence_thread_ids : [];
+  for (const threadId of explicitIds) {
+    const value = String(threadId || "").trim().replace(/^THREAD_REF_/, "");
+    if (value) threadIds.add(value);
+  }
+  return threadIds;
+}
+
+function confirmedEvidenceThreadLabels(payload: Record<string, unknown>, allowedThreadIds: Set<string>): Record<string, string> {
+  const labels = threadLabelsFromEvidence(payload);
+  const explicit = payload.evidence_thread_labels;
+  if (explicit && typeof explicit === "object") {
+    for (const [rawThreadId, rawSubject] of Object.entries(explicit as Record<string, unknown>)) {
+      const threadId = rawThreadId.trim().replace(/^THREAD_REF_/, "");
+      const subject = String(rawSubject || "").replace(/\s+/g, " ").trim().slice(0, 160);
+      if (allowedThreadIds.has(threadId) && subject) labels[threadId] = subject;
+    }
+  }
+  return Object.fromEntries(Object.entries(labels).filter(([threadId]) => allowedThreadIds.has(threadId)));
 }
 
 /** 从 Host tool 结果中提取 start_ai_turn / custom scan 的 run_id。 */
@@ -1514,9 +1596,9 @@ export function useAppController() {
       const count = 0;
       // 调用方主要看 ok；count/hasMore 由后续 feed 状态自行推导
       if (ok) {
-        showToast(days > 7
-          ? `Inbox synced for the last ${days} days.`
-          : "Inbox refreshed.");
+        showToast(days > 0
+          ? `Inbox synced. Showing the last ${days} days.`
+          : "Inbox synced.");
       }
       return {
         ok,
@@ -1568,9 +1650,16 @@ export function useAppController() {
       await preloadContactAvatars(mailbox, refreshedMessages);
       inboxFeedCache.current.set(`${mailbox}|all|${days}`, { payload, loadedAt: Date.now() });
       const count = nextOffset;
-      showToast(days > 7
-        ? `Inbox synced for the last ${days} days. ${count} email${count === 1 ? "" : "s"} loaded.`
-        : `Inbox refreshed. ${count} email${count === 1 ? "" : "s"} loaded.`);
+      const displayRange = days > 0 ? `the last ${days} days` : "the available cache";
+      const boundary = payload.sync_boundary;
+      const priorityDays = Number(boundary?.priority_days || 180);
+      let scanStatus = `${priorityDays}-day metadata scan is continuing in the background.`;
+      if (boundary?.initial_sync_complete) {
+        scanStatus = boundary.backfill_complete
+          ? `${Number(boundary.cache_total || 0)} emails are indexed in the cache.`
+          : `${priorityDays}-day priority cache is ready; older history is continuing in the background.`;
+      }
+      showToast(`Cache rebuilt. ${count} email${count === 1 ? "" : "s"} shown for ${displayRange}. ${scanStatus}`);
       return { ok: true, count, hasMore, nextOffset, messages: Array.isArray(payload.messages) ? payload.messages : [] };
     } catch (error) {
       if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
@@ -4241,6 +4330,7 @@ export function useAppController() {
     },
     async sendAiChatMessage(options = {}) {
       const userRequest = String(options.prompt ?? state.customScanInput).trim();
+      const agentRequest = String(options.agentPrompt || userRequest).trim() || userRequest;
       if (!state.runtime.connected) {
         showToast("LLM is offline. Please try again when it reconnects.");
         return;
@@ -4310,6 +4400,7 @@ export function useAppController() {
           savedPromptId: options.savedPromptId,
           selectedThreads: options.selectedThreads,
           routingIntent: options.routingIntent,
+          searchField: options.searchField,
           inboxListContext: options.inboxListContext,
         });
         // local 兼容环也不能收到列表展示时间窗；复合 Evidence 始终扫描全量索引缓存。
@@ -4323,7 +4414,7 @@ export function useAppController() {
           const scanScope = await loadScanPlanForRun(scanMailbox);
           if (!isCurrentGeneration()) return;
           const started = await client.startAiTurn({
-            user_text: userRequest,
+            user_text: agentRequest,
             mailbox: scanMailbox,
             ui_context: sidebarUiContext,
             conversation_id: conversationId,
@@ -4379,7 +4470,7 @@ export function useAppController() {
           const agentTurn = await runAiAgentTurn(
             state.runtime.client,
             conversationId,
-            buildAiAgentContent(userRequest, sidebarUiContext),
+            buildAiAgentContent(agentRequest, sidebarUiContext),
             {
               signal: generationRun.controller.signal,
               onText: (piece) => {
@@ -4509,10 +4600,20 @@ export function useAppController() {
         }
         if (!isCurrentGeneration()) return;
         const kind = String(payload.kind || "chat");
-        const assistantText = stripTerminalDoneMarker(
+        const rawAssistantText = stripTerminalDoneMarker(
           String(payload.assistant_text || payload.summary || "").trim(),
         )
           || "";
+        const confirmedThreadIds = confirmedEvidenceThreadIds(payload);
+        const threadReferenceLabels = confirmedEvidenceThreadLabels(payload, confirmedThreadIds);
+        const assistantText = ensureConfirmedThreadReference(
+          rawAssistantText,
+          confirmedThreadIds,
+          threadReferenceLabels,
+        );
+        const threadReferenceFields = Object.keys(threadReferenceLabels).length
+          ? { threadReferenceLabels }
+          : {};
         const { scanQuery, scanSource } = payloadScanQuery(payload);
         // 仅真实检索过才写入消息，驱动 Thinking 后可点 query chip
         const scanFields = scanQuery
@@ -4601,6 +4702,7 @@ export function useAppController() {
               .slice(0, 4)
             : [];
           return {
+            kind: String(value.kind || "") || undefined,
             original_input: String(value.original_input || userRequest),
             question: String(value.question || assistantText),
             actions,
@@ -4631,6 +4733,7 @@ export function useAppController() {
               sourcePrompt: userRequest,
               timestamp: new Date().toISOString(),
               ...scanFields,
+              ...threadReferenceFields,
             },
           ];
           upsertAiConversationHistory(conversationId, finalMessages, { kind: "scan", query: userRequest, result });
@@ -4644,6 +4747,7 @@ export function useAppController() {
               content: assistantText,
               clarification: parseClarification(),
               timestamp: new Date().toISOString(),
+              ...threadReferenceFields,
             },
           ];
           upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
@@ -4663,6 +4767,7 @@ export function useAppController() {
               sourcePrompt: userRequest,
               timestamp: new Date().toISOString(),
               ...scanFields,
+              ...threadReferenceFields,
             },
           ];
           upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
@@ -4723,6 +4828,7 @@ export function useAppController() {
                 : null,
               timestamp: new Date().toISOString(),
               ...scanFields,
+              ...threadReferenceFields,
             },
           ];
           upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
@@ -4737,6 +4843,7 @@ export function useAppController() {
               mailContext: parseMailContext(),
               timestamp: new Date().toISOString(),
               ...scanFields,
+              ...threadReferenceFields,
             },
           ];
           upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
@@ -4753,6 +4860,7 @@ export function useAppController() {
               content: assistantText,
               timestamp: new Date().toISOString(),
               ...scanFields,
+              ...threadReferenceFields,
             },
           ];
           upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });

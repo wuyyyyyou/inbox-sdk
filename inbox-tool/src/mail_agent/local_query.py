@@ -209,7 +209,9 @@ def _match_term(
 ) -> bool:
     hit = False
     if term.field == "subject":
-        hit = _has_match(_field(message, "subject"), term.value)
+        # 用户标题常带尾部省略号截断；去掉后再做子串匹配，避免 subject:Title... 永远不中。
+        subject_term = re.sub(r"(?:\.{2,}|…)+$", "", str(term.value or "")).strip() or str(term.value or "")
+        hit = _has_match(_field(message, "subject"), subject_term)
     elif term.field == "body":
         hit = _has_match(_field(message, "body"), term.value)
     elif term.field == "from":
@@ -376,6 +378,8 @@ def normalize_to_local_query(raw: str) -> str:
     无法识别的条件保留为裸词；相邻 Gmail 字段映射为 AND，字段值内的空格不拆分。
     """
     text = " ".join(str(raw or "").split())
+    # Gmail 的字段短语引号是语义标记；本地字段匹配按连续子串处理，不能把引号当作正文字符。
+    text = re.sub(r'(?i)\b(subject|body|from|to):"([^"]*)"', r'\1:\2', text)
     if not text:
         return ""
     clauses = _split_gmail_query_clauses(text)

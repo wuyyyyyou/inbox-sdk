@@ -1,20 +1,18 @@
 # AI 侧栏：Sampling 本地 Router → Host Agent Session 改造方案
 
-状态：**已实现并纳入 App `2.1.5` / Tool `2.2.5` 发布基线**
-基线：App `2.1.5` / Tool `2.2.5`
+状态：**已实现**；当前产品基线见 [2.3.1 架构与发布基线](2.3.1架构与发布基线.md)（App `2.2.1` / Tool `2.3.1`）
 对照官方文档：
 
 - [Agent Sessions（Executa）](https://staging.anna.partners/developers/tools/executa-agent)
 - [Agent sessions 参考](https://staging.anna.partners/developers/reference/executa-agent-sessions)
 - [App-Side LLM & Agent API](https://staging.anna.partners/developers/apps/llm-and-agent)
 - [host-api agent.*](https://staging.anna.partners/developers/reference/host-api-agent)
-- [Sampling](https://staging.anna.partners/developers/tools/executa-sampling)（仅作旧路径对照；侧栏不再依赖）
+- [Sampling](https://staging.anna.partners/developers/tools/executa-sampling)（仅作旧路径 / local 兼容对照；生产侧栏主路径不依赖）
 
 相关实现文档：
 
-- [AI 对话本地 Router 与白名单工具设计](AI对话本地Router与白名单工具设计.md)（**侧栏路径将被取代**；安全原则仍继承）
-- [Streaming 与任务 SystemPrompt 拆分](Streaming与任务SystemPrompt拆分.md)
-- [2.2.5 架构与发布基线](2.2.5架构与发布基线.md)
+- [2.3.1 架构与发布基线](2.3.1架构与发布基线.md)
+- [AI 侧栏本地测试开关](AI侧栏本地测试开关.md)
 
 ---
 
@@ -32,15 +30,17 @@
 
 ### 0.1 当前实现状态
 
-- 已实现：App 侧 `anna.agent.session`、官方 `systemPrompt`、侧栏流式帧消费、`agent.tools` 白名单，以及 Host 可调的 `ai_*` Executa 细粒度工具。
-- 已保留：`start_ai_turn` 仅用于既有详情页/兼容路径；侧栏不再调用本地 Router。
+- 已实现：App 侧 `anna.agent.session`、官方 `systemPrompt`、侧栏流式帧消费、`agent.tools` 白名单，以及 Host 可调的细粒度工具（主只读入口为 `query_mail_evidence`）。
+- 已保留：`start_ai_turn` 用于详情页/兼容路径；本地可用 `source=sidebar_local`（Sampling 选型 + 与 Host 相同 `handle_ai_agent_tool`），**不是**旧侧栏 Router 旁路。
+- 线程引用：仅允许本轮 confirmed Evidence 的 `THREAD_REF`；前端过滤未确认引用与直接 Gmail 链接。
 - 已完成代码侧验证：`agent.tools` 使用全限定工具名，前端兼容多种 Host tool_result 流式帧，Agent run 支持取消和会话清理；真实账号下的 Host 长工具超时仍属于发布后观测项。
 
-### 0.2 检索与输出约束（2026-07-21）
+### 0.2 检索与输出约束（现行）
 
-- Host 使用 `search_email` 实时检索 Gmail（不回退本地缓存）；本地工作流 `is:todo/done/snoozed` 仅 AND，并依赖 `ui_context` 中的 message id 列表；单次最多 20 条命中。
-- `search_email` 只返回日期、参与者、主题、`bodySnippet` 和 `THREAD_REF`；`read_email` 默认同样只读 metadata，只有 `readMask` 显式包含 `bodyFull` 才加载正文。
-- `systemPrompt` 禁止 Markdown 表格，要求标题/列表分组、真实 `[THREAD_REF_xxx]` 和简短的最终摘要。
+- 邮箱范围问答主路径只调一次 `query_mail_evidence`（Scope → QueryPlan → 本地缓存 Evidence）；Host 白名单不再直接暴露 `search_email` / `read_email` 给侧栏选型。
+- `search_email` / `read_email` 为 cache-only 底层能力；`bodyFull` 未缓存时 `body_pending`；仅当目标时间早于索引最早边界时，Evidence 才可一次受限 Gmail 历史检索。
+- 本地工作流 `is:todo/done/snoozed` 仅 AND；单次命中上限 20。
+- `systemPrompt` 禁止 Markdown 表格，要求标题/列表分组、仅 confirmed 的 `[THREAD_REF_xxx]` 和简短最终摘要。
 - App manifest 的 `agent.tools` 必须使用 Host RPC 中出现的全限定工具名（`tool_riazm4777_inbox_executa_dnsb9fqu__<tool>`）；短工具名会解析为空集并触发 `inherit_host_tools: true`。
 
 ---
@@ -384,7 +384,7 @@ for await (const frame of stream) {
 ### 阶段 3 — 清理与文档
 
 1. 删除或隔离死代码（侧栏 Router 路径、路径 B stream 双轨）。
-2. 回写 [本地 Router 设计](AI对话本地Router与白名单工具设计.md)：侧栏已迁 Host Agent。
+2. 删除已下线的侧栏 Router 方案文档。
 3. 更新基线文档 / README / AGENTS 描述。
 4. 回归：整理确认、发送、多选批量、澄清范围、授权失效提示。
 
@@ -437,9 +437,9 @@ for await (const frame of stream) {
 
 | 文档 | 关系 |
 | --- | --- |
-| **本文** | 侧栏 Host Agent Session 改造的权威方案 |
-| [本地 Router 设计](AI对话本地Router与白名单工具设计.md) | 历史实现与安全原则；侧栏选型章节将被本文取代 |
-| [Streaming 拆分](Streaming与任务SystemPrompt拆分.md) | 路径 B 将随阶段 2 废弃侧栏用法 |
+| **本文** | 侧栏 Host Agent Session 改造方案（历史决策 + 现行约束） |
+| [2.3.1 架构与发布基线](2.3.1架构与发布基线.md) | 当前产品/发布基线 |
+| [AI 侧栏本地测试开关](AI侧栏本地测试开关.md) | local 调试路径（与 Host 共用工具白名单） |
 | 官方 agent / llm-and-agent | 协议与 ACL 权威 |
 
 ---
@@ -448,5 +448,5 @@ for await (const frame of stream) {
 
 1. ~~产品方向对齐~~（已完成，见 §0）。
 2. ~~阶段 0：工具命名、systemPrompt 和流式帧探针~~（代码侧结论已落地：使用全限定工具名，适配多种 tool_result 帧）。
-3. ~~阶段 1/2：工具上架与前端切换~~（已完成，纳入 App `2.1.5` / Tool `2.2.5`）。
+3. ~~阶段 1/2：工具上架与前端切换~~（已完成；现行基线 App `2.2.1` / Tool `2.3.1`）。
 4. 发布后继续观测真实 Host 的长工具超时、跨多轮会话稳定性和取消行为；发现协议差异时只调整 `agentSessionClient` 适配层。

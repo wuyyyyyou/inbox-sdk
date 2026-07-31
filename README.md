@@ -10,11 +10,11 @@ Anna Inbox 是运行在 Anna App 中的 Gmail 工作台。2.0 以完整收件箱
 - 线程详情、清洗后的文本或安全 HTML、AI overview、回复/转发/Compose 富文本草稿（`body_html`）、Cc·Bcc 与发送（10 秒可撤销）。
 - 收件附件预览/下载（优先 Host transient upload，回退 APS Files；本地 dev 保留 loopback）；回复与 Compose 外发附件（合计 ≤25MB）。
 - 多邮箱切换：立刻取消上一邮箱扫描，首屏读本地缓存，后台 180 天 priority + History 静默同步；缓存刷新后预热联系人头像。
-- 可折叠、可调宽的 Anna AI 侧栏：默认 Host Agent Session，只读检索经 `query_mail_evidence` 一次取证；支持当前邮件上下文、可审阅草稿插入、停止/恢复与会话清理；本地可用 env/localStorage 走 `sidebar_local` 兼容路径。
+- 可折叠、可调宽的 Anna AI 侧栏：默认 Host Agent Session，只读检索经 `query_mail_evidence` 一次取证；host/local 仅由既有侧栏模式开关控制；支持当前邮件上下文、确认 Evidence 线程引用、可审阅草稿插入、停止/恢复与会话清理；本地可用 env/localStorage 走 `sidebar_local` 兼容路径。
 - Agent 工具仅执行只读检索、阅读、总结、草稿和整理建议；发送、删除、标签变更等状态修改仍须用户明确确认。
 - AI 检索默认扫描**本地已索引缓存**（非列表 7/30/60 窗）；`search_email`/`read_email` cache-only；超出索引最早边界时 Evidence 可受限回源 Gmail 历史；`sync_boundary` 标明覆盖范围。
 - 后台正文/附件预处理（文本、Office、PDF；图片 OCR 待平台接口）。
-- 邮箱级 Todo/Done/Snoozed 与 AI Ask 历史经 APS KV 读写，乐观并发 etag。
+- 选择性 APS 同步仅覆盖邮箱级 Todo/Done/Snoozed、AI Ask 历史、设置和草稿；邮件缓存及其余业务数据固定保留本地，乐观并发使用 etag。
 - 多 Gmail 账户发现与切换。
 - LLM 与 Gmail API 的真实连通性和延迟检测：反向 RPC 响应直通、12 秒统一总预算、检测去重，并在扫描或 AI turn 期间暂停轮询。
 - 平台超时安全诊断：阶段耗时与错误类型可反馈；禁止日志含邮箱、查询、邮件或凭据。
@@ -117,8 +117,8 @@ App 与 Tool **版本解耦**（当前基线）：
 
 | 端 | 版本 | 权威文件 |
 | --- | --- | --- |
-| App | `2.1.8` | `anna-inbox/app.json` |
-| Tool | `2.2.8` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
+| App | `2.2.1` | `anna-inbox/app.json` |
+| Tool | `2.3.1` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
 
 Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Tool 版本后运行：
 
@@ -133,6 +133,6 @@ python scripts/sync/sync_executa_identity.py --check
 
 当前文档索引见 [`anna-inbox/docs/README.md`](anna-inbox/docs/README.md)。
 
-- [2.2.8 架构与发布基线](anna-inbox/docs/2.2.8架构与发布基线.md)
+- [2.3.1 架构与发布基线](anna-inbox/docs/2.3.1架构与发布基线.md)
 - [邮箱同步 P0：缓存优先](anna-inbox/docs/邮箱同步P0缓存优先方案.md)
 - [平台超时诊断与反馈流程](anna-inbox/docs/平台超时诊断与反馈流程.md)

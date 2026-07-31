@@ -17,6 +17,7 @@ import {
   senderParts,
   splitAddresses,
   stripForwardedMessageBlock,
+  stripQuotedReplyForDisplay,
   triggerAttachmentDownload,
 } from "./mailDetailHelpers";
 
@@ -283,6 +284,14 @@ describe("mailDetailHelpers", () => {
     expect(body).toMatch(/Forwarded message|转发的邮件/);
     expect(body).toContain("Original body");
     expect(stripForwardedMessageBlock(body)).toBe("Please see below.");
+  });
+
+  it("removes quoted reply content from stale plain-text bodies", () => {
+    const cleaned = stripQuotedReplyForDisplay(
+      "I will wait for your approval.\n\nOn Thu, 28 May 2026, 7:04 am Kate <kate@example.com> wrote:\n>>>>>>>> Best regards\n>>>>>>>> Older content",
+    );
+    expect(cleaned).toBe("I will wait for your approval.");
+    expect(stripQuotedReplyForDisplay("> A Markdown quote remains.\nCurrent note.")).toContain("> A Markdown quote remains.");
   });
 
   it("preserves original html when building forward send bodies", () => {

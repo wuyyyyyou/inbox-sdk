@@ -1,7 +1,7 @@
 {
   "slug": "mail-assistant",
   "name": "Anna inbox",
-  "version": "2.1.8",
+  "version": "2.2.1",
   "tagline": "Turn email chaos into reviewable actions.",
   "description": "Finds what matters across your inbox, summarizes the context, drafts replies, and keeps you in control before anything is sent or changed.",
   "category": "communication",

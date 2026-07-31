@@ -218,6 +218,14 @@ export interface InboxEmailDetailPayload {
   message?: InboxMessage & { body_text?: string | null; body_truncated?: boolean };
 }
 
+export interface InboxSyncBoundary {
+  priority_days?: number;
+  cache_total?: number;
+  initial_sync_complete?: boolean;
+  backfill_complete?: boolean;
+  sync_stage?: string;
+}
+
 export interface InboxFeedPayload {
   mailbox?: string;
   days?: number;
@@ -230,6 +238,7 @@ export interface InboxFeedPayload {
   source?: "cache" | "gmail";
   page_token?: string;
   page_offset?: number;
+  sync_boundary?: InboxSyncBoundary;
   messages: InboxMessage[];
   updated_at?: string;
 }
@@ -998,6 +1007,8 @@ export interface AiChatMessage {
   scanQuery?: string;
   /** 检索数据源；当前固定 cache。 */
   scanSource?: "cache" | string;
+  /** 本轮确认 Evidence 的线程标题，仅用于 AI 详情入口的按钮文案。 */
+  threadReferenceLabels?: Record<string, string>;
 }
 
 /** 后端 clarify 文案提示；阶段 C 起不再用前端强制 kind 分流 */
@@ -1007,6 +1018,8 @@ export interface AiClarificationAction {
 }
 
 export interface AiClarificationPayload {
+  /** 澄清场景；search_field 需要把选项作为原问题的检索字段重新提交。 */
+  kind?: "search_field" | string;
   original_input: string;
   question: string;
   actions: AiClarificationAction[];
@@ -1060,6 +1073,10 @@ export interface SendAiMessageOptions {
   selectedThreads?: AiSelectedThreadRef[];
   /** Router 无法判断时由用户明确选择的范围。 */
   routingIntent?: AiRoutingIntent;
+  /** 字段澄清卡确认的邮件检索字段；必须透传给 Evidence，禁止再次由模型推断。 */
+  searchField?: "subject" | "body" | "participants" | "date";
+  /** 仅供 Agent 继续上一轮澄清所需的上下文，不写入用户可见对话消息。 */
+  agentPrompt?: string;
   /** 侧栏当前列表范围，仅作为 Host Agent 的只读事实。 */
   inboxListContext?: AiInboxListContext;
 }

@@ -2,7 +2,7 @@
 
 Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；AI 侧栏是唯一智能入口。Brief 产品面已下线，不再代表 2.0 主路径。
 
-当前发布基线：App `2.1.8` / Tool `2.2.8`。本版本重点：列表固定首屏 100 + **触底自动加载**（移除 Initial list size / Show more 按钮）；标签角标 `99+`；分页仅前端。继承：邮箱 **180 天 metadata 优先 + 无硬顶 backfill** 与 `sync_boundary`；侧栏 `query_mail_evidence`；`search_email`/`read_email` cache-only；正文/附件预处理；草稿产物可编辑插入。
+当前发布基线：App `2.2.1` / Tool `2.3.1`。本版本：Evidence 字段澄清与确定性 QueryPlan、确认线程引用、草稿主人身份、选择性 APS、本地 JSON salvage（无二次 repair）、同步边界 toast、Mail Detail 滚动稳定，以及根目录 P0 本地评测脚本（用例 CSV + 自动判据；运行产物不提交）。继承：列表固定首屏 100 + **触底自动加载**、邮箱 **180 天 metadata 优先 + 无硬顶 backfill** 与 `sync_boundary`、侧栏 `query_mail_evidence`、`search_email`/`read_email` cache-only、正文/附件预处理与草稿产物可编辑插入。
 
 ## Language
 
@@ -24,7 +24,7 @@ Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 或 All 
 
 **Anna AI Sidebar**
 
-主界面左侧的对话入口。默认创建 Host Agent Session，由 Host 在显式白名单中选型并调用 `query_mail_evidence`、写/改稿、整理建议和记忆工具；前端透传只读屏上上下文（不含把展示时间窗当检索边界）并消费流式文本与工具结果。本地可用 `ANNA_INBOX_AI_SIDEBAR_MODE=local` 或 localStorage 覆盖，走 `start_ai_turn(source=sidebar_local)`（Sampling 选型 + 与 Host 相同工具执行）。侧栏支持取消当前 run、复用会话继续对话和清理会话；整理类仅产出确认卡片，须用户确认后 mutation。
+主界面左侧的对话入口。默认创建 Host Agent Session，由 Host 在显式白名单中选型并调用 `query_mail_evidence`、写/改稿、整理建议和记忆工具；前端透传只读屏上上下文（不含把展示时间窗当检索边界）并消费流式文本与工具结果。host/local 路径仅由既有侧栏模式开关控制，不再提供独立 B 路径评测开关。本地可用 `ANNA_INBOX_AI_SIDEBAR_MODE=local` 或 localStorage 覆盖，走 `start_ai_turn(source=sidebar_local)`；其 route Sampling 选择 `query_mail_evidence` 时会同步生成 QueryPlan，避免重复 Sampling。侧栏支持取消当前 run、复用会话继续对话和清理会话；整理类仅产出确认卡片，须用户确认后 mutation。
 
 **sync_boundary**
 

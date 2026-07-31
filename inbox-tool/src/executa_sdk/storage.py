@@ -44,12 +44,47 @@ Error codes — keep in sync with ``matrix/src/executa/protocol.py``::
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .sampling import _write_frame  # reuse existing frame writer
+
+
+# 本地 Anna Runtime 的 bridge 在部分 Windows 环境仍以 GBK 写 stdout；
+# APS storage/set 的值若直接含 emoji 或中文会在 bridge 层崩溃。仅对
+# 非 ASCII 字符串使用可逆包装，确保 reverse-RPC 的 Python 对象全为 ASCII。
+_ASCII_TRANSPORT_STRING_KEY = "__anna_inbox_ascii_transport_v1__"
+
+
+def _encode_storage_transport_value(value: Any) -> Any:
+    """递归把非 ASCII 字符串包装为 ASCII JSON，保留原始数据类型结构。"""
+    if isinstance(value, str):
+        if value.isascii():
+            return value
+        return {_ASCII_TRANSPORT_STRING_KEY: json.dumps(value, ensure_ascii=True)}
+    if isinstance(value, list):
+        return [_encode_storage_transport_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _encode_storage_transport_value(item) for key, item in value.items()}
+    return value
+
+
+def _decode_storage_transport_value(value: Any) -> Any:
+    """还原 APS 读取结果中的 ASCII 字符串包装，兼容旧版未包装值。"""
+    if isinstance(value, list):
+        return [_decode_storage_transport_value(item) for item in value]
+    if isinstance(value, dict):
+        if set(value) == {_ASCII_TRANSPORT_STRING_KEY} and isinstance(value[_ASCII_TRANSPORT_STRING_KEY], str):
+            try:
+                decoded = json.loads(value[_ASCII_TRANSPORT_STRING_KEY])
+            except json.JSONDecodeError:
+                return value
+            return decoded if isinstance(decoded, str) else value
+        return {key: _decode_storage_transport_value(item) for key, item in value.items()}
+    return value
 
 
 # ─── Method names — keep in sync with matrix/src/executa/protocol.py ──
@@ -231,6 +266,8 @@ class StorageClient(_BaseRpcClient):
             if exc.code != STORAGE_ERR_NOT_FOUND:
                 raise
             return {"value": None, "exists": False, "etag": None}
+        if "value" in result:
+            result["value"] = _decode_storage_transport_value(result.get("value"))
         result.setdefault("exists", True)
         return result
 
@@ -250,7 +287,11 @@ class StorageClient(_BaseRpcClient):
         mismatches raise :class:`StorageError` with code
         :data:`STORAGE_ERR_PRECONDITION_FAILED`.
         """
-        params: Dict[str, Any] = {"key": key, "value": value, "scope": scope}
+        params: Dict[str, Any] = {
+            "key": key,
+            "value": _encode_storage_transport_value(value),
+            "scope": scope,
+        }
         if if_match is not None:
             params["if_match"] = if_match
         if ttl_seconds is not None:

@@ -89,6 +89,21 @@ describe("parseAiMessageMarkdown", () => {
     ]);
   });
 
+  it("keeps multiple thread references inline with one finding", () => {
+    expect(parseAiMessageMarkdown("- Related conversations [THREAD_REF_thread-1] [THREAD_REF_thread-2]")).toEqual([
+      {
+        type: "unordered_list",
+        indent: 0,
+        items: [[
+          { type: "text", value: "Related conversations " },
+          { type: "thread_ref", threadId: "thread-1" },
+          { type: "text", value: " " },
+          { type: "thread_ref", threadId: "thread-2" },
+        ]],
+      },
+    ]);
+  });
+
   it("renders an unclosed leading bold marker in email metadata as bold text", () => {
     expect(parseAiMessageMarkdown("发件人： ** Tony (SaneBox)\n主题： ** Kate, Book your SaneBox walkthrough call today!")).toEqual([
       { type: "metadata", label: "发件人", content: [{ type: "bold", value: "Tony (SaneBox)" }] },

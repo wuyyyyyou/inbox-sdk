@@ -43,15 +43,7 @@ def _is_platform() -> bool:
 
 
 def get_ai_sidebar_mode() -> str:
-    """返回后端默认的 AI 侧栏路径模式。
-
-    - ``host``（默认）：侧栏走 Host Agent Session（生产主路径）。
-    - ``local``：侧栏应走 ``start_ai_turn`` 本地 Router + Anna Sampling，
-      便于本地调试且不依赖平台 Agent Session / 频繁上传 Tool。
-
-    环境变量：``ANNA_INBOX_AI_SIDEBAR_MODE=local|host``。
-    前端可用 localStorage ``anna-inbox-ai-sidebar-mode`` 覆盖本默认值。
-    """
+    """返回后端默认侧栏模式，供本地兼容路径记录实际选路。"""
     raw = str(os.environ.get("ANNA_INBOX_AI_SIDEBAR_MODE") or "host").strip().lower()
     return "local" if raw == "local" else "host"
 
@@ -85,7 +77,7 @@ MAX_INBOX_THREAD_RESPONSE_BYTES = 48 * 1024
 CONNECTIVITY_CHECK_TIMEOUT_SECONDS = 12.0
 CONNECTIVITY_GMAIL_ACCOUNT_TIMEOUT_SECONDS = 3.0
 
-# Host Agent 细粒度工具 schema：描述要短、选型路径要直，避免 Host 多轮犹豫。
+# 本地 Agent 会话细粒度工具 schema：描述要短、选型路径要直，避免多轮犹豫。
 # mutation 不在此列表，必须由前端显式确认后调用。
 AI_AGENT_DEFAULT_TOOLS = [
     {
@@ -99,6 +91,7 @@ AI_AGENT_DEFAULT_TOOLS = [
             {"name": "mailbox", "type": "string", "description": "Active mailbox.", "required": False},
             {"name": "ui_context", "type": "object", "description": "Read-only current thread, selection, and list context.", "required": False},
             {"name": "conversation_id", "type": "string", "description": "Sidebar conversation id for structured active scope.", "required": False},
+            {"name": "scope_kind", "type": "string", "description": "Use current_thread or selected_threads only when the user explicitly refers to that scope; otherwise omit for the full indexed mailbox.", "required": False},
         ],
         "timeout": 120,
     },
@@ -898,12 +891,13 @@ DEFAULT_MANIFEST = {
         },
         {
             "name": "start_ai_turn",
-            "description": "Legacy unified AI turn with local router. Prefer Host Agent plus ai_* tools for sidebar.",
+            "description": "Unified AI turn. The sidebar uses source=sidebar_local for the local multi-step Agent Session and polls by run_id.",
             "parameters": [
                 {"name": "user_text", "type": "string", "description": "Natural language user message.", "required": True},
                 {"name": "mailbox", "type": "string", "description": "Primary mailbox email address.", "required": False},
                 {"name": "ui_context", "type": "object", "description": "Read-only screen context: current thread, last_draft, selected mailboxes, display range, etc.", "required": False},
                 {"name": "conversation_id", "type": "string", "description": "Ephemeral sidebar conversation id for multi-turn registry (process-local).", "required": False},
+                {"name": "source", "type": "string", "description": "sidebar_local for the local Agent Session; sidebar_evaluation for its evaluation path.", "required": False},
                 {"name": "run_id", "type": "string", "description": "Client-generated run ID for polling.", "required": False},
                 {"name": "max_messages", "type": "integer", "description": "Max messages for inbox search tools.", "required": False},
                 {"name": "scan_window_days", "type": "integer", "description": "Default day range for inbox search.", "required": False},
@@ -1289,16 +1283,18 @@ from mail_agent.storage.local import make_local_clients
 _local_data_dir = Path(os.environ.get("ZHAOPY_MAIL_AGENT_STORAGE_DIR") or data_root()).expanduser().resolve()
 _local_storage, _local_files = make_local_clients(_local_data_dir)
 
-from mail_agent.storage.client import init as init_storage_singleton
+from mail_agent.storage.client import init as init_storage_singleton, init_selective as init_selective_storage
 _active_storage_provider = ""
 _route_storage_response = lambda msg: False
+_aps_cleanup_completed = False
 
 
 def _set_storage_backend(provider: Any = "") -> str:
     global _active_storage_provider, _route_storage_response
     selected = _normalize_storage_provider(provider)
     if selected == "aps":
-        init_storage_singleton(_aps_storage, _aps_files, scope="user", backend="aps")
+        # APS 只负责用户明确要求的跨端数据；邮件缓存等其余 KV 一律落本地。
+        init_selective_storage(_local_storage, _local_files, _aps_storage, _aps_files, scope="user")
         _route_storage_response = _aps_route_storage_response
     else:
         init_storage_singleton(_local_storage, _local_files, scope="user", backend="local")
@@ -1310,11 +1306,37 @@ def _set_storage_backend(provider: Any = "") -> str:
     return selected
 
 
+def _cleanup_legacy_aps_data() -> None:
+    """在首个 APS 工具调用前迁移并清理旧业务键，失败时下次调用会重试。"""
+    global _aps_cleanup_completed
+    if _aps_cleanup_completed or _active_storage_provider != "aps":
+        return
+    from mail_agent.storage.aps_cleanup import migrate_and_cleanup_aps
+
+    future = asyncio.run_coroutine_threadsafe(migrate_and_cleanup_aps(_aps_storage, scope="user"), loop)
+    try:
+        summary = future.result(timeout=60.0)
+        _aps_cleanup_completed = True
+        log(f"APS selective cleanup: migrated={summary['migrated']} deleted={summary['deleted']}")
+    except Exception as exc:
+        future.cancel()
+        log(f"APS selective cleanup deferred: {type(exc).__name__}")
+
+
 def _apply_storage_provider(arguments: dict[str, Any]) -> str:
-    if "storage_provider" in arguments:
-        return _set_storage_backend(arguments.get("storage_provider"))
-    default_backend = "aps" if _is_platform() else "local"
-    return _active_storage_provider or _set_storage_backend(os.environ.get("ANNA_STORAGE_BACKEND", default_backend))
+    # anna-app dev --storage aps 会把该运行时变量传给 Executa 子进程。
+    # 此时前端历史参数中的 local 不能覆盖 Harness 已选择的 APS，
+    # 否则 Gmail 缓存会在同一会话中重新落回本地 JSON。
+    runtime_storage_mode = str(os.environ.get("ANNA_APP_RUNTIME_STORAGE_MODE") or "").strip().lower()
+    if runtime_storage_mode == "aps":
+        selected = _set_storage_backend("aps")
+    elif "storage_provider" in arguments:
+        selected = _set_storage_backend(arguments.get("storage_provider"))
+    else:
+        default_backend = "aps" if _is_platform() else "local"
+        selected = _active_storage_provider or _set_storage_backend(os.environ.get("ANNA_STORAGE_BACKEND", default_backend))
+    _cleanup_legacy_aps_data()
+    return selected
 
 
 def _should_use_aps_storage() -> bool:
@@ -1326,7 +1348,10 @@ def _should_use_aps_files() -> bool:
     return _is_platform() or _should_use_aps_storage()
 
 
-_set_storage_backend(os.environ.get("ANNA_STORAGE_BACKEND", "aps" if _is_platform() else "local"))
+_set_storage_backend(os.environ.get(
+    "ANNA_STORAGE_BACKEND",
+    "aps" if _is_platform() or str(os.environ.get("ANNA_APP_RUNTIME_STORAGE_MODE") or "").strip().lower() == "aps" else "local",
+))
 
 loop = asyncio.new_event_loop()
 loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
@@ -1532,16 +1557,35 @@ def _is_warning_stage(stage: str) -> bool:
 
 
 def _save_run_checkpoint(run_id: str) -> None:
-    # 后台任务是进程内存态；落盘用于本地 runtime 重启后的轮询诊断。
+    """持久化后台运行状态；Windows 临时占用不能中断正在执行的 AI 任务。"""
     with RUN_STATE_LOCK:
         state = MAIL_AGENT_RUNS.get(run_id)
         if not state:
             return
         RUN_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         path = _run_checkpoint_path(run_id)
-        tmp_path = path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(state, ensure_ascii=False, default=str), encoding="utf-8")
-        tmp_path.replace(path)
+        # 固定 .tmp 名称会让并发 Executa 进程互相覆盖；UUID 同时避免读写竞争。
+        tmp_path = path.with_name(f"{path.stem}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp_path.write_text(json.dumps(state, ensure_ascii=False, default=str), encoding="utf-8")
+            for attempt in range(4):
+                try:
+                    os.replace(tmp_path, path)
+                    return
+                except PermissionError:
+                    # Windows Defender、文件索引或另一个短生命周期 Executa 可能暂时持有文件。
+                    if attempt == 3:
+                        log(f"run checkpoint deferred: run_id={run_id} error=permission_denied")
+                        return
+                    time.sleep(0.03 * (attempt + 1))
+        except OSError as exc:
+            # 检查点只服务重启后的轮询诊断；内存态任务必须继续完成并返回结果。
+            log(f"run checkpoint deferred: run_id={run_id} error_type={type(exc).__name__}")
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _load_run_checkpoint(run_id: str) -> dict[str, Any] | None:

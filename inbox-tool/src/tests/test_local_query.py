@@ -109,6 +109,16 @@ def test_normalize_gmail_slash_date_for_local_cache() -> None:
     print("[PASS] test_normalize_gmail_slash_date_for_local_cache")
 
 
+def test_quoted_subject_phrase_matches_unquoted_subject_phrase() -> None:
+    message = _msg(subject="AI Agents Montreal: What's new with AI Agents Montreal")
+    quoted = normalize_to_local_query('subject:"AI Agents Montreal: What\'s new with AI Agents Montreal"')
+    plain = normalize_to_local_query("subject:AI Agents Montreal: What's new with AI Agents Montreal")
+    quoted_hits, _ = filter_cached_messages([message], quoted, limit=10)
+    plain_hits, _ = filter_cached_messages([message], plain, limit=10)
+    assert quoted_hits == plain_hits == [message]
+    print("[PASS] test_quoted_subject_phrase_matches_unquoted_subject_phrase")
+
+
 def test_build_local_query_from_plan() -> None:
     class Plan:
         direction = "inbox"
@@ -132,5 +142,6 @@ if __name__ == "__main__":
     test_filter_cached_messages()
     test_multiword_subject_matches_in_ai_local_query()
     test_normalize_gmail_slash_date_for_local_cache()
+    test_quoted_subject_phrase_matches_unquoted_subject_phrase()
     test_build_local_query_from_plan()
     print("[ALL TESTS PASSED]")

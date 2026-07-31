@@ -31,6 +31,50 @@ def _gmail_access_unavailable_message(user_text: str) -> str:
     return "AI is temporarily unavailable because Google account access has expired or lacks permission. Reconnect your Google account in Settings, refresh the inbox, then try again."
 
 
+def _confirmed_evidence_thread_ids(outcome: dict[str, Any]) -> list[str]:
+    """提取已确认 Evidence 的线程标识，供前端将 THREAD_REF 限定为可打开详情。
+
+    本地 Agent 的完整 Evidence 只在后端工具环内流转，轮询结果不能携带邮件主题、
+    发件人或正文。这里仅在严格命中时公开去重后的线程 ID；无命中和相近结果均返回
+    空列表，避免前端把非确认邮件渲染为可点击入口。
+    """
+    if str(outcome.get("match_status") or "") != "confirmed":
+        return []
+    rows = outcome.get("results") if isinstance(outcome.get("results"), list) else []
+    thread_ids: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        thread_id = str(row.get("thread_id") or row.get("thread_ref") or "").strip()
+        thread_id = thread_id.removeprefix("THREAD_REF_").strip()
+        if thread_id and thread_id not in seen:
+            seen.add(thread_id)
+            thread_ids.append(thread_id)
+    return thread_ids
+
+
+def _confirmed_evidence_thread_labels(outcome: dict[str, Any]) -> dict[str, str]:
+    """提取已确认线程的主题，供 Local 侧栏为详情入口显示邮件标题。
+
+    标题与线程 ID 均来自同一轮严格命中的 Evidence；相近结果、模型自行生成的
+    标题或空主题不会进入轮询结果，避免详情按钮错误地指向未确认邮件。
+    """
+    if str(outcome.get("match_status") or "") != "confirmed":
+        return {}
+    rows = outcome.get("results") if isinstance(outcome.get("results"), list) else []
+    labels: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        thread_id = str(row.get("thread_id") or row.get("thread_ref") or "").strip()
+        thread_id = thread_id.removeprefix("THREAD_REF_").strip()
+        subject = " ".join(str(row.get("subject") or "").split())[:160]
+        if thread_id and subject and thread_id not in labels:
+            labels[thread_id] = subject
+    return labels
+
+
 def _log_ai_turn_failure(run_id: str, error: object) -> None:
     """把前端可见失败码写入 stderr，同时避免日志记录模型正文或凭据。"""
     detail = " ".join(str(error or "unknown error").split())[:300]
@@ -209,6 +253,14 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
             "assistant_text": str(outcome.get("assistant_text") or ""),
             "fallback_used": bool(outcome.get("fallback_used")),
         }
+        evidence_thread_ids = _confirmed_evidence_thread_ids(outcome)
+        if evidence_thread_ids:
+            # Local Agent 以轮询结果回到前端时，保留已确认线程的最小引用边界。
+            # 前端据此恢复 Open email 入口，并继续过滤模型编造或相近结果的引用。
+            result_data["evidence_thread_ids"] = evidence_thread_ids
+            evidence_thread_labels = _confirmed_evidence_thread_labels(outcome)
+            if evidence_thread_labels:
+                result_data["evidence_thread_labels"] = evidence_thread_labels
         if callable(sampling_snapshot):
             # 仅公开预算与用量聚合，不包含 prompt、邮件内容、模型输出或凭据。
             result_data["sampling"] = sampling_snapshot()

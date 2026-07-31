@@ -747,14 +747,12 @@ def test_answer_sampling_budget_uses_phase_weights():
 
     assert ASK_SAMPLING_PHASE_WEIGHTS == {
         "planner": 0.10,
-        "answer": 0.60,
-        "answer_retry": 0.25,
-        "json_repair": 0.05,
+        "answer": 0.70,
+        "answer_retry": 0.30,
     }
     assert ask_sampling_tokens(None, "planner") == 600
     assert ask_sampling_tokens(None, "answer") == 4096
     assert ask_sampling_tokens(None, "answer_retry") == 4096
-    assert ask_sampling_tokens(None, "json_repair") == 800
     print("[PASS] test_answer_sampling_budget_uses_phase_weights")
 
 

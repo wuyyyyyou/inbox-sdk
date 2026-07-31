@@ -106,9 +106,11 @@ async def _handle_mark_card_read(arguments: dict[str, Any]) -> dict[str, Any]:
 
 async def run_aps_storage_smoke(arguments: dict[str, Any]) -> dict[str, Any]:
     """只验证 APS KV 的最小读写链路，不触碰业务邮箱数据。"""
-    from mail_agent.storage.client import get_storage, scope as default_scope
+    from mail_agent.storage.client import get_aps_storage, get_storage, scope as default_scope
 
-    storage = get_storage()
+    # 选择性存储模式下，普通 debug key 默认仅落本地；该诊断工具必须显式直连
+    # APS 原始客户端，才能验证平台 KV 链路本身。
+    storage = get_aps_storage() if _should_use_aps_storage() else get_storage()
     suffix = str(arguments.get("key_suffix") or uuid.uuid4().hex[:8]).strip()
     key = app_key(f"debug/aps_smoke/{suffix}")
     value = {

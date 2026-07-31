@@ -26,6 +26,7 @@ import type {
   InboxMessage,
   InboxThreadStateOperation,
   OutgoingAttachmentMeta,
+  SendAiMessageOptions,
 } from "../../types/mail";
 import { SnoozePicker } from "./SnoozePicker";
 import { ComposeView } from "./ComposeView";
@@ -1444,12 +1445,20 @@ function shouldAnimateAssistantText(timestamp?: string) {
   return Date.now() - createdAt < 15_000;
 }
 
+function truncateThreadReferenceLabel(subject: string) {
+  const normalized = subject.replace(/\s+/g, " ").trim();
+  const limit = 48;
+  return normalized.length > limit ? `${normalized.slice(0, limit - 3).trimEnd()}...` : normalized;
+}
+
 function AiMessageInlineContent({
   content,
   onOpenThread,
+  threadReferenceLabels,
 }: {
   content: AiMessageInline[];
   onOpenThread?: (threadId: string) => void;
+  threadReferenceLabels?: Record<string, string>;
 }) {
   return content.map((node, index) => {
     const key = `${node.type}-${index}`;
@@ -1463,19 +1472,23 @@ function AiMessageInlineContent({
           <AiMessageInlineContent
             content={parseAiMessageInline(node.label)}
             onOpenThread={onOpenThread}
+            threadReferenceLabels={threadReferenceLabels}
           />
         </a>
       );
     }
     if (node.type === "thread_ref") {
+      const fullLabel = threadReferenceLabels?.[node.threadId] || "Open email";
+      const label = truncateThreadReferenceLabel(fullLabel);
       return (
         <button
           key={key}
           type="button"
           className="ai-thread-reference"
+          title={fullLabel}
           onClick={() => onOpenThread?.(node.threadId)}
         >
-          Open email
+          {label}
         </button>
       );
     }
@@ -1486,9 +1499,11 @@ function AiMessageInlineContent({
 function RichAssistantBlocks({
   blocks,
   onOpenThread,
+  threadReferenceLabels,
 }: {
   blocks: AiMessageBlock[];
   onOpenThread?: (threadId: string) => void;
+  threadReferenceLabels?: Record<string, string>;
 }) {
   return (
     <div className="ai-message-rich-text">
@@ -1501,6 +1516,7 @@ function RichAssistantBlocks({
               <AiMessageInlineContent
                 content={block.content}
                 onOpenThread={onOpenThread}
+                threadReferenceLabels={threadReferenceLabels}
               />
             </Heading>
           );
@@ -1513,6 +1529,7 @@ function RichAssistantBlocks({
                   <AiMessageInlineContent
                     content={item}
                     onOpenThread={onOpenThread}
+                    threadReferenceLabels={threadReferenceLabels}
                   />
                 </li>
               ))}
@@ -1527,6 +1544,7 @@ function RichAssistantBlocks({
                   <AiMessageInlineContent
                     content={item}
                     onOpenThread={onOpenThread}
+                    threadReferenceLabels={threadReferenceLabels}
                   />
                 </li>
               ))}
@@ -1538,7 +1556,7 @@ function RichAssistantBlocks({
             <div key={key} className="ai-message-metadata-row">
               {block.label ? <span className="ai-message-metadata-label">{block.label}</span> : null}
               <span className="ai-message-metadata-value">
-                <AiMessageInlineContent content={block.content} onOpenThread={onOpenThread} />
+                <AiMessageInlineContent content={block.content} onOpenThread={onOpenThread} threadReferenceLabels={threadReferenceLabels} />
               </span>
             </div>
           );
@@ -1546,7 +1564,7 @@ function RichAssistantBlocks({
         if (block.type === "blockquote") {
           return (
             <blockquote key={key}>
-              <AiMessageInlineContent content={block.content} onOpenThread={onOpenThread} />
+              <AiMessageInlineContent content={block.content} onOpenThread={onOpenThread} threadReferenceLabels={threadReferenceLabels} />
             </blockquote>
           );
         }
@@ -1559,6 +1577,7 @@ function RichAssistantBlocks({
             <AiMessageInlineContent
               content={block.content}
               onOpenThread={onOpenThread}
+              threadReferenceLabels={threadReferenceLabels}
             />
           </p>
         );
@@ -1570,14 +1589,17 @@ function RichAssistantBlocks({
 function RichAssistantText({
   text,
   onOpenThread,
+  threadReferenceLabels,
 }: {
   text: string;
   onOpenThread?: (threadId: string) => void;
+  threadReferenceLabels?: Record<string, string>;
 }) {
   return (
     <RichAssistantBlocks
       blocks={parseAiMessageMarkdown(text)}
       onOpenThread={onOpenThread}
+      threadReferenceLabels={threadReferenceLabels}
     />
   );
 }
@@ -1587,11 +1609,13 @@ function AnimatedAssistantText({
   animate,
   onComplete,
   onOpenThread,
+  threadReferenceLabels,
 }: {
   text: string;
   animate: boolean;
   onComplete?: () => void;
   onOpenThread?: (threadId: string) => void;
+  threadReferenceLabels?: Record<string, string>;
 }) {
   // Parse full markdown once so typewriter never re-parses incomplete prefixes.
   const blocks = useMemo(() => parseAiMessageMarkdown(text), [text]);
@@ -1638,7 +1662,7 @@ function AnimatedAssistantText({
       : sliceAiMessageBlocks(blocks, visibleChars);
 
   return (
-    <RichAssistantBlocks blocks={visibleBlocks} onOpenThread={onOpenThread} />
+    <RichAssistantBlocks blocks={visibleBlocks} onOpenThread={onOpenThread} threadReferenceLabels={threadReferenceLabels} />
   );
 }
 
@@ -1744,6 +1768,7 @@ function AiAssistantMessage({
     () => !shouldAnimateAssistantText(message.timestamp),
   );
   const [clarificationInput, setClarificationInput] = useState("");
+  const [selectedSearchField, setSelectedSearchField] = useState("");
   const [clarificationSubmitting, setClarificationSubmitting] = useState(false);
   // 整理确认卡片：勾选状态与主动作
   const proposed = message.proposedActions;
@@ -1871,17 +1896,58 @@ function AiAssistantMessage({
     const submitClarification = async (actionId?: string) => {
       if (!clarification || clarificationSubmitting) return;
       const customInput = clarificationInput.trim();
+      const searchField = actionId || selectedSearchField;
+      const isSearchFieldClarification = clarification.kind === "search_field";
+      if (
+        isSearchFieldClarification
+        && ["search_participants", "search_date"].includes(searchField)
+        && !customInput
+      ) {
+        setSelectedSearchField(searchField);
+        return;
+      }
       const routingIntent = actionId && ["inbox", "current_thread", "compose", "chat"].includes(actionId)
         ? actionId as AiRoutingIntent
         : undefined;
-      if (!routingIntent && !customInput) return;
+      if (!isSearchFieldClarification && !routingIntent && !customInput) return;
+      const searchFieldInstruction: Record<string, string> = {
+        search_subject: "按邮件主题搜索",
+        search_body: "按邮件正文内容搜索",
+        search_participants: "按发件人或收件人搜索",
+        search_date: "按日期范围搜索",
+      };
+      const searchFieldOption: Record<string, SendAiMessageOptions["searchField"]> = {
+        search_subject: "subject",
+        search_body: "body",
+        search_participants: "participants",
+        search_date: "date",
+      };
+      const prompt = isSearchFieldClarification
+        ? [searchFieldInstruction[searchField], customInput].filter(Boolean).join("：")
+        : customInput || clarification.original_input;
+      const resolvedMessages = state.aiChatMessages.map((item) => (
+        item.id === message.id && item.clarification?.status === "pending"
+          ? {
+              ...item,
+              clarification: {
+                ...item.clarification,
+                status: "resolved" as const,
+                resolved_action: searchField || routingIntent || "custom",
+              },
+            }
+          : item
+      ));
       setClarificationSubmitting(true);
       try {
-        actions.resolveAiClarification(message.id, routingIntent || "custom");
+        actions.resolveAiClarification(message.id, searchField || routingIntent || "custom");
         await actions.sendAiChatMessage({
-          prompt: customInput || clarification.original_input,
-          baseMessages: state.aiChatMessages,
-          routingIntent: customInput ? undefined : routingIntent,
+          prompt,
+          baseMessages: resolvedMessages,
+          routingIntent: isSearchFieldClarification || customInput ? undefined : routingIntent,
+          searchField: isSearchFieldClarification ? searchFieldOption[searchField] : undefined,
+          agentPrompt: isSearchFieldClarification
+            ? `${clarification.original_input}\n搜索条件：${searchFieldInstruction[searchField]}。${customInput ? `\n补充条件：${customInput}` : ""}`
+            : undefined,
         });
       } finally {
         setClarificationSubmitting(false);
@@ -1961,47 +2027,70 @@ function AiAssistantMessage({
             onTextComplete?.();
           }}
           onOpenThread={openThreadReference}
+          threadReferenceLabels={message.threadReferenceLabels}
         />
         {clarification && clarification.status === "pending" ? (
           <div className="ai-clarification ai-routing-dialog" role="group" aria-label={clarification.question}>
-            <p>{clarification.question}</p>
-            <div className="ai-clarification-actions">
-              {clarification.actions.map((action) => (
-                <button
-                  key={action.id}
-                  type="button"
-                  disabled={clarificationSubmitting || state.aiChatLoading}
-                  onClick={() => void submitClarification(action.id)}
-                >
-                  {action.label}
-                </button>
-              ))}
-            </div>
+            {!selectedSearchField ? <p>{clarification.question}</p> : null}
+            {!selectedSearchField ? (
+              <div className="ai-clarification-actions">
+                {clarification.actions.map((action) => (
+                  <button
+                    key={action.id}
+                    type="button"
+                    aria-pressed={clarification.kind === "search_field" && selectedSearchField === action.id}
+                    disabled={clarificationSubmitting || state.aiChatLoading}
+                    onClick={() => void submitClarification(action.id)}
+                  >
+                    {action.label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
             {clarification.freeform_enabled ? (
               <div className="ai-routing-custom">
                 <textarea
                   value={clarificationInput}
                   disabled={clarificationSubmitting || state.aiChatLoading}
-                  placeholder="Describe what you want Anna to do"
+                  placeholder={selectedSearchField === "search_participants"
+                    ? "输入发件人或收件人"
+                    : selectedSearchField === "search_date"
+                      ? "输入日期或时间范围"
+                      : "补充搜索条件"}
                   onChange={(event) => setClarificationInput(event.target.value)}
                 />
-                <button
-                  type="button"
-                  disabled={!clarificationInput.trim() || clarificationSubmitting || state.aiChatLoading}
-                  onClick={() => void submitClarification()}
-                >
-                  Continue
-                </button>
+                <div className="ai-routing-footer">
+                  <button
+                    type="button"
+                    disabled={!clarificationInput.trim() || clarificationSubmitting || state.aiChatLoading}
+                    onClick={() => void submitClarification()}
+                  >
+                    {clarification.kind === "search_field" ? "搜索" : "Continue"}
+                  </button>
+                  <button
+                    type="button"
+                    className="ai-routing-dismiss"
+                    disabled={clarificationSubmitting}
+                    onClick={() => actions.dismissAiClarification(message.id)}
+                  >
+                    {/[\u3400-\u9fff]/.test(clarification.question) ? "忽略" : "Dismiss"}
+                  </button>
+                </div>
               </div>
-            ) : null}
-            <button
-              type="button"
-              className="ai-routing-dismiss"
-              disabled={clarificationSubmitting}
-              onClick={() => actions.dismissAiClarification(message.id)}
-            >
-              Dismiss
-            </button>
+            ) : (
+              <button
+                type="button"
+                className="ai-routing-dismiss"
+                disabled={clarificationSubmitting}
+                onClick={() => actions.dismissAiClarification(message.id)}
+              >
+                {/[\u3400-\u9fff]/.test(clarification.question) ? "忽略" : "Dismiss"}
+              </button>
+            )}
+          </div>
+        ) : clarification && clarification.status === "resolved" ? (
+          <div className="ai-clarification is-resolved">
+            {`已选择：${clarification.actions.find((action) => action.id === clarification.resolved_action)?.label || ""}`}
           </div>
         ) : null}
         {proposed ? (
@@ -2143,6 +2232,7 @@ function AiAssistantMessage({
                     : (proposed.followup_after_skip || proposeLabels.followSkip)
               }
               onOpenThread={openThreadReference}
+              threadReferenceLabels={message.threadReferenceLabels}
             />
             {(proposed.recommendation_groups || []).map((group) => {
               const linkItems = (group.items && group.items.length
@@ -2294,6 +2384,7 @@ function AiAssistantMessage({
             text={message.assistantFollowupText}
             animate={animate}
             onOpenThread={openThreadReference}
+            threadReferenceLabels={message.threadReferenceLabels}
             onComplete={onTextComplete}
           />
         ) : null}
@@ -2371,6 +2462,7 @@ function AiAssistantMessage({
         text={summaryText}
         animate={animate}
         onOpenThread={openThreadReference}
+        threadReferenceLabels={message.threadReferenceLabels}
         onComplete={onTextComplete}
       />
       {sections.length ? (

@@ -208,10 +208,31 @@ export function buildForwardSubject(subject?: string) {
 
 const FORWARD_BLOCK_RE =
   /(?:^|\n)(?:-{2,}\s*(?:Forwarded message|转发的邮件)\s*-{2,})[\s\S]*$/i;
+const QUOTED_REPLY_HEADER_RE = /^\s*On\s+(.{1,700}?)\s+wrote:\s*$/i;
+const QUOTED_REPLY_CONTEXT_RE = /@|<[^>]+@[^>]+>|\b\d{4}\b|\b\d{1,2}:\d{2}\b|\b(?:mon|tue|wed|thu|fri|sat|sun)\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/i;
+const OUTLOOK_REPLY_SEPARATOR_RE = /^\s*-{2,}\s*(?:Original Message|Forwarded message)\s*-{2,}\s*$/i;
 
 /** 去掉正文中的自动转发引用块，保留用户写的说明。 */
 export function stripForwardedMessageBlock(body: string) {
   return String(body || "").replace(FORWARD_BLOCK_RE, "").replace(/\s+$/u, "");
+}
+
+/** 清理旧缓存或异常纯文本中的邮件引用，保留普通 Markdown 单层引用。 */
+export function stripQuotedReplyForDisplay(body: string) {
+  const lines = String(body || "").replace(/\r\n?/g, "\n").split("\n");
+  const quoteStart = lines.findIndex((line) => {
+    const trimmed = line.trim();
+    if (OUTLOOK_REPLY_SEPARATOR_RE.test(trimmed)) return true;
+    const match = trimmed.match(QUOTED_REPLY_HEADER_RE);
+    if (!match || !QUOTED_REPLY_CONTEXT_RE.test(match[1])) return false;
+    return true;
+  });
+  const visible = quoteStart >= 0 ? lines.slice(0, quoteStart) : lines;
+  return visible
+    .map((line) => line.replace(/^[ \t]*>{2,}[ \t]?/, ""))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function forwardHeaderMeta(

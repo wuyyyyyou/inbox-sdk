@@ -56,6 +56,37 @@ def _sampling_prompt_bytes(request: dict[str, Any]) -> int:
     return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
 
 
+def _sampling_prompt_chars(request: dict[str, Any], metadata: dict[str, str]) -> tuple[int, int, int, int]:
+    """按稳定口径计算 prompt 字符指标；这里只记录长度，不记录 prompt 内容。"""
+    system_chars = len(str(request.get("system_prompt") or ""))
+    messages = request.get("messages") if isinstance(request.get("messages"), list) else []
+    user_message = ""
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, dict):
+                user_message += str(content.get("text") or "")
+            elif isinstance(content, list):
+                user_message += "".join(
+                    str(item.get("text") or "") if isinstance(item, dict) else str(item)
+                    for item in content
+                )
+            else:
+                user_message += str(content or "")
+
+    def _metadata_chars(name: str, fallback: int) -> int:
+        try:
+            value = int(metadata.get(name, ""))
+        except (TypeError, ValueError):
+            return fallback
+        return max(0, value)
+
+    user_chars = _metadata_chars("user_chars", len(user_message))
+    context_chars = _metadata_chars("context_chars", 0)
+    total_chars = system_chars + user_chars + context_chars
+    return system_chars, user_chars, context_chars, total_chars
+
+
 def _extract_usage_tokens(raw_usage: Any) -> tuple[int, int, int]:
     """从 Host usage 解析 input/output/total token（兼容驼峰与蛇形字段）。"""
     if not isinstance(raw_usage, dict):
@@ -182,11 +213,17 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str, sampling_grant:
         )
         request["metadata"] = metadata
         prompt_bytes = _sampling_prompt_bytes(request)
+        system_chars, user_chars, context_chars, total_chars = _sampling_prompt_chars(request, metadata)
+        stage = metadata.get("stage", "")
+        stage_field = f" stage={stage}" if stage else ""
         started = time.monotonic()
         log(
             "anna sampling started: "
             f"tool={tool_name} "
+            f"{stage_field.strip()} "
             f"timeout_s={request['timeout']} prompt_bytes={prompt_bytes}"
+            f" system_chars={system_chars} user_chars={user_chars} "
+            f"context_chars={context_chars} total_chars={total_chars}"
         )
         try:
             result = await sampling_fn(**request)
@@ -203,8 +240,11 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str, sampling_grant:
             log(
                 "anna sampling failed: "
                 f"tool={tool_name} "
+                f"{stage_field.strip()} "
                 f"timeout_s={request['timeout']} "
                 f"prompt_bytes={prompt_bytes} "
+                f"system_chars={system_chars} user_chars={user_chars} "
+                f"context_chars={context_chars} total_chars={total_chars} "
                 f"elapsed_ms={elapsed_ms} "
                 f"error_type={type(exc).__name__}"
             )
@@ -224,9 +264,12 @@ def build_budgeted_sampling(sampling_fn: Any, *, invoke_id: str, sampling_grant:
         log(
             "anna sampling completed: "
             f"tool={tool_name} "
+            f"{stage_field.strip()} "
             f"input_tokens={call_input} output_tokens={call_output} "
             f"timeout_s={request['timeout']} "
             f"prompt_bytes={prompt_bytes} "
+            f"system_chars={system_chars} user_chars={user_chars} "
+            f"context_chars={context_chars} total_chars={total_chars} "
             f"elapsed_ms={elapsed_ms} "
             f"tps={tps}"
         )

@@ -69,10 +69,8 @@ function extractToolOutcome(frame: Record<string, unknown>): AgentToolOutcome | 
   const payload = frame.data ?? frame.result ?? frame.tool_result ?? frame.toolResult;
   // tool_end 帧：{name, output} 中 output 可能是 JSON 字符串
   const rawOutput = frame.output ?? (isRecord(frame.delta) ? frame.delta : null);
-  let candidate: unknown = payload;
-  if (!candidate && isRecord(rawOutput)) {
-    candidate = rawOutput.output ?? rawOutput;
-  }
+  let candidate: unknown = payload ?? rawOutput;
+  if (!payload && isRecord(rawOutput)) candidate = rawOutput.output ?? rawOutput;
   if (typeof candidate === "string") {
     try {
       candidate = JSON.parse(candidate);

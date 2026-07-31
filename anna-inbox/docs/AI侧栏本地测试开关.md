@@ -23,7 +23,7 @@
 | 模式 | 选型 | 工具执行 | LLM |
 | --- | --- | --- | --- |
 | `host` | Host Agent Session | `query_mail_evidence` / `ai_*` / `propose_inbox_actions` 等 | Host 模型环 |
-| `local` | 本地 Sampling JSON 多步环（`local_agent_session`） | **同一套** `handle_ai_agent_tool` | `ai_provider: anna-llm` Sampling |
+| `local` | 本地 Sampling JSON 多步环（`local_agent_session`）；`query_mail_evidence` 的 QueryPlan 与 route 合并 | **同一套** `handle_ai_agent_tool` | `ai_provider: anna-llm` Sampling |
 
 ```text
 host:  侧栏 → anna.agent.session → Host 选型 → handle_ai_agent_tool

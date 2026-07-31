@@ -437,12 +437,11 @@ async def plan_ask_request(
             user_message=user_message,
             fallback={},
             temperature=0.1,
-            # Planner 只占本次授权的一小部分，并为回答、截断重试和 JSON
-            # 修复保留比例预算；不再假定所有 Host 都有固定 800 token 额度。
+            # Planner 只占本次授权的一小部分，并为回答和主请求重试保留比例预算。
             max_tokens=ask_sampling_tokens(
                 sampling_create_message,
                 "planner",
-                reserve_for=("answer", "answer_retry", "json_repair"),
+                reserve_for=("answer", "answer_retry"),
             ),
             timeout=30.0,
             metadata={"tool": "ask_planner"},

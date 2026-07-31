@@ -222,6 +222,8 @@ def test_ai_turn_system_prompts_use_xml_modules():
     assert "Evidence-needed mail" in router_prompt
     assert '"markdown"' in prompts[1]
     assert '"draft_body"' in prompts[2]
+    assert "ON BEHALF OF" in prompts[2]
+    assert "ON BEHALF OF" in prompts[3]
     assert "<memory>" in prompts[0]
     print("[PASS] test_ai_turn_system_prompts_use_xml_modules")
 

@@ -34,6 +34,56 @@ _backfill_lock = threading.Lock()
 _backfill_running: set[str] = set()
 
 
+def _emit_sync_log(message: str, *args: Any) -> None:
+    """同时写入 logging 与 Executa stderr，确保生产环境能看到 INFO 进度。"""
+    _logger.info(message, *args)
+    try:
+        rendered = message % args
+        from anna_inbox_executa.common import log
+
+        log(rendered)
+    except Exception:
+        # 直接运行同步模块或测试时 common 可能不可用，logging 仍保留进度记录。
+        pass
+
+
+def _log_sync_phase(
+    *,
+    phase: str,
+    fetched: int = 0,
+    complete: bool = False,
+    body_pending: int | None = None,
+    attachment_pending: int | None = None,
+    cache_total: int | None = None,
+    has_next_page: bool | None = None,
+    page_token_present: bool | None = None,
+    tick: int | None = None,
+    error_type: str | None = None,
+) -> None:
+    """记录不含邮箱、查询词、邮件 ID 和凭据的同步阶段进度。"""
+    message = "gmail_sync_phase phase=%s fetched=%s complete=%s"
+    args: list[Any] = [phase, fetched, complete]
+    if cache_total is not None:
+        message += " cache_total=%s"
+        args.append(cache_total)
+    if has_next_page is not None:
+        message += " has_next_page=%s"
+        args.append(has_next_page)
+    if page_token_present is not None:
+        message += " page_token_present=%s"
+        args.append(page_token_present)
+    if tick is not None:
+        message += " tick=%s"
+        args.append(tick)
+    if body_pending is not None or attachment_pending is not None:
+        message += " body_pending=%s attachment_pending=%s"
+        args.extend([body_pending if body_pending is not None else 0, attachment_pending if attachment_pending is not None else 0])
+    if error_type is not None:
+        message += " error_type=%s"
+        args.append(error_type)
+    _emit_sync_log(message, *args)
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -65,7 +115,7 @@ def configured_sync_range() -> dict[str, Any]:
 
 def empty_boundary(mailbox: str = "") -> dict[str, Any]:
     """无缓存时的边界默认值。"""
-    return {
+    boundary = {
         "mailbox": mailbox,
         "earliest_indexed_at": "",
         "latest_indexed_at": "",
@@ -80,6 +130,24 @@ def empty_boundary(mailbox: str = "") -> dict[str, Any]:
         "watch_status": "unknown",
         "updated_at": _utc_now_iso(),
     }
+    boundary["sync_stage"] = _sync_stage_from_state(boundary)
+    return boundary
+
+
+def _sync_stage_from_state(state: dict[str, Any]) -> str:
+    """根据已持久化的同步状态计算对外同步阶段，不读取缓存或外部数据。"""
+    if not bool(state.get("initial_sync_complete")):
+        return "priority_metadata"
+    if not bool(state.get("backfill_complete")):
+        return "backfill_metadata"
+    if not bool(state.get("body_sync_complete")) or not bool(state.get("attachment_sync_complete")):
+        return "content_preprocess"
+    watch_status = str(state.get("watch_status") or "unknown")
+    if watch_status.startswith("error:"):
+        return "watch_error"
+    if watch_status in {"", "unknown"}:
+        return "watch_setup"
+    return "ready"
 
 
 def _compute_index_bounds(messages: list[dict[str, Any]]) -> tuple[str, str, int, int]:
@@ -200,7 +268,7 @@ def get_mailbox_sync_boundary(mailbox: str) -> dict[str, Any]:
         earliest = str(state.get("earliest_indexed_at") or "")
     if not latest:
         latest = str(state.get("latest_indexed_at") or "")
-    return {
+    boundary = {
         "mailbox": normalized,
         "earliest_indexed_at": earliest,
         "latest_indexed_at": latest,
@@ -215,6 +283,8 @@ def get_mailbox_sync_boundary(mailbox: str) -> dict[str, Any]:
         "watch_status": str(state.get("watch_status") or "unknown"),
         "updated_at": str(state.get("updated_at") or _utc_now_iso()),
     }
+    boundary["sync_stage"] = _sync_stage_from_state(boundary)
+    return boundary
 
 
 def boundary_honesty_note(boundary: dict[str, Any], language: str = "zh") -> str:
@@ -369,6 +439,14 @@ def progress_priority_metadata_sync(
     state = read_sync_state(normalized)
     if bool(state.get("initial_sync_complete")):
         boundary = refresh_boundary_from_cache(normalized)
+        _log_sync_phase(
+            phase="priority_metadata",
+            fetched=0,
+            complete=True,
+            cache_total=int(boundary.get("cache_total") or 0),
+            has_next_page=False,
+            page_token_present=bool(state.get("priority_page_token")),
+        )
         return {
             "mailbox": normalized,
             "mode": "priority_done",
@@ -419,6 +497,15 @@ def progress_priority_metadata_sync(
         extra["backfill_page_token"] = ""
 
     refresh_boundary_from_cache(normalized, extra=extra)
+    boundary = get_mailbox_sync_boundary(normalized)
+    _log_sync_phase(
+        phase="priority_metadata",
+        fetched=len(fetched_ids),
+        complete=complete,
+        cache_total=int(boundary.get("cache_total") or 0),
+        has_next_page=bool(next_token),
+        page_token_present=bool(page_token),
+    )
     return {
         "mailbox": normalized,
         "mode": "priority",
@@ -441,6 +528,15 @@ def progress_backfill_metadata_sync(
     normalized = normalize_mailbox(mailbox)
     state = read_sync_state(normalized)
     if not bool(state.get("initial_sync_complete")):
+        boundary = get_mailbox_sync_boundary(normalized)
+        _log_sync_phase(
+            phase="backfill_metadata",
+            fetched=0,
+            complete=False,
+            cache_total=int(boundary.get("cache_total") or 0),
+            has_next_page=False,
+            page_token_present=bool(state.get("backfill_page_token")),
+        )
         return {
             "mailbox": normalized,
             "mode": "backfill_wait_priority",
@@ -449,6 +545,15 @@ def progress_backfill_metadata_sync(
             "boundary": get_mailbox_sync_boundary(normalized),
         }
     if bool(state.get("backfill_complete")):
+        boundary = get_mailbox_sync_boundary(normalized)
+        _log_sync_phase(
+            phase="backfill_metadata",
+            fetched=0,
+            complete=True,
+            cache_total=int(boundary.get("cache_total") or 0),
+            has_next_page=False,
+            page_token_present=bool(state.get("backfill_page_token")),
+        )
         return {
             "mailbox": normalized,
             "mode": "backfill_done",
@@ -493,6 +598,15 @@ def progress_backfill_metadata_sync(
         "attachment_sync_complete": bool(state.get("attachment_sync_complete")),
     }
     refresh_boundary_from_cache(normalized, extra=extra)
+    boundary = get_mailbox_sync_boundary(normalized)
+    _log_sync_phase(
+        phase="backfill_metadata",
+        fetched=len(fetched_ids),
+        complete=complete,
+        cache_total=int(boundary.get("cache_total") or 0),
+        has_next_page=bool(next_token),
+        page_token_present=bool(page_token),
+    )
     return {
         "mailbox": normalized,
         "mode": "backfill",
@@ -521,11 +635,25 @@ def schedule_background_backfill(mailbox: str) -> bool:
         _backfill_running.add(normalized)
 
     def _worker() -> None:
+        ticks = 0
+        completed = False
+        _emit_sync_log("gmail_sync_background_start max_ticks=%s", 5)
         try:
-            # 多 tick，避免一次占满；进程退出则中断，下次 sync 再续
-            for _ in range(5):
+            # 多 tick，避免一次占满；进程退出则中断，下次 sync 再续。
+            for tick in range(1, 6):
+                ticks = tick
                 result = progress_backfill_metadata_sync(normalized)
+                boundary = result.get("boundary") if isinstance(result.get("boundary"), dict) else {}
+                _log_sync_phase(
+                    phase="backfill_background_tick",
+                    fetched=int(result.get("fetched") or 0),
+                    complete=bool(result.get("backfill_complete")),
+                    cache_total=int(boundary.get("cache_total") or 0),
+                    has_next_page=not bool(result.get("backfill_complete")),
+                    tick=tick,
+                )
                 if result.get("backfill_complete"):
+                    completed = True
                     break
                 if int(result.get("new_count") or 0) == 0 and int(result.get("fetched") or 0) == 0:
                     break
@@ -533,6 +661,7 @@ def schedule_background_backfill(mailbox: str) -> bool:
         except Exception as exc:
             _logger.warning("background_backfill_failed error_type=%s", type(exc).__name__)
         finally:
+            _emit_sync_log("gmail_sync_background_end ticks=%s complete=%s", ticks, completed)
             with _backfill_lock:
                 _backfill_running.discard(normalized)
 
@@ -560,21 +689,43 @@ def schedule_background_sync(mailbox: str, *, profile_history_id: str = "") -> b
 
     def _record_content_progress(result: dict[str, Any]) -> None:
         """把正文/附件后台处理进度写入同步边界字段。"""
+        body_pending = int(result.get("body_pending") or 0)
+        attachment_pending = int(result.get("attachment_pending") or 0)
         state = read_sync_state(normalized)
         write_sync_state(normalized, {
             **{key: value for key, value in state.items() if key != "_etag"},
-            "body_sync_complete": int(result.get("body_pending") or 0) == 0,
-            "attachment_sync_complete": int(result.get("attachment_pending") or 0) == 0,
+            "body_sync_complete": body_pending == 0,
+            "attachment_sync_complete": attachment_pending == 0,
         })
+        _log_sync_phase(
+            phase="content_preprocess",
+            fetched=0,
+            complete=body_pending == 0 and attachment_pending == 0,
+            body_pending=body_pending,
+            attachment_pending=attachment_pending,
+        )
 
     def _worker() -> None:
+        ticks = 0
+        completed = False
+        _emit_sync_log("gmail_sync_background_start max_ticks=%s", 5)
         try:
-            for _ in range(5):
+            for tick in range(1, 6):
+                ticks = tick
                 state = read_sync_state(normalized)
                 if not bool(state.get("initial_sync_complete")):
                     result = progress_priority_metadata_sync(
                         normalized,
                         profile_history_id=profile_history_id,
+                    )
+                    boundary = result.get("boundary") if isinstance(result.get("boundary"), dict) else {}
+                    _log_sync_phase(
+                        phase="priority_background_tick",
+                        fetched=int(result.get("fetched") or 0),
+                        complete=bool(result.get("initial_sync_complete")),
+                        cache_total=int(boundary.get("cache_total") or 0),
+                        has_next_page=not bool(result.get("initial_sync_complete")),
+                        tick=tick,
                     )
                     if not result.get("initial_sync_complete"):
                         # priority metadata 写入后同步补少量正文/附件派生内容；不阻塞首屏。
@@ -587,6 +738,15 @@ def schedule_background_sync(mailbox: str, *, profile_history_id: str = "") -> b
                         time.sleep(0.05)
                         continue
                 result = progress_backfill_metadata_sync(normalized)
+                boundary = result.get("boundary") if isinstance(result.get("boundary"), dict) else {}
+                _log_sync_phase(
+                    phase="backfill_background_tick",
+                    fetched=int(result.get("fetched") or 0),
+                    complete=bool(result.get("backfill_complete")),
+                    cache_total=int(boundary.get("cache_total") or 0),
+                    has_next_page=not bool(result.get("backfill_complete")),
+                    tick=tick,
+                )
                 try:
                     from .adapter import preprocess_cached_content_batch
 
@@ -594,11 +754,13 @@ def schedule_background_sync(mailbox: str, *, profile_history_id: str = "") -> b
                 except Exception:
                     pass
                 if result.get("backfill_complete"):
+                    completed = True
                     break
                 time.sleep(0.05)
         except Exception as exc:
             _logger.warning("background_sync_failed error_type=%s", type(exc).__name__)
         finally:
+            _emit_sync_log("gmail_sync_background_end ticks=%s complete=%s", ticks, completed)
             with _backfill_lock:
                 _backfill_running.discard(normalized)
 

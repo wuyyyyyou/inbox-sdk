@@ -9,6 +9,7 @@ Run:  cd src && py -3 tests/test_storage_integration.py
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,28 @@ def check(label: str, condition: bool, detail: str = ""):
 
 async def main():
     global passed, failed
+
+    # APS 本地 Runtime 在 GBK stdout 下只能安全转发 ASCII reverse-RPC。
+    # SDK 必须在写入前包装 Unicode，并在读取后无损还原业务值。
+    from executa_sdk.storage import StorageClient
+
+    transport_frames: list[dict[str, Any]] = []
+    transport_client = StorageClient(write_frame=transport_frames.append)
+    stored_value = {"subject": "\U0001f4c5 \u4f1a\u8bae\u5b89\u6392", "nested": ["\u5f20\u4e09"]}
+    set_task = asyncio.create_task(transport_client.set("test/unicode", stored_value, scope="user"))
+    await asyncio.sleep(0)
+    set_frame = transport_frames.pop()
+    check("APS storage/set transport is ASCII", json.dumps(set_frame, ensure_ascii=False).isascii())
+    transport_client.dispatch_response({"id": set_frame["id"], "result": {"etag": "unicode-etag"}})
+    await set_task
+
+    get_task = asyncio.create_task(transport_client.get("test/unicode", scope="user"))
+    await asyncio.sleep(0)
+    get_frame = transport_frames.pop()
+    encoded_value = set_frame["params"]["value"]
+    transport_client.dispatch_response({"id": get_frame["id"], "result": {"exists": True, "etag": "unicode-etag", "value": encoded_value}})
+    restored = await get_task
+    check("APS storage/get restores Unicode", restored.get("value") == stored_value)
 
     # 1. Wire fake storage into the singleton
     print("\n── Setup ──")
@@ -368,6 +391,69 @@ async def main():
     check("contact memory backfills active cards", backfilled.get("backfilled") == 1 and backfilled_memory is not None)
     await clear_memory(["test@example.com"])
     # Brief pipeline / _persist_run_results 已下线，contact memory 改由侧栏与线程事件写入。
+
+    # 选择性 APS 同步：工作流分类走 APS，邮件缓存只留在本地。
+    print("\n── selective APS storage ──")
+    from mail_agent.storage.aps_cleanup import migrate_and_cleanup_aps
+    from mail_agent.storage.client import get_aps_storage, get_local_storage, get_storage, init_selective
+    from mail_agent.storage.keys import app_key
+    from mail_agent.storage.ops import get_inbox_workflow_state, set_inbox_workflow_state
+
+    local_sync = FakeStorageClient()
+    aps_sync = FakeStorageClient()
+    init_selective(local_sync, local_sync, aps_sync, aps_sync)
+    saved_workflow = await set_inbox_workflow_state(
+        "one@example.com",
+        {"todos": ["todo-1"], "done": ["done-1"], "snoozed": ["later-1"], "snoozedUntil": {"later-1": "2030-01-01"}},
+    )
+    synced_workflow = await get_inbox_workflow_state("one@example.com")
+    local_workflow = await get_local_storage().get(app_key("mailbox/one_example.com/inbox_workflow_state"))
+    aps_workflow = await get_aps_storage().get(app_key("mailbox/one_example.com/inbox_workflow_sync"))
+    check(
+        "selective workflow synchronizes all classifications",
+        synced_workflow["state"]["done"] == ["done-1"]
+        and local_workflow["value"]["done"] == ["done-1"]
+        and aps_workflow["value"]["done"] == ["done-1"]
+        and synced_workflow["etag"] == saved_workflow["etag"],
+    )
+    cache_key = app_key("gmail_cache/mailboxes/one_example.com/index")
+    await get_storage().set(cache_key, {"messages": []})
+    check(
+        "selective storage keeps cache local",
+        (await get_local_storage().get(cache_key))["exists"] is True
+        and (await get_aps_storage().get(cache_key))["exists"] is False,
+    )
+    sync_keys = [
+        app_key("mailbox/one_example.com/ask_history"),
+        app_key("mailbox/one_example.com/inbox_settings"),
+        app_key("mailbox/one_example.com/inbox-drafts/thread-1"),
+        app_key("mailbox/one_example.com/compose-drafts/draft-1"),
+    ]
+    for key in sync_keys:
+        await get_storage().set(key, {"synced": key})
+    aps_sync_results = [await get_aps_storage().get(key) for key in sync_keys]
+    local_sync_results = [await get_local_storage().get(key) for key in sync_keys]
+    check(
+        "selective storage routes all approved data to APS",
+        all(result["exists"] for result in aps_sync_results)
+        and not any(result["exists"] for result in local_sync_results),
+    )
+
+    legacy_workflow = app_key("mailbox/legacy_example.com/inbox_workflow_state")
+    unknown_key = app_key("future-feature/value")
+    await aps_sync.set(legacy_workflow, {"todos": ["todo-2"], "done": ["done-2"], "snoozed": ["later-2"]})
+    await aps_sync.set(unknown_key, {"keep": True})
+    cleanup = await migrate_and_cleanup_aps(aps_sync, scope="user")
+    migrated_key = app_key("mailbox/legacy_example.com/inbox_workflow_sync")
+    migrated = await aps_sync.get(migrated_key)
+    check(
+        "APS cleanup migrates workflow and preserves unknown keys",
+        cleanup["migrated"] == 1
+        and (await aps_sync.get(legacy_workflow))["exists"] is False
+        and migrated["value"]["todos"] == ["todo-2"]
+        and migrated["value"]["done"] == ["done-2"]
+        and (await aps_sync.get(unknown_key))["exists"] is True,
+    )
 
     # ── Summary ──
     print(f"\n{'='*50}")

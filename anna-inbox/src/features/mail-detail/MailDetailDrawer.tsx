@@ -55,6 +55,7 @@ import {
   resolveAttachmentAccess,
   resolveMessageThreadId,
   senderParts,
+  stripQuotedReplyForDisplay,
   splitAddresses,
   stripForwardedMessageBlock,
   triggerAttachmentDownload,
@@ -272,37 +273,16 @@ function MailThreadBodyLoading() {
 
 function AttachmentSection({
   attachments,
-  expectedAttachmentCount = 0,
-  onRefresh,
   onPreview,
   onDownload,
   isDownloading,
 }: {
   attachments: MailAttachmentMeta[];
-  expectedAttachmentCount?: number;
-  onRefresh?: () => void;
   onPreview: (attachment: MailAttachmentMeta) => void;
   onDownload: (attachment: MailAttachmentMeta) => void;
   isDownloading: (attachment: MailAttachmentMeta) => boolean;
 }) {
-  if (!attachments.length) {
-    if (!expectedAttachmentCount) return null;
-    return (
-      <div className="mail-detail-attachments">
-        <article className="mail-detail-attachment is-pending">
-          <div>
-            <strong>{expectedAttachmentCount > 1 ? `${expectedAttachmentCount} attachments` : "Attachment"}</strong>
-            <span>Attachment metadata is loading.</span>
-          </div>
-          {onRefresh ? (
-            <div className="mail-detail-attachment-actions">
-              <button type="button" onClick={onRefresh}>Refresh</button>
-            </div>
-          ) : null}
-        </article>
-      </div>
-    );
-  }
+  if (!attachments.length) return null;
   return (
     <div className="mail-detail-attachments">
       {attachments.map((attachment) => {
@@ -431,15 +411,6 @@ function inboxMessageAttachments(message: InboxMessage): MailAttachmentMeta[] {
   return Array.isArray(attachments) ? attachments : [];
 }
 
-function hasInboxMessageAttachment(message: InboxMessage | null | undefined) {
-  if (!message) return false;
-  return Boolean(
-    message.has_attachment
-    || Number(message.attachment_count || 0) > 0
-    || inboxMessageAttachments(message).length > 0
-  );
-}
-
 function singleMessagePageFromBody(
   mailbox: string,
   anchorMessage: InboxMessage,
@@ -489,24 +460,6 @@ async function resolveDisplayBodyPayload(payload: InboxMessageDisplayBodyPayload
   }
 }
 
-function expectedAttachmentCountForMessage(item: InboxThreadMessage, anchorMessage: InboxMessage | null) {
-  if (!anchorMessage || item.id !== anchorMessage.id || item.attachments.length) return 0;
-  if (!hasInboxMessageAttachment(anchorMessage)) return 0;
-  return Math.max(1, Number(anchorMessage.attachment_count || 0));
-}
-
-function pageMayBeMissingAnchorAttachments(page: InboxThreadPagePayload, anchorMessage: InboxMessage) {
-  if (!hasInboxMessageAttachment(anchorMessage)) return false;
-  const anchor = page.messages.find((item) => item.id === anchorMessage.id);
-  return Boolean(anchor && !anchor.attachments.length);
-}
-
-function pageMayBeMissingThreadContext(page: InboxThreadPagePayload, anchorMessage: InboxMessage) {
-  if (!anchorMessage.thread_id) return false;
-  if (page.has_earlier) return false;
-  return page.messages.length <= 1 && page.messages.some((item) => item.id === anchorMessage.id);
-}
-
 function isGmailDraftThreadMessage(message: InboxThreadMessage) {
   return (message.label_ids || []).some((label) => label.toUpperCase() === "DRAFT");
 }
@@ -552,39 +505,35 @@ async function cacheThreadPage(mailbox: string, page: InboxThreadPagePayload) {
   ));
 }
 
-async function hydrateCachedThreadPageBodies(mailbox: string, page: InboxThreadPagePayload): Promise<InboxThreadPagePayload> {
-  const visiblePage = withoutGmailDraftThreadMessages(page);
-  const messages = await Promise.all((visiblePage.messages || []).map(async (item) => {
-    const cached = await getCachedMessageBody(mailbox, item.id, item.internal_date);
-    if (!cached || (!cached.body_text && !cached.body_html)) return item;
-    if (!cached.body_html && (item.body_html || item.body_text)) return item;
-    if (
-      cached.body_text === item.body_text
-      && (cached.body_html || "") === (item.body_html || "")
-      && Boolean(cached.body_truncated) === Boolean(item.body_truncated)
-    ) return item;
-    return {
-      ...item,
-      body_text: cached.body_text || "",
-      body_html: cached.body_html || "",
-      body_truncated: Boolean(cached.body_truncated),
-      attachments: item.attachments,
-    };
-  }));
-  return messages.every((item, index) => item === visiblePage.messages[index])
-    ? visiblePage
-    : { ...visiblePage, messages };
+/** 距底部多少像素内视为仍贴底，用于用户上滑后停止自动跟随。 */
+const THREAD_BOTTOM_STICK_THRESHOLD_PX = 48;
+
+function isThreadScrollerNearBottom(container: HTMLDivElement, thresholdPx = THREAD_BOTTOM_STICK_THRESHOLD_PX) {
+  return container.scrollHeight - container.clientHeight - container.scrollTop <= thresholdPx;
 }
 
-function scrollToThreadBottom(container: HTMLDivElement | null, behavior: ScrollBehavior = "auto") {
+function scrollToThreadBottom(container: HTMLDivElement | null, behavior: ScrollBehavior = "smooth") {
   if (!container) return;
   const bottom = Math.max(0, container.scrollHeight - container.clientHeight);
   if (behavior === "smooth") {
     container.scrollTo({ top: bottom, behavior });
-  } else {
-    // 直接写入 scrollTop，兼容嵌入式 WebView 在 layout 尚未稳定时的 scrollTo 时序。
-    container.scrollTop = bottom;
+    return;
   }
+  // 直接写入 scrollTop，兼容嵌入式 WebView 在 layout 尚未稳定时的 scrollTo 时序。
+  container.scrollTop = bottom;
+}
+
+/** 将指定邮件卡片的底部对齐到详情阅读区底部，避免等待整条线程渲染。 */
+function scrollThreadMessageIntoView(
+  container: HTMLDivElement,
+  message: HTMLElement,
+  behavior: ScrollBehavior,
+) {
+  const containerBounds = container.getBoundingClientRect();
+  const messageBounds = message.getBoundingClientRect();
+  const top = Math.max(0, container.scrollTop + messageBounds.bottom - containerBounds.bottom);
+  container.scrollTo({ top, behavior });
+  return top;
 }
 
 const TEXT_PREVIEW_MAX_BYTES = 256 * 1024;
@@ -599,23 +548,6 @@ function AiSparkleIcon() {
 }
 
 function MailOverviewAction({ text, onClick }: { text: string; onClick: () => void }) {
-  const [visibleText, setVisibleText] = useState("");
-
-  useEffect(() => {
-    setVisibleText("");
-    let frame = 0;
-    const timer = window.setInterval(() => {
-      frame += Math.max(1, Math.ceil(text.length / 36));
-      if (frame >= text.length) {
-        window.clearInterval(timer);
-        setVisibleText(text);
-        return;
-      }
-      setVisibleText(text.slice(0, frame));
-    }, 24);
-    return () => window.clearInterval(timer);
-  }, [text]);
-
   return (
     <button
       type="button"
@@ -625,7 +557,7 @@ function MailOverviewAction({ text, onClick }: { text: string; onClick: () => vo
       onClick={onClick}
     >
       <AiSparkleIcon />
-      <span>{visibleText}</span>
+      <span>{text}</span>
     </button>
   );
 }
@@ -821,6 +753,11 @@ export function MailDetailDrawer({
   const [, setPreviewCacheRevision] = useState(0);
   const [resolvedAvatars, setResolvedAvatars] = useState<Record<string, string>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const latestMessageRef = useRef<HTMLElement | null>(null);
+  /** 初始滚动已开始，防止当前详情页重复定位。 */
+  const initialBottomScrollStartedRef = useRef(false);
+  /** 初始平滑滚动已抵达底部；此前不允许布局补偿改写 scrollTop。 */
+  const initialBottomScrollDoneRef = useRef(false);
   const preserveScrollOnPageUpdateRef = useRef(false);
   const historicalBodyHydrationRef = useRef<Promise<void> | null>(null);
   const footerRef = useRef<HTMLElement | null>(null);
@@ -1049,24 +986,43 @@ export function MailDetailDrawer({
     && normalizeComparableSubject(latestSubject) !== normalizeComparableSubject(displaySubject)
   );
 
+  // 最新邮件卡片出现后立即平滑定位，不等待历史正文、附件或 AI 区域完成渲染。
   useLayoutEffect(() => {
-    if (!open || !page || preserveScrollOnPageUpdateRef.current) return;
-    const frame = window.requestAnimationFrame(() => {
-      scrollToThreadBottom(scrollRef.current);
-      // HTML 邮件 iframe 可能在首帧后才完成尺寸测量，再补一帧确保滚到底部。
-      window.requestAnimationFrame(() => scrollToThreadBottom(scrollRef.current));
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [open, page, displayBodyLoaded]);
-
-  useLayoutEffect(() => {
-    if (!open || (!showQuickReplies && !showNoReplyNotice)) return;
+    if (!open || loading || !latestMessage?.id || preserveScrollOnPageUpdateRef.current) return;
+    if (initialBottomScrollStartedRef.current) return;
     const scroller = scrollRef.current;
-    if (!scroller) return;
-    // AI prompts / no-reply notice arrive after the thread page. They are part
-    // of the detail's destination, so always reveal them even if the user scrolled.
-    scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
-  }, [assistFooterKey, assistLoading, open, showNoReplyNotice, showQuickReplies]);
+    const latestMessageElement = latestMessageRef.current;
+    if (!scroller || !latestMessageElement) return;
+
+    let cancelled = false;
+    let scrollCompletionFrame = 0;
+    const targetTop = scrollThreadMessageIntoView(scroller, latestMessageElement, "smooth");
+    initialBottomScrollStartedRef.current = true;
+
+    const completeWhenPositioned = () => {
+      if (cancelled) return;
+      if (Math.abs(scroller.scrollTop - targetTop) <= 2) {
+        initialBottomScrollDoneRef.current = true;
+        return;
+      }
+      scrollCompletionFrame = window.requestAnimationFrame(completeWhenPositioned);
+    };
+    scrollCompletionFrame = window.requestAnimationFrame(completeWhenPositioned);
+
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(scrollCompletionFrame);
+    };
+  }, [latestMessage?.id, loading, open]);
+
+  // quick reply / no-reply 条出现在线程下方：仅当用户仍在底部附近时补一次 smooth，不打断阅读。
+  useEffect(() => {
+    if (!open || (!showQuickReplies && !showNoReplyNotice)) return;
+    if (!initialBottomScrollDoneRef.current || preserveScrollOnPageUpdateRef.current) return;
+    const scroller = scrollRef.current;
+    if (!scroller || !isThreadScrollerNearBottom(scroller)) return;
+    scrollToThreadBottom(scroller, "smooth");
+  }, [assistFooterKey, open, showNoReplyNotice, showQuickReplies]);
 
   // footer 展开/收缩会改变 context 高度；在动画帧内持续补偿 scrollTop，让正文随 footer 上下移
   useEffect(() => {
@@ -1083,10 +1039,16 @@ export function MailDetailDrawer({
       // setTimeout 完全跳出 RO 投递周期，比 rAF 更能避免 loop 通知。
       timer = window.setTimeout(() => {
         const currentHeight = scroller.clientHeight;
+        // 初始平滑滚动尚未完成时，任何 footer/header 尺寸变化都只能更新基线，
+        // 不能按旧 scrollTop 补偿，否则会把滚动动画拉回顶部。
+        if (!initialBottomScrollDoneRef.current) {
+          previousHeight = currentHeight;
+          composerContextHeightRef.current = currentHeight;
+          return;
+        }
         const heightDelta = previousHeight - currentHeight;
-        const wasAtBottom = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop <= 4;
+        const wasAtBottom = isThreadScrollerNearBottom(scroller, 4);
         if (wasAtBottom) {
-          // 内容渲染或详情布局变化时，已经在底部就继续锁定底部，避免先到底再跳回顶部。
           scroller.scrollTop = Math.max(0, scroller.scrollHeight - currentHeight);
         } else if (heightDelta) {
           scroller.scrollTop += heightDelta;
@@ -1130,9 +1092,10 @@ export function MailDetailDrawer({
   useEffect(() => {
     if (!open || !message || !mailbox || !messageId) return;
     let cancelled = false;
-    let networkPageLoaded = false;
     const anchorMessage = message;
     preserveScrollOnPageUpdateRef.current = false;
+    initialBottomScrollStartedRef.current = false;
+    initialBottomScrollDoneRef.current = false;
     setPage(null);
     setLoading(true);
     setError("");
@@ -1195,41 +1158,26 @@ export function MailDetailDrawer({
     const load = async () => {
       try {
         if (threadId) {
-          const cachedPage = await getCachedThreadPage(mailbox, threadId, latestThreadMessageId || messageId);
-          if (cancelled) return;
-          if (cachedPage) {
+          // 缓存仅在网络线程页失败时回退，避免打开过程先显示半成品又被网络结果覆盖。
+          const cachedPagePromise = getCachedThreadPage(mailbox, threadId, latestThreadMessageId || messageId)
+            .catch(() => null);
+          try {
+            const nextPage = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: messageId, limit: 5, includeDisplayBody: true });
+            if (cancelled) return;
+            const visiblePage = withoutGmailDraftThreadMessages(nextPage);
+            setPage(visiblePage);
+            void cacheThreadPage(mailbox, visiblePage);
+            loadFullAnchorMessage(visiblePage);
+            requestAssist(visiblePage.latest_message_id || messageId);
+          } catch (reason) {
+            const cachedPage = await cachedPagePromise;
+            if (cancelled) return;
+            if (!cachedPage) throw reason;
             const visibleCachedPage = withoutGmailDraftThreadMessages(cachedPage);
             setPage(visibleCachedPage);
+            loadFullAnchorMessage(visibleCachedPage);
             requestAssist(visibleCachedPage.latest_message_id || messageId);
-            // 先展示缓存；若缺附件元数据/线程上下文，或需要刷新，继续走网络。
-            // 不能因列表 has_attachment=false 就永久跳过网络（缓存回归后常见）。
-            if (
-              !pageMayBeMissingAnchorAttachments(visibleCachedPage, anchorMessage)
-              && !pageMayBeMissingThreadContext(visibleCachedPage, anchorMessage)
-            ) {
-              void hydrateCachedThreadPageBodies(mailbox, visibleCachedPage)
-                .then((hydratedPage) => {
-                  // 网络页已经到达后，不能让较慢的缓存 hydration 把新页面覆盖回去。
-                  if (cancelled || networkPageLoaded) return;
-                  if (hydratedPage !== visibleCachedPage) {
-                    setPage(hydratedPage);
-                  }
-                  loadFullAnchorMessage(hydratedPage);
-                })
-                .catch(() => {
-                  if (!cancelled) loadFullAnchorMessage(visibleCachedPage);
-                });
-              // stale-while-revalidate：后台刷新线程页，补齐附件元数据
-            }
           }
-          const nextPage = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: messageId, limit: 5, includeDisplayBody: true });
-          if (cancelled) return;
-          networkPageLoaded = true;
-          const visiblePage = withoutGmailDraftThreadMessages(nextPage);
-          setPage(visiblePage);
-          void cacheThreadPage(mailbox, visiblePage);
-          loadFullAnchorMessage(visiblePage);
-          requestAssist(visiblePage.latest_message_id || messageId);
         } else {
           const cachedBody = await getCachedMessageBody(mailbox, messageId, anchorMessage.internal_date);
           if (cancelled) return;
@@ -1590,37 +1538,6 @@ export function MailDetailDrawer({
       }));
     requestAnimationFrame(() => bodyRef.current?.focus());
   }, [composerDrafts.reply.body, draftStorageKey, insertRequest, mailbox, message, onConsumeInsertRequest, showToast, threadId]);
-
-  const refreshThread = async () => {
-    if (!threadId || !messageId) return;
-    setLoading(true);
-    setError("");
-    try {
-      const refreshed = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: messageId, limit: 5, includeDisplayBody: true, forceRefresh: true });
-      const visiblePage = withoutGmailDraftThreadMessages(refreshed);
-      setPage(visiblePage);
-      void cacheThreadPage(mailbox, visiblePage);
-      if (visiblePage.latest_message_id) {
-        setAssistLoading(true);
-        const requestKey = `${mailbox}:${threadId}:${visiblePage.latest_message_id}:${messageId}`;
-        assistRequestKeyRef.current = requestKey;
-        void loadInboxThreadAssistRef.current(mailbox, threadId, visiblePage.latest_message_id, messageId)
-          .then((result) => {
-            if (assistRequestKeyRef.current === requestKey) setAssist(result);
-          })
-          .catch((reason) => {
-            if (assistRequestKeyRef.current === requestKey) setAssistError(reason instanceof Error ? reason.message : String(reason));
-          })
-          .finally(() => {
-            if (assistRequestKeyRef.current === requestKey) setAssistLoading(false);
-          });
-      }
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const loadEarlier = async () => {
     if (!page?.has_earlier || page.next_before_index === null || !threadId) return;
@@ -2342,6 +2259,7 @@ export function MailDetailDrawer({
         </header>
 
         <div className="mail-detail-context" ref={scrollRef}>
+          <div className="mail-detail-thread">
           {page?.has_earlier ? <button className="mail-detail-load-earlier" onClick={() => void loadEarlier()}>Load earlier messages</button> : null}
           {loading && !page ? <MailDetailLoadingSkeleton /> : null}
           {error ? <div className="mail-detail-error">Thread failed to load. {error}</div> : null}
@@ -2352,7 +2270,12 @@ export function MailDetailDrawer({
               && !displayBodyLoaded.has(item.id)
               && !displayBodyErrors[item.id];
             return (
-            <article key={item.id} className="mail-thread-message" data-message-id={item.id}>
+            <article
+              key={item.id}
+              className="mail-thread-message"
+              data-message-id={item.id}
+              ref={item.id === latestMessage?.id ? latestMessageRef : undefined}
+            >
               <div className="mail-thread-message-head">
                 <div className="mail-thread-message-author">
                   {(() => {
@@ -2374,9 +2297,7 @@ export function MailDetailDrawer({
                 </div>
                 <time>{formatAbsoluteDateTime(item.internal_date)}</time>
               </div>
-              {waitForFullBody ? <MailThreadBodyLoading /> : item.body_html ? <SafeEmailHtml className="mail-thread-message-body is-html" html={item.body_html} scaleToFit onRendered={() => {
-                if (!preserveScrollOnPageUpdateRef.current) scrollToThreadBottom(scrollRef.current);
-              }} /> : hasDisplayBody ? <SafeEmailText className="mail-thread-message-body" text={item.body_text || ""} /> : null}
+              {waitForFullBody ? <MailThreadBodyLoading /> : item.body_html ? <SafeEmailHtml className="mail-thread-message-body is-html" html={item.body_html} scaleToFit /> : hasDisplayBody ? <SafeEmailText className="mail-thread-message-body" text={stripQuotedReplyForDisplay(item.body_text || "")} /> : null}
               {displayBodyErrors[item.id] ? (
                 <p className="mail-thread-message-notice is-error">
                   <span>{displayBodyErrors[item.id]}</span>
@@ -2385,8 +2306,6 @@ export function MailDetailDrawer({
               ) : null}
               <AttachmentSection
                 attachments={item.attachments}
-                expectedAttachmentCount={expectedAttachmentCountForMessage(item, message)}
-                onRefresh={() => void refreshThread()}
                 onPreview={(attachment) => void openAttachmentPreview({ attachment, messageId: attachment.message_id || item.id })}
                 onDownload={(attachment) => void downloadAttachment({ attachment, messageId: attachment.message_id || item.id }).catch((reason) => showToast(reason instanceof Error ? reason.message : String(reason)))}
                 isDownloading={(attachment) => isAttachmentDownloading({ attachment, messageId: attachment.message_id || item.id })}
@@ -2412,6 +2331,7 @@ export function MailDetailDrawer({
               </p>
             </section>
           ) : null}
+          </div>
         </div>
 
         <footer ref={footerRef} className={`mail-detail-footer ${composerVisible ? "is-composer-open" : ""} ${composerClosing ? "is-composer-closing" : ""} ${composerExpanded ? "is-expanded" : ""}`}>

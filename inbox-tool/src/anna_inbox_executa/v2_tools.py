@@ -1321,19 +1321,29 @@ def _load_thread_messages(mailbox: str, thread_id: str, *, force_refresh: bool =
         attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
         return max(len(attachments), int(item.get("attachment_count") or 0), 1 if item.get("has_attachment") else 0)
 
+    def _attachment_metadata_count(item: dict[str, Any] | None) -> int:
+        """只计算可展示/下载的真实附件条目，不能把摘要数量当作 metadata。"""
+        if not isinstance(item, dict):
+            return 0
+        attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
+        return len(attachments)
+
     attachment_metadata_complete = all(
-        _attachment_count(cached_by_id.get(message_id)) >= _attachment_count(summary)
+        _attachment_metadata_count(cached_by_id.get(message_id)) >= _attachment_count(summary)
         for message_id, summary in summaries_by_id.items()
     )
-    if cached_messages and not force_refresh:
+    if cached_messages and not force_refresh and attachment_metadata_complete:
         try:
-            # 完整缓存时同步附件摘要；部分缓存只用于首屏展示，不阻塞详情打开。
-            if len(cached_messages) == expected_count and attachment_metadata_complete:
+            # 完整缓存时同步附件摘要；详情页可直接复用，不发起 Gmail 线程刷新。
+            if len(cached_messages) == expected_count:
                 sync_cached_message_summaries(normalized_mailbox, cached_messages)
         except Exception as exc:
             # 摘要缓存更新失败不能影响用户打开邮件详情。
             log(f"thread summary cache sync failed for {thread_id}: {type(exc).__name__}: {exc}")
         return cached_messages
+    # 摘要已经声明存在附件、但详情缓存缺少 metadata 时，不能重复返回同一份
+    # 不完整对象，否则前端会永久停在附件加载占位。浏览器仍会先展示本地缓存，
+    # 这里仅让随后的线程页请求补齐 Gmail 附件描述。
     try:
         messages = refresh_thread_cache(mailbox, thread_id)
         if messages:

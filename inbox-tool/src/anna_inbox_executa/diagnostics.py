@@ -16,11 +16,19 @@ from typing import Any
 _CURRENT_TRACE: ContextVar[dict[str, Any] | None] = ContextVar("anna_runtime_trace", default=None)
 _MAX_SPANS = 40
 _SAFE_FIELD_NAMES = {
+    "api_calls",
     "cached",
     "code",
     "endpoint",
     "error_type",
     "http_status",
+    "index_build_ms",
+    "index_reused",
+    "fts_query_ms",
+    "path",
+    "result_count",
+    "rows_indexed",
+    "rows_scanned",
     "source",
 }
 

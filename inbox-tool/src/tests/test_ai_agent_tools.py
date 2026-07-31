@@ -49,6 +49,31 @@ def test_flat_thread_fields_merge_into_readonly_context() -> None:
     print("[PASS] test_flat_thread_fields_merge_into_readonly_context")
 
 
+def test_draft_party_context_separates_owner_from_counterparty() -> None:
+    """写稿身份：主人是连接邮箱，对方来自线程非主人参与者。"""
+    from mail_agent.ai_turn.tools import _draft_identity_block, _draft_party_context
+
+    parties = _draft_party_context(
+        "kate@anna.partners",
+        {
+            "from_addr": "Pervaiz Alam <pervaiz@gurru.example>",
+            "body": (
+                "From: Pervaiz Alam <pervaiz@gurru.example>\n"
+                "To: kate@anna.partners\n"
+                "Body:\nHi Kate,\nNo worries\n"
+            ),
+        },
+        {},
+    )
+    assert parties["owner_email"] == "kate@anna.partners"
+    assert "pervaiz@gurru.example" in parties["reply_to"].lower()
+    block = _draft_identity_block(parties)
+    assert "Mailbox owner" in block
+    assert "Last_message_from" in block
+    assert "kate" in block.lower()
+    print("[PASS] test_draft_party_context_separates_owner_from_counterparty")
+
+
 def test_host_agent_tool_schemas_are_decision_compact() -> None:
     """Host 选型 schema 必须短且含 when/never 约束，减少 session 犹豫与 input tokens。"""
     from anna_inbox_executa.common import AI_AGENT_DEFAULT_TOOLS, load_manifest
@@ -117,7 +142,7 @@ def test_public_evidence_omits_raw_coverage_note() -> None:
 def test_search_limit_applies_per_call_only() -> None:
     """每次搜索独立限制返回量，同一会话可以持续发起新搜索。"""
     assert [_reserve_search_limit(7) for _ in range(10)] == [7] * 10
-    assert _reserve_search_limit(999) == 20
+    assert _reserve_search_limit(999) == 200
     assert _reserve_search_limit(None) == 12
     assert _reserve_search_limit(0) == 12
     print("[PASS] test_search_limit_applies_per_call_only")
@@ -228,6 +253,46 @@ def test_search_email_includes_attachment_filenames() -> None:
     print("[PASS] test_search_email_includes_attachment_filenames")
 
 
+def test_search_email_falls_back_to_cached_full_body_for_body_clause() -> None:
+    """body: 精确短语不在摘要时，仍可从已缓存正文命中且不访问 Gmail。"""
+    messages = [
+        {
+            "id": "body-match", "thread_id": "thread-body", "from": "news@example.com",
+            "to": "me@example.com", "subject": "Weekly launch notes", "snippet": "Short preview",
+            "internal_date": "1783814400000", "label_ids": ["INBOX"],
+        },
+        {
+            "id": "other", "thread_id": "thread-other", "from": "news@example.com",
+            "to": "me@example.com", "subject": "Other", "snippet": "Different preview",
+            "internal_date": "1783814300000", "label_ids": ["INBOX"],
+        },
+    ]
+
+    def fake_read(_mailbox, message_id):
+        return {
+            "id": message_id,
+            "body_text": "Your best product launch ever! Read the full announcement."
+            if message_id == "body-match" else "Nothing relevant here.",
+        }
+
+    with patch("mail_agent.mail_providers.gmail.adapter.list_messages", return_value=messages), patch(
+        "mail_agent.mail_providers.gmail.adapter.read_message", side_effect=fake_read,
+    ), patch(
+        "mail_agent.mail_providers.gmail.mailbox_sync.get_mailbox_sync_boundary",
+        return_value={"cache_total": 2, "initial_sync_complete": True},
+    ), patch(
+        "mail_agent.mail_providers.gmail.mailbox_sync.boundary_honesty_note", return_value="",
+    ):
+        result = _search_email(
+            {"mailbox": "me@example.com", "about": "body:Your best product launch ever!", "limit": 5},
+            {},
+        )
+
+    assert [row["message_id"] for row in result["results"]] == ["body-match"]
+    assert "body_text" not in result["results"][0]
+    print("[PASS] test_search_email_falls_back_to_cached_full_body_for_body_clause")
+
+
 def test_search_email_order_oldest_uses_full_cached_range() -> None:
     """最早邮件必须在完整缓存排序后取值，不能从 newest 前 20 条猜测。"""
     messages = [
@@ -315,6 +380,7 @@ def test_gmail_search_failure_logs_safe_diagnostics() -> None:
 if __name__ == "__main__":
     test_host_agent_tool_whitelist_excludes_mutations()
     test_flat_thread_fields_merge_into_readonly_context()
+    test_draft_party_context_separates_owner_from_counterparty()
     test_host_agent_tool_schemas_are_decision_compact()
     test_public_outcome_strips_internal_fields()
     test_public_evidence_omits_raw_coverage_note()
@@ -323,6 +389,7 @@ if __name__ == "__main__":
     test_search_email_uses_full_cache_and_workflow_ids()
     test_plain_search_only_fetches_requested_candidates()
     test_search_email_includes_attachment_filenames()
+    test_search_email_falls_back_to_cached_full_body_for_body_clause()
     test_search_email_order_oldest_uses_full_cached_range()
     test_merge_ui_context_accepts_thread_ref_for_draft()
     test_gmail_search_failure_logs_safe_diagnostics()

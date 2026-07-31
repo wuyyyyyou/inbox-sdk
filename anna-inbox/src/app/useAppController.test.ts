@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { ensureConfirmedThreadReference } from "./aiThreadReferences";
 
 const controllerSource = readFileSync(
   new URL("./useAppController.ts", import.meta.url),
@@ -7,6 +8,10 @@ const controllerSource = readFileSync(
 );
 const homeViewSource = readFileSync(
   new URL("../features/home/HomeView.tsx", import.meta.url),
+  "utf8",
+);
+const threadReferencesSource = readFileSync(
+  new URL("./aiThreadReferences.ts", import.meta.url),
   "utf8",
 );
 
@@ -66,7 +71,50 @@ describe("AI scan invocation", () => {
     expect(sidebarHandler).toContain("aiSidebarModeByConversationRef.current.set(conversationId, sidebarMode)");
     expect(sidebarHandler).toContain("messages: messagesWithUser");
     expect(sidebarHandler).toContain("ui_context: sidebarUiContext");
+    expect(controllerSource).toContain("search_field: args.searchField || \"\"");
+    expect(controllerSource).toContain("searchField: options.searchField");
+    expect(controllerSource).toContain("const agentRequest = String(options.agentPrompt || userRequest)");
     expect(controllerSource).not.toMatch(/decideAiRoute\(/);
+  });
+
+  it("keeps only confirmed thread references and attaches them to the reply", () => {
+    expect(controllerSource).toContain("ensureConfirmedThreadReference");
+    expect(controllerSource).toContain("confirmedEvidenceThreadIdsFromOutcomes");
+    expect(controllerSource).toContain('from "./aiThreadReferences"');
+    expect(threadReferencesSource).toContain("removeDirectMailLinks");
+    expect(threadReferencesSource).toContain("isGmailMessageUrl");
+    expect(threadReferencesSource).toContain("hostname === \"mail.google.com\"");
+    expect(threadReferencesSource).toContain("line.toLowerCase().includes(subject)");
+    expect(threadReferencesSource).toContain("const fallbackLineIndex");
+    expect(threadReferencesSource).toContain("const fallbackLineIndex = lines.findIndex");
+    expect(threadReferencesSource).toContain("lines[fallbackLineIndex].trimEnd()");
+    expect(threadReferencesSource).toContain("const fallbackThreadId");
+    expect(threadReferencesSource).toContain("${lines[lineIndex].trimEnd()} [THREAD_REF_${threadId}]");
+    expect(threadReferencesSource).toContain("[THREAD_REF_${threadId}]");
+    expect(controllerSource).toContain("confirmedEvidenceThreadIds(payload)");
+    expect(controllerSource).toContain("confirmedEvidenceThreadLabels(payload, confirmedThreadIds)");
+    expect(controllerSource).toContain("evidence_thread_labels");
+    expect(threadReferencesSource).toContain("THREAD_?REF_?");
+  });
+
+  it("does not append an unrelated confirmed candidate after an inline evidence reference", () => {
+    const result = ensureConfirmedThreadReference(
+      "该收据的实付金额为 **$11.00**。 [THREAD_REF_eleven]",
+      new Set(["eleven", "x-payment"]),
+      {
+        eleven: "Your receipt from Eleven Labs Inc.",
+        "x-payment": "HK$54.00 payment to X was unsuccessful again",
+      },
+    );
+
+    expect(result).toContain("[THREAD_REF_eleven]");
+    expect(result).not.toContain("THREAD_REF_x-payment");
+  });
+
+  it("renders evidence references as compact subject links", () => {
+    expect(homeViewSource).toContain("truncateThreadReferenceLabel");
+    expect(homeViewSource).toContain("const limit = 48");
+    expect(homeViewSource).toContain("title={fullLabel}");
   });
 
   it("routes thread detail prompts through the same unified AI turn", () => {

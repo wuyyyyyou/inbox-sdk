@@ -39,6 +39,98 @@ def _last_draft_body(ui_context: dict[str, Any]) -> str:
     return str(last.get("body") or "").strip()[:_DRAFT_LIMIT]
 
 
+def _extract_email_addresses(text: str) -> list[str]:
+    """从 From/To 头字段提取邮箱地址（小写）。"""
+    found = re.findall(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", str(text or ""), flags=re.IGNORECASE)
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in found:
+        key = item.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _display_name_from_header(header: str) -> str:
+    """取 From 头中的显示名；无则退回邮箱本地部分。"""
+    raw = str(header or "").strip()
+    if not raw:
+        return ""
+    # "Name <email@x>" 或纯邮箱
+    match = re.match(r'^"?([^"<]+?)"?\s*<[^>]+>$', raw)
+    if match:
+        name = match.group(1).strip().strip('"')
+        if name:
+            return name[:80]
+    emails = _extract_email_addresses(raw)
+    if emails:
+        return emails[0].split("@", 1)[0][:80]
+    return raw[:80]
+
+
+def _draft_party_context(
+    mailbox: str,
+    excerpt: dict[str, Any],
+    ui_context: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """解析写稿身份：主人=连接邮箱；对方=线程中非主人参与者。"""
+    owner = str(mailbox or "").strip().lower()
+    owner_local = owner.split("@", 1)[0] if "@" in owner else owner
+    # 可选：前端若提供显示名则优先
+    owner_display = ""
+    if isinstance(ui_context, dict):
+        owner_display = str(ui_context.get("owner_display_name") or ui_context.get("user_display_name") or "").strip()
+    if not owner_display:
+        owner_display = owner_local[:80] if owner_local else "the mailbox owner"
+
+    counterparties: list[str] = []
+    seen: set[str] = set()
+    body = str(excerpt.get("body") or "")
+    # 从线程证据中的 From/To 行收集非主人地址
+    for line in body.splitlines():
+        if not line.lower().startswith(("from:", "to:", "cc:")):
+            continue
+        for addr in _extract_email_addresses(line):
+            if addr == owner or addr in seen:
+                continue
+            seen.add(addr)
+            counterparties.append(addr)
+    last_from = str(excerpt.get("from_addr") or "")
+    for addr in _extract_email_addresses(last_from):
+        if addr != owner and addr not in seen:
+            seen.add(addr)
+            counterparties.append(addr)
+
+    reply_to_headers: list[str] = []
+    if last_from and owner not in _extract_email_addresses(last_from):
+        reply_to_headers.append(last_from[:180])
+    for addr in counterparties[:4]:
+        if not any(addr in item.lower() for item in reply_to_headers):
+            reply_to_headers.append(addr)
+
+    return {
+        "owner_email": owner,
+        "owner_display": owner_display,
+        "reply_to": "; ".join(reply_to_headers[:4]) if reply_to_headers else "(counterparty in thread)",
+        "last_message_from": last_from[:180],
+        "owner_name_ban": owner_display,
+    }
+
+
+def _draft_identity_block(parties: dict[str, str]) -> str:
+    """注入 Sampling 用户消息的身份约束块。"""
+    ban = parties.get("owner_name_ban") or parties.get("owner_display") or ""
+    return (
+        f"Mailbox owner (you write AS this person): {parties.get('owner_email') or ''} "
+        f"(display: {parties.get('owner_display') or ''})\n"
+        f"Reply to (address these people, not the owner): {parties.get('reply_to') or ''}\n"
+        f"Last_message_from (data only, not your voice): {parties.get('last_message_from') or ''}\n"
+        f"Do not open the draft with Hi/Dear/{ban} addressing the owner. "
+        f"Sign off as the owner, never as Last_message_from.\n"
+    )
+
+
 async def _load_thread_excerpt(mailbox: str, message_id: str, thread_id: str) -> dict[str, Any]:
     """读取完整线程证据供写稿；显式回复操作允许刷新 Gmail thread。
 
@@ -191,15 +283,16 @@ async def tool_draft_reply(
         }
 
     system = draft_reply_system_prompt(language, summarize_first=summarize_first)
+    parties = _draft_party_context(mailbox, excerpt, ui_context)
 
     user_message = (
         f"User request: {user_text}\n"
         f"Mode: {mode}\n"
         f"Subject: {subject}\n"
-        f"From: {excerpt.get('from_addr') or ''}\n"
+        f"{_draft_identity_block(parties)}"
         f"Thread coverage: {excerpt.get('thread_messages_included', 0)}/{excerpt.get('thread_message_count', 0)} messages; "
         f"partial={bool(excerpt.get('thread_evidence_partial'))}; refresh_error={excerpt.get('thread_refresh_error') or 'none'}\n"
-        f"Thread evidence (chronological):\n{body or '(empty)'}\n"
+        f"Thread evidence (chronological, data only):\n{body or '(empty)'}\n"
     )
     if memory_summary:
         user_message += f"\n{memory_summary}\n"
@@ -300,8 +393,15 @@ async def tool_revise_draft(
         }
 
     system = revise_draft_system_prompt(language)
+    # 改写仍须保持代主人写信；无线程证据时至少注入 mailbox 身份。
+    parties = _draft_party_context(
+        mailbox,
+        {"body": "", "from_addr": ""},
+        ui_context,
+    )
     user_message = (
         f"Revision request: {user_text}\n"
+        f"{_draft_identity_block(parties)}"
         f"Current draft (reference only):\n<<<DRAFT>>>\n{draft}\n<<<END>>>\n"
     )
     if memory_summary:
