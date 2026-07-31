@@ -53,12 +53,14 @@ require_command() {
 
 PYTHON_BIN="${PYTHON_BIN:-}"
 if [ -z "$PYTHON_BIN" ]; then
-  if command -v python3 >/dev/null 2>&1; then
-    PYTHON_BIN="python3"
-  elif command -v python >/dev/null 2>&1; then
-    PYTHON_BIN="python"
-  else
-    echo "Missing required command: python3 or python" >&2
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys' >/dev/null 2>&1; then
+      PYTHON_BIN="$candidate"
+      break
+    fi
+  done
+  if [ -z "$PYTHON_BIN" ]; then
+    echo "Missing working Python command: python3 or python" >&2
     exit 1
   fi
 fi
@@ -290,7 +292,7 @@ run_list_inbox_invoke_smoke() {
   local smoke_storage_dir="$WORK_DIR/smoke-local-storage"
 
   printf '%s\n' '{"jsonrpc":"2.0","method":"invoke","params":{"tool":"list_inbox_emails","arguments":{"mailbox":""},"context":{}},"id":1}' \
-    | env ZHAOPY_MAIL_AGENT_STORAGE_DIR="$smoke_storage_dir" "$PACKAGE_DIR/bin/$BINARY_NAME" >"$output_path" 2>"$error_path"
+    | env ANNA_STORAGE_BACKEND=local ZHAOPY_MAIL_AGENT_STORAGE_DIR="$smoke_storage_dir" "$PACKAGE_DIR/bin/$BINARY_NAME" >"$output_path" 2>"$error_path"
 
   "$PYTHON_BIN" - "$output_path" <<'PY'
 import json
