@@ -55,6 +55,7 @@ import {
   resolveAttachmentAccess,
   resolveMessageThreadId,
   senderParts,
+  shouldFollowLatestThreadMessage,
   stripQuotedReplyForDisplay,
   splitAddresses,
   stripForwardedMessageBlock,
@@ -523,19 +524,6 @@ function scrollToThreadBottom(container: HTMLDivElement | null, behavior: Scroll
   container.scrollTop = bottom;
 }
 
-/** 将指定邮件卡片的底部对齐到详情阅读区底部，避免等待整条线程渲染。 */
-function scrollThreadMessageIntoView(
-  container: HTMLDivElement,
-  message: HTMLElement,
-  behavior: ScrollBehavior,
-) {
-  const containerBounds = container.getBoundingClientRect();
-  const messageBounds = message.getBoundingClientRect();
-  const top = Math.max(0, container.scrollTop + messageBounds.bottom - containerBounds.bottom);
-  container.scrollTo({ top, behavior });
-  return top;
-}
-
 const TEXT_PREVIEW_MAX_BYTES = 256 * 1024;
 
 function AiSparkleIcon() {
@@ -591,6 +579,7 @@ export function MailDetailDrawer({
   insertRequest,
   onConsumeInsertRequest,
   onClose,
+  onRequestClose,
   onTodoMessage,
   onDoneMessage,
   onSnoozeMessage,
@@ -624,6 +613,7 @@ export function MailDetailDrawer({
   insertRequest: InsertRequest;
   onConsumeInsertRequest: (nonce: string) => void;
   onClose: () => void;
+  onRequestClose: () => void;
   onTodoMessage: (message: InboxMessage) => void;
   onDoneMessage: (message: InboxMessage) => void;
   onSnoozeMessage: (message: InboxMessage) => void;
@@ -753,12 +743,12 @@ export function MailDetailDrawer({
   const [, setPreviewCacheRevision] = useState(0);
   const [resolvedAvatars, setResolvedAvatars] = useState<Record<string, string>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const latestMessageRef = useRef<HTMLElement | null>(null);
   /** 初始滚动已开始，防止当前详情页重复定位。 */
   const initialBottomScrollStartedRef = useRef(false);
   /** 初始平滑滚动已抵达底部；此前不允许布局补偿改写 scrollTop。 */
   const initialBottomScrollDoneRef = useRef(false);
   const preserveScrollOnPageUpdateRef = useRef(false);
+  const detailSessionRef = useRef(0);
   const historicalBodyHydrationRef = useRef<Promise<void> | null>(null);
   const footerRef = useRef<HTMLElement | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
@@ -986,22 +976,30 @@ export function MailDetailDrawer({
     && normalizeComparableSubject(latestSubject) !== normalizeComparableSubject(displaySubject)
   );
 
-  // 最新邮件卡片出现后立即平滑定位，不等待历史正文、附件或 AI 区域完成渲染。
+  useEffect(() => {
+    if (open) return;
+    detailSessionRef.current += 1;
+    const scroller = scrollRef.current;
+    if (scroller) {
+      scroller.scrollTo({ top: scroller.scrollTop, behavior: "auto" });
+    }
+  }, [open]);
+
   useLayoutEffect(() => {
-    if (!open || loading || !latestMessage?.id || preserveScrollOnPageUpdateRef.current) return;
+    if (!open || loading || !visibleThreadMessages.length || preserveScrollOnPageUpdateRef.current) return;
     if (initialBottomScrollStartedRef.current) return;
     const scroller = scrollRef.current;
-    const latestMessageElement = latestMessageRef.current;
-    if (!scroller || !latestMessageElement) return;
+    if (!scroller) return;
+    const session = detailSessionRef.current;
 
     let cancelled = false;
     let scrollCompletionFrame = 0;
-    const targetTop = scrollThreadMessageIntoView(scroller, latestMessageElement, "smooth");
+    scrollToThreadBottom(scroller, "smooth");
     initialBottomScrollStartedRef.current = true;
 
     const completeWhenPositioned = () => {
-      if (cancelled) return;
-      if (Math.abs(scroller.scrollTop - targetTop) <= 2) {
+      if (cancelled || session !== detailSessionRef.current || !open) return;
+      if (isThreadScrollerNearBottom(scroller, 2)) {
         initialBottomScrollDoneRef.current = true;
         return;
       }
@@ -1013,7 +1011,7 @@ export function MailDetailDrawer({
       cancelled = true;
       window.cancelAnimationFrame(scrollCompletionFrame);
     };
-  }, [latestMessage?.id, loading, open]);
+  }, [loading, open, visibleThreadMessages.length]);
 
   // quick reply / no-reply 条出现在线程下方：仅当用户仍在底部附近时补一次 smooth，不打断阅读。
   useEffect(() => {
@@ -1091,6 +1089,7 @@ export function MailDetailDrawer({
 
   useEffect(() => {
     if (!open || !message || !mailbox || !messageId) return;
+    const session = ++detailSessionRef.current;
     let cancelled = false;
     const anchorMessage = message;
     preserveScrollOnPageUpdateRef.current = false;
@@ -1158,46 +1157,69 @@ export function MailDetailDrawer({
     const load = async () => {
       try {
         if (threadId) {
-          // 缓存仅在网络线程页失败时回退，避免打开过程先显示半成品又被网络结果覆盖。
           const cachedPagePromise = getCachedThreadPage(mailbox, threadId, latestThreadMessageId || messageId)
             .catch(() => null);
-          try {
-            const nextPage = await loadInboxThreadPageRef.current(mailbox, threadId, { anchorMessageId: messageId, limit: 5, includeDisplayBody: true });
-            if (cancelled) return;
+          const applyThreadPage = (nextPage: InboxThreadPagePayload) => {
             const visiblePage = withoutGmailDraftThreadMessages(nextPage);
             setPage(visiblePage);
             void cacheThreadPage(mailbox, visiblePage);
             loadFullAnchorMessage(visiblePage);
             requestAssist(visiblePage.latest_message_id || messageId);
-          } catch (reason) {
-            const cachedPage = await cachedPagePromise;
-            if (cancelled) return;
-            if (!cachedPage) throw reason;
+          };
+          const refreshNetworkPage = async (previousPage?: InboxThreadPagePayload) => {
+            const scroller = scrollRef.current;
+            const nextPage = await loadInboxThreadPageRef.current(mailbox, threadId, {
+              anchorMessageId: messageId,
+              limit: 5,
+              includeDisplayBody: true,
+            });
+            if (cancelled || session !== detailSessionRef.current) return;
+            const visiblePage = withoutGmailDraftThreadMessages(nextPage);
+            const shouldFollowRefresh = shouldFollowLatestThreadMessage(
+              previousPage?.latest_message_id || "",
+              visiblePage.latest_message_id || "",
+              Boolean(scroller && isThreadScrollerNearBottom(scroller)),
+              preserveScrollOnPageUpdateRef.current,
+            );
+            applyThreadPage(nextPage);
+            if (shouldFollowRefresh && scroller) {
+              window.requestAnimationFrame(() => {
+                if (cancelled || session !== detailSessionRef.current || !open) return;
+                scrollToThreadBottom(scroller, "smooth");
+                initialBottomScrollDoneRef.current = true;
+              });
+            }
+          };
+          const cachedPage = await cachedPagePromise;
+          if (cancelled || session !== detailSessionRef.current) return;
+          if (cachedPage) {
             const visibleCachedPage = withoutGmailDraftThreadMessages(cachedPage);
-            setPage(visibleCachedPage);
-            loadFullAnchorMessage(visibleCachedPage);
-            requestAssist(visibleCachedPage.latest_message_id || messageId);
+            applyThreadPage(visibleCachedPage);
+            setLoading(false);
+            void refreshNetworkPage(visibleCachedPage).catch(() => undefined);
+            return;
           }
+          await refreshNetworkPage();
         } else {
           const cachedBody = await getCachedMessageBody(mailbox, messageId, anchorMessage.internal_date);
-          if (cancelled) return;
+          if (cancelled || session !== detailSessionRef.current) return;
           if (cachedBody) {
             setPage(singleMessagePageFromBody(mailbox, anchorMessage, cachedBody));
             return;
           }
           const body = await loadInboxEmailBodyRef.current(messageId, mailbox);
-          if (cancelled) return;
+          if (cancelled || session !== detailSessionRef.current) return;
           const nextPage = singleMessagePageFromBody(mailbox, anchorMessage, { body_text: body, attachments: inboxMessageAttachments(anchorMessage) });
           setPage(nextPage);
           void setCachedMessageBody(mailbox, anchorMessage, { body_text: body, attachments: inboxMessageAttachments(anchorMessage) });
         }
       } catch (reason) {
-        if (cancelled) return;
+        if (cancelled || session !== detailSessionRef.current) return;
         const threadError = reason instanceof Error ? reason.message : String(reason);
         if (threadId) {
           try {
             const display = await resolveDisplayBodyPayload(await loadInboxMessageDisplayBodyRef.current(mailbox, messageId));
-            if (cancelled) return;
+            if (cancelled || session !== detailSessionRef.current) return;
             setPage(singleMessagePageFromBody(mailbox, anchorMessage, {
               body_html: display.body_html || "",
               body_text: display.body_text || "",
@@ -1220,13 +1242,14 @@ export function MailDetailDrawer({
         } else {
           setError(threadError);
         }
-      } finally {
-        if (!cancelled) setLoading(false);
+        } finally {
+        if (!cancelled && session === detailSessionRef.current) setLoading(false);
       }
     };
     void load();
     return () => {
       cancelled = true;
+      if (session === detailSessionRef.current) detailSessionRef.current += 1;
     };
   // A saved local draft overlays the selected inbox message with a new object. That
   // is not a navigation event, so avoid using the whole message as a dependency:
@@ -1241,18 +1264,33 @@ export function MailDetailDrawer({
       skipSoftThreadRefreshRef.current = false;
       return;
     }
+    const session = detailSessionRef.current;
     let cancelled = false;
     const softRefresh = async () => {
       try {
+        const scroller = scrollRef.current;
         const nextPage = await loadInboxThreadPageRef.current(mailbox, threadId, {
           anchorMessageId: messageId,
           limit: 5,
           includeDisplayBody: true,
         });
-        if (cancelled) return;
+        if (cancelled || session !== detailSessionRef.current || !open) return;
         const visiblePage = withoutGmailDraftThreadMessages(nextPage);
+        const shouldFollowRefresh = shouldFollowLatestThreadMessage(
+          page?.latest_message_id || "",
+          visiblePage.latest_message_id || "",
+          Boolean(scroller && isThreadScrollerNearBottom(scroller)),
+          preserveScrollOnPageUpdateRef.current,
+        );
         setPage(visiblePage);
         void cacheThreadPage(mailbox, visiblePage);
+        if (shouldFollowRefresh && scroller) {
+          window.requestAnimationFrame(() => {
+            if (cancelled || session !== detailSessionRef.current || !open) return;
+            scrollToThreadBottom(scroller, "smooth");
+            initialBottomScrollDoneRef.current = true;
+          });
+        }
         const requestKey = `${mailbox}:${threadId}:${visiblePage.latest_message_id || latestThreadMessageId}:${messageId}`;
         if (assistRequestKeyRef.current !== requestKey) {
           assistRequestKeyRef.current = requestKey;
@@ -2162,6 +2200,7 @@ export function MailDetailDrawer({
   };
 
   const closeThread = async () => {
+    onRequestClose();
     const forwardDraft = composerDrafts.forward;
     const forwardNote = stripForwardedMessageBlock(forwardDraft.body).trim();
     if (forwardNote) {
@@ -2274,7 +2313,6 @@ export function MailDetailDrawer({
               key={item.id}
               className="mail-thread-message"
               data-message-id={item.id}
-              ref={item.id === latestMessage?.id ? latestMessageRef : undefined}
             >
               <div className="mail-thread-message-head">
                 <div className="mail-thread-message-author">
@@ -2409,16 +2447,18 @@ export function MailDetailDrawer({
                       </div>
                     ) : (
                       <div className="mail-detail-forward-to">
-                        <RecipientChipInput
-                          label="To"
-                          emails={replyToAddress ? [replyToAddress] : []}
-                          onChange={() => undefined}
-                          mailbox={mailbox}
-                          searchContacts={searchComposeContacts}
-                          fieldRole="to"
-                          placeholder="thread"
-                          readOnly
-                        />
+                        {!loading && replyToAddress ? (
+                          <RecipientChipInput
+                            label="To"
+                            emails={[replyToAddress]}
+                            onChange={() => undefined}
+                            mailbox={mailbox}
+                            searchContacts={searchComposeContacts}
+                            fieldRole="to"
+                            placeholder=""
+                            readOnly
+                          />
+                        ) : null}
                       </div>
                     )}
                   </div>

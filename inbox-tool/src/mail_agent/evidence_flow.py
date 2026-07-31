@@ -370,6 +370,10 @@ def _deterministic_topic_query(user_text: str) -> str:
         if title:
             return f"subject:{title}"
         return "subject:New invoice from fal - Features & Labels, Inc. AND body:LWTZJX-00001"
+    # 「关于'话题'的邮件」：用 body 锚定话题，避免 in:anywhere 误命中无关缓存（J10）。
+    topic = _topic_quoted_phrase(text)
+    if topic:
+        return f"body:{topic}"
     return ""
 
 
@@ -438,11 +442,16 @@ def _plan_query_needs_deterministic_override(query: str, user_text: str) -> bool
     return False
 
 
+def _explicit_iso_date_match(text: str) -> re.Match[str] | None:
+    """提取用户原话中的 YYYY-MM-DD；中文后紧跟日期时 \\b 失效，故用更宽边界。"""
+    return re.search(r"(?<![0-9])(\d{4})-(\d{2})-(\d{2})(?![0-9])", str(text or ""))
+
+
 def _apply_explicit_absolute_date(plan: dict[str, Any], user_text: str) -> None:
     """用户原话中的 YYYY-MM-DD 钉死单日窗口；标题覆盖后若丢了日期则补回。"""
-    if re.search(r"\b(?:after|before):\d{4}-\d{2}-\d{2}\b", str(plan.get("query") or ""), re.IGNORECASE):
+    if re.search(r"(?:^|\s)(?:after|before):\d{4}-\d{2}-\d{2}(?:\s|$)", str(plan.get("query") or ""), re.IGNORECASE):
         return
-    date_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", str(user_text or ""))
+    date_match = _explicit_iso_date_match(user_text)
     if not date_match:
         return
     try:
@@ -464,11 +473,13 @@ def _sanitize_plan_query(plan: dict[str, Any], user_text: str) -> None:
     current = str(plan.get("query") or "")
     preserved_dates = re.findall(r"(?:after|before):\d{4}-\d{2}-\d{2}", current, re.IGNORECASE)
     # 《》标题始终重建为干净 subject，防止模型把 PayPal 等词拼进 subject 短语。
+    # 同时用 subject OR body 覆盖「主题字段存了书名号/方括号变体」的缓存。
     explicit_title = _explicit_subject_title(user_text)
     if explicit_title:
-        plan["query"] = f"subject:{explicit_title}"
+        title_query = f"subject:{explicit_title} OR body:{explicit_title}"
+        plan["query"] = title_query
         if preserved_dates:
-            plan["query"] = f"{plan['query']} AND {' AND '.join(dict.fromkeys(preserved_dates))}"
+            plan["query"] = f"{title_query} AND {' AND '.join(dict.fromkeys(preserved_dates))}"
     else:
         deterministic = _deterministic_topic_query(user_text)
         if deterministic and _plan_query_needs_deterministic_override(current, user_text):
@@ -947,6 +958,30 @@ def _forced_search_plan(search_field: str, user_text: str) -> dict[str, Any] | N
     }
 
 
+def _topic_quoted_phrase(user_text: str) -> str:
+    """提取「关于'X' / about "X"」中的话题短语；无则返回空。"""
+    text = str(user_text or "")
+    if not _MAIL_SEARCH_REQUEST_RE.search(text):
+        return ""
+    patterns = (
+        r"(?:关于|有关|关于主题|about)\s*[\"'“‘「]([^\"'”’」]{2,160})[\"'”’」]",
+        r"(?:找|搜索|查询|查找|find|search)\s*(?:一下)?\s*(?:关于|有关|about)?\s*"
+        r"[\"'“‘「]([^\"'”’」]{2,160})[\"'”’」]",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            phrase = " ".join(str(match.group(1) or "").split()).strip()
+            if phrase:
+                return phrase
+    return ""
+
+
+def _topic_quoted_mail_search(user_text: str) -> bool:
+    """「找关于'X'的邮件 / find emails about "X"」是主题检索，不是字段歧义澄清。"""
+    return bool(_topic_quoted_phrase(user_text))
+
+
 def _search_field_clarification(user_text: str, language: str) -> dict[str, Any] | None:
     """仅对「引号内短语且未声明字段」先澄清，禁止把引号内容擅自猜成主题。
 
@@ -957,6 +992,9 @@ def _search_field_clarification(user_text: str, language: str) -> dict[str, Any]
     text = str(user_text or "")
     # 只对引号歧义片段澄清；无引号的找邮请求一律允许检索。
     if not _QUOTED_CONTENT_RE.search(text):
+        return None
+    # 「关于"X"的邮件」类：引号只是话题分隔，直接检索并诚实无命中（J10）。
+    if _topic_quoted_mail_search(text):
         return None
     if _EXPLICIT_SEARCH_FIELD_RE.search(text):
         return None
@@ -992,15 +1030,37 @@ def _search_field_clarification(user_text: str, language: str) -> dict[str, Any]
 
 
 def _no_match_answer(evidence: dict[str, Any], language: str) -> str:
-    """零严格命中时的诚实文案；nearby 仅作相近提示，不得当命中。"""
+    """零严格命中时的诚实文案（三分法）；nearby 仅作相近提示，不得当命中。
+
+    - 未尝试 Gmail：只说明本地全量缓存无匹配
+    - 已尝试且失败/超时：不得说「确定没有」
+    - 已尝试且仍零命中：本地与 Gmail 均无匹配
+    """
     nearby = evidence.get("nearby_results") if isinstance(evidence.get("nearby_results"), list) else []
+    gmail_attempted = bool(evidence.get("gmail_fallback_attempted"))
+    gmail_status = str(evidence.get("gmail_fallback_status") or "")
+    gmail_failed = (
+        gmail_status.endswith("_failed")
+        or bool(evidence.get("history_search_failed"))
+        or bool(evidence.get("cache_gap_search_failed"))
+    )
     if language == "zh":
-        base = "已在当前全部本地缓存中检索，未找到与您条件匹配的相关邮件。"
-        if nearby:
+        if gmail_attempted and gmail_failed:
+            base = "本地缓存未命中，且未能完成 Gmail 确认，请稍后重试。"
+        elif gmail_attempted:
+            base = "已在本地缓存与 Gmail 中检索，均未找到与您条件匹配的相关邮件。"
+        else:
+            base = "已在当前全部本地缓存中检索，未找到与您条件匹配的相关邮件。"
+        if nearby and not (gmail_attempted and gmail_failed):
             return base + " 以下仅为主题相近、未确认匹配的线程，不能当作检索命中。"
         return base
-    base = "I searched all currently cached mail and found no emails matching your conditions."
-    if nearby:
+    if gmail_attempted and gmail_failed:
+        base = "No match in the local cache, and Gmail could not confirm either. Please try again."
+    elif gmail_attempted:
+        base = "I searched the local cache and Gmail and found no emails matching your conditions."
+    else:
+        base = "I searched all currently cached mail and found no emails matching your conditions."
+    if nearby and not (gmail_attempted and gmail_failed):
         return base + " Nearby threads are similar by subject only and are not confirmed matches."
     return base
 
@@ -1204,13 +1264,6 @@ def _domain_warning_note(evidence: dict[str, Any], language: str, *, user_text: 
     if pure_window:
         # 纯时间窗列举/计数不需要域名风险注脚。
         return ""
-    rows = evidence.get("results") if isinstance(evidence.get("results"), list) else []
-    warned: list[dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict) or not row.get("has_domain_warning"):
-            continue
-        warned.append(row)
-    # LinkedIn 账号申诉：即使缓存只命中单封，也提示核对多客服域名（B12/C02）。
     linkedin_case = bool(re.search(
         r"linkedin|领英|260708-005160|locked\s+out",
         f"{user_text} {plan_query}",
@@ -1220,6 +1273,20 @@ def _domain_warning_note(evidence: dict[str, Any], language: str, *, user_text: 
         f"{user_text} {plan_query}",
         re.IGNORECASE,
     ))
+    if not linkedin_case and not re.search(
+        r"安全|风险|仿冒|钓鱼|诈骗|可疑|真假|真实性|可信|核实|核验|官方|域名|发件人地址|"
+        r"security|risk|phish|impersonat|scam|fraud|suspicious|authentic|legit|verify|official|"
+        r"domain|sender\s+address",
+        f"{user_text} {plan_query}",
+        re.IGNORECASE,
+    ):
+        return ""
+    rows = evidence.get("results") if isinstance(evidence.get("results"), list) else []
+    warned: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("has_domain_warning"):
+            continue
+        warned.append(row)
     if not warned and not evidence.get("domain_warning_threads") and not linkedin_case:
         return ""
     if linkedin_case and not warned:
@@ -1260,42 +1327,6 @@ def _domain_warning_note(evidence: dict[str, Any], language: str, *, user_text: 
     return (
         "Note: multiple sender domains appear in this case/thread. "
         "Verify via official channels before acting."
-    )
-
-
-def _thread_time_span_note(evidence: dict[str, Any], language: str) -> str:
-    """从命中结果提取最早/最晚日期，提示总结覆盖跨月背景（B02 等长链）。"""
-    rows = evidence.get("results") if isinstance(evidence.get("results"), list) else []
-    dates: list[datetime] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        raw = str(row.get("date") or "").strip()
-        if not raw:
-            continue
-        try:
-            if re.fullmatch(r"\d{10,13}", raw):
-                ms = int(raw)
-                if ms < 10_000_000_000:
-                    ms *= 1000
-                dates.append(datetime.fromtimestamp(ms / 1000, tz=timezone.utc))
-                continue
-            dates.append(datetime.fromisoformat(raw.replace("Z", "+00:00")))
-        except (TypeError, ValueError, OSError):
-            continue
-    if len(dates) < 2:
-        return ""
-    earliest, latest = min(dates), max(dates)
-    if earliest.date() == latest.date():
-        return ""
-    if language == "zh":
-        return (
-            f"证据时间跨度：{earliest.strftime('%Y-%m-%d')} 至 {latest.strftime('%Y-%m-%d')}。"
-            "总结须覆盖起止背景，不能只看最新一两封。"
-        )
-    return (
-        f"Evidence span: {earliest.strftime('%Y-%m-%d')} to {latest.strftime('%Y-%m-%d')}. "
-        "Cover the full background, not only the latest messages."
     )
 
 
@@ -1465,16 +1496,26 @@ def _normalize_search_bar_query(plan: dict[str, Any], user_text: str) -> None:
         or ")" in query
         or re.search(r"\bbody:\s*(?:#|\)|$)", query, re.IGNORECASE)
     )
-    if explicit_title and (title_plan_damaged or explicit_title.lower() not in query.lower()):
-        # 标题可能含括号、冒号和多个空格；直接重建 subject 条件，避免通用词法器拆散标题。
+    if explicit_title and (
+        title_plan_damaged
+        or explicit_title.lower() not in query.lower()
+        or not re.search(r"\bsubject:", query, re.IGNORECASE)
+    ):
+        # 标题可能含括号、冒号和多个空格；重建 subject|body，避免通用词法器拆散标题。
         date_clauses: list[str] = []
-        date_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", str(user_text or ""))
+        date_match = _explicit_iso_date_match(user_text)
         if date_match:
-            current = datetime.fromisoformat(date_match.group(0))
-            date_clauses = [f"after:{current:%Y-%m-%d}", f"before:{current + timedelta(days=1):%Y-%m-%d}"]
+            current = datetime(
+                int(date_match.group(1)),
+                int(date_match.group(2)),
+                int(date_match.group(3)),
+                tzinfo=timezone.utc,
+            )
+            date_clauses = [f"after:{current:%Y-%m-%d}", f"before:{(current + timedelta(days=1)):%Y-%m-%d}"]
         else:
             date_clauses = re.findall(r"(?:after|before):\d{4}-\d{2}-\d{2}", query, re.IGNORECASE)
-        plan["query"] = " AND ".join([f"subject:{explicit_title}", *date_clauses])
+        title_core = f"subject:{explicit_title} OR body:{explicit_title}"
+        plan["query"] = " AND ".join([title_core, *date_clauses]) if date_clauses else title_core
         return
     # 历史 QueryPlan 已使用完整 subject 短语并串联日期/参与者字段；无括号和未知字段时保留原串，
     # 以免把主题中的冒号或空格误拆成正文条件。
@@ -1715,12 +1756,34 @@ def _log_evidence_plan_query(query: str, *, scope: str, source: str) -> None:
 
 
 def _gmail_fallback_answer(language: str) -> str:
-    """Gmail 托底失败时明确区分缓存零命中与回源未确认。"""
+    """Gmail 托底失败时明确区分缓存零命中与回源未确认（不得答「没有」）。"""
     return (
-        "缓存未命中且 Gmail 查询未能确认，请稍后重试。"
+        "本地缓存未命中，且未能完成 Gmail 确认，请稍后重试。"
         if language == "zh" else
-        "The cache had no match, and the Gmail query could not confirm one. Please try again."
+        "No match in the local cache, and Gmail could not confirm either. Please try again."
     )
+
+
+def _cache_gap_allows_gmail_fallback(boundary: dict[str, Any]) -> bool:
+    """仅在同步缺口时允许零命中后做一次 Gmail 托底；完整索引上的普通 0 命中不回源。
+
+    触发（须 boundary 显式带字段，避免空 dict 误触发）：
+    - `initial_sync_complete` 显式为 False（180 天 priority 未完成）
+    - 或 `cache_total` 显式为 0（缓存空）
+
+    不因单独的 `backfill_complete=False` 触发：无硬顶 backfill 可能长期未完成，
+    否则几乎每次零命中都会打 Gmail，拖垮平均耗时。更早历史仍靠时间边界 history 托底。
+    """
+    if not isinstance(boundary, dict) or not boundary:
+        return False
+    if "initial_sync_complete" in boundary and not bool(boundary.get("initial_sync_complete")):
+        return True
+    if "cache_total" in boundary:
+        try:
+            return int(boundary.get("cache_total") or 0) <= 0
+        except (TypeError, ValueError):
+            return False
+    return False
 
 
 def _template_answer(plan: dict[str, Any], evidence: dict[str, Any], language: str) -> str:
@@ -1928,10 +1991,15 @@ async def query_mail_evidence(
         title = next((" ".join(item.split()) for item in re.findall(r"《([^》]+)》", user_text) if item.strip()), "")
         if title:
             plan["query"] = f"subject:{title}"
-            date_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", user_text)
+            date_match = _explicit_iso_date_match(user_text)
             if date_match:
-                current = datetime.fromisoformat(date_match.group(0))
-                plan["query"] += f" after:{current:%Y-%m-%d} before:{current + timedelta(days=1):%Y-%m-%d}"
+                current = datetime(
+                    int(date_match.group(1)),
+                    int(date_match.group(2)),
+                    int(date_match.group(3)),
+                    tzinfo=timezone.utc,
+                )
+                plan["query"] += f" after:{current:%Y-%m-%d} before:{(current + timedelta(days=1)):%Y-%m-%d}"
             recovered_query = True
         else:
             quoted = _QUOTED_CONTENT_RE.search(user_text)
@@ -2006,6 +2074,19 @@ async def query_mail_evidence(
         "gmail_api_calls": 0,
     }
     evidence = _search_email(query_args, context)
+    # 《》标题 + 绝对日期严格零命中时，去掉日期再查一次：缓存 internal_date 可能跨日。
+    if (
+        _explicit_subject_title(user_text)
+        and not (evidence.get("results") if isinstance(evidence, dict) else None)
+        and re.search(r"\b(?:after|before):\d{4}-\d{2}-\d{2}\b", str(plan.get("query") or ""), re.IGNORECASE)
+    ):
+        undated_query = _strip_date_clauses(str(plan.get("query") or "")).strip() or str(plan.get("query") or "")
+        if undated_query and undated_query.lower() != str(plan.get("query") or "").lower():
+            undated_evidence = _search_email({**query_args, "about": undated_query}, context)
+            if undated_evidence.get("results"):
+                evidence = undated_evidence
+                plan["query"] = undated_query
+                evidence["query_fallback"] = "explicit_title_without_date"
     # 计数意图：用返回条数作为 exact_count（_search_email 已按 limit 截断，上限 200）。
     if plan.get("intent") == "count" and isinstance(evidence, dict):
         rows = evidence.get("results") if isinstance(evidence.get("results"), list) else []
@@ -2045,9 +2126,12 @@ async def query_mail_evidence(
             f"fts_query_ms={evaluation_metrics.get('fts_query_ms', 0)}"
         )
     boundary = evidence.get("sync_boundary") if isinstance(evidence.get("sync_boundary"), dict) else {}
-    history_attempted = False
-    if not evaluation_path and _history_query_before_cache(plan["query"], user_text, boundary):
-        history_attempted = True
+    # Gmail 托底：每轮最多一次；history（超边界时间）或 cache_gap（同步缺口+零命中）。
+    gmail_reason = ""
+    gmail_failed = False
+    gmail_query = str(plan.get("query") or "").strip()
+    if not evaluation_path and mailbox and _history_query_before_cache(plan["query"], user_text, boundary):
+        gmail_reason = "history"
         searched = _run_history_gmail_search(mailbox, plan["query"])
         if searched is not None:
             evidence = _search_email(query_args, context)
@@ -2056,6 +2140,7 @@ async def query_mail_evidence(
         else:
             evidence["history_search"] = True
             evidence["history_search_failed"] = True
+            gmail_failed = True
     if _needs_cached_bodies(plan, user_text) and not evidence.get("results"):
         fallback_query = _body_query_fallback(user_text)
         if fallback_query and fallback_query.lower() != str(plan.get("query") or "").lower():
@@ -2089,9 +2174,6 @@ async def query_mail_evidence(
         evidence["cache_candidates_scanned"] = len(rows)
     strict_results = evidence.get("results") if isinstance(evidence.get("results"), list) else []
     strict_result_count = len(strict_results)
-    # 普通缓存零命中不再触发 Gmail 回源；只有上面的显式历史边界逻辑允许回源。
-    gmail_status = "history" if history_attempted else ""
-    gmail_query = str(plan.get("query") or "").strip()
     if scope["kind"] == "all_indexed":
         nearby_query = _nearby_subject_query(plan["query"]) if not strict_results else ""
         if nearby_query:
@@ -2121,6 +2203,32 @@ async def query_mail_evidence(
                 evidence["count"] = len(fallback_results)
                 evidence["match_status"] = "candidate_match"
                 strict_results = fallback_results
+                strict_result_count = len(strict_results)
+    # 本地路径（含锚点候选）仍严格零命中，且存在同步缺口时，再做一次受限 Gmail 托底。
+    # 不覆盖 history 已尝试的轮次；不进入 current_thread / selected_threads。
+    gap_boundary = evidence.get("sync_boundary") if isinstance(evidence.get("sync_boundary"), dict) else boundary
+    if (
+        not evaluation_path
+        and not gmail_reason
+        and scope["kind"] == "all_indexed"
+        and strict_result_count == 0
+        and str(evidence.get("match_status") or "") != "candidate_match"
+        and mailbox
+        and _cache_gap_allows_gmail_fallback(gap_boundary)
+    ):
+        gmail_reason = "cache_gap"
+        searched = _run_history_gmail_search(mailbox, plan["query"])
+        if searched is not None:
+            evidence = _search_email(query_args, context)
+            evidence["scan_source"] = "gmail"
+            evidence["cache_gap_search"] = True
+            # 保留附近主题提示（若先前已挂），但严格结果以托底后的缓存检索为准。
+            strict_results = evidence.get("results") if isinstance(evidence.get("results"), list) else []
+            strict_result_count = len(strict_results)
+        else:
+            evidence["cache_gap_search"] = True
+            evidence["cache_gap_search_failed"] = True
+            gmail_failed = True
     if str(evidence.get("match_status") or "") != "candidate_match":
         evidence["match_status"] = "confirmed" if strict_results else "no_confirmed_match"
     if _needs_cached_bodies(plan, user_text):
@@ -2137,9 +2245,14 @@ async def query_mail_evidence(
     evidence["query_plan"] = plan
     evidence["query_plan_recovered"] = recovered_query
     evidence["query_plan_recovery_source"] = "explicit_user_anchor" if recovered_query else ""
-    evidence["gmail_fallback_attempted"] = bool(gmail_status) if 'gmail_status' in locals() else False
-    evidence["gmail_fallback_status"] = gmail_status or "not_attempted"
-    evidence["gmail_fallback_query"] = gmail_query if 'gmail_query' in locals() else ""
+    evidence["gmail_fallback_attempted"] = bool(gmail_reason)
+    if not gmail_reason:
+        evidence["gmail_fallback_status"] = "not_attempted"
+    elif gmail_failed:
+        evidence["gmail_fallback_status"] = f"{gmail_reason}_failed"
+    else:
+        evidence["gmail_fallback_status"] = gmail_reason
+    evidence["gmail_fallback_query"] = gmail_query
     evidence["gmail_fallback_timeout_seconds"] = 12
     # _search_email 的 coverage_note 是旧路径的用户文案，P3 只保留结构化边界，
     # 防止 Host 把「本地索引已回填」诊断直接复述为回答。
@@ -2161,7 +2274,6 @@ async def query_mail_evidence(
     paypal_recipient = _paypal_statement_recipient_template(evidence, user_text, language) if strict_results else ""
     payment_due = _payment_due_template(evidence, user_text, language) if strict_results else ""
     domain_note = _domain_warning_note(evidence, language, user_text=user_text) if strict_results else ""
-    span_note = _thread_time_span_note(evidence, language) if strict_results else ""
     if amount_template:
         evidence["assistant_text"] = amount_template
         evidence["kind"] = "evidence_template"
@@ -2183,18 +2295,10 @@ async def query_mail_evidence(
         evidence["kind"] = "evidence_template"
     else:
         evidence["kind"] = "evidence"
-    # 跨月时间跨度与域名矛盾只作结构化备注：
-    # - 已有模板主文时追加注脚
-    # - kind=evidence 时绝不单独写成 assistant_text，否则 force_final 失败会只回注脚
-    if span_note:
-        evidence["time_span_note"] = span_note
+    # 域名矛盾只保留为结构化证据，交给 Agent 按上下文自然总结。
+    # 不把内部提示直接追加到 assistant_text，避免用户看到固定的检索说明尾句。
     if domain_note:
         evidence["domain_warning_note"] = domain_note
-    existing = str(evidence.get("assistant_text") or "").strip()
-    if existing and evidence.get("kind") == "evidence_template" and plan.get("intent") != "count":
-        extras = [item for item in (span_note, domain_note) if item]
-        if extras:
-            evidence["assistant_text"] = existing + "\n\n" + "\n\n".join(extras)
     if mailbox and conversation_id:
         await set_conversation_state(mailbox, conversation_id, {
             "active_scope": scope,

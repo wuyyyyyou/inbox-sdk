@@ -563,6 +563,10 @@ export class MailAgentClient {
     return this.invoke<RunStatus>("start_ai_turn", args, { timeoutMs: CUSTOM_SCAN_INVOKE_TIMEOUT_MS, retry: "safe" });
   }
 
+  draftAiReply(args: Record<string, unknown>) {
+    return this.invoke<Record<string, unknown>>("ai_draft_reply", args, { timeoutMs: CUSTOM_SCAN_INVOKE_TIMEOUT_MS });
+  }
+
   /** 用户确认整理建议后执行（非 Router 静默 mutation）。 */
   applyProposedActions(args: { action: string; items: Array<Record<string, unknown>> }) {
     return this.invoke<{

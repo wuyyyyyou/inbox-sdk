@@ -60,6 +60,20 @@ export function formatAttachmentSize(size?: number) {
   return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
 }
 
+export function shouldFollowLatestThreadMessage(
+  previousLatestMessageId: string,
+  currentLatestMessageId: string,
+  userNearBottom: boolean,
+  preserveScroll: boolean,
+) {
+  return Boolean(
+    currentLatestMessageId
+    && currentLatestMessageId !== previousLatestMessageId
+    && userNearBottom
+    && !preserveScroll,
+  );
+}
+
 function attachmentExtension(filename: string) {
   const match = String(filename || "").trim().toLowerCase().match(/\.([a-z0-9]+)$/);
   return match?.[1] || "";

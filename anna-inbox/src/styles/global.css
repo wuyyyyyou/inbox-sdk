@@ -9939,6 +9939,8 @@ textarea::placeholder {
 }
 .compose-view .compose-header {
   padding: 5px 24px 14px;
+  overflow: visible;
+  z-index: 2;
 }
 .compose-view .compose-header {
   display: block;
@@ -9951,6 +9953,8 @@ textarea::placeholder {
 }
 .compose-view .compose-header .mail-detail-toolbar {
   display: flex;
+  position: relative;
+  z-index: 1;
 }
 .compose-view .compose-header .mail-detail-summary {
   margin-left: 0;
@@ -12735,6 +12739,23 @@ body,
   transform: translateX(-50%) translateY(0);
 }
 
+.compose-view .compose-header .mail-detail-toolbar > button:last-child::after {
+  right: 0;
+  left: auto;
+  transform: translateY(-4px);
+}
+
+.compose-view
+  .compose-header
+  .mail-detail-toolbar
+  > button:last-child:hover::after,
+.compose-view
+  .compose-header
+  .mail-detail-toolbar
+  > button:last-child:focus-visible::after {
+  transform: translateY(0);
+}
+
 .mail-detail-summary h2 {
   margin: 0;
   font-size: 24px;
@@ -13562,7 +13583,7 @@ body,
   min-height: 112px;
   display: flex;
   flex-direction: column;
-  overflow: visible;
+  overflow: hidden;
   border: 1px solid rgba(120, 131, 164, 0.2);
   border-radius: 16px;
   background: #fff;
@@ -13704,9 +13725,9 @@ body,
 
 .rich-text-editor-surface {
   flex: 1 1 auto;
-  min-height: 112px;
+  min-height: 0;
   padding: 14px 16px;
-  overflow-y: visible;
+  overflow-y: auto;
   outline: 0;
   color: #29364c;
   font: inherit;
@@ -14128,6 +14149,8 @@ body,
 }
 
 .ai-draft-artifact {
+  display: grid;
+  gap: 10px;
   border: 1px solid rgba(111, 129, 214, 0.15);
   box-shadow: 0 12px 28px rgba(65, 76, 130, 0.08);
   animation: aiDraftArtifactIn 220ms ease-out both;
@@ -14170,9 +14193,10 @@ body,
 }
 
 .ai-draft-artifact-field textarea {
-  min-height: 132px;
+  min-height: 34px;
   padding: 8px;
-  resize: vertical;
+  overflow: hidden;
+  resize: none;
 }
 
 .ai-draft-artifact-field input[readonly] {
@@ -14235,6 +14259,17 @@ body,
   background: rgba(235, 240, 255, 0.72);
   box-shadow: none;
   opacity: 0.72;
+}
+
+@media (max-width: 640px) {
+  .ai-draft-artifact {
+    padding: 12px;
+    border-radius: 14px;
+  }
+
+  .ai-draft-artifact-actions {
+    flex-wrap: wrap;
+  }
 }
 
 .ai-propose-card {

@@ -57,6 +57,28 @@ describe("AI sidebar collapse", () => {
 });
 
 describe("mail detail composer controls", () => {
+  it("keeps compose header tooltips above the header content", () => {
+    const composeHeaderRule = styles.match(
+      /\.compose-view \.compose-header \{\r?\n  padding: 5px 24px 14px;\r?\n  overflow: visible;\r?\n  z-index: 2;\r?\n}\r?\n/,
+    )?.[0];
+    const composeToolbarRule = styles.match(
+      /\.compose-view \.compose-header \.mail-detail-toolbar \{\r?\n  display: flex;\r?\n  position: relative;\r?\n  z-index: 1;\r?\n}\r?\n/,
+    )?.[0];
+
+    expect(composeHeaderRule).toContain("overflow: visible;");
+    expect(composeHeaderRule).toContain("z-index: 2;");
+    expect(composeToolbarRule).toContain("position: relative;");
+    expect(composeToolbarRule).toContain("z-index: 1;");
+  });
+
+  it("keeps the discard tooltip inside the compose drawer edge", () => {
+    expect(styles).toContain(
+      ".compose-view .compose-header .mail-detail-toolbar > button:last-child::after",
+    );
+    expect(styles).toContain("right: 0;");
+    expect(styles).toContain("transform: translateY(-4px);");
+  });
+
   it("uses icon reply and forward actions with visible tooltips", () => {
     expect(styles).toContain(".mail-detail-reply-action {");
     expect(styles).toContain(".mail-detail-reply-action::after {");

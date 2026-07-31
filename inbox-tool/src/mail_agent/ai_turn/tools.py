@@ -25,6 +25,65 @@ _THREAD_EVIDENCE_LIMIT = 32_000
 _THREAD_MESSAGE_BODY_LIMIT = 5_000
 
 
+_DRAFT_REVIEW_NOTICE_ZH = "我已根据邮件内容整理了回复草稿，请核对邮件内容、收件人和主题。"
+_DRAFT_REVIEW_NOTICE_EN = "I prepared a reply draft from the email. Please review the email content, recipients, and subject."
+
+
+def _draft_review_text(text: str, language: str) -> str:
+    value = str(text or "").strip()
+    if language == "zh":
+        review_prefix = "我已根据邮件内容整理了回复草稿"
+        review_details = "请核对邮件内容、收件人和主题"
+        value = re.sub(
+            r"(?:已草拟并发送|已发送成功|邮件已发送|邮件发送成功|发送成功)",
+            "我已根据邮件内容整理了回复草稿",
+            value,
+            flags=re.IGNORECASE,
+        )
+        notice = _DRAFT_REVIEW_NOTICE_ZH
+        value = re.sub(
+            rf"(?:{re.escape(review_prefix)}[，,。\s]*){{2,}}",
+            f"{review_prefix}，",
+            value,
+        )
+        if value.startswith(review_prefix):
+            if review_details not in value:
+                return f"{value.rstrip('。')}，{review_details}。"
+            return value
+    else:
+        review_prefix = "I prepared a reply draft from the email"
+        review_details = "Please review the email content, recipients, and subject"
+        value = re.sub(
+            r"(?:sent successfully|email has been sent|the email has been sent)",
+            "I prepared a reply draft from the email",
+            value,
+            flags=re.IGNORECASE,
+        )
+        notice = _DRAFT_REVIEW_NOTICE_EN
+        value = re.sub(
+            rf"(?:{re.escape(review_prefix)}[\s,.;]*){{2,}}",
+            f"{review_prefix} ",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if value.lower().startswith(review_prefix.lower()):
+            if review_details.lower() not in value.lower():
+                return f"{value.rstrip('.')} {review_details}."
+            return value
+    if not value:
+        return notice
+    if notice in value:
+        return value
+    return f"{notice} {value}"
+
+
+def _mark_unsent_draft(artifact: dict[str, Any]) -> dict[str, Any]:
+    """为旧 artifact schema 增加明确的投递状态，不触碰原有字段。"""
+    artifact["delivery_status"] = "not_sent"
+    artifact["requires_user_review"] = True
+    return artifact
+
+
 def _uses_chinese(text: str) -> bool:
     return bool(re.search(r"[\u3400-\u9fff]", text or ""))
 
@@ -250,9 +309,9 @@ async def tool_draft_reply(
     composer_mode = "forward" if mode == "draft_forward" else "reply"
 
     fallback_text = (
-        f"已根据「{subject or '当前邮件'}」准备草稿，请核对后发送。"
+        f"我已根据「{subject or '当前邮件'}」整理回复草稿，请核对邮件内容、收件人和主题。"
         if language == "zh"
-        else f"Draft ready for “{subject or 'this email'}”. Review before sending."
+        else f"I prepared a reply draft from “{subject or 'this email'}”. Review the email content, recipients, and subject."
     )
     if sampling_create_message is None:
         draft_body = (
@@ -262,16 +321,17 @@ async def tool_draft_reply(
         )
         return {
             "kind": "draft",
-            "assistant_text": fallback_text,
-            "artifact": {
+            "assistant_text": _draft_review_text(fallback_text, language),
+            "artifact": _mark_unsent_draft({
                 "type": "draft_reply",
                 "mailbox": mailbox,
                 "thread_id": thread_id,
+                "message_id": message_id,
                 "body": draft_body,
                 "source_prompt": user_text,
                 "composer_mode": composer_mode,
                 "subject": subject,
-            },
+            }),
             "mail_context": {
                 "kind": "thread",
                 "mailbox": mailbox,
@@ -326,16 +386,17 @@ async def tool_draft_reply(
         }
     return {
         "kind": "draft",
-        "assistant_text": assistant_text,
-        "artifact": {
+        "assistant_text": _draft_review_text(assistant_text, language),
+        "artifact": _mark_unsent_draft({
             "type": "draft_reply",
             "mailbox": mailbox,
             "thread_id": thread_id,
+            "message_id": message_id,
             "body": draft_body,
             "source_prompt": user_text,
             "composer_mode": composer_mode,
             "subject": subject,
-        },
+        }),
         "mail_context": {
             "kind": "thread",
             "mailbox": mailbox,
@@ -387,8 +448,8 @@ async def tool_revise_draft(
             artifact["mode"] = "replace"
         return {
             "kind": "draft",
-            "assistant_text": fallback_text,
-            "artifact": artifact,
+            "assistant_text": _draft_review_text(fallback_text, language),
+            "artifact": _mark_unsent_draft(artifact),
             "fallback_used": True,
         }
 
@@ -441,8 +502,8 @@ async def tool_revise_draft(
         }
     return {
         "kind": "draft",
-        "assistant_text": assistant_text,
-        "artifact": artifact,
+        "assistant_text": _draft_review_text(assistant_text, language),
+        "artifact": _mark_unsent_draft(artifact),
         "mail_context": {
             "kind": "thread" if thread_id else "compose",
             "mailbox": mailbox,
@@ -1033,7 +1094,7 @@ async def tool_batch_draft(
     n = len(artifacts)
     fail_n = len(failures)
     if language == "zh":
-        assistant_text = f"已为 {n} 封邮件生成草稿（证据按封隔离，请逐封核对后发送）。"
+        assistant_text = f"我已根据邮件内容整理 {n} 封回复草稿（证据按封隔离，请逐封核对邮件内容、收件人和主题）。"
         if fail_n:
             assistant_text += f" 另有 {fail_n} 封未能生成。"
         if mode == "batch_outreach":
@@ -1042,8 +1103,8 @@ async def tool_batch_draft(
             )
     else:
         assistant_text = (
-            f"Prepared {n} draft{'s' if n != 1 else ''} "
-            f"(one evidence set per message — review before sending)."
+            f"I prepared {n} reply draft{'s' if n != 1 else ''} "
+            f"from the email content (one evidence set per message — review the content, recipients, and subject)."
         )
         if fail_n:
             assistant_text += f" {fail_n} could not be generated."

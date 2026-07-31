@@ -220,6 +220,22 @@ def main() -> None:
     assert text_payload["body_text"] == "Plain body"
     assert "body_html" not in text_payload
 
+    quoted_only = _message(2, body_text="", payload={"mimeType": "text/html"})
+    with patch(
+        "mail_agent.mail_providers.gmail.adapter.decode_body_for_display",
+        return_value={"html": '<div class="gmail_quote"><p>Forwarded details</p></div>', "text": ""},
+    ):
+        quoted_only_payload = tools._display_body_payload(quoted_only, limit=24000)
+    assert "Forwarded details" in str(quoted_only_payload.get("body_html") or "")
+    assert quoted_only_payload["body_truncated"] is False
+
+    with patch(
+        "mail_agent.mail_providers.gmail.adapter.decode_body_for_display",
+        return_value={"html": '<div class="gmail_quote"><p>Forwarded details</p></div>', "text": ""},
+    ):
+        quoted_only_display = tools._build_inbox_message_display_response("user@example.com", quoted_only)
+    assert "Forwarded details" in str(quoted_only_display.get("body_html") or "")
+
     messages = [_message(index) for index in range(12)]
     with (
         patch.object(tools, "_load_thread_messages", return_value=messages),

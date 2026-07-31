@@ -14,10 +14,10 @@ const LLM_POLL_LABELS: Record<LlmStatusPollSeconds, string> = {
 
 const AUTO_SYNC_LABELS: Record<InboxAutoSyncSeconds, string> = {
   0: "Off",
+  5: "5 seconds",
   15: "15 seconds",
   30: "30 seconds",
   60: "60 seconds",
-  120: "2 minutes",
 };
 
 function TrashIcon() {

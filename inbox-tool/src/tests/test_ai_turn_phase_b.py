@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, patch
 import sys
 from pathlib import Path
 
@@ -43,6 +44,57 @@ async def test_fallback_revise_with_draft():
     )
     assert route["steps"][0]["tool"] == "revise_draft"
     print("[PASS] test_fallback_revise_with_draft")
+
+
+async def test_draft_outputs_use_review_copy_and_rewrite_bad_model_status():
+    from mail_agent.ai_turn.tools import tool_draft_reply, tool_revise_draft
+
+    sampling = object()
+    bad_payload = {
+        "payload": {
+            "assistant_text": "已草拟并发送，发送成功。",
+            "draft_body": "您好，感谢来信。",
+        }
+    }
+    context = {
+        "mailbox": "owner@example.com",
+        "current_thread": {
+            "mailbox": "owner@example.com",
+            "message_id": "m1",
+            "thread_id": "t1",
+            "subject": "合作",
+        },
+        "last_draft": {"body": "旧草稿"},
+    }
+    with patch("mail_agent.ai_turn.tools.call_llm_json_safe", new=AsyncMock(return_value=bad_payload)), patch(
+        "mail_agent.ai_turn.tools._load_thread_excerpt",
+        new=AsyncMock(return_value={"subject": "合作", "body": "原邮件"}),
+    ):
+        draft = await tool_draft_reply("请回复", context, language="zh", sampling_create_message=sampling)
+        revised = await tool_revise_draft("请改写", context, language="zh", sampling_create_message=sampling)
+
+    for outcome in (draft, revised):
+        assert outcome["artifact"]["delivery_status"] == "not_sent"
+        assert outcome["artifact"]["requires_user_review"] is True
+        assert "请核对邮件内容、收件人和主题" in outcome["assistant_text"]
+        assert outcome["assistant_text"].count("我已根据邮件内容整理了回复草稿") == 1
+        assert "未发送" not in outcome["assistant_text"]
+        assert "发送" not in outcome["assistant_text"]
+        assert "发送成功" not in outcome["assistant_text"]
+        assert "已草拟并发送" not in outcome["assistant_text"]
+    print("[PASS] test_draft_outputs_use_review_copy_and_rewrite_bad_model_status")
+
+
+def test_draft_review_text_preserves_historical_sent_facts():
+    from mail_agent.ai_turn.tools import _draft_review_text
+
+    text = _draft_review_text("这是基于昨天已发送的邮件整理的说明。", "zh")
+    assert "昨天已发送" in text
+    assert "请核对邮件内容、收件人和主题" in text
+    assert "未发送" not in text
+    english = _draft_review_text("This is based on yesterday's sent email.", "en")
+    assert "yesterday's sent email" in english
+    assert "review the email content, recipients, and subject" in english
 
 
 async def test_fallback_organize():
@@ -151,6 +203,8 @@ async def test_phase_a_search_still_works():
 def main():
     asyncio.run(test_fallback_draft_with_thread())
     asyncio.run(test_fallback_revise_with_draft())
+    asyncio.run(test_draft_outputs_use_review_copy_and_rewrite_bad_model_status())
+    test_draft_review_text_preserves_historical_sent_facts()
     asyncio.run(test_fallback_organize())
     asyncio.run(test_fallback_remember())
     asyncio.run(test_normalize_rejects_mutation_tool())

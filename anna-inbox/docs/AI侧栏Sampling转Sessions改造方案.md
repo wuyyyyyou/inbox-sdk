@@ -1,6 +1,6 @@
 # AI 侧栏：Sampling 本地 Router → Host Agent Session 改造方案
 
-状态：**已实现**；当前产品基线见 [2.3.1 架构与发布基线](2.3.1架构与发布基线.md)（App `2.2.1` / Tool `2.3.1`）
+状态：**已实现**；当前产品基线见 [2.3.2 架构与发布基线](2.3.2架构与发布基线.md)（App `2.2.2` / Tool `2.3.2`）
 对照官方文档：
 
 - [Agent Sessions（Executa）](https://staging.anna.partners/developers/tools/executa-agent)
@@ -11,7 +11,7 @@
 
 相关实现文档：
 
-- [2.3.1 架构与发布基线](2.3.1架构与发布基线.md)
+- [2.3.2 架构与发布基线](2.3.2架构与发布基线.md)
 - [AI 侧栏本地测试开关](AI侧栏本地测试开关.md)
 
 ---
@@ -38,7 +38,7 @@
 ### 0.2 检索与输出约束（现行）
 
 - 邮箱范围问答主路径只调一次 `query_mail_evidence`（Scope → QueryPlan → 本地缓存 Evidence）；Host 白名单不再直接暴露 `search_email` / `read_email` 给侧栏选型。
-- `search_email` / `read_email` 为 cache-only 底层能力；`bodyFull` 未缓存时 `body_pending`；仅当目标时间早于索引最早边界时，Evidence 才可一次受限 Gmail 历史检索。
+- `search_email` / `read_email` 为 cache-only 底层能力；`bodyFull` 未缓存时 `body_pending`；Evidence 每轮最多一次 Gmail 托底：目标时间早于索引最早边界，或同步缺口下严格零命中（priority 未完成 / 空缓存）。
 - 本地工作流 `is:todo/done/snoozed` 仅 AND；单次命中上限 20。
 - `systemPrompt` 禁止 Markdown 表格，要求标题/列表分组、仅 confirmed 的 `[THREAD_REF_xxx]` 和简短最终摘要。
 - App manifest 的 `agent.tools` 必须使用 Host RPC 中出现的全限定工具名（`tool_riazm4777_inbox_executa_dnsb9fqu__<tool>`）；短工具名会解析为空集并触发 `inherit_host_tools: true`。
@@ -438,7 +438,7 @@ for await (const frame of stream) {
 | 文档 | 关系 |
 | --- | --- |
 | **本文** | 侧栏 Host Agent Session 改造方案（历史决策 + 现行约束） |
-| [2.3.1 架构与发布基线](2.3.1架构与发布基线.md) | 当前产品/发布基线 |
+| [2.3.2 架构与发布基线](2.3.2架构与发布基线.md) | 当前产品/发布基线 |
 | [AI 侧栏本地测试开关](AI侧栏本地测试开关.md) | local 调试路径（与 Host 共用工具白名单） |
 | 官方 agent / llm-and-agent | 协议与 ACL 权威 |
 
@@ -448,5 +448,5 @@ for await (const frame of stream) {
 
 1. ~~产品方向对齐~~（已完成，见 §0）。
 2. ~~阶段 0：工具命名、systemPrompt 和流式帧探针~~（代码侧结论已落地：使用全限定工具名，适配多种 tool_result 帧）。
-3. ~~阶段 1/2：工具上架与前端切换~~（已完成；现行基线 App `2.2.1` / Tool `2.3.1`）。
+3. ~~阶段 1/2：工具上架与前端切换~~（已完成；现行基线 App `2.2.2` / Tool `2.3.2`）。
 4. 发布后继续观测真实 Host 的长工具超时、跨多轮会话稳定性和取消行为；发现协议差异时只调整 `agentSessionClient` 适配层。

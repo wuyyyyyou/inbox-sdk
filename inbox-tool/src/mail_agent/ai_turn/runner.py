@@ -372,6 +372,24 @@ async def run_ai_turn(
     ).strip()
 
     if requested_artifact in {"draft_reply", "send_plan"}:
+        from mail_agent.evidence_flow import query_mail_evidence
+
+        evidence_context = dict(context)
+        evidence_context["current_thread"] = dict(current)
+        evidence = await query_mail_evidence(
+            text,
+            evidence_context,
+            sampling_create_message=sampling_create_message,
+            conversation_id=conversation_id,
+            scope_kind="current_thread",
+        )
+        if str(evidence.get("match_status") or "") not in {"confirmed", "candidate_match"}:
+            return {
+                "kind": "clarify",
+                "assistant_text": str(evidence.get("assistant_text") or "未找到当前邮件的可用内容，暂时无法起草回复。"),
+                "evidence": evidence,
+                "route": {"execution": "thread_evidence"},
+            }
         if progress_callback:
             progress_callback("draft", {"stage": "thread_draft"})
         outcome = await tool_draft_reply(

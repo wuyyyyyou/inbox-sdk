@@ -422,8 +422,57 @@ function buildAiAgentContent(userText: string, uiContext: Record<string, unknown
   return `[ui_context]\n${JSON.stringify(agentContext)}\n\n[user]\n${userText}`;
 }
 
+function isDraftReplyArtifact(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object") return false;
+  const artifact = value as Record<string, unknown>;
+  return String(artifact.type || "") === "draft_reply" && Boolean(String(artifact.body || "").trim());
+}
+
+function isAiArtifact(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object") return false;
+  const artifact = value as Record<string, unknown>;
+  const type = String(artifact.type || "");
+  return (type === "draft_reply" || type === "compose_draft")
+    && Boolean(String(artifact.body || "").trim());
+}
+
+function collectAiArtifacts(value: unknown, result: Record<string, unknown>[], seen: Set<unknown>): void {
+  if (seen.has(value) || !value || typeof value !== "object") return;
+  seen.add(value);
+  if (isAiArtifact(value)) result.push(value);
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectAiArtifacts(item, result, seen));
+    return;
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of ["artifact", "artifacts", "data", "result"]) {
+    collectAiArtifacts(record[key], result, seen);
+  }
+}
+
+/** 将 Host/local 不同层级的 artifact 形态统一成消息可消费的字段。 */
+export function normalizeAiArtifactPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const found: Record<string, unknown>[] = [];
+  collectAiArtifacts(payload, found, new Set());
+  if (!found.length) return payload;
+  return {
+    ...payload,
+    artifact: found[0],
+    artifacts: found,
+  };
+}
+
+function latestDraftOutcome(outcomes: AgentToolOutcome[]): Record<string, unknown> | null {
+  for (const outcome of [...outcomes].reverse()) {
+    const normalized = normalizeAiArtifactPayload(outcome);
+    if (isDraftReplyArtifact(normalized.artifact)) return normalized;
+  }
+  return null;
+}
+
 function agentOutcomePayload(outcomes: AgentToolOutcome[], finalText: string): Record<string, unknown> {
   const latest = [...outcomes].reverse().find((outcome) => typeof outcome.kind === "string") || {};
+  const draftOutcome = latestDraftOutcome(outcomes);
   // 仅当本轮真实跑过 search 时带上 scan_query（供 Thinking 后小字 chip）。
   let scanQuery = "";
   let scanSource = "";
@@ -473,6 +522,7 @@ function agentOutcomePayload(outcomes: AgentToolOutcome[], finalText: string): R
     : null;
   const kind = String(
     runResult?.kind
+    || (draftOutcome ? "draft" : "")
     || latest.kind
     || (scanQuery ? "chat" : "chat"),
   );
@@ -481,15 +531,16 @@ function agentOutcomePayload(outcomes: AgentToolOutcome[], finalText: string): R
   );
   const evidenceThreadIds = confirmedEvidenceThreadIdsFromOutcomes(outcomes);
   const evidenceThreadLabels = confirmedEvidenceThreadLabelsFromOutcomes(outcomes);
-  return {
+  return normalizeAiArtifactPayload({
     ...latest,
     ...(runResult || {}),
+    ...(draftOutcome || {}),
     kind,
     assistant_text: finalText || assistantFromRun || String(latest.assistant_text || ""),
     ...(evidenceThreadIds.length ? { evidence_thread_ids: evidenceThreadIds } : {}),
     ...(Object.keys(evidenceThreadLabels).length ? { evidence_thread_labels: evidenceThreadLabels } : {}),
     ...(scanQuery ? { scan_query: scanQuery, scan_source: scanSource || "cache" } : {}),
-  };
+  });
 }
 
 function threadIdsFromEvidence(value: unknown): string[] {
@@ -3370,7 +3421,9 @@ export function useAppController() {
         if (completed.status === "failed" || completed.error) {
           throw new Error(completed.error || "Mail prompt failed");
         }
-        const payload = (completed.result || {}) as unknown as MailPromptRunResult;
+        const payload = normalizeAiArtifactPayload(
+          (completed.result || {}) as unknown as Record<string, unknown>,
+        ) as unknown as MailPromptRunResult;
         const summaryTitle = String(payload.thread_title || request.contextTitle || "").trim();
         const finalMessages: AiChatMessage[] = [
           ...messagesWithUser,
@@ -4329,7 +4382,7 @@ export function useAppController() {
       }));
     },
     async sendAiChatMessage(options = {}) {
-      const userRequest = String(options.prompt ?? state.customScanInput).trim();
+const userRequest = String(options.prompt ?? state.customScanInput).trim();
       const agentRequest = String(options.agentPrompt || userRequest).trim() || userRequest;
       if (!state.runtime.connected) {
         showToast("LLM is offline. Please try again when it reconnects.");
@@ -4464,7 +4517,7 @@ export function useAppController() {
           if (completed.status === "failed" || completed.error) {
             throw new Error(formatRunDiagnostics(completed, completed.error || "AI turn failed"));
           }
-          payload = (completed.result || {}) as Record<string, unknown>;
+          payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, unknown>);
         } else {
           let streamed = "";
           const agentTurn = await runAiAgentTurn(
@@ -4495,7 +4548,7 @@ export function useAppController() {
                   },
                 }));
               },
-              onToolOutcome: (outcome) => {
+onToolOutcome: (outcome) => {
                 if (!isCurrentGeneration()) return;
                 const bgRunId = String(outcome.run_id || "").trim();
                 if (bgRunId) runId = bgRunId;
@@ -4596,7 +4649,7 @@ export function useAppController() {
           if (completed.status === "failed" || completed.error) {
             throw new Error(formatRunDiagnostics(completed, completed.error || "AI turn failed"));
           }
-          payload = (completed.result || {}) as Record<string, unknown>;
+payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, unknown>);
         }
         if (!isCurrentGeneration()) return;
         const kind = String(payload.kind || "chat");

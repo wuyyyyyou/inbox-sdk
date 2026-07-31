@@ -887,6 +887,7 @@ Rules:
 - If enough information is available, return a concise plain-text draft_reply.body.
 - assistant_text should briefly explain your understanding of the thread and the user's intent.
 - assistant_followup_text should briefly summarize the draft strategy and invite a useful adjustment. Omit it when no reliable summary is possible.
+- Never claim that a draft was saved to the outbox or sent, and never tell the user to send it. Ask the user to confirm the reply content and related email information instead.
 - In assistant_text and assistant_followup_text, use only Markdown headings, bold text, ordered or unordered lists, and HTTP/HTTPS links in the form [label](https://example.com). Do not use HTML, tables, images, code blocks, or block quotes. If the user requests an unsupported format, say so and offer an equivalent using the supported formats.
 - When referring to this Gmail thread, replace <Thread ID> with the Thread ID from the prompt and use the exact token [THREAD_REF_<Thread ID>] so the sidebar can open it.
 - Do not repeat the draft body in either assistant text field.
@@ -940,11 +941,21 @@ _DRAFT_SIGNOFF_BLANK_LINE_RE = re.compile(
     r"[,.!，。！]?[ \t]*)\n(?:[ \t]*\n)+(?=[^\n]+\Z)"
 )
 
+_DRAFT_STATUS_ERROR_RE = re.compile(
+    r"(?:草稿已保存(?:至(?:您的)?发件箱)?|已保存至(?:您的)?发件箱)"
+    r"[，,。；; \t]*(?:请核对(?:后发送|并发送)|核对后发送|请发送)?[。.!！]?"
+)
+
 
 def _normalize_generated_draft_body(value: Any) -> str:
     """Remove an accidental blank line between a closing and final signature line."""
     body = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     return _DRAFT_SIGNOFF_BLANK_LINE_RE.sub(r"\g<signoff>\n", body)
+
+
+def _normalize_draft_assistant_text(value: Any) -> str:
+    text = str(value or "").strip()
+    return _DRAFT_STATUS_ERROR_RE.sub("请确认邮件回复内容和相关信息。", text)
 
 
 def _inbox_sort_key(message: dict[str, Any]) -> tuple[int, str]:
@@ -1097,6 +1108,14 @@ def _display_body_source(message: dict[str, Any]) -> tuple[str, str, dict[str, A
     return str(display.get("html") or ""), str(display.get("text") or ""), payload
 
 
+def _display_html_with_quote_fallback(raw_html: str, payload: dict[str, Any]) -> str:
+    cleaned_html = _strip_quoted_reply_html(raw_html)
+    sanitized_html = _resolve_cid_images(_sanitize_email_html(cleaned_html), payload)
+    if sanitized_html.strip():
+        return sanitized_html
+    return _resolve_cid_images(_sanitize_email_html(raw_html), payload)
+
+
 def _display_body_payload(
     message: dict[str, Any],
     *,
@@ -1110,10 +1129,7 @@ def _display_body_payload(
     raw_html, raw_text, payload = source or _display_body_source(message)
 
     if prefer_html and raw_html.strip():
-        sanitized_html = _resolve_cid_images(
-            _sanitize_email_html(_strip_quoted_reply_html(raw_html)),
-            payload,
-        )
+        sanitized_html = _display_html_with_quote_fallback(raw_html, payload)
         # CID 图片转 data URI 会让几 KB HTML 膨胀为数 MB。线程页只给不含
         # CID 的完整 HTML；含 CID 的邮件交由单封 URL 正文链路加载。
         if not _CID_IMAGE_RE.search(sanitized_html) and len(sanitized_html) <= limit:
@@ -1123,7 +1139,10 @@ def _display_body_payload(
             }
 
     if raw_text.strip():
-        compact_text, text_truncated = _compact_body_text(_strip_quoted_reply(raw_text), limit=limit)
+        cleaned_text = _strip_quoted_reply(raw_text)
+        if not cleaned_text.strip():
+            cleaned_text = raw_text.strip()
+        compact_text, text_truncated = _compact_body_text(cleaned_text, limit=limit)
         return {
             "body_text": compact_text,
             "body_truncated": text_truncated or bool(raw_html.strip()),
@@ -1185,10 +1204,7 @@ def _build_inbox_message_display_response(mailbox: str, message: dict[str, Any])
     }
     raw_html, raw_text, payload = _display_body_source(message)
     if raw_html.strip():
-        sanitized_html = _resolve_cid_images(
-            _sanitize_email_html(_strip_quoted_reply_html(raw_html)),
-            payload,
-        )
+        sanitized_html = _display_html_with_quote_fallback(raw_html, payload)
         # 只有不含 CID 的小 HTML 才直走 JSON-RPC。其余 HTML 一律通过本地
         # loopback 读取，确保在序列化响应之前就停止正文的协议膨胀。
         inline_data = {**base, "body_html": sanitized_html, "body_truncated": False}
@@ -1212,6 +1228,8 @@ def _build_inbox_message_display_response(mailbox: str, message: dict[str, Any])
     plain_text = _strip_quoted_reply(raw_text) if raw_text.strip() else _strip_quoted_reply(
         _dedup_body(str(message.get("body_text") or "")),
     )
+    if not plain_text.strip():
+        plain_text = raw_text.strip() or str(message.get("body_text") or "").strip()
     inline_data = {**base, "body_text": plain_text, "body_truncated": False}
     if _inbox_message_display_rpc_frame_size(inline_data) <= INBOX_THREAD_RESPONSE_MAX_BYTES:
         return inline_data
@@ -1810,7 +1828,9 @@ async def _generate_mail_prompt_result(
         "latest_message_id": latest_message_id,
         "visible_prompt": visible_prompt,
         "thread_title": thread_title,
-        "assistant_text": str(payload.get("assistant_text") or fallback_assistant).strip(),
+        "assistant_text": _normalize_draft_assistant_text(
+            str(payload.get("assistant_text") or fallback_assistant).strip()
+        ),
         "assistant_followup_text": str(payload.get("assistant_followup_text") or "").strip(),
         "artifact": artifact,
         "reply_gaps": {

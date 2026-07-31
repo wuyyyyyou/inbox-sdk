@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  AUTO_SYNC_OPTIONS,
   DEFAULT_INBOX_SETTINGS,
   clampInboxSettings,
   groupSplitMessages,
@@ -9,6 +10,7 @@ import {
 
 describe("inbox settings", () => {
   it("uses the agreed defaults and clamps invalid values", () => {
+    expect(AUTO_SYNC_OPTIONS).toEqual([0, 5, 15, 30, 60]);
     expect(DEFAULT_INBOX_SETTINGS).toMatchObject({
       display_range_days: 30,
       time_section_mode: "detailed",
@@ -17,6 +19,7 @@ describe("inbox settings", () => {
       todos_enabled: true,
       todos_limit: 10,
       llm_status_poll_seconds: 60,
+      auto_sync_seconds: 5,
     });
 
     expect(clampInboxSettings({ display_range_days: 9, stars_limit: 1000, llm_status_poll_seconds: 15 as never })).toMatchObject({

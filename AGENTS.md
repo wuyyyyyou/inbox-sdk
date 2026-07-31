@@ -3,6 +3,7 @@
 ## 开发约定
 
 - 代码编写前先保证对功能和内容的理解和我完全对齐，发现存在不明确的内容先与我沟通，最后再进行代码编写
+- 前端构建完成后不要运行，由我手动运行并亲自验收
 - 每次只改和当前任务直接相关的文件，设计遵从最简原则，完成前说明验证命令和结果
 - 所有的后端代码编写都要有详细清晰的`中文`注释，如果读取到的后端代码没有`中文`注释，应该及时补充
 - 所有文档必须在 `anna-inbox/docs/` 中，且文档必须为中文文档
@@ -22,20 +23,21 @@
 
 ## 项目基线
 
-- **App（前端）**：`2.2.1` — 位于 `anna-inbox/`
-- **Tool（Executa）**：`2.3.1` — 位于 `inbox-tool/`
+- **App（前端）**：`2.2.2` — 位于 `anna-inbox/`
+- **Tool（Executa）**：`2.3.2` — 位于 `inbox-tool/`
 
 - 唯一智能入口：Inbox Workspace + AI 侧栏；Brief 产品面下线。
-- AI 生成内容过程中，滚动条自动滑动到底部。
-- 邮箱同步 P0：180 天 priority metadata + 无硬顶 backfill + History/Watch 注册 + `sync_boundary`；列表 `display_range_days` 仅控制展示，不限制 AI 检索。
+- AI 生成内容过程中，滚动条自动滑动到底部；草稿产物出现后强制贴底。
+- 邮箱同步 P0：180 天 priority metadata + 无硬顶 backfill + History/Watch 注册 + `sync_boundary`；列表 `display_range_days` 仅控制展示，不限制 AI 检索；`auto_sync_seconds` 默认 5（档位 0/5/15/30/60）。
 - 列表分页：固定首屏 100；触底自动续页（无 Show more 按钮）；无 `initial_list_size` 设置；Inbox 标签角标 `99+`。
 - AI 侧栏只读主路径：一次 `query_mail_evidence`（Scope → QueryPlan → 本地缓存 Evidence；引号短语可澄清 `search_field`）；Host 白名单不再直接暴露 `search_email`/`read_email`。
-- `search_email`/`read_email`：cache-only；`order=oldest|newest`；`bodyFull` 未缓存时 `body_pending`，禁止 AI 隐式 Gmail 回源（Evidence 边界外历史检索除外）。
-- AI 线程引用：仅本轮 confirmed Evidence 的 `THREAD_REF`；前端过滤未确认引用与直接 Gmail 链接；引用按钮可打开详情。
+- `search_email`/`read_email`：cache-only；`order=oldest|newest`；`bodyFull` 未缓存时 `body_pending`；禁止 AI 隐式 Gmail 回源。Evidence 每轮最多一次托底：超 `earliest_indexed_at` 的历史检索，或同步缺口（priority 未完成 / 空缓存）下严格零命中。
+- 回复草稿两步流：首轮摘要+确认，用户确认后再出 `draft_reply` 卡片；「仅正文」请求不展示卡片；Host/local 产物统一归一化。
+- AI 线程引用：仅本轮 confirmed Evidence 的 `THREAD_REF`；前端过滤未确认引用与直接 Gmail 链接；引用按钮可打开详情；打开详情 token 防关闭后重开。
 - 后台 `content_preprocess` / `preprocess_cached_content_batch`：正文派生与受限附件解析（含 `pypdf`）。
 - `anna-inbox/src/features/home/HomeView.tsx`：2.0 Inbox 工作台、AI 侧栏、账户切换和邮件列表；草稿产物卡片可编辑插入；列表触底自动加载 / 扩大范围在后台 refresh 时仍可点；详情打开期间列表短暂丢消息不关抽屉；Evidence 字段澄清与线程引用展示。
-- `anna-inbox/src/features/mail-detail/`：线程详情、正文、富文本草稿和附件预览；详情打开后固定滚到线程底部；同线程同步刷新不清附件预览。
-- `anna-inbox/src/app/useAppController.ts`：主要状态与工作流控制；AI 侧栏默认 Host Agent Session；host/local 路径仅由既有侧栏模式开关控制；本地可用 `ANNA_INBOX_AI_SIDEBAR_MODE=local` 或 `localStorage anna-inbox-ai-sidebar-mode` 走 `start_ai_turn(source=sidebar_local)`（Sampling 选型 + **与 Host 相同** `handle_ai_agent_tool`，`query_mail_evidence` 在 route 内同时生成 QueryPlan）；`display_range_days` 不传给 Agent 选型上下文；同步边界 toast；邮件缓存刷新后预热联系人头像；soft prune 保留 `mailDetailMessageId`。
+- `anna-inbox/src/features/mail-detail/`：线程详情、正文、富文本草稿和附件预览；用户靠近底部时跟随最新消息；同线程同步刷新不清附件预览；Compose/草稿输入自适应高度。
+- `anna-inbox/src/app/useAppController.ts`：主要状态与工作流控制；AI 侧栏默认 Host Agent Session；host/local 路径仅由既有侧栏模式开关控制；本地可用 `ANNA_INBOX_AI_SIDEBAR_MODE=local` 或 `localStorage anna-inbox-ai-sidebar-mode` 走 `start_ai_turn(source=sidebar_local)`（Sampling 选型 + **与 Host 相同** `handle_ai_agent_tool`，`query_mail_evidence` 在 route 内同时生成 QueryPlan）；`display_range_days` 不传给 Agent 选型上下文；同步边界 toast；邮件缓存刷新后预热联系人头像；soft prune 保留 `mailDetailMessageId`；AI 产物归一化。
 - `anna-inbox/src/api/agentSessionClient.ts`：Host Agent Session 创建、流式帧解析、工具结果消费、run 取消和会话清理。
 - `anna-inbox/src/api/mailAgentClient.ts`：所有 Executa 工具调用的统一 facade。
 - `anna-inbox/manifest.json`、`inbox-tool/src/anna_inbox_executa/common.py` 与 `mailbox_tools.py`：Google Connected accounts 声明、多账号发现状态和安全错误提示；APS Files reverse-RPC 响应始终可路由。
@@ -96,14 +98,14 @@ App 与 Tool **版本号解耦，互不强制对齐**：
 
 | 端 | 当前版本 | 权威文件 | 须同步的文件 |
 | --- | --- | --- | --- |
-| App | `2.2.1` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
-| Tool | `2.3.1` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
+| App | `2.2.2` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
+| Tool | `2.3.2` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
 
 规则：
 
 - 只改前端 / App 发布：只 bump **App** 版本（`anna-inbox/app.json`），**不要**改 Tool 版本。
 - 只改后端 / Executa 发布：只 bump **Tool** 版本；平台若报「同版本已发布且内容不同」，必须再 bump Tool（不可覆盖已发布版本）。
-- Tool 线自 `2.1.1` 起独立演进，现进入 `2.3.x`；App 线自 `2.1.1` 起。当前基线：App `2.2.1` / Tool `2.3.1`。
+- Tool 线自 `2.1.1` 起独立演进，现进入 `2.3.x`；App 线自 `2.1.1` 起。当前基线：App `2.2.2` / Tool `2.3.2`。
 - `min_version` 跟随 **Tool** 版本，不跟随 App 版本。
 - 提交前审核时，若未说明只升哪一端，先与我确认，再改版本号。
 

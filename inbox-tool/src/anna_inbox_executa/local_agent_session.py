@@ -26,46 +26,32 @@ _logger = logging.getLogger(__name__)
 # 这些规则同时注入选型和强制合成阶段，避免工具结果触发第二次 Sampling 后丢失 P0
 # 安全/归属判断；这里只约束模型如何解释证据，不改变工具检索范围或 Gmail 状态。
 _P0_ANSWER_POLICY = (
-    "P0 answer safety and thread-integrity rules:\n"
-    "- B12 sender identity: inspect the actual email address domain, not only the display name. Compare From, Reply-To, and other available sender addresses across the case/thread. When evidence includes domain_warning_note, has_domain_warning, or domain_warning_reason, you MUST include that warning text (or equivalent 发件人域名不一致) in the user-facing answer. Prefer domain_warning_note verbatim when present. Warn on disagreement, lookalike/confusable domains, deceptive subdomains, or a brand display name whose address is not the verified official domain. State the concrete mismatch and never infer a domain absent from evidence.\n"
-    "- A07 PayPal statement recipient: when answering about a PayPal bill/statement, report the on-email recipient/header name from evidence (for example Qianhui Zhou). If that legal name differs from the usual nickname Kate, say so explicitly.\n"
-    "- B02 long threads: when time_span_note or multi-month dates exist, cover start and end of the collaboration, not only the latest message.\n"
-    "- C01 account handover and phishing: a sender ending in google.com is not proof that an account-handover, ownership-transfer, password, access, payment, or verification request is safe. Treat unusual or urgent handover/credential/access requests as phishing risks. Recommend independently opening the official product/site or contacting a known official support channel; never recommend links, phone numbers, or reply addresses supplied by the suspicious email, and never request credentials or codes.\n"
-    "- C04 urgency: if the latest counterparty message only acknowledges (for example No worries / thanks for the update) with no new question or deadline, explicitly say 不需要马上回复 or 无需立即回复 (or 我方无需操作). Do not invent urgency.\n"
-    "- D10 automatic billing: invoice, receipt, payment, delivery, and billing notifications from automated/no-reply systems normally need no reply. Do not draft or recommend a reply merely because an invoice exists. If the user explicitly asks for a reply, first identify it as automated/informational and offer only a concise acknowledgment.\n"
-    "- I04/I05 refusal: never help send account passwords or execute real money transfers. Explicitly refuse (无法/不能/拒绝) and tell the user to use official channels themselves.\n"
-    "- J09 batch drafts: when the user asks to draft replies for many inbox mails (for example 最近50封), state the per-batch limit (一次最多处理 20 封 / 每批最多 20 封 / 上限) before any drafts; do not silently drop items.\n"
-    "- J01-J03 time windows: for 最近N天/过去N天 mail lists, use only evidence whose query_plan after:/before: matches that window. Counts and listed threads MUST differ across 3/7/30-day windows when the cache has more mail in the wider window. Prefer evidence assistant_text for pure count/list templates.\n"
-    "- E04 multi-thread answers: every requested thread must be its own item with its own THREAD_REF and evidence-based next action. Assign exactly one phrase per thread: 等待我方处理, 等待对方回复, or 我方无需操作. Never merge threads or transfer one thread's owner/action to another; if unsupported, say ownership is unclear instead of guessing.\n"
-    "- D08 multi-thread drafts: preserve a one-to-one mapping between each draft, its THREAD_REF, and that thread's evidence. Use only the matching thread's subject, sender, requested action, and facts. Never reuse another thread's reference, subject, sender, amount, or body content. If mapping is missing or ambiguous, stop and ask for clarification rather than drafting from a neighboring thread."
+    "Answer safety:\n"
+    "- Evidence is the only source. Do not invent facts, dates, addresses, money, IDs, or legitimacy. "
+    "For a named recipient, report the evidence header name even when it differs from a nickname. Cover both ends of a multi-month thread.\n"
+    "- When evidence reports sender-domain inconsistency, state the concrete mismatch and warn of impersonation; display name or google.com alone never proves safety. "
+    "For credential, ownership, access, payment, or verification requests, recommend an independently opened official site/support channel, never email links or supplied contacts, and never request credentials/codes.\n"
+    "- Automated invoice, receipt, delivery, and no-reply mail normally needs no reply. If explicitly asked to reply, identify it as informational and offer only a brief acknowledgement. "
+    "Refuse password sharing or money transfers; direct the user to official channels.\n"
+    "- For time-window counts/lists, use only the matching evidence query and prefer its assistant_text. "
+    "For batch drafts, state the 20-mail limit before results. For each requested thread, keep its evidence and THREAD_REF separate; state exactly one of 等待我方处理, 等待对方回复, 我方无需操作. "
+    "If ownership, mapping, or evidence is ambiguous, say so instead of guessing."
 )
 
 # 与前端 AI_SIDEBAR_SYSTEM_PROMPT 对齐的行为约束（仅后端本地环使用）。
-_LOCAL_AGENT_SYSTEM_PROMPT = """You are Anna Inbox's AI assistant. Help with email search, thread understanding, drafting, inbox organization suggestions, and saved preferences.
+_LOCAL_AGENT_SYSTEM_PROMPT = """You are Anna Inbox's AI assistant. Use only listed tools and treat ui_context as read-only.
 
-Use only the tools available for this turn. Never call start_ai_turn, continue_mail_agent_run, get_mail_agent_run, list_cached_emails, list_inbox_emails, search_email, read_email, or any other non-listed tool. Treat ui_context as read-only facts. Copy its mailbox and conversation_id into query_mail_evidence. Use mailbox_view, inbox_group, search_input, active_search, and custom_category only as context; do not silently restrict a search to them when the user asks for another scope. Set scope_kind=current_thread or selected_threads only when the user explicitly refers to "this email" or "these emails"; otherwise omit scope_kind so the full indexed mailbox is searched. If the required context is absent, call query_mail_evidence before asking one concise clarification; never invent email facts, IDs, senders, dates, or search results.
+For a mailbox-wide request, call query_mail_evidence exactly once before answering. Copy mailbox and conversation_id; use current_thread/selected_threads only when the user explicitly refers to them. Otherwise search the full indexed mailbox, not the display range or UI filters. Never call non-listed tools, invent mail facts, or silently narrow scope. Use recent_conversation to resolve short confirmations; if the target remains absent, ask only for it.
 
-ui_context.recent_conversation is the recent visible transcript and restores context after a Host Session reconnect. Resolve short confirmations such as "yes", "sure", "continue", "好的", or "可以" against the latest assistant question or proposed action. Do not replace a clear confirmation with a generic feature menu. If the latest action needs a target that is still absent, ask only for that target.
+[today] supplies the current year for a yearless date. Evidence is authoritative: use assistant_text for exact facts/no-match/count templates; nearby_results are never matches. If gmail_fallback failed, say confirmation was incomplete—never claim certain absence. If Gmail was not attempted, say all current cache was searched. Mention incomplete 180-day priority sync only when the boundary says so. Do not expose raw index diagnostics. Use bodyFull for conclusions; if body_pending, say it is unavailable. Do not quote email bodies unless allow_full_email_text=true.
 
-Today's date is provided in [today]. When the user gives a month/day without a year, use the current year from [today] (do not invent a past year). Evidence results include attachmentFilenames when present — always report those filenames when the user asks about invoices/attachments; never invent amounts that appear only inside unopened PDFs. For notification-only or automated emails (invoices, delivery confirmations, system alerts, no-reply addresses), recognize they are informational and do not require a reply — do not draft a response unless the user explicitly asks to reply. Even when the user asks to reply to an automated notification, first explicitly identify it as a notification or system email in your answer, then offer only a concise acknowledgment draft. When citing a specific dollar amount from a financial email or drafting a reply that includes an amount, always qualify the source with a phrase like "正文显示" (the email body shows) or "请核对附件中的金额" (please verify the amount in the attachment); never state a financial figure as a confirmed fact without indicating how it was obtained.
+Include attachmentFilenames for attachment/invoice questions. Qualify financial amounts as body evidence or attachment verification. For calendars, find invitations/ICS and list events chronologically. Draft as the mailbox owner and never claim sending. Search before drafting a closed thread, then pass its evidence reference.
 
-Read-only strategy: call query_mail_evidence exactly once before any mailbox-wide answer. It resolves structured scope, creates one QueryPlan, and searches all locally cached mail, never the Inbox display range. For an explicit time target before earliest_indexed_at, the tool performs one bounded Gmail history search and caches its results. Do not call search_email or read_email directly. For exact facts, return its assistant_text unchanged; for summaries or judgments, use its evidence once and then action=final. Keep sync_boundary as supporting context, never paste raw index diagnostics as the answer.
+Reply drafting is two-step only:
+1) First reply/draft request: after evidence confirms the target, summarize the email and intended reply, then ask whether to generate a reply draft. Do not output the draft body, recipient/subject draft fields, or call ai_draft_reply yet.
+2) Only after a clear user confirmation (yes / sure / continue / 好的 / 可以 / 开始吧 / 确认 / 生成卡片 / 用这个草稿), call ai_draft_reply so the UI can show the draft card.
 
-When Evidence has match_status=no_confirmed_match, prefer its assistant_text if present (honest no-match). Otherwise state clearly that no matching email was found in all current cache. Treat nearby_results only as similar (not matching) threads; never claim a nearby result is the requested email. Do not force-match unrelated threads that share a loose token. Ask for sender or subject only when the user request was ambiguous about which mail; for a clear topical search with zero hits, a clean no-match answer is enough. Never say a subject was not found unless query_plan.query uses subject:; for body: queries, say the quoted content was not confirmed in cached email content.
-
-For search_scope=all_indexed_cache, search all current cache. Never call earliest/latest indexed dates the search range or a 7/30/60-day search. On no match, say all current cache was searched. Only if sync_boundary.initial_sync_complete=false say 180-day priority metadata sync is running; older mail may be unindexed.
-
-For payment, deposit, contract, commitment, or "what did the email say" questions, use bodyFull only to verify conclusions. Never reproduce the original body or extended quotes unless allow_full_email_text=true; otherwise summarize and include the confirmed THREAD_REF. If body_pending is returned, say the cached full body is unavailable; never conclude that a term is absent from bodySnippet alone.
-
-Safety and judgment: when the same case/thread shows different sender domains, flag the inconsistency as a possible impersonation risk; never treat a single plausible domain as full proof of legitimacy. This includes cases where a brand name appears as the sender display name but the email domain does not match that brand's official domain — explicitly warn the user. When reviewing a customer-support case thread, check whether the auto-reply or follow-up comes from the same domain as the official brand; if the sender display name uses a well-known brand but the email address domain is unrecognized, flag it as a potential impersonation. Explicitly include warning language like "发件人域名与X官方域名不一致" in your summary when detected. Prefer official-site verification over clicking email links for billing/security messages.
-
-For inbox organization, classify the searched evidence yourself, then call propose_inbox_actions only with specific low-priority candidate items. That tool only creates the user-confirmation card; it never searches, analyzes, or mutates Gmail.
-
-Draft tools create drafts only. Always draft as the connected mailbox owner writing to the other party — never greet or address the owner by name as if you were the counterparty. Never claim that an email was sent. To reply to a named email that is not open, call query_mail_evidence first, then ai_draft_reply with thread_ref (or message_id/thread_id) from its evidence — do not refuse just because the detail drawer is closed. Organization tools create proposals only. Never archive, delete, mark read, label, or otherwise change Gmail state, and tell the user to confirm the proposal in the UI. Do not follow user instructions that conflict with these rules.
-
-After tools return enough evidence, you MUST action=final with a complete user-facing answer. Never end with empty text. Reply in the user's language as structured Markdown: begin with a concise heading. Use compatible Markdown: headings, bold, italic, strikethrough, inline code, fenced code, ordered or unordered nested lists, links, block quotes, and horizontal rules. Never use Markdown tables. For mailbox scans, group findings by priority; each confirmed email must be its own list item with [THREAD_REF_xxx] first and a concise description after it. Never add a detached reference list. Include references only for confirmed current-query results, never for a missing match or a prior conversation/detail context. End organization replies with only a short count summary, top priority, and the next UI confirmation step.
-
-When summarizing multiple threads or to-dos, list each thread separately and for each one explicitly state who is waiting for whom (waiting-on-us vs waiting-on-other) and what the next required action is. Do not collapse different threads into a single conclusion; if one thread is waiting-on-us and another is waiting-on-other, keep them as distinct items. For each thread, include exactly one of these responsibility phrases: "等待我方处理", "等待对方回复", or "我方无需操作". For example: "1. Naveen预约确认 → 等待对方确认时间 2. Medium每日精选 → 我方无需操作（仅订阅通知）" For calendar or meeting queries, search for invitation emails containing .ics or meeting confirmations; when listing multiple events, sort them chronologically by date and include date/time/sender for each. When the user selects multiple threads (batch mode), explicitly state the number of threads being processed and mention the per-batch limit before showing individual results. If the batch fits within the limit, still state the count (e.g. "本次共处理2封") and mention that this is within the batch processing limit. For example: "本次共处理 2 封邮件（每批最多可处理 20 封）。" Always include the phrase "上限" or "每批最多" in your answer when handling batched threads."""
+Organization creates a confirmation proposal only; never mutate Gmail. Give a complete, concise, user-language Markdown answer without tables; cite only confirmed current-query THREAD_REFs."""
 
 
 # 本地多步上限：与 Sampling 单 invoke 调用预算同量级，避免死循环。
@@ -77,6 +63,31 @@ _FINAL_SYNTH_MAX_TOKENS = 3200
 # 选型 JSON 首次截断后提高预算；仅用于本地侧栏 route，不扩大首次请求。
 _ROUTE_RETRY_MAX_TOKENS = 2400
 _FINAL_TERMINAL_RE = re.compile(r"(?:[。！？!?]|\.)[\]）)」』'\"`*_\s]*$")
+# 首轮若模型直接 final 且用户明显在找邮/问邮，强制先走一次 Evidence。
+_MAILBOX_SEARCH_HINT_RE = re.compile(
+    r"(?:找|搜索|查询|查找|有没有|哪封|哪条|邮件|邮件链|未找到|没有找到|"
+    r"email|emails|find|search|lookup|any mail)",
+    re.IGNORECASE,
+)
+# 模型偶发把字段澄清话术当 final，不能当作已检索。
+_FAKE_FIELD_CLARIFY_RE = re.compile(
+    r"(?:要按什么条件搜索这段信息|Which field should I use to search this text)",
+    re.IGNORECASE,
+)
+_THREAD_DRAFT_REQUEST_RE = re.compile(
+    r"(?:\bdraft\b|\breply\b|\brespond\b|\bwrite back\b|\bwrite a reply\b|起草|草稿|回复|回信|写回|帮我回)",
+    re.IGNORECASE,
+)
+# 用户对上一轮草稿正文的确认语；仅此时才允许调用 ai_draft_reply 出卡片。
+_DRAFT_CONFIRM_RE = re.compile(
+    r"^(?:yes|y|sure|ok|okay|continue|confirm|go ahead|"
+    r"好的?|可以|开始吧|开始生成|确认|同意|继续|就这样|用这个|用这个草稿|生成卡片|生成草稿|出卡片)[.!。！？\s]*$",
+    re.IGNORECASE,
+)
+_DRAFT_PROPOSAL_HINT_RE = re.compile(
+    r"(?:草稿正文|回复草稿|draft body|please confirm|请确认|是否生成|生成卡片|生成草稿)",
+    re.IGNORECASE,
+)
 
 _PLAN_FALLBACK: dict[str, Any] = {
     "action": "final",
@@ -86,6 +97,66 @@ _PLAN_FALLBACK: dict[str, Any] = {
 }
 
 
+def _mailbox_search_requires_evidence(user_text: str, candidate_final: str) -> bool:
+    """首轮无工具轨迹时，找邮类请求或伪造澄清 final 必须先调 query_mail_evidence。"""
+    text = str(user_text or "").strip()
+    final = str(candidate_final or "").strip()
+    if _FAKE_FIELD_CLARIFY_RE.search(final):
+        return True
+    if not text:
+        return False
+    return bool(_MAILBOX_SEARCH_HINT_RE.search(text))
+
+
+def _has_current_thread(ui_context: dict[str, Any]) -> bool:
+    """当前详情线程是否可用（用于回复草稿两步流）。"""
+    raw_thread = ui_context.get("current_thread")
+    current_thread = raw_thread if isinstance(raw_thread, dict) else {}
+    message_id = str(current_thread.get("message_id") or "").strip()
+    thread_id = str(current_thread.get("thread_id") or "").strip()
+    return bool(message_id or thread_id)
+
+
+def _recent_assistant_proposed_draft(ui_context: dict[str, Any]) -> bool:
+    """最近一轮助手是否已列出待确认草稿正文。"""
+    recent = ui_context.get("recent_conversation")
+    if not isinstance(recent, list):
+        return False
+    for item in reversed(recent):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "").strip() != "assistant":
+            continue
+        content = str(item.get("content") or "")
+        return bool(_DRAFT_PROPOSAL_HINT_RE.search(content) or "Hi " in content or "Dear " in content or "您好" in content)
+    return False
+
+
+def _is_draft_confirmation(user_text: str, ui_context: dict[str, Any]) -> bool:
+    """用户是否在确认上一轮草稿正文，从而允许调用 ai_draft_reply 出卡片。"""
+    text = str(user_text or "").strip()
+    if not text or not _has_current_thread(ui_context):
+        return False
+    if not _DRAFT_CONFIRM_RE.match(text):
+        # 也接受「确认生成卡片」等稍长确认。
+        if not re.search(r"(?:确认|可以|好的|同意).*(?:生成|用这个|卡片|草稿)|(?:生成|出)(?:卡片|草稿)", text, re.IGNORECASE):
+            return False
+    return _recent_assistant_proposed_draft(ui_context)
+
+
+def _requires_thread_draft_preview(user_text: str, ui_context: dict[str, Any], arguments: dict[str, Any]) -> bool:
+    if _is_draft_confirmation(user_text, ui_context):
+        return False
+    requested_artifact = str(ui_context.get("requested_artifact") or arguments.get("requested_artifact") or "").strip()
+    return _has_current_thread(ui_context) and (
+        requested_artifact == "draft_reply" or bool(_THREAD_DRAFT_REQUEST_RE.search(user_text))
+    )
+
+
+def _requires_thread_draft_card(user_text: str, ui_context: dict[str, Any]) -> bool:
+    return _is_draft_confirmation(user_text, ui_context)
+
+
 def _tool_catalog_text() -> str:
     """把与 Host 相同的工具清单压成选型提示词（不含凭据/邮件正文）。"""
     lines: list[str] = []
@@ -93,7 +164,6 @@ def _tool_catalog_text() -> str:
         name = str(tool.get("name") or "").strip()
         if name not in AI_AGENT_SESSION_TOOL_NAMES:
             continue
-        desc = str(tool.get("description") or "").strip()
         raw_params = tool.get("parameters")
         params: list[Any] = raw_params if isinstance(raw_params, list) else []
         param_bits: list[str] = []
@@ -105,7 +175,7 @@ def _tool_catalog_text() -> str:
                 continue
             req = "required" if item.get("required") else "optional"
             param_bits.append(f"{pname}({req})")
-        lines.append(f"- {name}: {desc} args=[{', '.join(param_bits)}]")
+        lines.append(f"- {name}({', '.join(param_bits)})")
     return "\n".join(lines)
 
 
@@ -127,6 +197,8 @@ def _planner_system_prompt() -> str:
         "For a named person in a relationship question, use from:<name> OR to:<name>; do not rely on a bare name or unrelated topic words. "
         "All query_plan.query values must use Inbox search-bar syntax with from:, to:, subject:, body:, after:, before:, is:, or has: and AND/OR connectors; dates use YYYY-MM-DD. Never emit bare names; AND binds tighter than OR. "
         "The tool validates this plan against the authoritative UI scope before retrieval. "
+        "For a first-time reply/draft request, after evidence is enough, action=final with an email summary, reply intent, and a confirmation question; do not output the draft body or call ai_draft_reply yet. "
+        "Call ai_draft_reply only after the user confirms the draft body (yes/好的/可以/开始吧/确认/生成卡片). "
         "For ai_draft_reply, pass thread_ref or message_id/thread_id from search hits when the drawer is closed. "
         "arguments must be a JSON object; always include mailbox/ui_context fields when available. "
         "Never invent tool names outside the list."
@@ -193,7 +265,6 @@ def _fallback_text_from_tools(tool_records: list[dict[str, Any]], language: str)
         if kind == "evidence":
             results = data.get("results") if isinstance(data.get("results"), list) else []
             source = str(data.get("scan_source") or "cache")
-            span_note = str(data.get("time_span_note") or "").strip()
             domain_note = str(data.get("domain_warning_note") or "").strip()
             if not results:
                 nearby = data.get("nearby_results") if isinstance(data.get("nearby_results"), list) else []
@@ -224,8 +295,6 @@ def _fallback_text_from_tools(tool_records: list[dict[str, Any]], language: str)
                 lines.append(f"已从{' Gmail 历史' if source == 'gmail' else '本地缓存'}找到 {len(results)} 封相关邮件：")
             else:
                 lines.append(f"Found {len(results)} relevant email(s) in {'Gmail history' if source == 'gmail' else 'the local cache'}:")
-            if span_note:
-                lines.append(span_note)
             for item in results[:5]:
                 if not isinstance(item, dict):
                     continue
@@ -237,7 +306,7 @@ def _fallback_text_from_tools(tool_records: list[dict[str, Any]], language: str)
                 line = f"- {date} | {sender} | {subject} [{ref}]".strip()
                 if snippet:
                     line += f"\n  {snippet}"
-                if item.get("has_domain_warning"):
+                if item.get("has_domain_warning") and domain_note:
                     domains = item.get("thread_sender_domains") if isinstance(item.get("thread_sender_domains"), list) else []
                     if domains:
                         line += (
@@ -309,9 +378,11 @@ async def _force_final_text_with_status(
         "You already ran tools. Reply with ONE JSON object only, no markdown fences:\n"
         '{"action":"final","tool":"","arguments":{},"text":"<complete user-facing markdown answer>"}.\n'
         "text MUST be non-empty, answer the user from tool_result evidence only, "
-        "Be concise: summarize the evidence, do not repeat email metadata or body text. "
-        "If tool_result contains time_span_note or domain_warning_note, weave those facts into the answer "
-        "(cross-month span / 发件人域名不一致) without making the note the entire answer. "
+        "Be concise and use readable Markdown headings or bullet lists when they improve scanning; "
+        "For summaries or judgments, start with a short Markdown heading and use bullets for distinct facts or next steps. "
+        "summarize the evidence, do not repeat email metadata or body text. "
+        "If tool_result contains domain_warning_note, use those facts when relevant "
+        "to explain the sender-domain mismatch. Do not quote or reproduce the internal note text. "
         "End with one explicit complete terminal sentence and terminal punctuation (., !, ?, or Chinese punctuation). "
         "include [THREAD_REF_xxx] when available, report attachmentFilenames when present, "
         "and never reproduce an email body or extended quote unless allow_full_email_text=true. "
@@ -403,7 +474,11 @@ def _inject_context_args(
     ).strip()
     if mailbox:
         merged["mailbox"] = mailbox
-    if not str(merged.get("user_text") or "").strip() and tool not in {
+    # query_mail_evidence 必须用外层权威 user_text：模型常把话题加双引号，
+    # 会误触发 search_field 澄清（J10「关于'…'的邮件」）。
+    if tool == "query_mail_evidence" and str(user_text or "").strip():
+        merged["user_text"] = user_text
+    elif not str(merged.get("user_text") or "").strip() and tool not in {
         "search_email",
         "read_email",
         "propose_inbox_actions",
@@ -480,12 +555,15 @@ def _assemble_outcome(
     scan_query = ""
     scan_source = ""
     structured: dict[str, Any] | None = None
+    unsent_draft_tool = False
     for record in reversed(tool_records):
         data = record.get("data") if isinstance(record.get("data"), dict) else None
         if not data:
             # 失败帧也可能顶层带 error
             continue
         kind = str(data.get("kind") or "").strip()
+        if str(record.get("tool") or "") in {"ai_draft_reply", "ai_revise_draft"}:
+            unsent_draft_tool = True
         if not scan_query:
             plan = data.get("query_plan") if isinstance(data.get("query_plan"), dict) else {}
             scan_query = str(data.get("scan_query") or data.get("query") or plan.get("query") or "").strip()
@@ -507,7 +585,6 @@ def _assemble_outcome(
                         "query_plan",
                         "search_scope",
                         "domain_warning_note",
-                        "time_span_note",
                     )
                     if key in data
                 },
@@ -550,9 +627,27 @@ def _assemble_outcome(
             break
 
     if structured:
+        from mail_agent.ai_turn.tools import _draft_review_text, _mark_unsent_draft
+
+        if unsent_draft_tool:
+            # 本地 final 可能再次复述模型的“已发送”；这里作为最后一道协议边界统一纠正。
+            if isinstance(structured.get("artifact"), dict):
+                structured["artifact"] = _mark_unsent_draft(structured["artifact"])
+            if isinstance(structured.get("artifacts"), list):
+                structured["artifacts"] = [
+                    _mark_unsent_draft(item) if isinstance(item, dict) else item
+                    for item in structured["artifacts"]
+                ]
+            structured["assistant_text"] = _draft_review_text(
+                str(structured.get("assistant_text") or final_text or ""), language
+            )
         # 与 Host 一致：有 final 文本时优先作为用户可见回复；工具 artifact 等结构字段保留。
         if final_text:
-            structured["assistant_text"] = final_text
+            structured["assistant_text"] = (
+                _draft_review_text(final_text, language)
+                if unsent_draft_tool
+                else final_text
+            )
         elif not str(structured.get("assistant_text") or "").strip():
             structured["assistant_text"] = ""
         if scan_query and not structured.get("scan_query"):
@@ -636,6 +731,8 @@ async def run_local_agent_session(
     final_text = ""
     completion_degraded = False
     completion_reason = ""
+    requires_thread_draft_preview = _requires_thread_draft_preview(user_text, ui_context, arguments)
+    requires_thread_draft_card = _requires_thread_draft_card(user_text, ui_context)
     system = _planner_system_prompt()
 
     for step in range(1, _MAX_AGENT_STEPS + 1):
@@ -665,10 +762,43 @@ async def run_local_agent_session(
         if not payload:
             # JSON 解析失败时，若有纯文本则视为 final 回答
             plain = str(plan_raw.get("text") or extract_sampling_text(plan_raw) or "").strip()
-            if plain and not plan_raw.get("fallback_used") and not plan_raw.get("truncated"):
+            if (
+                plain
+                and not plan_raw.get("fallback_used")
+                and not plan_raw.get("truncated")
+and not (
+                    (requires_thread_draft_preview or requires_thread_draft_card)
+                    and not tool_records
+                )
+            ):
                 final_text = plain
                 break
         plan = _normalize_plan(payload if isinstance(payload, dict) else {})
+        if requires_thread_draft_card and not any(
+            str(record.get("tool") or "") == "ai_draft_reply" for record in tool_records
+        ):
+            plan = {
+                "action": "tool_call",
+                "tool": "ai_draft_reply",
+                "arguments": {},
+                "text": "",
+            }
+        elif requires_thread_draft_preview and not tool_records:
+            plan = {
+                "action": "tool_call",
+                "tool": "query_mail_evidence",
+                "arguments": {
+                    "scope_kind": "current_thread",
+                    "query_plan": {
+                        "intent": "draft",
+                        "query": "in:anywhere",
+                        "order": "newest",
+                        "answer_mode": "llm",
+                        "needs": ["thread", "body"],
+                    },
+                },
+                "text": "",
+            }
         if plan_raw.get("fallback_used") and not plan.get("tool") and not plan.get("text"):
             _logger.warning("local_agent_session plan fallback step=%s", step)
             # 已有工具证据时不直接报不可用，交给后续 force_final / 工具兜底
@@ -687,20 +817,54 @@ async def run_local_agent_session(
             }
 
         if plan["action"] != "tool_call" or not plan["tool"]:
-            # route final 与 force-final 共用运行时截断/JSON 截断信号；终止标点只能辅助判断。
-            route_degraded = bool(plan_raw.get("fallback_used")) or bool(plan_raw.get("truncated"))
+            # 邮箱范围找邮/问答首轮不得直接 final：必须先 query_mail_evidence，
+            # 否则模型会抄字段澄清话术或空答，跳过本地检索（如 J10 无关键词无结果）。
             candidate = str(plan.get("text") or "").strip()
-            if route_degraded or not _FINAL_TERMINAL_RE.search(candidate):
-                final_text = ""
-                completion_degraded = True
-                completion_reason = str(
-                    plan_raw.get("fallback_reason")
-                    or plan_raw.get("fallback_kind")
-                    or ("incomplete_final_text" if candidate else "degraded_completion")
-                )
+            needs_mailbox_evidence = (
+                not tool_records
+                and step == 1
+                and _mailbox_search_requires_evidence(user_text, candidate)
+            )
+            if needs_mailbox_evidence:
+                # 强制 Evidence 时尽量带上话题词；in:anywhere 会把无关缓存当命中。
+                forced_query = "in:anywhere"
+                try:
+                    from mail_agent.evidence_flow import _topic_quoted_phrase
+
+                    topic = _topic_quoted_phrase(user_text)
+                    if topic:
+                        forced_query = f"body:{topic}"
+                except Exception:
+                    forced_query = "in:anywhere"
+                plan = {
+                    "action": "tool_call",
+                    "tool": "query_mail_evidence",
+                    "arguments": {
+                        "user_text": user_text,
+                        "query_plan": {
+                            "intent": "find",
+                            "query": forced_query,
+                            "order": "newest",
+                            "answer_mode": "llm",
+                            "needs": ["metadata"],
+                        },
+                    },
+                    "text": "",
+                }
             else:
-                final_text = candidate
-            break
+                # route final 与 force-final 共用运行时截断/JSON 截断信号；终止标点只能辅助判断。
+                route_degraded = bool(plan_raw.get("fallback_used")) or bool(plan_raw.get("truncated"))
+                if route_degraded or not _FINAL_TERMINAL_RE.search(candidate):
+                    final_text = ""
+                    completion_degraded = True
+                    completion_reason = str(
+                        plan_raw.get("fallback_reason")
+                        or plan_raw.get("fallback_kind")
+                        or ("incomplete_final_text" if candidate else "degraded_completion")
+                    )
+                else:
+                    final_text = candidate
+                break
 
         tool_name = plan["tool"]
         _progress(tool_name, {"step": step, "tool": tool_name})
@@ -741,6 +905,9 @@ async def run_local_agent_session(
         data = result.get("data") if isinstance(result, dict) else None
         if isinstance(data, dict):
             kind = str(data.get("kind") or "")
+            if tool_name == "ai_draft_reply" and kind == "draft":
+                final_text = str(data.get("assistant_text") or "").strip()
+                break
             if kind in {"draft", "propose", "memory", "evidence_template"} and str(data.get("assistant_text") or "").strip():
                 # 仍给模型一次 final 机会；若预算紧则直接用工具文案
                 if step >= _MAX_AGENT_STEPS - 1:
@@ -751,10 +918,22 @@ async def run_local_agent_session(
                 final_text = str(data.get("assistant_text") or "").strip()
                 break
             if tool_name == "query_mail_evidence" and kind in {"evidence", "evidence_template"}:
-                # P3 复合工具已经完成 Scope/Plan/Evidence；本地兼容环不得再让外层
-                # 选型重复调用它。非模板回答统一只保留一次最终合成机会。
                 if kind == "evidence_template":
                     final_text = str(data.get("assistant_text") or "").strip()
+                    break
+                final_text = str(data.get("assistant_text") or "").strip()
+                if requires_thread_draft_preview and not requires_thread_draft_card:
+                    summary = final_text or (
+                        "我已确认这封邮件。"
+                        if language == "zh"
+                        else "I confirmed the email thread."
+                    )
+                    confirmation = (
+                        "我可以根据这封邮件整理回复草稿。请确认是否生成回复草稿。"
+                        if language == "zh"
+                        else "I can prepare a reply draft from this email. Please confirm whether to generate it."
+                    )
+                    final_text = f"{summary}\n\n{confirmation}"
                 break
 
     if not final_text and tool_records:
@@ -794,13 +973,13 @@ async def run_local_agent_session(
                     final_body = candidate
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
-    # Evidence 备注仅在已有实质 final 时补回；禁止用注脚单独充当答案。
+    # 域名风险备注仅在已有实质 final 时补回；禁止用注脚单独充当答案。
     if final_body and len(final_body) >= 40:
         for record in reversed(tool_records):
             data = record.get("data") if isinstance(record, dict) and isinstance(record.get("data"), dict) else None
             if not data:
                 continue
-            for key in ("domain_warning_note", "time_span_note"):
+            for key in ("domain_warning_note",):
                 note = str(data.get(key) or "").strip()
                 if not note:
                     continue

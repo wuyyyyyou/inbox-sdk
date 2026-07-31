@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
 def main() -> None:
     from anna_inbox_executa.v2_tools import (
         MAIL_PROMPT_SYSTEM,
+        _normalize_draft_assistant_text,
         _normalize_generated_draft_body,
     )
 
@@ -25,6 +26,12 @@ def main() -> None:
     )
     assert _normalize_generated_draft_body("Thanks,\r\n\r\nKate\r\n") == "Thanks,\nKate"
     assert "no blank line between them" in MAIL_PROMPT_SYSTEM
+    assert _normalize_draft_assistant_text(
+        "草稿已保存至您的发件箱，请核对后发送。"
+    ) == "请确认邮件回复内容和相关信息。"
+    assert "发件箱" not in _normalize_draft_assistant_text(
+        "草稿已保存至您的发件箱，请核对后发送。"
+    )
 
     print("PASS mail prompt draft format tests")
 

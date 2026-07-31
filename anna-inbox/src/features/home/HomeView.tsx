@@ -1427,8 +1427,22 @@ function relativeTimeLabel(value?: string) {
   return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+function isDraftContentOnlyRequest(value: string) {
+  return /(?:只(?:输出|提供|给我|要)|仅(?:输出|提供|给我|要)|不要卡片|不要生成卡片)(?:邮件)?(?:草稿)?(?:内容|正文)|draft\s+(?:content|body)\s+only|body\s+only/i.test(value);
+}
+
 function displayAssistantText(message: AiChatMessage) {
   const text = message.content || "";
+  // 模型不支持图片输入时可能把底层错误直接回传到侧栏；不要把协议错误当成助手正文展示。
+  if (/error:\s*cannot read ["']?image\.png["']?\s*\(this model does not support image input\)/i.test(text)
+    || /cannot read ["']?image\.png["']?\s*\(this model does not support image input\)/i.test(text)) {
+    return [
+      "## Image attachment unavailable",
+      "",
+      "- This AI model cannot read image attachments.",
+      "- Choose a text-capable model or remove the image, then try again.",
+    ].join("\n");
+  }
   if (
     message.kind === "error" &&
     (text.includes("[tool_failed]") || text.includes("executa process exited"))
@@ -1674,7 +1688,16 @@ function DraftReplyArtifactCard({
   onUse: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
 }) {
   const [draft, setDraft] = useState(artifact);
+  const messageRef = useRef<HTMLTextAreaElement | null>(null);
   const isForward = draft.composer_mode === "forward";
+
+  useLayoutEffect(() => {
+    const textarea = messageRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${textarea.scrollHeight}px`;
+  }, [draft.body]);
+
   return (
     <div className="ai-draft-artifact">
       <strong className="ai-draft-artifact-title">{isForward ? "Forward draft" : "Reply draft"}</strong>
@@ -1696,7 +1719,12 @@ function DraftReplyArtifactCard({
       </label>
       <label className="ai-draft-artifact-field">
         <span>Message</span>
-        <textarea value={draft.body} onChange={(event) => setDraft((current) => ({ ...current, body: event.target.value }))} />
+        <textarea
+          ref={messageRef}
+          value={draft.body}
+          onChange={(event) => setDraft((current) => ({ ...current, body: event.target.value }))}
+          rows={1}
+        />
       </label>
       <div className="ai-draft-artifact-actions">
         <button className="is-primary" onClick={() => onUse(draft, "replace")}>Insert into {isForward ? "forward" : "reply"}</button>
@@ -1878,9 +1906,11 @@ function AiAssistantMessage({
     );
     const draftArtifact =
       message.artifact?.type === "draft_reply" &&
-      (!animate || assistantTextComplete)
+      !isDraftContentOnlyRequest(message.sourcePrompt || "") &&
+        (!animate || assistantTextComplete)
         ? message.artifact
         : null;
+    const cardDraftArtifact = draftArtifact;
     const composeArtifact =
       message.artifact?.type === "compose_draft" &&
       (!animate || assistantTextComplete)
@@ -2304,8 +2334,8 @@ function AiAssistantMessage({
           const batchArtifacts =
             Array.isArray(message.artifacts) && message.artifacts.length > 1
               ? message.artifacts
-              : draftArtifact
-                ? [draftArtifact]
+              : cardDraftArtifact
+                ? [cardDraftArtifact]
                 : [];
           if (!batchArtifacts.length || (animate && !assistantTextComplete)) return null;
             return batchArtifacts.map((item, index) => {
@@ -2378,15 +2408,6 @@ function AiAssistantMessage({
               </button>
             </div>
           </div>
-        ) : null}
-        {draftArtifact && message.assistantFollowupText ? (
-          <AnimatedAssistantText
-            text={message.assistantFollowupText}
-            animate={animate}
-            onOpenThread={openThreadReference}
-            threadReferenceLabels={message.threadReferenceLabels}
-            onComplete={onTextComplete}
-          />
         ) : null}
         {assistantTextComplete && message.replyGaps?.needs_user_input ? (
           <div className="ai-reply-gaps">
@@ -2639,12 +2660,30 @@ function AiSidebar({
     { label: "Organize my inbox", routingIntent: "organize" },
   ];
   const conversation = state.aiChatMessages;
+  const draftArtifactSignature = conversation
+    .filter((message) =>
+      message.artifact?.type === "draft_reply" ||
+      message.artifacts?.some((artifact) => artifact.type === "draft_reply"),
+    )
+    .map((message) => {
+      const artifactBodyLength =
+        message.artifact?.type === "draft_reply"
+          ? message.artifact.body.length
+          : 0;
+      const artifactCount = message.artifacts?.length || 0;
+      return `${message.id}:${artifactBodyLength}:${artifactCount}`;
+    })
+    .join("|");
+  const previousDraftArtifactSignatureRef = useRef("");
 
   const scrollConversationToBottom = useCallback(
     (behavior: ScrollBehavior = "smooth") => {
       const scroller = conversationRef.current;
       if (!scroller) return;
-      scroller.scrollTo({ top: scroller.scrollHeight, behavior });
+      scroller.scrollTo({
+        top: Math.max(0, scroller.scrollHeight - scroller.clientHeight),
+        behavior,
+      });
       pinnedToBottomRef.current = true;
       setShowNewMessagePrompt(false);
     },
@@ -2654,14 +2693,53 @@ function AiSidebar({
   const previousRunningRef = useRef(running);
 
   useEffect(() => {
-    const frame = window.requestAnimationFrame(() => {
+    let frame = window.requestAnimationFrame(() => {
       if (!pinnedToBottomRef.current && !scrollAfterSubmitRef.current) return;
       const behavior = scrollAfterSubmitRef.current ? "smooth" : "auto";
       scrollAfterSubmitRef.current = false;
       scrollConversationToBottom(behavior);
     });
-    return () => window.cancelAnimationFrame(frame);
+    const scroller = conversationRef.current;
+    if (!scroller || typeof ResizeObserver === "undefined") {
+      return () => window.cancelAnimationFrame(frame);
+    }
+    const content = scroller.querySelector<HTMLElement>(".ai-message-stack") || scroller;
+    const observer = new ResizeObserver(() => {
+      if (pinnedToBottomRef.current) scrollConversationToBottom("auto");
+    });
+    observer.observe(content);
+    const stopObserving = window.setTimeout(() => observer.disconnect(), 900);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(stopObserving);
+      observer.disconnect();
+    };
   }, [conversation, scrollConversationToBottom]);
+
+  useEffect(() => {
+    if (
+      !draftArtifactSignature ||
+      draftArtifactSignature === previousDraftArtifactSignatureRef.current
+    ) {
+      return;
+    }
+    previousDraftArtifactSignatureRef.current = draftArtifactSignature;
+    pinnedToBottomRef.current = true;
+    setShowNewMessagePrompt(false);
+    const scroller = conversationRef.current;
+    if (!scroller) return;
+    const forceDraftArtifactScroll = () => scrollConversationToBottom("auto");
+    let frame = window.requestAnimationFrame(forceDraftArtifactScroll);
+    const content = scroller.querySelector<HTMLElement>(".ai-message-stack") || scroller;
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(forceDraftArtifactScroll);
+    observer?.observe(content);
+    const stopObserving = window.setTimeout(() => observer?.disconnect(), 1200);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(stopObserving);
+      observer?.disconnect();
+    };
+  }, [draftArtifactSignature, scrollConversationToBottom]);
 
   useEffect(() => {
     pinnedToBottomRef.current = true;
@@ -3475,6 +3553,8 @@ export function HomeView() {
   const avatarMisses = useRef(new Set<string>());
   const avatarPermissionNoticeShown = useRef(false);
   const drawerCloseTimer = useRef<number | null>(null);
+  // AI 侧栏打开详情是异步的；关闭或再次打开时递增 token，丢弃过期回写，避免关后自动重开
+  const aiDetailOpenTokenRef = useRef(0);
   const mailbox = state.selectedMailboxes[0] || state.mailbox;
   const flagsKey = `anna-inbox:mail-flags:${mailbox}`;
   const contactAvatarsKey = `anna-inbox:contact-avatars:${mailbox}`;
@@ -5192,7 +5272,6 @@ export function HomeView() {
         window.clearTimeout(drawerCloseTimer.current);
         drawerCloseTimer.current = null;
       }
-      // 先让抽屉指向与 AI 草稿一致的邮件，再交由抽屉写入并保存草稿。
       setDrawerMessage(selectedMessage);
       setDrawerOpen(true);
       setInsertRequest({ nonce: crypto.randomUUID(), artifact, mode });
@@ -5226,9 +5305,13 @@ export function HomeView() {
 
   const closeDetailDrawer = useCallback(() => {
     const currentId = selectedId;
+    // 作废进行中的 AI 打开详情请求，防止 await 结束后重新 setSelectedId
+    aiDetailOpenTokenRef.current += 1;
     setDrawerOpen(false);
     setSelectedId("");
     setExternalDetailMessage(null);
+    setInsertRequest(null);
+    setReplyDraftRestore(null);
     if (drawerCloseTimer.current) window.clearTimeout(drawerCloseTimer.current);
     drawerCloseTimer.current = window.setTimeout(() => {
       setDrawerMessage(null);
@@ -5516,9 +5599,12 @@ export function HomeView() {
         actions.showToast("This email reference is incomplete.");
         return;
       }
+      const openToken = ++aiDetailOpenTokenRef.current;
+      const isStaleOpen = () => openToken !== aiDetailOpenTokenRef.current;
       try {
         if (targetMailbox !== mailbox.trim().toLowerCase()) {
           await actions.switchMailbox(targetMailbox);
+          if (isStaleOpen()) return;
         }
         const known = [
           ...state.inboxMessages,
@@ -5534,6 +5620,7 @@ export function HomeView() {
               : (item.thread_id || item.id) === target.thread_id),
         );
         if (known) {
+          if (isStaleOpen()) return;
           setExternalDetailMessage(null);
           setSelectedId(known.id);
           return;
@@ -5551,6 +5638,7 @@ export function HomeView() {
           label_ids: [],
           snippet: "",
         };
+        if (isStaleOpen()) return;
         setExternalDetailMessage(openingPlaceholder);
         setSelectedId(openingPlaceholder.id);
         setMailboxView("inbox");
@@ -5563,6 +5651,8 @@ export function HomeView() {
             includeDisplayBody: true,
           },
         );
+        // 用户已关闭详情或点了另一封引用时，禁止用过期结果重新打开
+        if (isStaleOpen()) return;
         const anchor =
           page.messages.find((item) => item.id === target.message_id) ||
           page.messages.find((item) => item.id === page.latest_message_id) ||
@@ -5584,6 +5674,7 @@ export function HomeView() {
         setSelectedId(placeholder.id);
         setMailboxView("inbox");
       } catch (reason) {
+        if (isStaleOpen()) return;
         actions.showToast(
           reason instanceof Error ? reason.message : String(reason),
         );
@@ -6960,6 +7051,7 @@ export function HomeView() {
             )
           }
           onClose={closeDetailDrawer}
+          onRequestClose={closeDetailDrawer}
           onTodoMessage={handleTodoFromDetail}
           onDoneMessage={handleDoneFromDetail}
           onSnoozeMessage={openSnoozePicker}

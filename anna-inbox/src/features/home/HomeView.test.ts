@@ -19,6 +19,13 @@ describe("AI thread reference", () => {
       handler.indexOf("await actions.loadInboxThreadPage"),
     );
   });
+
+  it("ignores stale AI detail opens after the drawer is closed", () => {
+    expect(homeViewSource).toContain("aiDetailOpenTokenRef");
+    expect(homeViewSource).toContain("if (isStaleOpen()) return");
+    const closeHandler = homeViewSource.match(/const closeDetailDrawer = useCallback\([\s\S]*?\}, \[selectedId\]\);/)?.[0] || "";
+    expect(closeHandler).toContain("aiDetailOpenTokenRef.current += 1");
+  });
 });
 
 describe("mail detail complete body", () => {
@@ -30,6 +37,66 @@ describe("mail detail complete body", () => {
     expect(drawerSource).toContain("|| visiblePage.messages.find((item) => item.id === visiblePage.latest_message_id)");
     expect(drawerSource).not.toContain("This message is too large to display completely.");
     expect(drawerSource).not.toContain("Load full message");
+  });
+
+  it("renders the IndexedDB thread page before waiting for the network refresh", () => {
+    const drawerSource = readFileSync(
+      new URL("../mail-detail/MailDetailDrawer.tsx", import.meta.url),
+      "utf8",
+    );
+    const cacheRead = drawerSource.indexOf("const cachedPage = await cachedPagePromise");
+    const cacheBranch = drawerSource.indexOf("if (cachedPage)", cacheRead);
+    const cacheRender = drawerSource.indexOf("setLoading(false);", cacheRead);
+    const backgroundRefresh = drawerSource.search(/void refreshNetworkPage\([^)]*\)/);
+
+    expect(cacheRead).toBeGreaterThan(-1);
+    expect(cacheRead).toBeLessThan(cacheBranch);
+    expect(cacheRender).toBeGreaterThan(cacheRead);
+    expect(cacheRender).toBeLessThan(backgroundRefresh);
+  });
+});
+
+describe("legacy AI draft preview", () => {
+  it("only renders structured draft artifacts after confirmation", () => {
+    expect(homeViewSource).not.toContain("parseLegacyDraftPreview(message)");
+    expect(homeViewSource).toContain('message.artifact?.type === "draft_reply"');
+  });
+
+  it("keeps the first reply step as a confirmation request", () => {
+    const promptSource = readFileSync(
+      new URL("../../app/aiAgentSystemPrompt.ts", import.meta.url),
+      "utf8",
+    );
+    expect(promptSource).toContain("ask whether to generate a reply draft");
+    expect(promptSource).toContain("Do not output the draft body");
+  });
+});
+
+describe("AI draft card layout", () => {
+  it("auto-expands the message editor and omits the second assistant follow-up", () => {
+    expect(homeViewSource).toContain("textarea.style.height = \"auto\";");
+    expect(homeViewSource).toContain("textarea.style.height = `${textarea.scrollHeight}px`;");
+    expect(homeViewSource).toContain("rows={1}");
+    expect(homeViewSource).not.toContain("message.assistantFollowupText");
+  });
+
+  it("scrolls the AI conversation to the actual bottom while card layout settles", () => {
+    expect(homeViewSource).toContain("scroller.scrollHeight - scroller.clientHeight");
+    expect(homeViewSource).toContain("new ResizeObserver");
+    expect(homeViewSource).toContain('querySelector<HTMLElement>(".ai-message-stack")');
+    expect(homeViewSource).toContain("observer.observe(content)");
+    expect(homeViewSource).toContain("draftArtifactSignature");
+    expect(homeViewSource).toContain("pinnedToBottomRef.current = true;");
+    expect(homeViewSource).toContain("forceDraftArtifactScroll");
+  });
+
+  it("invalidates a pending detail close before async draft persistence finishes", () => {
+    const drawerSource = readFileSync(
+      new URL("../mail-detail/MailDetailDrawer.tsx", import.meta.url),
+      "utf8",
+    );
+    expect(drawerSource).toContain("onRequestClose");
+    expect(drawerSource).toContain("onRequestClose();");
   });
 });
 

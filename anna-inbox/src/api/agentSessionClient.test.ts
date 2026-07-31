@@ -25,7 +25,12 @@ describe("AI sidebar Host Agent contract", () => {
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never describe it as a 7/30/60-day search");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never call start_ai_turn");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("each confirmed email must be its own list item");
-    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never add a detached reference list");
+expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never add a detached reference list");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Two-step reply drafting is mandatory");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("do NOT call ai_draft_reply yet");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Only after the user clearly confirms");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("开始吧");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("开始吧");
     expect(agentClientSource).toContain("tool_end");
   });
 
@@ -99,5 +104,66 @@ describe("AI sidebar Host Agent contract", () => {
     expect(agentClientSource).toContain("export async function cancelAiAgentTurn");
     expect(agentClientSource).toContain("session.cancel");
     expect(agentClientSource).toContain("activeRuns");
+  });
+
+  it("preserves a draft artifact returned by the Host draft tool", async () => {
+    const client = {
+      agent: {
+        session: async () => ({
+          run: async () => [{
+            event: "tool_result",
+            data: {
+              success: true,
+              data: {
+                kind: "draft",
+                artifact: {
+                  type: "draft_reply",
+                  mailbox: "kate@example.com",
+                  thread_id: "thread-123",
+                  body: "Hello Christopher,",
+                },
+              },
+            },
+          }],
+        }),
+      },
+    };
+
+    const result = await runAiAgentTurn(client, "draft-artifact", "Draft a reply");
+
+    expect(result.toolOutcomes).toContainEqual(expect.objectContaining({
+      kind: "draft",
+      artifact: expect.objectContaining({ type: "draft_reply", body: "Hello Christopher," }),
+    }));
+  });
+
+  it("unwraps a nested data.result artifact returned by Host", async () => {
+    const result = await runAiAgentTurn(
+      {
+        agent: {
+          session: async () => ({
+            run: async () => [{
+              event: "tool_result",
+              data: {
+                success: true,
+                data: {
+                  result: {
+                    artifact: { type: "draft_reply", body: "Nested reply" },
+                  },
+                },
+              },
+            }],
+          }),
+        },
+      },
+      "nested-draft-artifact",
+      "Draft a reply",
+    );
+
+    expect(result.toolOutcomes).toContainEqual(expect.objectContaining({
+      result: expect.objectContaining({
+        artifact: expect.objectContaining({ type: "draft_reply", body: "Nested reply" }),
+      }),
+    }));
   });
 });

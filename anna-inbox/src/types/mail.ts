@@ -401,7 +401,7 @@ export interface CustomRunResultItem {
 /** 当前邮箱的 Inbox 展示偏好；由 Executa 按邮箱地址独立持久化。 */
 /** LLM 连通性探测轮询间隔（秒）；0 表示关闭自动轮询 */
 export type LlmStatusPollSeconds = 0 | 30 | 60 | 120 | 300;
-export type InboxAutoSyncSeconds = 0 | 15 | 30 | 60 | 120;
+export type InboxAutoSyncSeconds = 0 | 5 | 15 | 30 | 60;
 
 export interface InboxSettings {
   mailbox: string;

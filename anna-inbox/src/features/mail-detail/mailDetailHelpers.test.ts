@@ -15,6 +15,7 @@ import {
   parseSnoozeInput,
   resolveAttachmentAccess,
   senderParts,
+  shouldFollowLatestThreadMessage,
   splitAddresses,
   stripForwardedMessageBlock,
   stripQuotedReplyForDisplay,
@@ -54,6 +55,13 @@ describe("mailDetailHelpers", () => {
   it("falls back to the message id when a thread id is unavailable", () => {
     expect(resolveMessageThreadId({ id: "message-1" })).toBe("message-1");
     expect(resolveMessageThreadId({ id: "message-1", thread_id: "thread-1" })).toBe("thread-1");
+  });
+
+  it("follows a newer cached-thread refresh only when the reader is still at the bottom", () => {
+    expect(shouldFollowLatestThreadMessage("old", "new", true, false)).toBe(true);
+    expect(shouldFollowLatestThreadMessage("old", "new", false, false)).toBe(false);
+    expect(shouldFollowLatestThreadMessage("old", "new", true, true)).toBe(false);
+    expect(shouldFollowLatestThreadMessage("new", "new", true, false)).toBe(false);
   });
 
   it("appends generated drafts with an explicit paragraph break", () => {

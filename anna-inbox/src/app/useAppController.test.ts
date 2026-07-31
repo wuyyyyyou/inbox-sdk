@@ -41,6 +41,26 @@ describe("Manage Splits tooltip", () => {
 });
 
 describe("AI scan invocation", () => {
+  it("normalizes artifacts from every supported Host/local result shape", () => {
+    expect(controllerSource).toContain("function normalizeAiArtifactPayload");
+    expect(controllerSource).toMatch(/for \(const key of \[\"artifact\", \"artifacts\", \"data\", \"result\"\]\)/);
+    expect(controllerSource).toContain("artifact: found[0]");
+    expect(controllerSource).toContain("artifacts: found");
+  });
+
+  it("leaves draft card creation to the Host artifact", () => {
+    expect(controllerSource).not.toContain("function isThreadDraftRequest");
+    expect(controllerSource).not.toContain("function canRecoverThreadDraft");
+    expect(controllerSource).not.toContain("client.draftAiReply({");
+    expect(controllerSource).not.toContain("两步草稿流");
+  });
+
+  it("prioritizes a Host draft artifact over a later evidence result", () => {
+    expect(controllerSource).toContain("function latestDraftOutcome");
+    expect(controllerSource).toContain('|| (draftOutcome ? "draft" : "")');
+    expect(controllerSource).toContain("...(draftOutcome || {})");
+  });
+
   it("keeps the current Scan Plan for remaining pollable scans and passes it to Agent context", () => {
     expect(controllerSource.match(/wait_timeout_seconds: 45/g)?.length || 0).toBeGreaterThanOrEqual(1);
     expect(controllerSource.match(/scan_window_days: scanScope\.scan_window_days/g)?.length || 0).toBeGreaterThanOrEqual(2);

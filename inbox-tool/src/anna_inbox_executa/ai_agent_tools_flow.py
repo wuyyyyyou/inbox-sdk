@@ -545,7 +545,6 @@ _PUBLIC_OUTCOME_KEYS = (
     "evaluation_metrics",
     # B12/C02：域名矛盾备注须透传给 local final，否则只能依赖模型自行察觉。
     "domain_warning_note",
-    "time_span_note",
     "domain_warning_threads",
 )
 

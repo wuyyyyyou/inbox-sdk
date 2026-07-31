@@ -2,7 +2,7 @@
 
 Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；AI 侧栏是唯一智能入口。Brief 产品面已下线，不再代表 2.0 主路径。
 
-当前发布基线：App `2.2.1` / Tool `2.3.1`。本版本：Evidence 字段澄清与确定性 QueryPlan、确认线程引用、草稿主人身份、选择性 APS、本地 JSON salvage（无二次 repair）、同步边界 toast、Mail Detail 滚动稳定，以及根目录 P0 本地评测脚本（用例 CSV + 自动判据；运行产物不提交）。继承：列表固定首屏 100 + **触底自动加载**、邮箱 **180 天 metadata 优先 + 无硬顶 backfill** 与 `sync_boundary`、侧栏 `query_mail_evidence`、`search_email`/`read_email` cache-only、正文/附件预处理与草稿产物可编辑插入。
+当前发布基线：App `2.2.2` / Tool `2.3.2`。本版本：Evidence Gmail 托底（history + cache_gap）、回复草稿两步确认流、「仅正文」不展示卡片、AI 侧栏滚动/关闭稳定、详情条件跟随最新消息、`auto_sync` 默认 5 秒档位。继承：Evidence 字段澄清与确定性 QueryPlan、确认线程引用、草稿主人身份、选择性 APS、本地 JSON salvage、同步边界 toast、列表固定首屏 100 + 触底加载、180 天 priority + 无硬顶 backfill、`query_mail_evidence` cache-only 主路径、P0 本地评测。
 
 ## Language
 
@@ -32,7 +32,7 @@ Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 或 All 
 
 **query_mail_evidence**
 
-侧栏邮箱范围问答的复合只读工具：解析 scope、生成一条 QueryPlan、在本地缓存上确定性取证；仅当目标时间早于索引最早边界时才允许一次受限 Gmail 历史检索。
+侧栏邮箱范围问答的复合只读工具：解析 scope、生成一条 QueryPlan、在本地缓存上确定性取证；每轮最多一次 Gmail 托底（超最早边界，或同步缺口下严格零命中）；完整索引普通零命中不回源。
 
 **Saved prompts / AI Memory**
 

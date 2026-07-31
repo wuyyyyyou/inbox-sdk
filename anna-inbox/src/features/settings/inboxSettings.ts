@@ -4,7 +4,7 @@ import { senderParts } from "../../shared/mailIdentity";
 
 /** Settings 中暴露的 LLM 状态轮询档位（秒） */
 export const LLM_STATUS_POLL_OPTIONS = [0, 30, 60, 120, 300] as const;
-export const AUTO_SYNC_OPTIONS = [0, 15, 30, 60, 120] as const;
+export const AUTO_SYNC_OPTIONS = [0, 5, 15, 30, 60] as const;
 
 export const DEFAULT_INBOX_SETTINGS: InboxSettings = {
   mailbox: "",
@@ -15,7 +15,7 @@ export const DEFAULT_INBOX_SETTINGS: InboxSettings = {
   todos_enabled: true,
   todos_limit: 10,
   llm_status_poll_seconds: 60,
-  auto_sync_seconds: 15,
+  auto_sync_seconds: 5,
   custom_categories: [],
 };
 
