@@ -292,7 +292,7 @@ run_list_inbox_invoke_smoke() {
   local smoke_storage_dir="$WORK_DIR/smoke-local-storage"
 
   printf '%s\n' '{"jsonrpc":"2.0","method":"invoke","params":{"tool":"list_inbox_emails","arguments":{"mailbox":""},"context":{}},"id":1}' \
-    | env ANNA_STORAGE_BACKEND=local ZHAOPY_MAIL_AGENT_STORAGE_DIR="$smoke_storage_dir" "$PACKAGE_DIR/bin/$BINARY_NAME" >"$output_path" 2>"$error_path"
+    | env ANNA_APP_RUNTIME_STORAGE_MODE=local ANNA_STORAGE_BACKEND=local ZHAOPY_MAIL_AGENT_STORAGE_DIR="$smoke_storage_dir" "$PACKAGE_DIR/bin/$BINARY_NAME" >"$output_path" 2>"$error_path"
 
   "$PYTHON_BIN" - "$output_path" <<'PY'
 import json
