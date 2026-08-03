@@ -1084,6 +1084,8 @@ export function useAppController() {
   const snapshotPromise = useRef<Promise<boolean> | null>(null);
   const runtimeReconnectPromise = useRef<Promise<AppState["runtime"]> | null>(null);
   const inboxAutoSyncTimer = useRef<number | null>(null);
+  /** 任一同步（自动/手动/初始加载/切账号）进行中时置 true，供自动同步定时器判断「本轮是否该跳过」。 */
+  const inboxSyncInProgress = useRef(false);
   const inboxAutoSyncInFlight = useRef(false);
   const inboxAutoSyncPending = useRef<{ mailbox: string; days: number } | null>(null);
   /** 扫描/Ask 进行中切邮箱时，延后 live Gmail 拉取，避免与扫描抢 Host getToken。 */
@@ -1407,6 +1409,8 @@ export function useAppController() {
     const requestKey = `${mailbox}#silent:${++inboxRequestSequence.current}`;
     snapshotRequestMailbox.current = requestKey;
     snapshotPromise.current = null;
+    // 同步置位，避免 setState 渲染前自动同步定时器读到过期「未在同步」状态。
+    inboxSyncInProgress.current = true;
     setState((s) => ({
       ...s,
       inboxSnapshotLoading: true,
@@ -1446,6 +1450,7 @@ export function useAppController() {
       return false;
     } finally {
       if (snapshotRequestMailbox.current === requestKey) {
+        inboxSyncInProgress.current = false;
         setState((s) => ({ ...s, inboxSnapshotLoading: false }));
       }
     }
@@ -1453,6 +1458,10 @@ export function useAppController() {
 
   // 第三方 Gmail 客户端变更只在前台、当前邮箱稳定且没有 AI/列表重任务时同步。
   // 使用递归 timeout 而不是 interval，避免平台较慢时堆叠多个 History invoke。
+  useEffect(() => {
+    inboxSyncInProgress.current = state.inboxSnapshotLoading;
+  }, [state.inboxSnapshotLoading]);
+
   useEffect(() => {
     const AUTO_SYNC_INTERVAL_MS = Number(state.inboxSettings.auto_sync_seconds) * 1000;
     const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
@@ -1481,6 +1490,9 @@ export function useAppController() {
         disposed
         || document.visibilityState !== "visible"
         || inboxAutoSyncInFlight.current
+        // 定时器到点时若仍有任意同步在途（手动/初始/切账号），不再并发重开新一轮。
+        // 直接跳过本轮，等满一个周期后再走同一套判断。
+        || inboxSyncInProgress.current
       ) {
         if (!disposed && document.visibilityState === "visible") schedule();
         return;
