@@ -545,12 +545,23 @@ async def set_inbox_settings(
 # ── Inbox thread assist / draft ─────────────────────────────────────
 
 
-def _inbox_thread_assist_key(mailbox: str, thread_id: str, latest_message_id: str) -> str:
+def _inbox_thread_assist_key(mailbox: str, thread_id: str, latest_message_id: str, locale: str = "en-US") -> str:
+    # locale 进入缓存键：同一线程不同语言的结果分别缓存，避免切换语言后命中另一语言的摘要。
+    locale_part = sanitize_key_part(_normalize_assist_locale(locale))
     return (
         f"{_mailbox_prefix(mailbox)}/inbox-thread-assist/"
         f"{sanitize_key_part(str(thread_id or 'thread'))}/"
-        f"{sanitize_key_part(str(latest_message_id or 'latest'))}"
+        f"{sanitize_key_part(str(latest_message_id or 'latest'))}/"
+        f"{locale_part}"
     )
+
+
+def _normalize_assist_locale(value: str) -> str:
+    """把 zh-CN/en-US 等 locale 收敛为 zh/en，未知值回退 en，保证缓存键与存储值一致。"""
+    raw = str(value or "").strip().lower().replace("_", "-")
+    if raw.startswith("zh"):
+        return "zh"
+    return "en"
 
 
 def _inbox_thread_draft_key(mailbox: str, thread_id: str) -> str:
@@ -560,8 +571,8 @@ def _inbox_thread_draft_key(mailbox: str, thread_id: str) -> str:
     )
 
 
-async def get_inbox_thread_assist(mailbox: str, thread_id: str, latest_message_id: str) -> dict[str, Any]:
-    key = _inbox_thread_assist_key(mailbox, thread_id, latest_message_id)
+async def get_inbox_thread_assist(mailbox: str, thread_id: str, latest_message_id: str, locale: str = "en-US") -> dict[str, Any]:
+    key = _inbox_thread_assist_key(mailbox, thread_id, latest_message_id, locale)
     result = await get_storage().get(key, scope=default_scope())
     value = result.get("value") if result.get("exists") and isinstance(result.get("value"), dict) else {}
     return {
@@ -577,13 +588,15 @@ async def set_inbox_thread_assist(
     latest_message_id: str,
     payload: dict[str, Any],
     *,
+    locale: str = "en-US",
     if_match: str | None = None,
 ) -> dict[str, Any]:
-    key = _inbox_thread_assist_key(mailbox, thread_id, latest_message_id)
+    key = _inbox_thread_assist_key(mailbox, thread_id, latest_message_id, locale)
     stored = {
         **(payload if isinstance(payload, dict) else {}),
         "thread_id": str(thread_id or ""),
         "latest_message_id": str(latest_message_id or ""),
+        "locale": _normalize_assist_locale(locale),
         "updated_at": _now(),
     }
     return await get_storage().set(key, stored, scope=default_scope(), if_match=if_match)

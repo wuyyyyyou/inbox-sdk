@@ -10,6 +10,7 @@ import {
   totalOutgoingAttachmentBytes,
 } from "../../shared/outgoingAttachments";
 import { RecipientChipInput } from "../../shared/RecipientChipInput";
+import { useI18n } from "../../i18n";
 import { RichTextEditor, plainTextToEditorHtml } from "../mail-detail/RichTextEditor";
 import type {
   ComposeDraft,
@@ -79,6 +80,7 @@ export function ComposeView({
   ) => void;
 }) {
   const { actions } = useApp();
+  const { t } = useI18n();
   const [draftId, setDraftId] = useState(initialDraft?.id || "");
   const [etag, setEtag] = useState(initialDraft?.etag || "");
   const [recipients, setRecipients] = useState<string[]>(
@@ -234,9 +236,9 @@ export function ComposeView({
           draft_key: draftId || "",
         });
         if (!begun.ok || !begun.upload_url || !begun.attachment_id || !begun.storage_key) {
-          throw new Error(begun.error || "Failed to stage attachment");
+          throw new Error(begun.error || t("compose.stageFailed"));
         }
-         await putFileToUploadUrl(begun.upload_url, file, begun.upload_headers || {}, (ratio) => {
+        await putFileToUploadUrl(begun.upload_url, file, begun.upload_headers || {}, (ratio) => {
           setAttachments((current) =>
             current.map((item) => (item.id === tempId ? { ...item, progress: ratio } : item)),
           );
@@ -339,14 +341,14 @@ export function ComposeView({
   const saveToDrafts = async () => {
     if (isEmpty) {
       actions.showToast(
-        "Add a recipient, subject, or body before saving a draft.",
+        t("compose.saveRequirement"),
       );
       return;
     }
     const saved = await save();
     if (!saved) return;
-    actions.showToast("Draft saved.", {
-      actionLabel: "View",
+    actions.showToast(t("compose.saved"), {
+      actionLabel: t("compose.view"),
       onAction: onViewDrafts,
     });
     onClose();
@@ -359,7 +361,7 @@ export function ComposeView({
 
   const send = async () => {
     if (!canSend) {
-      setError("Add a valid recipient, subject, and content before sending.");
+      setError(t("compose.invalidSend"));
       return;
     }
     const saved = await save();
@@ -377,7 +379,7 @@ export function ComposeView({
             setFocusField("cc");
           }}
         >
-          Cc
+          {t("compose.cc")}
         </button>
       ) : null}
       {!bccOpen ? (
@@ -389,7 +391,7 @@ export function ComposeView({
             setFocusField("bcc");
           }}
         >
-          Bcc
+          {t("compose.bcc")}
         </button>
       ) : null}
     </div>
@@ -402,48 +404,48 @@ export function ComposeView({
         aria-hidden={!open}
         role="dialog"
         aria-modal="true"
-        aria-label="Compose email"
+        aria-label={t("compose.title")}
       >
         <header className="mail-detail-header compose-header">
           <div className="mail-detail-toolbar">
             <button
               type="button"
               onClick={() => void close()}
-              aria-label="Close compose"
-              data-tooltip="Close compose"
+              aria-label={t("compose.close")}
+              data-tooltip={t("compose.close")}
             >
               <CloseIcon />
             </button>
             <button
               type="button"
               onClick={() => void discard()}
-              aria-label="Discard draft"
-              data-tooltip="Discard draft"
+              aria-label={t("compose.discard")}
+              data-tooltip={t("compose.discard")}
               disabled={saving}
             >
               <TrashIcon />
             </button>
           </div>
           <div className="mail-detail-summary">
-            <h2>{draftId ? "Edit draft" : "New email"}</h2>
+            <h2>{draftId ? t("compose.editDraft") : t("compose.newEmail")}</h2>
             <p className="compose-header-copy">
-              Compose an email from {mailbox}
+              {t("compose.fromMailbox", { mailbox })}
             </p>
           </div>
         </header>
         <RecipientChipInput
-          label="To"
+          label={t("compose.to")}
           emails={recipients}
           onChange={setRecipients}
           mailbox={mailbox}
           searchContacts={actions.searchComposeContacts}
-          placeholder="Name or email"
+          placeholder={t("compose.nameOrEmail")}
           fieldRole="to"
           trailing={!ccOpen || !bccOpen ? ccBccButtons : null}
         />
         {ccOpen ? (
           <RecipientChipInput
-            label="Cc"
+            label={t("compose.cc")}
             emails={cc}
             onChange={setCc}
             mailbox={mailbox}
@@ -459,7 +461,7 @@ export function ComposeView({
         ) : null}
         {bccOpen ? (
           <RecipientChipInput
-            label="Bcc"
+            label={t("compose.bcc")}
             emails={bcc}
             onChange={setBcc}
             mailbox={mailbox}
@@ -474,22 +476,22 @@ export function ComposeView({
           />
         ) : null}
         <label className="compose-field">
-          <span>Subject</span>
+          <span>{t("compose.subject")}</span>
           <input
             value={subject}
             onChange={(event) => setSubject(event.target.value)}
-            placeholder="Add a subject"
+            placeholder={t("compose.subjectPlaceholder")}
           />
         </label>
         <div className="compose-body">
-          <span>Content</span>
+          <span>{t("compose.content")}</span>
           <RichTextEditor
             value={bodyHtml}
             onChange={(value) => {
               setBody(value.text);
               setBodyHtml(value.html);
             }}
-            placeholder="Write your message or key points…"
+            placeholder={t("compose.bodyPlaceholder")}
           />
         </div>
         <OutgoingAttachmentList items={attachments} onRemove={(id) => void removeAttachment(id)} />
@@ -505,8 +507,8 @@ export function ComposeView({
             <button
               type="button"
               className="mail-detail-composer-icon-btn"
-              aria-label="AI draft"
-              data-tooltip="AI draft"
+              aria-label={t("compose.aiDraft")}
+              data-tooltip={t("compose.aiDraft")}
               disabled={saving}
               onClick={() =>
                 onOpenAiDraft({ recipients, cc, bcc, subject, body })
@@ -517,8 +519,8 @@ export function ComposeView({
             <button
               type="button"
               className="mail-detail-composer-icon-btn"
-              aria-label="Save to drafts"
-              data-tooltip="Save to drafts"
+              aria-label={t("compose.saveDraft")}
+              data-tooltip={t("compose.saveDraft")}
               disabled={saving}
               onClick={() => void saveToDrafts()}
             >
@@ -530,7 +532,7 @@ export function ComposeView({
               onClick={() => void send()}
               disabled={saving || !canSend}
             >
-              {saving ? "Saving…" : "Send"}
+              {saving ? t("compose.saving") : t("compose.send")}
             </button>
           </div>
         </footer>
@@ -549,9 +551,9 @@ export function ComposeView({
             aria-describedby="compose-exit-without-saving-description"
             onClick={(event) => event.stopPropagation()}
           >
-            <h3 id="compose-exit-without-saving-title">Cannot save draft</h3>
+            <h3 id="compose-exit-without-saving-title">{t("compose.cannotSave")}</h3>
             <p id="compose-exit-without-saving-description">
-              Add a recipient to save this draft. Exit without saving?
+              {t("compose.exitDescription")}
             </p>
             <div className="confirm-actions">
               <button
@@ -559,7 +561,7 @@ export function ComposeView({
                 className="soft-btn"
                 onClick={() => setExitWithoutSavingConfirmation(false)}
               >
-                Keep editing
+                {t("compose.keepEditing")}
               </button>
               <button
                 type="button"
@@ -569,7 +571,7 @@ export function ComposeView({
                   onClose();
                 }}
               >
-                Exit without saving
+                {t("compose.exitWithoutSaving")}
               </button>
             </div>
           </section>

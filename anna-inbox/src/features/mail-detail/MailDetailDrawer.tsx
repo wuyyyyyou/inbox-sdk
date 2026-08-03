@@ -27,23 +27,25 @@ import {
 import { mailAvatarFallback } from "../../shared/mailIdentity";
 import { OutgoingAttachButton, OutgoingAttachmentList } from "../../shared/OutgoingAttachmentBar";
 import {
-  isBlockedOutgoingFilename,
   isImageOutgoingAttachment,
-  OUTGOING_ATTACHMENT_TOTAL_MAX_BYTES,
   putFileToUploadUrl,
   toPersistedOutgoingAttachments,
   totalOutgoingAttachmentBytes,
+  validateOutgoingAttachment,
 } from "../../shared/outgoingAttachments";
 import { PdfAttachmentPreview } from "./PdfAttachmentPreview";
 import { RichTextEditor, plainTextToEditorHtml, type RichTextValue } from "./RichTextEditor";
+import { useI18n } from "../../i18n/I18nContext";
 import {
   buildForwardDraftBody,
   buildForwardSendBodies,
   buildForwardSubject,
   buildQuickReplyPrompt,
+  deriveReplyAllRecipients,
   deriveReplyToAddress,
   extractForwardNoteHtml,
   estimateAttachmentPreviewMemory,
+  attachmentFallbackMetadata,
   formatAbsoluteDateTime,
   formatAttachmentSize,
   isOutboundMessageForMailbox,
@@ -64,6 +66,7 @@ import {
 } from "./mailDetailHelpers";
 
 type ComposerMode = "reply" | "forward";
+type ReplyMode = "reply_to_sender" | "reply_all";
 
 type ComposerDraftState = {
   id: string;
@@ -171,12 +174,13 @@ function CloseIcon() {
 }
 
 function DownloadButton({ onClick, disabled = false }: { onClick: () => void; disabled?: boolean }) {
+  const { t } = useI18n();
   return (
     <button
       className="attachment-download-button"
       type="button"
-      aria-label="Download"
-      data-tooltip={disabled ? "Preparing download" : "Download"}
+      aria-label={t("detail.download")}
+      data-tooltip={disabled ? t("detail.preparingDownload") : t("detail.download")}
       disabled={disabled}
       onClick={onClick}
     >
@@ -208,8 +212,9 @@ function PreviewToolbarButton({
 }
 
 function PreviewArrow({ direction, onClick, disabled }: { direction: "previous" | "next"; onClick: () => void; disabled: boolean }) {
+  const { t } = useI18n();
   const previous = direction === "previous";
-  const label = previous ? "Previous attachment" : "Next attachment";
+  const label = previous ? t("detail.previousAttachment") : t("detail.nextAttachment");
   return (
     <button
       className={`attachment-preview-arrow is-${direction}`}
@@ -241,8 +246,9 @@ function ThreadMessageAvatar({
 }
 
 function MailDetailLoadingSkeleton() {
+  const { t } = useI18n();
   return (
-    <div className="mail-detail-loading-skeleton" role="status" aria-label="Loading thread">
+    <div className="mail-detail-loading-skeleton" role="status" aria-label={t("detail.loadingThread")}>
       <article className="mail-detail-loading-card">
         <div className="mail-detail-loading-head">
           <span className="mail-detail-loading-avatar" />
@@ -260,14 +266,15 @@ function MailDetailLoadingSkeleton() {
 }
 
 function MailThreadBodyLoading() {
+  const { locale, t } = useI18n();
   return (
-    <div className="mail-thread-message-loading" role="status" aria-label="Loading full message">
+    <div className="mail-thread-message-loading" role="status" aria-label={t("detail.loadingMessage")}>
       <div className="mail-detail-loading-body">
         <span className="mail-detail-loading-line" />
         <span className="mail-detail-loading-line" />
         <span className="mail-detail-loading-line is-short" />
       </div>
-      <p>Loading full message…</p>
+      <p>{t("detail.loadingMessage")}</p>
     </div>
   );
 }
@@ -283,25 +290,35 @@ function AttachmentSection({
   onDownload: (attachment: MailAttachmentMeta) => void;
   isDownloading: (attachment: MailAttachmentMeta) => boolean;
 }) {
+  const { t } = useI18n();
   if (!attachments.length) return null;
+  const fallbackLabel = (category: string): string => {
+    switch (category) {
+      case "office": return t("attach.office");
+      case "calendar": return t("attach.calendar");
+      case "archive": return t("attach.archive");
+      default: return t("attach.download");
+    }
+  };
   return (
     <div className="mail-detail-attachments">
       {attachments.map((attachment) => {
         const previewable = isPreviewableAttachment(attachment);
+        const fallback = attachmentFallbackMetadata(attachment);
         return (
           <article key={attachment.id} className={`mail-detail-attachment${previewable ? " is-previewable" : ""}`}>
             {previewable ? (
               <button
                 className="attachment-preview-hitarea"
                 type="button"
-                aria-label={`Preview ${attachment.filename}`}
+                aria-label={t("detail.previewAttachment", { filename: attachment.filename })}
                 onClick={() => onPreview(attachment)}
               />
             ) : null}
             <div>
               <strong>{attachment.filename}</strong>
               <span>
-                {[attachment.mime_type !== "application/octet-stream" ? attachment.mime_type : "", attachment.size ? formatAttachmentSize(attachment.size) : ""]
+                {[fallbackLabel(fallback.category), attachment.mime_type !== "application/octet-stream" ? attachment.mime_type : "", attachment.size ? formatAttachmentSize(attachment.size) : ""]
                   .filter(Boolean)
                   .join(" · ")}
               </span>
@@ -321,10 +338,10 @@ function firstAddress(value: string | undefined) {
   return candidates[0] || null;
 }
 
-function displayAddress(parts: { name: string; email: string } | null) {
-  if (!parts) return { title: "Unknown", subtitle: "" };
+function displayAddress(parts: { name: string; email: string } | null, unknown = "Unknown") {
+  if (!parts) return { title: unknown, subtitle: "" };
   return {
-    title: parts.name && parts.name !== parts.email ? parts.name : parts.email || "Unknown",
+    title: parts.name && parts.name !== parts.email ? parts.name : parts.email || unknown,
     subtitle: parts.name && parts.email && parts.name !== parts.email ? parts.email : "",
   };
 }
@@ -346,8 +363,10 @@ function HeaderContactRow({
   address: { name: string; email: string } | null;
   avatarUrl?: string;
 }) {
-  const display = displayAddress(address);
-  const sender = address?.name || address?.email || "Unknown";
+  const { t } = useI18n();
+  const unknown = t("mail.unknown");
+  const display = displayAddress(address, unknown);
+  const sender = address?.name || address?.email || unknown;
   return (
     <div className="mail-detail-contact-row">
       <span className="mail-detail-contact-label">{label}:</span>
@@ -371,14 +390,16 @@ function HeaderRecipientRows({
   addresses: Array<{ name: string; email: string }>;
   avatarUrls: Record<string, string | undefined>;
 }) {
+  const { t } = useI18n();
+  const unknown = t("mail.unknown");
   if (!addresses.length) return null;
   return (
     <div className="mail-detail-contact-row mail-detail-contact-row--recipients">
       <span className="mail-detail-contact-label">{label}:</span>
       <div className="mail-detail-contact-recipient-list">
         {addresses.map((address, index) => {
-          const display = displayAddress(address);
-          const sender = address.name || address.email || "Unknown";
+          const display = displayAddress(address, unknown);
+          const sender = address.name || address.email || unknown;
           return (
             <div className="mail-detail-contact-recipient" key={`${address.email}-${index}`}>
               <span className="mail-detail-contact-avatar">
@@ -535,13 +556,13 @@ function AiSparkleIcon() {
   );
 }
 
-function MailOverviewAction({ text, onClick }: { text: string; onClick: () => void }) {
+function MailOverviewAction({ text, onClick, label }: { text: string; onClick: () => void; label: string }) {
   return (
     <button
       type="button"
       className="mail-detail-overview-result"
-      data-tooltip="Expand and discuss summary"
-      aria-label="Expand and discuss summary"
+      data-tooltip={label}
+      aria-label={label}
       onClick={onClick}
     >
       <AiSparkleIcon />
@@ -567,6 +588,7 @@ const ExpandInlineIcon = () => <ToolbarIcon><path d="M9 4H4v5" /><path d="M4 4l6
 const CollapseInlineIcon = () => <ToolbarIcon><path d="M10 4v6H4" /><path d="m4 10 6-6" /><path d="M14 20v-6h6" /><path d="m20 14-6 6" /></ToolbarIcon>;
 const AiDraftIcon = () => <ToolbarIcon><path d="M14.5 4.5 19.5 9.5" /><path d="M5 15.5 15.5 5a2.1 2.1 0 0 1 3 3L8 18.5 4 20l1-4.5Z" /><path d="M19 16v4" /><path d="M17 18h4" /></ToolbarIcon>;
 const ReplyModeIcon = () => <ToolbarIcon><path d="M9 14 4 9l5-5" /><path d="M20 20v-7a4 4 0 0 0-4-4H4" /></ToolbarIcon>;
+const ReplyAllModeIcon = () => <ToolbarIcon><path d="m8 14-5-5 5-5" /><path d="M20 20v-7a4 4 0 0 0-4-4H3" /><path d="m13 14-5-5 5-5" /><path d="M20 20v-3a4 4 0 0 0-4-4h-3" /></ToolbarIcon>;
 const ForwardModeIcon = () => <ToolbarIcon><path d="m15 14 5-5-5-5" /><path d="M4 20v-7a4 4 0 0 1 4-4h12" /></ToolbarIcon>;
 const ModeChevronIcon = () => <ToolbarIcon><path d="m6 9 6 6 6-6" /></ToolbarIcon>;
 
@@ -628,7 +650,7 @@ export function MailDetailDrawer({
     forceRefresh?: boolean;
   }) => Promise<InboxThreadPagePayload>;
   loadInboxMessageDisplayBody: (mailbox: string, messageId: string) => Promise<InboxMessageDisplayBodyPayload>;
-  loadInboxThreadAssist: (mailbox: string, threadId: string, latestMessageId: string, anchorMessageId?: string) => Promise<InboxThreadAssistPayload>;
+  loadInboxThreadAssist: (mailbox: string, threadId: string, latestMessageId: string, anchorMessageId?: string, locale?: string) => Promise<InboxThreadAssistPayload>;
   getInboxThreadDraft: (mailbox: string, threadId: string) => Promise<{
     exists: boolean;
     body: string;
@@ -656,6 +678,7 @@ export function MailDetailDrawer({
     bodyHtml?: string;
     cc?: string[];
     bcc?: string[];
+    replyMode?: ReplyMode;
     message: InboxMessage;
     attachments?: OutgoingAttachmentMeta[];
   }) => boolean;
@@ -691,6 +714,7 @@ export function MailDetailDrawer({
     bodyHtml?: string;
     cc?: string[];
     bcc?: string[];
+    replyMode?: ReplyMode;
     mode?: ComposerMode;
     recipients?: string[];
     composeDraftId?: string;
@@ -707,6 +731,7 @@ export function MailDetailDrawer({
   /** 仅从 Drafts 分类进入详情时为 true：默认展开编辑区并加载已存草稿 */
   autoOpenDraftComposer?: boolean;
 }) {
+  const { locale, t } = useI18n();
   const [page, setPage] = useState<InboxThreadPagePayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -717,6 +742,7 @@ export function MailDetailDrawer({
   const [composerClosing, setComposerClosing] = useState(false);
   const [composerExpanded, setComposerExpanded] = useState(false);
   const [composerMode, setComposerMode] = useState<ComposerMode>("reply");
+  const [replyMode, setReplyMode] = useState<ReplyMode>("reply_to_sender");
   const { actions } = useApp();
   const [modeMenuOpen, setModeMenuOpen] = useState(false);
   const [composerDrafts, setComposerDrafts] = useState<Record<ComposerMode, ComposerDraftState>>(() => ({
@@ -912,6 +938,16 @@ export function MailDetailDrawer({
   );
   const latestMessage = visibleThreadMessages[visibleThreadMessages.length - 1] || page?.messages[page.messages.length - 1];
   const replyToAddress = deriveReplyToAddress(latestMessage, mailbox);
+  const replyAllRecipients = deriveReplyAllRecipients(latestMessage, mailbox);
+  const canReplyAll = replyAllRecipients.cc.length > 0;
+  const effectiveReplyToAddress = replyMode === "reply_all"
+    ? replyAllRecipients.to
+    : replyToAddress;
+  const effectiveReplyCc = replyMode === "reply_all"
+    ? [...replyAllRecipients.cc, ...replyCc].filter((email, index, values) =>
+      values.findIndex((candidate) => candidate.toLowerCase() === email.toLowerCase()) === index,
+    )
+    : replyCc;
   const important = Boolean(latestMessage?.label_ids?.includes("IMPORTANT") || message?.important);
   const starred = Boolean(latestMessage?.label_ids?.includes("STARRED") || message?.starred);
   const trashed = Boolean(latestMessage?.label_ids?.includes("TRASH") || message?.label_ids?.includes("TRASH"));
@@ -940,8 +976,21 @@ export function MailDetailDrawer({
     // 仅在需要回复时展示 draft 快捷提示；无需回复时由后端清空 quick_replies
     if (assist?.needs_reply === false) return [];
     const generated = (assist?.quick_replies || []).filter((item) => item.label && item.intent);
-    return generated;
-  }, [assist?.needs_reply, assist?.quick_replies]);
+    const localizedLabels: Record<string, string> = {
+      "ready_to_start": t("detail.quickReply.readyToStart"),
+      "reviewing_with_team": t("detail.quickReply.reviewingWithTeam"),
+      "provide_status_update": t("detail.quickReply.provideStatusUpdate"),
+      "request_more_time": t("detail.quickReply.requestMoreTime"),
+      "ready to start": t("detail.quickReply.readyToStart"),
+      "reviewing with team": t("detail.quickReply.reviewingWithTeam"),
+      "provide status update": t("detail.quickReply.provideStatusUpdate"),
+      "request more time": t("detail.quickReply.requestMoreTime"),
+    };
+    return generated.map((item) => ({
+      ...item,
+      label: localizedLabels[String(item.id || "").toLowerCase()] || localizedLabels[String(item.label || "").toLowerCase()] || item.label,
+    }));
+  }, [assist?.needs_reply, assist?.quick_replies, t]);
   const noReplyReason = String(assist?.no_reply_reason || "").trim();
   const showNoReplyNotice = Boolean(
     context
@@ -968,7 +1017,7 @@ export function MailDetailDrawer({
     const avatars = { ...contactAvatars, ...resolvedAvatars };
     return Object.fromEntries(toAddresses.map((address) => [address.email.toLowerCase(), avatars[address.email.toLowerCase()]]));
   }, [contactAvatars, resolvedAvatars, toAddresses]);
-  const displaySubject = page?.subject || message?.subject || "(no subject)";
+  const displaySubject = page?.subject || message?.subject || t("mail.noSubject");
   const latestSubject = page?.latest_subject || message?.latest_subject || "";
   const subjectWasModified = Boolean(
     latestSubject
@@ -1129,12 +1178,12 @@ export function MailDetailDrawer({
         setAssistLoading(false);
         return;
       }
-      const requestKey = `${mailbox}:${threadId}:${latestMessageId}:${messageId}`;
+      const requestKey = `${mailbox}:${threadId}:${latestMessageId}:${messageId}:${locale}`;
       if (assistRequestKeyRef.current === requestKey) return;
       assistRequestKeyRef.current = requestKey;
       setAssistError("");
       setAssistLoading(true);
-      void loadInboxThreadAssistRef.current(mailbox, threadId, latestMessageId, messageId)
+      void loadInboxThreadAssistRef.current(mailbox, threadId, latestMessageId, messageId, locale)
         .then((result) => {
           if (!cancelled && assistRequestKeyRef.current === requestKey) setAssist(result);
         })
@@ -1291,7 +1340,7 @@ export function MailDetailDrawer({
             initialBottomScrollDoneRef.current = true;
           });
         }
-        const requestKey = `${mailbox}:${threadId}:${visiblePage.latest_message_id || latestThreadMessageId}:${messageId}`;
+        const requestKey = `${mailbox}:${threadId}:${visiblePage.latest_message_id || latestThreadMessageId}:${messageId}:${locale}`;
         if (assistRequestKeyRef.current !== requestKey) {
           assistRequestKeyRef.current = requestKey;
           setAssistError("");
@@ -1301,6 +1350,7 @@ export function MailDetailDrawer({
             threadId,
             visiblePage.latest_message_id || latestThreadMessageId,
             messageId,
+            locale,
           )
             .then((result) => {
               if (!cancelled && assistRequestKeyRef.current === requestKey) setAssist(result);
@@ -1322,7 +1372,7 @@ export function MailDetailDrawer({
     return () => {
       cancelled = true;
     };
-  }, [latestThreadMessageId, mailbox, messageId, open, threadId]);
+  }, [latestThreadMessageId, locale, mailbox, messageId, open, threadId]);
 
   useEffect(() => {
     setResolvedAvatars(contactAvatars || {});
@@ -1395,6 +1445,7 @@ export function MailDetailDrawer({
     setComposerOpen(true);
     const restoreMode = replyDraftRestore.mode || "reply";
     setComposerMode(restoreMode);
+    setReplyMode(replyDraftRestore.replyMode || "reply_to_sender");
     updateComposerDraft(restoreMode, (current) => ({
       ...current,
       body: replyDraftRestore.body,
@@ -1936,22 +1987,22 @@ export function MailDetailDrawer({
     aiDraftModeRef.current = composerMode;
     void submitPrompt(
       composerMode === "forward"
-        ? "Write a concise note to accompany forwarding the current thread"
-        : "Write a first draft reply to the current thread",
+        ? t("detail.prompt.forwardNote")
+        : t("detail.prompt.draftReply"),
       "draft_reply",
       true,
     );
   };
 
   const expandOverview = () => {
-    void submitPrompt("Summarize this thread", "summary", true);
+    void submitPrompt(t("detail.prompt.summarizeThread"), "summary", true);
   };
 
   const retryOverview = () => {
     if (!context || context.kind !== "gmail_thread") return;
     setAssistError("");
     setAssistLoading(true);
-    void loadInboxThreadAssist(mailbox, context.thread_id, context.latest_message_id, context.anchor_message_id)
+    void loadInboxThreadAssist(mailbox, context.thread_id, context.latest_message_id, context.anchor_message_id, locale)
       .then(setAssist)
       .catch((reason) => setAssistError(reason instanceof Error ? reason.message : String(reason)))
       .finally(() => setAssistLoading(false));
@@ -1973,6 +2024,7 @@ export function MailDetailDrawer({
       return;
     }
     setComposerMode("reply");
+    setReplyMode("reply_to_sender");
     requestAnimationFrame(() => bodyRef.current?.focus());
   };
 
@@ -1990,6 +2042,7 @@ export function MailDetailDrawer({
     }
     clearEmptyForwardDraft();
     setComposerMode("reply");
+    setReplyMode("reply_to_sender");
   };
 
   const stageComposerFiles = async (files: FileList) => {
@@ -1997,13 +2050,10 @@ export function MailDetailDrawer({
     if (!list.length) return;
     let runningTotal = totalOutgoingAttachmentBytes(composerAttachments.filter((item) => item.status !== "error"));
     for (const file of list) {
-      if (isBlockedOutgoingFilename(file.name)) {
-        showToast(`Blocked file type: ${file.name}`);
+      const validation = validateOutgoingAttachment(file, runningTotal);
+      if (!validation.ok) {
+        showToast(validation.error || `Attachment rejected: ${file.name}`);
         continue;
-      }
-      if (runningTotal + file.size > OUTGOING_ATTACHMENT_TOTAL_MAX_BYTES) {
-        showToast("Total attachments must stay within 25 MB.");
-        break;
       }
       const tempId = crypto.randomUUID().replace(/-/g, "");
       const localPreview = isImageOutgoingAttachment({ filename: file.name, mime_type: file.type })
@@ -2132,7 +2182,7 @@ export function MailDetailDrawer({
       }
       return;
     }
-    const to = deriveReplyToAddress(latestMessage, mailbox);
+    const to = effectiveReplyToAddress;
     if (!to) {
       showToast("Reply recipient is unavailable.");
       return;
@@ -2170,8 +2220,9 @@ export function MailDetailDrawer({
         to,
         body: draft,
         bodyHtml: draftHtml || undefined,
-        cc: replyCc,
+        cc: effectiveReplyCc,
         bcc: replyBcc,
+        replyMode,
         message,
         attachments: readyAttachments,
       })) return;
@@ -2225,7 +2276,7 @@ export function MailDetailDrawer({
     } else {
       clearEmptyForwardDraft();
     }
-    if (composerMode === "reply" && draftDirty && draft.trim()) showToast("Draft saved to Drafts.");
+    if (composerMode === "reply" && draftDirty && draft.trim()) showToast(t("detail.draftSaved"));
     onClose();
   };
 
@@ -2259,21 +2310,21 @@ export function MailDetailDrawer({
       <aside className={`mail-detail-drawer ${open ? "is-open" : ""}`} aria-hidden={!open}>
         <header className="mail-detail-header">
           <div className="mail-detail-toolbar">
-            <button aria-label="Close thread" data-tooltip="Close thread" onClick={() => void closeThread()}><CloseThreadIcon /></button>
+            <button aria-label={t("detail.closeThread")} data-tooltip={t("detail.closeThread")} onClick={() => void closeThread()}><CloseThreadIcon /></button>
             {trashed ? (
-              <button className="is-active is-trashed" aria-label="Remove from trash" data-tooltip="Remove from trash" disabled={toolbarPending} onClick={() => void runThreadAction("untrash")}><TrashOffIcon /></button>
+              <button className="is-active is-trashed" aria-label={t("detail.removeFromTrash")} data-tooltip={t("detail.removeFromTrash")} disabled={toolbarPending} onClick={() => void runThreadAction("untrash")}><TrashOffIcon /></button>
             ) : (
               <>
-                <button aria-label="Mark unread" data-tooltip="Mark unread" disabled={toolbarPending} onClick={() => void runThreadAction("mark_unread")}><MarkUnreadIcon /></button>
-                <button className={starred ? "is-active is-starred" : ""} aria-label={starred ? "Remove stars" : "Add stars"} data-tooltip={starred ? "Remove stars" : "Add stars"} disabled={toolbarPending} onClick={() => void runThreadAction(starred ? "unstar" : "star")}><StarIcon /></button>
-                <button className={important ? "is-active is-important" : ""} aria-label={important ? "Mark not important" : "Mark important"} data-tooltip={important ? "Mark not important" : "Mark important"} disabled={toolbarPending} onClick={() => void runThreadAction(important ? "mark_not_important" : "mark_important")}><ImportantIcon /></button>
-                <button className={isTodo ? "is-active is-todo" : ""} aria-label={isTodo ? "Click Done to remove" : "Add to Todo"} data-tooltip={isTodo ? "Click Done to remove" : "Add to Todo"} disabled={toolbarPending || isTodo} onClick={() => onTodoMessage(message)}><TodoIcon /></button>
-                <button className={isSnoozed ? "is-active is-snoozed" : ""} aria-label={isSnoozed ? "Remove from snoozed" : "Snooze"} data-tooltip={isSnoozed ? "Remove from snoozed" : "Snooze"} disabled={toolbarPending} onClick={() => onSnoozeMessage(message)}><ClockIcon /></button>
-                <button aria-label="Move to trash" data-tooltip="Move to trash" disabled={toolbarPending} onClick={() => void runThreadAction("trash")}><TrashIcon /></button>
+                <button aria-label={t("detail.markUnread")} data-tooltip={t("detail.markUnread")} disabled={toolbarPending} onClick={() => void runThreadAction("mark_unread")}><MarkUnreadIcon /></button>
+                <button className={starred ? "is-active is-starred" : ""} aria-label={starred ? t("detail.star.remove") : t("detail.star.add")} data-tooltip={starred ? t("detail.star.remove") : t("detail.star.add")} disabled={toolbarPending} onClick={() => void runThreadAction(starred ? "unstar" : "star")}><StarIcon /></button>
+                <button className={important ? "is-active is-important" : ""} aria-label={important ? t("detail.important.remove") : t("detail.important.add")} data-tooltip={important ? t("detail.important.remove") : t("detail.important.add")} disabled={toolbarPending} onClick={() => void runThreadAction(important ? "mark_not_important" : "mark_important")}><ImportantIcon /></button>
+                <button className={isTodo ? "is-active is-todo" : ""} aria-label={isTodo ? t("detail.todo.remove") : t("detail.todo.add")} data-tooltip={isTodo ? t("detail.todo.remove") : t("detail.todo.add")} disabled={toolbarPending || isTodo} onClick={() => onTodoMessage(message)}><TodoIcon /></button>
+                <button className={isSnoozed ? "is-active is-snoozed" : ""} aria-label={isSnoozed ? t("detail.snooze.remove") : t("detail.snooze.add")} data-tooltip={isSnoozed ? t("detail.snooze.remove") : t("detail.snooze.add")} disabled={toolbarPending} onClick={() => onSnoozeMessage(message)}><ClockIcon /></button>
+                <button aria-label={t("detail.moveToTrash")} data-tooltip={t("detail.moveToTrash")} disabled={toolbarPending} onClick={() => void runThreadAction("trash")}><TrashIcon /></button>
                 <button
                   className={isDone ? "is-active is-done" : ""}
-                  aria-label={isSent ? "Sent and done" : isDone ? "Move to inbox" : "Done"}
-                  data-tooltip={isSent ? "Sent and done" : isDone ? "Move to inbox" : "Done"}
+                  aria-label={isSent ? t("detail.done.sent") : isDone ? t("detail.done.moveToInbox") : t("detail.done")}
+                  data-tooltip={isSent ? t("detail.done.sent") : isDone ? t("detail.done.moveToInbox") : t("detail.done")}
                   disabled={toolbarPending || isSent}
                   onClick={() => onDoneMessage(message)}
                 ><DoneIcon /></button>
@@ -2283,15 +2334,15 @@ export function MailDetailDrawer({
           <div className="mail-detail-summary">
             <h2>{displaySubject}</h2>
             {subjectWasModified ? (
-              <p className="mail-detail-subject-note">Latest message subject: {latestSubject}</p>
+              <p className="mail-detail-subject-note">{t("detail.latestSubject", { subject: latestSubject })}</p>
             ) : null}
             <div className="mail-detail-overview">
-              {assistLoading ? <p className="mail-detail-overview-loading">Generating overview...</p> : assist?.overview ? <MailOverviewAction text={assist.overview} onClick={expandOverview} /> : assistError ? <p>AI is unavailable. <button onClick={retryOverview}>Retry</button></p> : null}
+              {assistLoading ? <p className="mail-detail-overview-loading">{t("detail.generatingOverview")}</p> : assist?.overview ? <MailOverviewAction text={assist.overview} label={t("detail.expandDiscuss")} onClick={expandOverview} /> : assistError ? <p>{t("detail.aiUnavailable")} <button onClick={retryOverview}>{t("detail.retry")}</button></p> : null}
             </div>
             {fromAddress || toAddresses.length ? (
               <div className="mail-detail-participants">
-                <HeaderContactRow label="From" address={fromAddress} avatarUrl={fromAvatarUrl} />
-                <HeaderRecipientRows label="To" addresses={toAddresses} avatarUrls={recipientAvatarUrls} />
+                <HeaderContactRow label={t("detail.from")} address={fromAddress} avatarUrl={fromAvatarUrl} />
+                <HeaderRecipientRows label={t("detail.to")} addresses={toAddresses} avatarUrls={recipientAvatarUrls} />
               </div>
             ) : null}
           </div>
@@ -2299,9 +2350,9 @@ export function MailDetailDrawer({
 
         <div className="mail-detail-context" ref={scrollRef}>
           <div className="mail-detail-thread">
-          {page?.has_earlier ? <button className="mail-detail-load-earlier" onClick={() => void loadEarlier()}>Load earlier messages</button> : null}
+          {page?.has_earlier ? <button className="mail-detail-load-earlier" onClick={() => void loadEarlier()}>{t("detail.loadEarlier")}</button> : null}
           {loading && !page ? <MailDetailLoadingSkeleton /> : null}
-          {error ? <div className="mail-detail-error">Thread failed to load. {error}</div> : null}
+          {error ? <div className="mail-detail-error">{t("detail.threadLoadFailed")} {error}</div> : null}
           {(visibleThreadMessages.length ? visibleThreadMessages : []).map((item) => {
             const hasDisplayBody = Boolean(item.body_html?.trim() || item.body_text?.trim());
             const waitForFullBody = !hasDisplayBody
@@ -2328,12 +2379,12 @@ export function MailDetailDrawer({
                             avatarUrl={resolvedAvatars[email] || contactAvatars?.[email]}
                           />
                         </span>
-                        <strong>{sender.name || sender.email || "Unknown sender"}</strong>
+                        <strong>{sender.name || sender.email || t("mail.unknownSender")}</strong>
                       </>
                     );
                   })()}
                 </div>
-                <time>{formatAbsoluteDateTime(item.internal_date)}</time>
+                <time>{formatAbsoluteDateTime(item.internal_date, locale)}</time>
               </div>
               {waitForFullBody ? <MailThreadBodyLoading /> : item.body_html ? <SafeEmailHtml className="mail-thread-message-body is-html" html={item.body_html} scaleToFit /> : hasDisplayBody ? <SafeEmailText className="mail-thread-message-body" text={stripQuotedReplyForDisplay(item.body_text || "")} /> : null}
               {displayBodyErrors[item.id] ? (
@@ -2352,7 +2403,7 @@ export function MailDetailDrawer({
             );
           })}
           {showQuickReplies ? (
-            <section className="mail-detail-quick-replies" aria-label="Quick reply prompts">
+            <section className="mail-detail-quick-replies" aria-label={t("detail.quickReplies")}>
               {quickReplySuggestions.map((item) => (
                 <button key={item.id} onClick={() => void submitPrompt(buildQuickReplyPrompt(item))}>
                   <AiSparkleIcon />
@@ -2362,9 +2413,9 @@ export function MailDetailDrawer({
             </section>
           ) : null}
           {showNoReplyNotice ? (
-            <section className="mail-detail-no-reply-notice" aria-label="No reply needed">
+            <section className="mail-detail-no-reply-notice" aria-label={t("detail.noReplyNeeded")}>
               <p>
-                <strong>No reply needed.</strong>
+                <strong>{t("detail.noReplyNeeded")}</strong>
                 {noReplyReason ? ` ${noReplyReason}` : ""}
               </p>
             </section>
@@ -2379,17 +2430,42 @@ export function MailDetailDrawer({
                 <button
                   type="button"
                   className="mail-detail-reply-action"
-                  aria-label="Reply"
-                  data-tooltip="Reply"
+                  aria-label={t("detail.reply")}
+                  data-tooltip={t("detail.reply")}
                   onClick={() => openComposer("reply")}
                 >
                   <ReplyModeIcon />
                 </button>
+                {canReplyAll ? <button
+                  type="button"
+                  className="mail-detail-reply-action mail-detail-reply-all-action"
+                  aria-label={t("detail.replyAll")}
+                  data-tooltip={t("detail.replyAll")}
+                  onClick={() => {
+                    const recipients = deriveReplyAllRecipients(latestMessage, mailbox);
+                    if (!recipients.to) {
+                      showToast("Reply All recipients are unavailable.");
+                      return;
+                    }
+                    setComposerClosing(false);
+                    setComposerOpen(true);
+                    setComposerMode("reply");
+                    setReplyMode("reply_all");
+                    updateComposerDraft("reply", (current) => ({
+                      ...current,
+                      cc: current.cc.length ? current.cc : recipients.cc,
+                      ccOpen: Boolean(current.cc.length || recipients.cc.length),
+                    }));
+                    requestAnimationFrame(() => bodyRef.current?.focus());
+                  }}
+                >
+                  <ReplyAllModeIcon />
+                </button> : null}
                 <button
                   type="button"
                   className="mail-detail-reply-action"
-                  aria-label="Forward"
-                  data-tooltip="Forward"
+                  aria-label={t("detail.forward")}
+                  data-tooltip={t("detail.forward")}
                   onClick={() => openComposer("forward")}
                 >
                   <ForwardModeIcon />
@@ -2403,7 +2479,7 @@ export function MailDetailDrawer({
                       <button
                         type="button"
                         className="mail-detail-mode-btn"
-                        aria-label={composerMode === "forward" ? "Forward mode" : "Reply mode"}
+                        aria-label={composerMode === "forward" ? t("detail.forwardMode") : replyMode === "reply_all" ? t("detail.replyAllMode") : t("detail.replyMode")}
                         aria-expanded={modeMenuOpen}
                         onClick={() => setModeMenuOpen((value) => !value)}
                       >
@@ -2415,12 +2491,35 @@ export function MailDetailDrawer({
                           <button
                             type="button"
                             role="menuitem"
-                            className={composerMode === "reply" ? "is-active" : ""}
+                            className={composerMode === "reply" && replyMode === "reply_to_sender" ? "is-active" : ""}
                             onClick={() => switchComposerMode("reply")}
                           >
                             <ReplyModeIcon />
-                            <span>Reply</span>
+                            <span>{t("detail.reply")}</span>
                           </button>
+                          {canReplyAll ? <button
+                            type="button"
+                            role="menuitem"
+                            className={composerMode === "reply" && replyMode === "reply_all" ? "is-active" : ""}
+                            onClick={() => {
+                              const recipients = deriveReplyAllRecipients(latestMessage, mailbox);
+                              if (!recipients.to) {
+                                showToast("Reply All recipients are unavailable.");
+                                return;
+                              }
+                              setComposerMode("reply");
+                              setReplyMode("reply_all");
+                              setModeMenuOpen(false);
+                              updateComposerDraft("reply", (current) => ({
+                                ...current,
+                                cc: current.cc.length ? current.cc : recipients.cc,
+                                ccOpen: Boolean(current.cc.length || recipients.cc.length),
+                              }));
+                            }}
+                          >
+                            <ReplyAllModeIcon />
+                            <span>{t("detail.replyAll")}</span>
+                          </button> : null}
                           <button
                             type="button"
                             role="menuitem"
@@ -2428,7 +2527,7 @@ export function MailDetailDrawer({
                             onClick={() => switchComposerMode("forward")}
                           >
                             <ForwardModeIcon />
-                            <span>Forward</span>
+                            <span>{t("detail.forward")}</span>
                           </button>
                         </div>
                       ) : null}
@@ -2436,21 +2535,21 @@ export function MailDetailDrawer({
                     {composerMode === "forward" ? (
                       <div className="mail-detail-forward-to">
                         <RecipientChipInput
-                          label="To"
+                          label={t("detail.to")}
                           emails={forwardTo}
                           onChange={setForwardTo}
                           mailbox={mailbox}
                           searchContacts={searchComposeContacts}
                           fieldRole="to"
-                          placeholder="Enter a name or email"
+                          placeholder={t("detail.forwardToPlaceholder")}
                         />
                       </div>
                     ) : (
                       <div className="mail-detail-forward-to">
-                        {!loading && replyToAddress ? (
+                        {!loading && effectiveReplyToAddress ? (
                           <RecipientChipInput
-                            label="To"
-                            emails={[replyToAddress]}
+                            label={t("detail.to")}
+                            emails={[effectiveReplyToAddress]}
                             onChange={() => undefined}
                             mailbox={mailbox}
                             searchContacts={searchComposeContacts}
@@ -2493,8 +2592,8 @@ export function MailDetailDrawer({
                     ) : null}
                     <button
                       className="mail-detail-composer-icon-btn"
-                      aria-label={composerExpanded ? "Collapse inline" : "Expand inline"}
-                      data-tooltip={composerExpanded ? "Collapse inline" : "Expand inline"}
+                      aria-label={composerExpanded ? t("detail.collapse") : t("detail.expand")}
+                      data-tooltip={composerExpanded ? t("detail.collapse") : t("detail.expand")}
                       onClick={() => setComposerExpanded((value) => !value)}
                     >
                       {composerExpanded ? <CollapseInlineIcon /> : <ExpandInlineIcon />}
@@ -2502,8 +2601,8 @@ export function MailDetailDrawer({
                     <OutgoingAttachButton disabled={sending} onPick={(files) => void stageComposerFiles(files)} />
                     <button
                       className="mail-detail-composer-icon-btn"
-                      aria-label={composerMode === "forward" ? "AI forward note" : "AI draft"}
-                      data-tooltip={composerMode === "forward" ? "AI forward note" : "AI draft"}
+                      aria-label={composerMode === "forward" ? t("detail.aiForwardNote") : t("detail.aiDraft")}
+                      data-tooltip={composerMode === "forward" ? t("detail.aiForwardNote") : t("detail.aiDraft")}
                       disabled={aiBusy || !context}
                       onClick={requestAiDraft}
                     >
@@ -2511,8 +2610,8 @@ export function MailDetailDrawer({
                     </button>
                     <button
                       className="mail-detail-composer-icon-btn"
-                      aria-label="Discard draft"
-                      data-tooltip="Discard draft"
+                      aria-label={t("detail.discardDraft")}
+                      data-tooltip={t("detail.discardDraft")}
                       onClick={() => void discardDraft()}
                     >
                       <TrashIcon />
@@ -2560,10 +2659,10 @@ export function MailDetailDrawer({
                         ref={bodyRef}
                         value={draftHtml || plainTextToEditorHtml(forwardNote)}
                         onChange={updateForwardNote}
-                        placeholder="Add a message…"
+                        placeholder={t("detail.forwardMessagePlaceholder")}
                       />
                       {forwardQuote ? (
-                        <div className="mail-detail-forward-quote" aria-label="Forwarded email content">
+                        <div className="mail-detail-forward-quote" aria-label={t("detail.forwardedContent")}>
                           <pre>{forwardQuote}</pre>
                         </div>
                       ) : null}
@@ -2577,7 +2676,7 @@ export function MailDetailDrawer({
                         setDraftContent(value);
                         setDraftDirty(true);
                       }}
-                      placeholder="Write your reply…"
+                      placeholder={t("detail.replyPlaceholder")}
                     />
                   )}
                 </div>
@@ -2604,7 +2703,7 @@ export function MailDetailDrawer({
 
       {previewAttachment ? (
         <div className="attachment-preview-modal" role="dialog" aria-modal="true" aria-label={previewAttachment.attachment.filename}>
-          <button className="attachment-preview-backdrop" aria-label="Close attachment preview" onClick={closePreview} />
+          <button className="attachment-preview-backdrop" aria-label={t("detail.closePreview")} onClick={closePreview} />
           <div className="attachment-preview-sheet">
             <header>
               <strong>{previewIndex + 1} / {previewableAttachments.length} - {previewAttachment.attachment.filename}</strong>

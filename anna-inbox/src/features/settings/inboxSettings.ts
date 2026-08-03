@@ -1,6 +1,7 @@
 import type { InboxMessage, InboxSettings } from "../../types/mail";
 import { matchInboxQuery, parseInboxQuery } from "../search/inboxQuery";
 import { senderParts } from "../../shared/mailIdentity";
+import { tFallback, type Locale, type TranslateFn } from "../../i18n";
 
 /** Settings 中暴露的 LLM 状态轮询档位（秒） */
 export const LLM_STATUS_POLL_OPTIONS = [0, 30, 60, 120, 300] as const;
@@ -15,7 +16,7 @@ export const DEFAULT_INBOX_SETTINGS: InboxSettings = {
   todos_enabled: true,
   todos_limit: 10,
   llm_status_poll_seconds: 60,
-  auto_sync_seconds: 5,
+  auto_sync_seconds: 15,
   custom_categories: [],
 };
 
@@ -158,18 +159,25 @@ function splitMessageDate(message: InboxMessage): Date | null {
   return Number.isFinite(milliseconds) ? new Date(milliseconds) : null;
 }
 
-function defaultSplitGroupLabel(message: InboxMessage, mode: InboxSettings["time_section_mode"]): string {
+function defaultSplitGroupLabel(
+  message: InboxMessage,
+  mode: InboxSettings["time_section_mode"],
+  t: TranslateFn = tFallback,
+  locale: Locale = "en-US",
+): string {
   const date = splitMessageDate(message);
-  if (!date) return "LAST 30 DAYS";
+  if (!date) return t("mail.group.last30");
   const now = new Date();
-  if (mode === "detailed" && date.toDateString() === now.toDateString()) return "TODAY";
+  if (mode === "detailed" && date.toDateString() === now.toDateString()) return t("mail.group.today");
   const yesterday = new Date(now);
   yesterday.setDate(now.getDate() - 1);
-  if (mode === "detailed" && date.toDateString() === yesterday.toDateString()) return "YESTERDAY";
+  if (mode === "detailed" && date.toDateString() === yesterday.toDateString()) return t("mail.group.yesterday");
   const daysAgo = Math.floor((now.getTime() - date.getTime()) / (24 * 60 * 60 * 1000));
-  if (daysAgo < 7 && mode !== "months_only") return "LAST 7 DAYS";
-  if (daysAgo < 30 && mode !== "months_only") return "EARLIER THIS MONTH";
-  return `EARLIER IN ${date.toLocaleDateString("en-US", { month: "long" }).toUpperCase()}`;
+  if (daysAgo < 7 && mode !== "months_only") return t("mail.group.last7");
+  if (daysAgo < 30 && mode !== "months_only") return t("mail.group.earlierThisMonth");
+  return t("mail.group.earlierIn", {
+    month: date.toLocaleDateString(locale, { month: "long" }),
+  });
 }
 
 /** 根据 Split 的 bundling 选项返回稳定的展示分组，调用方继续负责邮件排序。 */
@@ -177,14 +185,16 @@ export function groupSplitMessages(
   messages: InboxMessage[],
   behavior: "default" | "by_sender" | "none",
   timeSectionMode: InboxSettings["time_section_mode"],
+  t: TranslateFn = tFallback,
+  locale: Locale = "en-US",
 ): InboxSplitGroup[] {
   if (behavior === "none") return [{ label: "", messages }];
   const groups = new Map<string, InboxMessage[]>();
   for (const message of messages) {
     const sender = senderParts(message.from);
     const label = behavior === "by_sender"
-      ? sender.name || sender.email || "Unknown sender"
-      : defaultSplitGroupLabel(message, timeSectionMode);
+      ? sender.name || sender.email || t("mail.sender.unknown")
+      : defaultSplitGroupLabel(message, timeSectionMode, t, locale);
     groups.set(label, [...(groups.get(label) || []), message]);
   }
   return [...groups.entries()].map(([label, groupedMessages]) => ({ label, messages: groupedMessages }));

@@ -54,6 +54,12 @@ describe("mail detail complete body", () => {
     expect(cacheRender).toBeGreaterThan(cacheRead);
     expect(cacheRender).toBeLessThan(backgroundRefresh);
   });
+
+  it("keeps the cached mailbox snapshot when the active mailbox changes", () => {
+    const rangeEffect = homeViewSource.match(/const appliedDisplayRangeRef[\s\S]*?const lastSyncedLabel/)?.[0] || "";
+    expect(rangeEffect).toContain("void syncInbox(configuredDays);");
+    expect(rangeEffect).not.toContain("void syncInbox(configuredDays, true);");
+  });
 });
 
 describe("legacy AI draft preview", () => {

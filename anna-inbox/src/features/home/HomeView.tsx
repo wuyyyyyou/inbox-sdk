@@ -11,6 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import { useApp } from "../../app/AppContext";
+import { useI18n, tFallback, type Locale, type MessageKey, type TranslateFn } from "../../i18n";
 import type {
   AiChatMessage,
   AiComposeContextRef,
@@ -196,18 +197,35 @@ export function isAiConversationNearBottom(
   );
 }
 
-const MAILBOX_VIEWS: Array<{ id: MailboxView; label: string }> = [
-  { id: "inbox", label: "Inbox" },
-  { id: "todos", label: "Todos" },
-  { id: "starred", label: "Starred" },
-  { id: "snoozed", label: "Snoozed" },
-  { id: "done", label: "Done" },
-  { id: "drafts", label: "Drafts" },
-  { id: "sent", label: "Sent" },
-  { id: "trash", label: "Trash" },
-  { id: "spam", label: "Spam" },
-  { id: "all", label: "All mail" },
+const MAILBOX_VIEW_IDS: MailboxView[] = [
+  "inbox",
+  "todos",
+  "starred",
+  "snoozed",
+  "done",
+  "drafts",
+  "sent",
+  "trash",
+  "spam",
+  "all",
 ];
+
+const MAILBOX_VIEW_LABEL_KEYS: Record<MailboxView, MessageKey> = {
+  inbox: "mail.folder.inbox",
+  todos: "mail.folder.todos",
+  starred: "mail.folder.starred",
+  snoozed: "mail.folder.snoozed",
+  done: "mail.folder.done",
+  drafts: "mail.folder.drafts",
+  sent: "mail.folder.sent",
+  trash: "mail.folder.trash",
+  spam: "mail.folder.spam",
+  all: "mail.folder.all",
+};
+
+function mailboxViewLabel(view: MailboxView, t: TranslateFn): string {
+  return t(MAILBOX_VIEW_LABEL_KEYS[view]);
+}
 
 function isLocalMailboxView(
   view: MailboxView,
@@ -530,6 +548,7 @@ export function messageParticipant(
   message: InboxMessage,
   mailboxView: MailboxView,
   mailbox: string,
+  t: TranslateFn = tFallback,
 ) {
   const labels = new Set(
     (message.label_ids || []).map((label) => label.toUpperCase()),
@@ -584,7 +603,7 @@ export function messageParticipant(
     return outgoingParticipant();
   }
 
-  const fallbackName = draft ? "Draft" : "No sender";
+  const fallbackName = draft ? t("mail.sender.draft") : t("mail.sender.none");
   return {
     name: sender.name === "Unknown sender" ? fallbackName : sender.name,
     title: String(message.from || fallbackName),
@@ -611,22 +630,22 @@ function messageDate(message: InboxMessage) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function dateLabel(message: InboxMessage) {
+function dateLabel(message: InboxMessage, t: TranslateFn = tFallback, locale: Locale = "en-US") {
   const date = messageDate(message);
   if (!date) return "";
   const now = new Date();
   if (date.toDateString() === now.toDateString())
-    return date.toLocaleTimeString("en-US", {
+    return date.toLocaleTimeString(locale, {
       hour: "2-digit",
       minute: "2-digit",
     });
   const yesterday = new Date(now);
   yesterday.setDate(now.getDate() - 1);
-  if (date.toDateString() === yesterday.toDateString()) return "Yesterday";
-  return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  if (date.toDateString() === yesterday.toDateString()) return t("mail.date.yesterday");
+  return date.toLocaleDateString(locale, { month: "short", day: "numeric" });
 }
 
-function snoozeUntilLabel(value: string | undefined) {
+function snoozeUntilLabel(value: string | undefined, t: TranslateFn = tFallback, locale: Locale = "en-US") {
   if (!value) return "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
@@ -638,11 +657,11 @@ function snoozeUntilLabel(value: string | undefined) {
   );
   const dayLabel =
     days === 0
-      ? "Today"
+      ? t("mail.snooze.today")
       : days === 1
-        ? "Tomorrow"
+        ? t("mail.snooze.tomorrow")
         : date.toLocaleDateString(
-            "en-US",
+            locale,
             days > 1 && days < 7
               ? { weekday: "short" }
               : { month: "short", day: "numeric" },
@@ -654,52 +673,49 @@ function snoozeUntilLabel(value: string | undefined) {
 function groupLabel(
   message: InboxMessage,
   mode: "detailed" | "recent_then_months" | "months_only" = "detailed",
+  t: TranslateFn = tFallback,
+  locale: Locale = "en-US",
 ) {
   const date = messageDate(message);
-  if (!date) return "LAST 30 DAYS";
+  if (!date) return t("mail.group.last30");
   const now = new Date();
   if (mode === "detailed" && date.toDateString() === now.toDateString())
-    return "TODAY";
+    return t("mail.group.today");
   const yesterday = new Date(now);
   yesterday.setDate(now.getDate() - 1);
   if (mode === "detailed" && date.toDateString() === yesterday.toDateString())
-    return "YESTERDAY";
+    return t("mail.group.yesterday");
   const daysAgo = Math.floor(
     (now.getTime() - date.getTime()) / (24 * 60 * 60 * 1000),
   );
   if (daysAgo < 7 && mode !== "months_only")
-    return mode === "detailed" ? "LAST 7 DAYS" : "LAST 7 DAYS";
+    return t("mail.group.last7");
   if (mode !== "months_only" && daysAgo < INBOX_LAST_MONTH_DAYS)
-    return "EARLIER THIS MONTH";
-  const currentMonthLabel = date
-    .toLocaleDateString("en-US", { month: "long" })
-    .toUpperCase();
-  // if (date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth()) {
-  //   return `EARLIER IN ${currentMonthLabel}`;
-  // }
-  return `EARLIER IN ${currentMonthLabel}`;
+    return t("mail.group.earlierThisMonth");
+  const currentMonthLabel = date.toLocaleDateString(locale, { month: "long" });
+  return t("mail.group.earlierIn", { month: currentMonthLabel });
 }
 
-function inboxRangeLabel(days: number) {
-  if (days === INBOX_ALL_TIME_DAYS) return "All time";
-  if (days === INBOX_LAST_MONTH_DAYS) return "Last 30 days";
-  return `Last ${days} days`;
+function inboxRangeLabel(days: number, t: TranslateFn = tFallback) {
+  if (days === INBOX_ALL_TIME_DAYS) return t("mail.range.allTime");
+  if (days === INBOX_LAST_MONTH_DAYS) return t("mail.range.lastDays", { days });
+  return t("mail.range.lastDays", { days });
 }
 
-function olderRangeButtonLabel(currentDays: number, nextDays: number | null) {
+function olderRangeButtonLabel(currentDays: number, nextDays: number | null, t: TranslateFn = tFallback) {
   if (nextDays === null) return "";
-  if (nextDays === INBOX_ALL_TIME_DAYS) return "Show all older emails";
-  if (currentDays <= 0) return `Show emails from the last ${nextDays} days`;
-  return `Show emails older than ${currentDays} days (last ${nextDays} days)`;
+  if (nextDays === INBOX_ALL_TIME_DAYS) return t("mail.range.showAllOlder");
+  if (currentDays <= 0) return t("mail.range.showFromLast", { days: nextDays });
+  return t("mail.range.showOlderThan", { current: currentDays, next: nextDays });
 }
 
-export function inboxLastSyncedLabel(value?: string) {
+export function inboxLastSyncedLabel(value?: string, t: TranslateFn = tFallback, locale: Locale = "en-US") {
   if (!value) return "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   const now = new Date();
   // 精确到秒，便于核对自动同步是否刚跑完
-  const time = date.toLocaleTimeString("en-US", {
+  const time = date.toLocaleTimeString(locale, {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -707,8 +723,8 @@ export function inboxLastSyncedLabel(value?: string) {
   const datePrefix =
     date.toDateString() === now.toDateString()
       ? ""
-      : `${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}, `;
-  return `Last synced: ${datePrefix}${time}`;
+      : `${date.toLocaleDateString(locale, { month: "short", day: "numeric" })}, `;
+  return t("mail.lastSynced", { time: `${datePrefix}${time}` });
 }
 
 export function hasMessageLabel(message: InboxMessage, label: string) {
@@ -1049,8 +1065,9 @@ function InboxRow({
   onComposeDraftDelete?: () => void;
 }) {
   const { actions } = useApp();
+  const { t, locale } = useI18n();
   const [avatarFailed, setAvatarFailed] = useState(false);
-  const participant = messageParticipant(message, mailboxView, mailbox);
+  const participant = messageParticipant(message, mailboxView, mailbox, t);
   const fallbackAvatar = mailAvatarFallback(
     participant.name || participant.email || participant.initial,
     participant.name || participant.initial,
@@ -1064,7 +1081,7 @@ function InboxRow({
   const trashed = isTrashMessage(message);
   const snoozeLabel =
     !trashed && mailboxView === "snoozed"
-      ? snoozeUntilLabel(flags.snoozedUntil?.[message.id])
+      ? snoozeUntilLabel(flags.snoozedUntil?.[message.id], t)
       : "";
   const important = isImportantMessage(message);
   const starred = isStarredMessage(message);
@@ -1074,7 +1091,7 @@ function InboxRow({
     (draft ? message.draft_body : "") ||
     message.snippet ||
     message.body_preview ||
-    "No preview available";
+    t("mail.noPreview");
   return (
     <article
       className={`mail-row ${mailboxView === "all" ? "is-all-mail" : ""} ${unread ? "is-unread" : ""} ${selected ? "is-selected" : ""} ${entering ? "is-entering" : ""}`}
@@ -1083,7 +1100,7 @@ function InboxRow({
         <button
           type="button"
           className="draft-select"
-          aria-label={`Select ${message.subject || "draft"}`}
+          aria-label={t("mail.action.selectDraft", { subject: message.subject || "draft" })}
           aria-pressed={selectedForBatch}
           onClick={onBatchToggle}
         >
@@ -1115,12 +1132,12 @@ function InboxRow({
           {participant.name}
         </span>
         <span className="mail-content">
-          <strong>{message.subject || "(no subject)"}</strong>
+          <strong>{message.subject || t("mail.noSubject")}</strong>
           <span>
             —{" "}
             {draft && !trashed ? (
               <>
-                <b className="mail-draft-label">Draft:</b> {preview}
+                <b className="mail-draft-label">{t("mail.draftLabel")}</b> {preview}
               </>
             ) : (
               preview
@@ -1129,40 +1146,40 @@ function InboxRow({
         </span>
         <span className="mail-flags">
           {trashed ? (
-            <span className="mail-trash-icon" title="Trash">
+            <span className="mail-trash-icon" title={t("mail.badge.trash")}>
               <TrashIcon />
             </span>
           ) : null}
           {!trashed && shouldShowImportantIcon(important, sentView, draft) ? (
-            <span className="mail-important-icon" title="Important">
+            <span className="mail-important-icon" title={t("mail.badge.important")}>
               <ImportantIcon />
             </span>
           ) : null}
           {!trashed && draft ? (
-            <span className="mail-draft-icon" title="Draft">
+            <span className="mail-draft-icon" title={t("mail.badge.draft")}>
               <DraftIcon />
             </span>
           ) : !trashed && sentMessage ? (
-            <span className="mail-sent-badge" title="Sent and done">
+            <span className="mail-sent-badge" title={t("mail.badge.sentDone")}>
               <SentIcon />
               <span className="mail-sent-check">
                 <CheckIcon />
               </span>
             </span>
           ) : !trashed && isDone ? (
-            <span className="mail-sent-check" title="Done">
+            <span className="mail-sent-check" title={t("mail.badge.done")}>
               <CheckIcon />
             </span>
           ) : null}
           {!trashed && starred ? (
-            <span className="mail-starred" title="Starred">
+            <span className="mail-starred" title={t("mail.badge.starred")}>
               <StarIcon />
             </span>
           ) : null}
           {hasInboxMessageAttachment(message) ? (
             <span
               className="mail-attachment"
-              title={`${message.attachment_count || 1} attachment(s)`}
+              title={t("mail.badge.attachments", { count: message.attachment_count || 1 })}
             >
               <PaperclipIcon />
             </span>
@@ -1171,20 +1188,20 @@ function InboxRow({
         {snoozeLabel ? (
           <span
             className="mail-snooze-until"
-            title={`Snoozed until ${snoozeLabel}`}
+            title={t("mail.badge.snoozedUntil", { time: snoozeLabel })}
           >
             <ClockIcon />
             <span>{snoozeLabel}</span>
           </span>
         ) : (
-          <time>{dateLabel(message)}</time>
+          <time>{dateLabel(message, t, locale)}</time>
         )}
       </button>
       <span className="mail-row-actions">
         {isComposeDraft ? (
           <button
-            aria-label="Delete draft"
-            data-tooltip="Delete draft"
+            aria-label={t("mail.action.deleteDraft")}
+            data-tooltip={t("mail.action.deleteDraft")}
             onClick={onComposeDraftDelete}
           >
             <TrashIcon />
@@ -1192,8 +1209,8 @@ function InboxRow({
         ) : trashed ? (
           <button
             className="is-trashed"
-            aria-label="Remove from trash"
-            data-tooltip="Remove from trash"
+            aria-label={t("mail.action.removeFromTrash")}
+            data-tooltip={t("mail.action.removeFromTrash")}
             onClick={() => onThreadAction("untrash", message)}
           >
             <TrashOffIcon />
@@ -1202,8 +1219,8 @@ function InboxRow({
           <>
             <button
               className={starred ? "is-active is-starred" : ""}
-              aria-label={starred ? "Unstar" : "Star"}
-              data-tooltip={starred ? "Unstar" : "Star"}
+              aria-label={starred ? t("mail.action.unstar") : t("mail.action.star")}
+              data-tooltip={starred ? t("mail.action.unstar") : t("mail.action.star")}
               onClick={() =>
                 onThreadAction(starred ? "unstar" : "star", message)
               }
@@ -1212,8 +1229,8 @@ function InboxRow({
             </button>
             <button
               className={important ? "is-active is-important" : ""}
-              aria-label={important ? "Mark not important" : "Mark important"}
-              data-tooltip={important ? "Mark not important" : "Mark important"}
+              aria-label={important ? t("mail.action.markNotImportant") : t("mail.action.markImportant")}
+              data-tooltip={important ? t("mail.action.markNotImportant") : t("mail.action.markImportant")}
               onClick={() =>
                 onThreadAction(
                   important ? "mark_not_important" : "mark_important",
@@ -1225,8 +1242,8 @@ function InboxRow({
             </button>
             <button
               className={isTodo ? "is-active is-todo" : ""}
-              aria-label={isTodo ? "Click Done to remove" : "Add to Todo"}
-              data-tooltip={isTodo ? "Click Done to remove" : "Add to Todo"}
+              aria-label={isTodo ? t("mail.action.removeTodo") : t("mail.action.addTodo")}
+              data-tooltip={isTodo ? t("mail.action.removeTodo") : t("mail.action.addTodo")}
               disabled={isTodo}
               onClick={() => onFlag("todos", message)}
             >
@@ -1234,24 +1251,24 @@ function InboxRow({
             </button>
             <button
               className={isSnoozed ? "is-active is-snoozed" : ""}
-              aria-label={isSnoozed ? "Remove from snoozed" : "Snooze"}
-              data-tooltip={isSnoozed ? "Remove from snoozed" : "Snooze"}
+              aria-label={isSnoozed ? t("mail.action.removeSnooze") : t("mail.action.snooze")}
+              data-tooltip={isSnoozed ? t("mail.action.removeSnooze") : t("mail.action.snooze")}
               onClick={() => onSnooze(message)}
             >
               <ClockIcon />
             </button>
             {unread ? (
               <button
-                aria-label="Mark as read"
-                data-tooltip="Mark as read"
+                aria-label={t("mail.action.markRead")}
+                data-tooltip={t("mail.action.markRead")}
                 onClick={() => void actions.markInboxRead(message.id)}
               >
                 <MailOpenIcon />
               </button>
             ) : null}
             <button
-              aria-label="Move to trash"
-              data-tooltip="Move to trash"
+              aria-label={t("mail.action.moveToTrash")}
+              data-tooltip={t("mail.action.moveToTrash")}
               onClick={() => void actions.trashInboxMessage(message.id)}
             >
               <TrashIcon />
@@ -1687,6 +1704,7 @@ function DraftReplyArtifactCard({
   artifact: DraftReplyArtifact;
   onUse: (artifact: DraftReplyArtifact, mode: "append" | "replace") => void;
 }) {
+  const { t } = useI18n();
   const [draft, setDraft] = useState(artifact);
   const messageRef = useRef<HTMLTextAreaElement | null>(null);
   const isForward = draft.composer_mode === "forward";
@@ -1705,7 +1723,7 @@ function DraftReplyArtifactCard({
         <span>To</span>
         <input
           value={(isForward ? (draft.recipients || []) : []).join(", ")}
-          placeholder={isForward ? "Add recipient" : "Reply recipient from thread"}
+          placeholder={isForward ? t("ai.addRecipient") : t("ai.replyRecipientFromThread")}
           readOnly={!isForward}
           onChange={(event) => setDraft((current) => ({
             ...current,
@@ -1715,7 +1733,7 @@ function DraftReplyArtifactCard({
       </label>
       <label className="ai-draft-artifact-field">
         <span>Subject</span>
-        <input value={draft.subject || ""} placeholder="Thread subject" readOnly />
+        <input value={draft.subject || ""} placeholder={t("ai.threadSubject")} readOnly />
       </label>
       <label className="ai-draft-artifact-field">
         <span>Message</span>
@@ -1727,8 +1745,8 @@ function DraftReplyArtifactCard({
         />
       </label>
       <div className="ai-draft-artifact-actions">
-        <button className="is-primary" onClick={() => onUse(draft, "replace")}>Insert into {isForward ? "forward" : "reply"}</button>
-        <button className="is-secondary" onClick={() => onUse(draft, "append")}>Append</button>
+        <button className="is-primary" onClick={() => onUse(draft, "replace")}>{t("ai.insertNewEmail")}</button>
+        <button className="is-secondary" onClick={() => onUse(draft, "append")}>{t("ai.append")}</button>
       </div>
     </div>
   );
@@ -1742,23 +1760,24 @@ function ComposeDraftArtifactCard({
   onUse: (artifact: ComposeDraftArtifact) => void;
 }) {
   const [draft, setDraft] = useState(artifact);
+  const { t } = useI18n();
   return (
     <div className="ai-draft-artifact">
-      <strong className="ai-draft-artifact-title">New email draft</strong>
+      <strong className="ai-draft-artifact-title">{t("mail.compose")}</strong>
       <label className="ai-draft-artifact-field">
-        <span>To</span>
-        <input value={(draft.recipients || []).join(", ")} placeholder="Add recipient" onChange={(event) => setDraft((current) => ({ ...current, recipients: event.target.value.split(",").map((value) => value.trim()).filter(Boolean) }))} />
+        <span>{t("compose.to")}</span>
+        <input value={(draft.recipients || []).join(", ")} placeholder={t("ai.addRecipient")} onChange={(event) => setDraft((current) => ({ ...current, recipients: event.target.value.split(",").map((value) => value.trim()).filter(Boolean) }))} />
       </label>
       <label className="ai-draft-artifact-field">
-        <span>Subject</span>
-        <input value={draft.subject || ""} placeholder="Add subject" onChange={(event) => setDraft((current) => ({ ...current, subject: event.target.value }))} />
+        <span>{t("compose.subject")}</span>
+        <input value={draft.subject || ""} placeholder={t("ai.addSubject")} onChange={(event) => setDraft((current) => ({ ...current, subject: event.target.value }))} />
       </label>
       <label className="ai-draft-artifact-field">
-        <span>Message</span>
+        <span>{t("compose.content")}</span>
         <textarea value={draft.body} onChange={(event) => setDraft((current) => ({ ...current, body: event.target.value }))} />
       </label>
       <div className="ai-draft-artifact-actions">
-        <button className="is-primary" onClick={() => onUse(draft)}>Insert into new email</button>
+        <button className="is-primary" onClick={() => onUse(draft)}>{t("ai.insertNewEmail")}</button>
       </div>
     </div>
   );
@@ -1790,6 +1809,7 @@ function AiAssistantMessage({
   onApplyScanQuery?: (query: string) => void;
 }) {
   const { state, actions } = useApp();
+  const { t } = useI18n();
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [submittingGap, setSubmittingGap] = useState(false);
   const [assistantTextComplete, setAssistantTextComplete] = useState(
@@ -1887,7 +1907,7 @@ function AiAssistantMessage({
       >
         {executionSteps.length ? executionSteps.map((step) => (
           <p key={step.label}>{step.status === "complete" ? "Completed: " : step.status === "active" ? "In progress: " : ""}{step.label}</p>
-        )) : <p>Thinking...</p>}
+        )) : <p>{t("ai.thinking")}</p>}
         <div className="ai-message-footer">
           <time>{aiTimeLabel(message.timestamp)}</time>
           <AiThinkingElapsed startedAt={message.thinkingStartedAt || message.timestamp} />
@@ -2368,7 +2388,7 @@ function AiAssistantMessage({
                     >
                       Go to email
                     </button>
-                    <button className="is-secondary" onClick={() => void actions.copyDraft(item.body)}>Copy draft</button>
+                    <button className="is-secondary" onClick={() => void actions.copyDraft(item.body)}>{t("ai.copyDraft")}</button>
                     </div>
                   </div>
                 )}
@@ -2387,14 +2407,14 @@ function AiAssistantMessage({
         ) : null}
         {sendPlan ? (
           <div className="ai-draft-artifact ai-send-plan">
-            <strong>Review before sending</strong>
+            <strong>{t("ai.reviewBeforeSending")}</strong>
             {sendPlan.messages.map((item, index) => (
               <div key={index}>
                 <p>
-                  <b>To:</b> {item.recipients.join(", ") || "Missing recipient"}
+                  <b>{t("compose.to")}:</b> {item.recipients.join(", ") || t("ai.missingRecipient")}
                 </p>
                 <p>
-                  <b>Subject:</b> {item.subject || "Missing subject"}
+                  <b>{t("compose.subject")}:</b> {item.subject || t("ai.missingSubject")}
                 </p>
                 <pre>{item.body}</pre>
               </div>
@@ -2419,7 +2439,7 @@ function AiAssistantMessage({
                 <span>{question.question}</span>
                 <input
                   value={answers[question.id] || ""}
-                  placeholder={question.hint || "Your answer"}
+                  placeholder={question.hint || t("ai.yourAnswer")}
                   onChange={(event) =>
                     setAnswers((current) => ({
                       ...current,
@@ -2444,8 +2464,8 @@ function AiAssistantMessage({
             <button
               type="button"
               className="ai-retry-button"
-              aria-label="Retry"
-              data-tooltip="Retry"
+              aria-label={t("ai.retry")}
+              data-tooltip={t("ai.retry")}
               onClick={() => actions.retryAiMessage(message.id)}
             >
               <RefreshIcon />
@@ -2635,6 +2655,7 @@ function AiSidebar({
   composerFocusKey: number;
 }) {
   const { state, actions } = useApp();
+  const { t } = useI18n();
   const [historyOpen, setHistoryOpen] = useState(false);
   const [showNewMessagePrompt, setShowNewMessagePrompt] = useState(false);
   const [savedPromptsOpen, setSavedPromptsOpen] = useState(false);
@@ -2655,9 +2676,9 @@ function AiSidebar({
   const llmOffline = state.llmStatus.status === "unavailable" || state.llmStatus.status === "error";
   // 侧栏 starter 为按钮级显式意图：带 routingIntent，后端跳过 Router Sampling。
   const starters: Array<{ label: string; routingIntent: AiRoutingIntent }> = [
-    { label: "What needs my reply?", routingIntent: "inbox" },
-    { label: "Find urgent emails", routingIntent: "inbox" },
-    { label: "Organize my inbox", routingIntent: "organize" },
+    { label: t("ai.starter.reply"), routingIntent: "inbox" },
+    { label: t("ai.starter.urgent"), routingIntent: "inbox" },
+    { label: t("ai.starter.organize"), routingIntent: "organize" },
   ];
   const conversation = state.aiChatMessages;
   const draftArtifactSignature = conversation
@@ -2791,7 +2812,7 @@ function AiSidebar({
 
   const submit = () => {
     if (llmOffline) {
-      actions.showToast("LLM is offline. Please try again when it reconnects.");
+      actions.showToast(t("ai.offlineRetry"));
       return;
     }
     if (!state.customScanInput.trim() || running) return;
@@ -2819,7 +2840,7 @@ function AiSidebar({
         <div className="anna-wordmark">
           <button
             className="anna-logo-button"
-            title={collapsed ? "Expand AI sidebar" : "Collapse AI sidebar"}
+            title={collapsed ? t("ai.expandSidebar") : t("ai.collapseSidebar")}
             onClick={onToggle}
           >
             <SparkleIcon />
@@ -2827,7 +2848,7 @@ function AiSidebar({
           <label>Anna Inbox</label>
         </div>
         <button className="new-chat-btn" onClick={startNewChat}>
-          <span>＋</span> New chat
+          <span>＋</span> {t("ai.newChat")}
         </button>
       </div>
 
@@ -2861,11 +2882,8 @@ function AiSidebar({
             <div className="ai-orb">
               <SparkleIcon />
             </div>
-            <h1>How can I help you today?</h1>
-            <p>
-              Your AI assistant can search, summarize, draft/revise, and suggest
-              inbox organization.
-            </p>
+            <h1>{t("ai.emptyTitle")}</h1>
+            <p>{t("ai.emptyDescription")}</p>
           </div>
         )}
       </div>
@@ -2877,13 +2895,13 @@ function AiSidebar({
         <div className="ask-history-head">
           <button
             onClick={() => setHistoryOpen(false)}
-            aria-label="Back to Ask"
+            aria-label={t("ai.backToAsk")}
           >
             <ChevronLeftIcon />
           </button>
           <div>
-            <strong>Ask history</strong>
-            <span>Your previous conversations with Anna</span>
+            <strong>{t("ai.askHistory")}</strong>
+            <span>{t("ai.historySubtitle")}</span>
           </div>
         </div>
         <div className="ask-history-list">
@@ -2919,8 +2937,8 @@ function AiSidebar({
                   </button>
                   <button
                     className="ask-history-delete"
-                    aria-label="Delete chat"
-                    data-tooltip="Delete chat"
+                    aria-label={t("ai.deleteChat")}
+                    data-tooltip={t("ai.deleteChat")}
                     onClick={() => actions.deleteAiConversation(index)}
                   >
                     <TrashIcon />
@@ -2928,8 +2946,8 @@ function AiSidebar({
                   {entry.pendingRun ? (
                     <button
                       className="ask-history-refresh"
-                      aria-label="Refresh timed out request"
-                      data-tooltip="Refresh task"
+                      aria-label={t("ai.refreshTask")}
+                      data-tooltip={t("ai.refreshTask")}
                       onClick={() => {
                         actions.resumeAiConversation(index);
                         setHistoryOpen(false);
@@ -2944,7 +2962,7 @@ function AiSidebar({
           ) : (
             <div className="ask-history-empty">
               <HistoryIcon />
-              <span>No conversation history</span>
+              <span>{t("ai.noHistory")}</span>
             </div>
           )}
         </div>
@@ -2955,7 +2973,7 @@ function AiSidebar({
           <button
             className="ai-new-message-prompt"
             onClick={() => scrollConversationToBottom("smooth")}
-            aria-label="Scroll to new emails"
+            aria-label={t("ai.scrollToNew")}
           >
             有新消息 <span aria-hidden="true">↓</span>
           </button>
@@ -2964,14 +2982,14 @@ function AiSidebar({
           className={`ai-composer ${running ? "is-running" : ""} ${llmOffline ? "is-offline" : ""}`}
           data-tooltip={
             llmOffline
-              ? "LLM is offline. Please try again when it reconnects."
+              ? t("ai.offlineRetry")
               : undefined
           }
         >
           {savedPromptsOpen ? (
-            <div className="ai-saved-prompts-panel" ref={savedPromptsPanelRef} role="listbox" aria-label="Saved prompts">
+            <div className="ai-saved-prompts-panel" ref={savedPromptsPanelRef} role="listbox" aria-label={t("ai.savedPrompts")}>
               <header>
-                <span>Saved prompts</span>
+                <span>{t("ai.savedPrompts")}</span>
                 <button
                   type="button"
                   className="ai-saved-prompts-settings"
@@ -2979,8 +2997,8 @@ function AiSidebar({
                     setSavedPromptsOpen(false);
                     actions.openSettings(true);
                   }}
-                  aria-label="Open Saved prompts settings"
-                  title="Saved prompts settings"
+                  aria-label={t("ai.savedPromptsSettings")}
+                  title={t("ai.savedPromptsSettings")}
                 >
                   <SettingsIcon />
                 </button>
@@ -2997,14 +3015,14 @@ function AiSidebar({
                           setSavedPromptsOpen(false);
                         }}
                       >
-                        <strong>{item.title || "Untitled"}</strong>
+                        <strong>{item.title || t("ai.untitled")}</strong>
                         <div>{item.body.slice(0, 80)}</div>
                       </button>
                       <button
                         type="button"
                         className="ai-saved-prompt-delete"
-                        aria-label={`Delete ${item.title || "saved prompt"}`}
-                        data-tooltip="Delete"
+                        aria-label={t("ai.deletePrompt", { title: item.title || t("ai.untitled") })}
+                        data-tooltip={t("common.delete")}
                         onClick={() => {
                           void actions.deleteSavedPrompt(item.id).then((deleted) => {
                             if (deleted) {
@@ -3021,14 +3039,14 @@ function AiSidebar({
                   ))}
                 </div>
               ) : (
-                <div className="ai-saved-prompts-empty">No saved prompts</div>
+                <div className="ai-saved-prompts-empty">{t("ai.noSavedPrompts")}</div>
               )}
             </div>
           ) : null}
           <textarea
             ref={composerInputRef}
             value={state.customScanInput}
-            placeholder={composerFocused ? "Press ↑ for saved prompts" : "Ask your AI assistant…"}
+            placeholder={composerFocused ? t("ai.savedPromptsPlaceholder") : t("ai.inputPlaceholder")}
             rows={3}
             disabled={llmOffline}
             onFocus={() => setComposerFocused(true)}
@@ -3054,8 +3072,8 @@ function AiSidebar({
                 <button
                   className="ai-stop-button"
                   onClick={actions.stopAiGeneration}
-                  aria-label="Stop generating"
-                  title="Stop generating"
+                  aria-label={t("ai.stop")}
+                  title={t("ai.stop")}
                 >
                   <StopIcon />
                 </button>
@@ -3065,7 +3083,7 @@ function AiSidebar({
                   llmOffline || running || !state.customScanInput.trim()
                 }
                 onClick={submit}
-                aria-label="Ask AI assistant"
+                aria-label={t("ai.send")}
               >
                 <SendIcon />
               </button>
@@ -3107,12 +3125,12 @@ function AiSidebar({
           <button
             type="button"
             className="ai-conn-chip"
-            title={state.llmStatus.message || "Check LLM connectivity"}
+            title={state.llmStatus.message || t("ai.checkLlm")}
             onClick={() => void actions.refreshSamplingStatus()}
           >
             <i className={state.llmStatus.status === "connected" ? "is-live" : ""} />
             {state.llmStatus.status === "checking" || (state.llmStatus.status === "unknown" && !state.llmStatus.checked) ? (
-              <span>LLM · <span className="conn-checking">checking</span></span>
+              <span>LLM · <span className="conn-checking">{t("ai.checking")}</span></span>
             ) : state.llmStatus.status === "connected" ? (
               <span>
                 LLM
@@ -3135,19 +3153,19 @@ function AiSidebar({
               </span>
             ) : (
               <span>
-                LLM · <span className="conn-timeout">timeout</span>
+                LLM · <span className="conn-timeout">{t("ai.timeout")}</span>
               </span>
             )}
           </button>
           <button
             type="button"
             className="ai-conn-chip"
-            title={state.gmailApiStatus.message || "Check Gmail API connectivity"}
+            title={state.gmailApiStatus.message || t("ai.checkGmail")}
             onClick={() => void actions.refreshGmailApiStatus()}
           >
             <i className={state.gmailApiStatus.status === "connected" ? "is-live" : ""} />
             {state.gmailApiStatus.status === "checking" || (state.gmailApiStatus.status === "unknown" && !state.gmailApiStatus.checked) ? (
-              <span>Gmail · <span className="conn-checking">checking</span></span>
+              <span>Gmail · <span className="conn-checking">{t("ai.checking")}</span></span>
             ) : state.gmailApiStatus.status === "connected" ? (
               <span>
                 Gmail
@@ -3170,7 +3188,7 @@ function AiSidebar({
               </span>
             ) : (
               <span>
-                Gmail · <span className="conn-timeout">timeout</span>
+                Gmail · <span className="conn-timeout">{t("ai.timeout")}</span>
               </span>
             )}
           </button>
@@ -3178,7 +3196,9 @@ function AiSidebar({
         <div>
           <button
             className={historyOpen ? "is-active" : ""}
-            title="Ask history"
+            aria-label={t("ai.askHistory")}
+            data-tooltip={t("ai.askHistory")}
+            title={t("ai.askHistory")}
             onClick={() => setHistoryOpen((open) => !open)}
           >
             <HistoryIcon />
@@ -3239,6 +3259,7 @@ function AccountAvatar({
 
 function AccountRail() {
   const { state, actions } = useApp();
+  const { t } = useI18n();
   const [menuOpen, setMenuOpen] = useState(false);
   const mailbox = state.mailbox || state.selectedMailboxes[0] || "";
   const activeMailbox = state.mailboxes.find(
@@ -3268,12 +3289,11 @@ function AccountRail() {
     activeMailbox?.last_error,
     state.scanError,
   );
-
   return (
     <aside className="account-rail" aria-label="Account controls">
       <button
         className="account-avatar-btn"
-        title="Switch account"
+        title={t("account.switch")}
         aria-expanded={menuOpen}
         onClick={() => setMenuOpen((open) => !open)}
       >
@@ -3289,9 +3309,9 @@ function AccountRail() {
       <button
         className="icon-btn account-settings-btn"
         type="button"
-        aria-label="Open settings"
-        title="Settings"
-        data-tooltip="Settings"
+        aria-label={t("account.openSettings")}
+        title={t("account.settings")}
+        data-tooltip={t("account.settings")}
         onClick={() => actions.openSettings()}
       >
         <svg
@@ -3314,7 +3334,7 @@ function AccountRail() {
       {menuOpen ? (
         <button
           className="account-menu-backdrop"
-          aria-label="Close account menu"
+          aria-label={t("common.close")}
           onClick={() => setMenuOpen(false)}
         />
       ) : null}
@@ -3323,12 +3343,12 @@ function AccountRail() {
         aria-hidden={!menuOpen}
       >
         <header>
-          <span>Accounts</span>
-          <small>Switch inbox</small>
+          <span>{t("account.accounts")}</span>
+          <small>{t("account.switchInbox")}</small>
         </header>
         <div>
           {!mailboxes.length ? (
-            <p className="account-menu-empty">empty</p>
+            <p className="account-menu-empty">{t("account.empty")}</p>
           ) : null}
           {mailboxes.map((item) => {
             const active = item.email.toLowerCase() === mailbox.toLowerCase();
@@ -3367,6 +3387,7 @@ function AccountRail() {
 
 export function HomeView() {
   const { state, actions } = useApp();
+  const { t, locale } = useI18n();
   const [filter, setFilter] = useState<FeedFilter>("important");
   const [search, setSearch] = useState("");
   const [searchFocused, setSearchFocused] = useState(false);
@@ -3484,6 +3505,7 @@ export function HomeView() {
     bodyHtml?: string;
     cc?: string[];
     bcc?: string[];
+    replyMode?: "reply_to_sender" | "reply_all";
     mode?: "reply" | "forward";
     recipients?: string[];
     composeDraftId?: string;
@@ -4668,7 +4690,9 @@ export function HomeView() {
       return;
     }
     if (mailboxChanged) {
-      void syncInbox(configuredDays, true);
+      // switchMailbox has already rendered this mailbox's cache. Keep it while
+      // History sync merges fresh changes instead of deleting the cache again.
+      void syncInbox(configuredDays);
       return;
     }
     if (settingsChanged) {
@@ -4701,7 +4725,7 @@ export function HomeView() {
     state.inboxSettingsEtag,
     syncInbox,
   ]);
-  const lastSyncedLabel = inboxLastSyncedLabel(state.inboxUpdatedAt);
+  const lastSyncedLabel = inboxLastSyncedLabel(state.inboxUpdatedAt, t, locale);
   const nextRangeDays = nextFeedRangeDays(days);
   const canExpandFeedRange =
     isExpandableMailboxView(mailboxView) &&
@@ -4819,7 +4843,7 @@ export function HomeView() {
           .then((payload) => setComposeDrafts(payload.drafts || []))
           .catch(() => setComposeDrafts([])),
       ]);
-      actions.showToast("Drafts refreshed.");
+      actions.showToast(t("mail.draftsRefreshed"));
     } catch (reason) {
       actions.showToast(
         reason instanceof Error ? reason.message : String(reason),
@@ -4844,6 +4868,8 @@ export function HomeView() {
         displayedVisible,
         selectedCustomSplit.bundling_behavior,
         state.inboxSettings.time_section_mode,
+        t,
+        locale,
       );
     }
     const normalImportant = displayedVisible.filter(
@@ -4876,7 +4902,7 @@ export function HomeView() {
     for (const message of source) {
       const label =
         (message as InboxMessage & { __groupLabel?: string }).__groupLabel ||
-        groupLabel(message, state.inboxSettings.time_section_mode);
+        groupLabel(message, state.inboxSettings.time_section_mode, t, locale);
       const current = groups[groups.length - 1];
       if (!current || current.label !== label)
         groups.push({ label, messages: [message] });
@@ -4887,9 +4913,11 @@ export function HomeView() {
     displayedVisible,
     filter,
     flags.todos,
+    locale,
     mailboxView,
     pinnedImportantMessages,
     state.inboxSettings,
+    t,
   ]);
 
   const aiInboxListContext = useMemo<AiInboxListContext>(() => {
@@ -5160,18 +5188,18 @@ export function HomeView() {
       try {
         const ids = selectedInboxMessages.map((message) => message.id);
         const toastMessage = (count: number) =>
-          action === "trash" ? `Moved ${count} to trash.`
-            : action === "mark_done" ? `Marked ${count} done.`
-              : action === "star" ? `Starred ${count}.`
-                : action === "unstar" ? `Removed star from ${count}.`
-                  : action === "mark_unread" ? `Marked ${count} unread.`
-                    : `Marked ${count} read.`;
+          action === "trash" ? t("toast.movedCountTrash", { count })
+            : action === "mark_done" ? t("toast.markedCountDone", { count })
+              : action === "star" ? t("toast.starredCount", { count })
+                : action === "unstar" ? t("toast.unstarredCount", { count })
+                  : action === "mark_unread" ? t("toast.markedCountUnread", { count })
+                    : t("toast.markedCountRead", { count });
         const showUndoToast = (
           result: { count: number; undo?: () => Promise<boolean> },
           previousFlags?: MailUiFlags,
         ) => {
           actions.showToast(toastMessage(result.count), {
-            actionLabel: "Undo",
+            actionLabel: t("toast.undo"),
             durationMs: 6_000,
             onAction: () => {
               void result.undo?.().then((restored) => {
@@ -5187,7 +5215,7 @@ export function HomeView() {
           const previous = flags;
           const result = await actions.batchInboxActions(ids, "mark_done");
           if (!result.ok) {
-            actions.showToast("Failed to mark as done.");
+            actions.showToast(t("toast.failedMarkDone"));
             return;
           }
           setWorkflowFlag("done", selectedInboxMessages, true);
@@ -5332,13 +5360,15 @@ export function HomeView() {
       bodyHtml?: string;
       cc?: string[];
       bcc?: string[];
+      replyMode?: "reply_to_sender" | "reply_all";
       message: InboxMessage;
       attachments?: OutgoingAttachmentMeta[];
     }) => {
       const scheduled = pendingSendScheduler.current?.schedule({
         countdownMessage: (seconds) =>
-          `Will send in ${seconds} second${seconds === 1 ? "" : "s"}.`,
-        sendingMessage: "Sending…",
+          t("toast.willSendIn", { seconds }),
+        sendingMessage: t("toast.sending"),
+        pendingMessage: t("toast.pendingSend"),
         onUndo: () => {
           setExternalDetailMessage(args.message);
           setReplyDraftRestore({
@@ -5348,6 +5378,7 @@ export function HomeView() {
             bodyHtml: args.bodyHtml,
             cc: args.cc,
             bcc: args.bcc,
+            replyMode: args.replyMode,
             mode: "reply",
           });
           setSelectedId(args.message.id);
@@ -5361,7 +5392,7 @@ export function HomeView() {
             bodyHtml: args.bodyHtml,
             cc: args.cc,
             bcc: args.bcc,
-            replyMode: "reply_to_sender",
+            replyMode: args.replyMode || "reply_to_sender",
             dryRun: false,
             attachments: args.attachments,
           });
@@ -5373,9 +5404,23 @@ export function HomeView() {
           actions.showToast("Email sent.");
         },
         onError: (reason) =>
-          actions.showToast(
-            reason instanceof Error ? reason.message : String(reason),
-          ),
+          {
+            setExternalDetailMessage(args.message);
+            setReplyDraftRestore({
+              nonce: crypto.randomUUID(),
+              threadId: args.threadId,
+              body: args.body,
+              bodyHtml: args.bodyHtml,
+              cc: args.cc,
+              bcc: args.bcc,
+              replyMode: args.replyMode,
+              mode: "reply",
+            });
+            setDrawerMessage(args.message);
+            setDrawerOpen(true);
+            setSelectedId(args.message.id);
+            actions.showToast(t("toast.emailSendFailedKeep", { detail: reason instanceof Error ? reason.message : String(reason) }));
+          },
       });
       if (!scheduled) return false;
       closeDetailDrawer();
@@ -5399,8 +5444,9 @@ export function HomeView() {
       const draftId = crypto.randomUUID().replace(/-/g, "");
       const scheduled = pendingSendScheduler.current?.schedule({
         countdownMessage: (seconds) =>
-          `Will send in ${seconds} second${seconds === 1 ? "" : "s"}.`,
-        sendingMessage: "Sending…",
+          t("toast.willSendIn", { seconds }),
+        sendingMessage: t("toast.sending"),
+        pendingMessage: t("toast.pendingSend"),
         onUndo: () => {
           setExternalDetailMessage(args.message);
           setReplyDraftRestore({
@@ -5881,8 +5927,8 @@ export function HomeView() {
       if (closeAfter) {
         closeDetailDrawer();
       }
-      actions.showToast(wasDone ? "Moved to inbox." : "Marked as done.", {
-        actionLabel: "Undo",
+      actions.showToast(wasDone ? t("toast.movedToInbox") : t("toast.markedDone"), {
+        actionLabel: t("toast.undo"),
         onAction: () => restoreWorkflowFlags(messages, previous),
         secondaryActionLabel: "View",
         onSecondaryAction: () => {
@@ -6019,22 +6065,27 @@ export function HomeView() {
       if (bulk.length > 1) clearListSelection();
       actions.showToast(
         bulk.length > 1
-          ? `Snoozed ${bulk.length} email${bulk.length === 1 ? "" : "s"} until ${new Date(isoTime).toLocaleString("en-US", {
-              month: "short",
-              day: "numeric",
-              year: "numeric",
-              hour: "numeric",
-              minute: "2-digit",
-            })}.`
-          : `Snoozed until ${new Date(isoTime).toLocaleString("en-US", {
-              month: "short",
-              day: "numeric",
-              year: "numeric",
-              hour: "numeric",
-              minute: "2-digit",
-            })}.`,
+          ? t("mail.snoozedCount", {
+              count: bulk.length,
+              time: new Date(isoTime).toLocaleString(locale, {
+                month: "short",
+                day: "numeric",
+                year: "numeric",
+                hour: "numeric",
+                minute: "2-digit",
+              }),
+            })
+          : t("mail.snoozedOne", {
+              time: new Date(isoTime).toLocaleString(locale, {
+                month: "short",
+                day: "numeric",
+                year: "numeric",
+                hour: "numeric",
+                minute: "2-digit",
+              }),
+            }),
         {
-          actionLabel: "Undo",
+          actionLabel: t("mail.undo"),
           onAction: () => restoreWorkflowFlags(bulk, previous),
         },
       );
@@ -6044,8 +6095,10 @@ export function HomeView() {
       clearListSelection,
       closeDetailDrawer,
       flags,
+      locale,
       messagesInThread,
       restoreWorkflowFlags,
+      t,
       selectedId,
       selectedInboxMessages,
       setWorkflowFlag,
@@ -6126,8 +6179,9 @@ export function HomeView() {
     (draft: ComposeDraft) => {
       const scheduled = pendingSendScheduler.current?.schedule({
         countdownMessage: (seconds) =>
-          `Will send in ${seconds} second${seconds === 1 ? "" : "s"}.`,
-        sendingMessage: "Sending…",
+          t("toast.willSendIn", { seconds }),
+        sendingMessage: t("toast.sending"),
+        pendingMessage: t("toast.pendingSend"),
         onUndo: () => {
           void actions.deleteComposeDraft(mailbox, draft.id).catch(() => undefined);
           if (composeCloseTimer.current)
@@ -6141,11 +6195,13 @@ export function HomeView() {
           const result = results[0];
           if (result?.ok) {
             await actions.deleteComposeDraft(mailbox, draft.id);
-            actions.showToast("Email sent.");
+            actions.showToast(t("toast.emailSent"));
             return;
           }
           actions.showToast(
-            result?.error || "Email could not be sent. The draft was kept.",
+            result?.error
+              ? t("toast.emailSendFailedKeep", { detail: result.error })
+              : t("toast.emailSendFailedKeep", { detail: "" }),
           );
         },
         onError: (reason) =>
@@ -6203,8 +6259,9 @@ export function HomeView() {
       setBatchConfirmDrafts(null);
       pendingSendScheduler.current?.schedule({
         countdownMessage: (seconds) =>
-          `${selected.length} drafts will send in ${seconds} second${seconds === 1 ? "" : "s"}.`,
-        sendingMessage: "Sending drafts…",
+          t("toast.batchWillSendIn", { count: selected.length, seconds }),
+        sendingMessage: t("toast.sendingDrafts"),
+        pendingMessage: t("toast.pendingSend"),
         onUndo: () => undefined,
         onSend: async () => {
           const results = await actions.sendComposeEmails(mailbox, selected);
@@ -6340,9 +6397,8 @@ export function HomeView() {
               <div>
                 <strong>
                   {filter === "search"
-                    ? "Search"
-                    : MAILBOX_VIEWS.find((item) => item.id === mailboxView)
-                        ?.label}
+                    ? t("mail.search")
+                    : mailboxViewLabel(mailboxView, t)}
                 </strong>
                 <span>{mailbox || "Gmail"}</span>
               </div>
@@ -6353,24 +6409,24 @@ export function HomeView() {
             {folderOpen ? (
               <button
                 className="mailbox-picker-backdrop"
-                aria-label="Close folders"
+                aria-label={t("mail.closeFolders")}
                 onClick={() => setFolderOpen(false)}
               />
             ) : null}
             <div
               className={`mailbox-picker-menu ${folderOpen ? "is-open" : ""}`}
             >
-              {MAILBOX_VIEWS.map((item) => (
+              {MAILBOX_VIEW_IDS.map((viewId) => (
                 <button
-                  key={item.id}
-                  className={mailboxView === item.id ? "is-active" : ""}
-                  onClick={() => selectMailboxView(item.id)}
+                  key={viewId}
+                  className={mailboxView === viewId ? "is-active" : ""}
+                  onClick={() => selectMailboxView(viewId)}
                 >
-                  <span className={`folder-glyph is-${item.id}`}>
-                    <FolderIcon view={item.id} />
+                  <span className={`folder-glyph is-${viewId}`}>
+                    <FolderIcon view={viewId} />
                   </span>
-                  <span>{item.label}</span>
-                  {mailboxView === item.id ? <CheckIcon /> : null}
+                  <span>{mailboxViewLabel(viewId, t)}</span>
+                  {mailboxView === viewId ? <CheckIcon /> : null}
                 </button>
               ))}
             </div>
@@ -6440,13 +6496,13 @@ export function HomeView() {
                     } else applySearch(search);
                   }
                 }}
-                placeholder="search emails..."
+                placeholder={t("mail.searchPlaceholder")}
               />
               {activeSearch || search ? (
                 <button
                   type="button"
                   className="mail-search-clear"
-                  aria-label="Clear search"
+                  aria-label={t("mail.action.clearSearch")}
                   onMouseDown={(event) => event.preventDefault()}
                   onClick={() => {
                     setSearch("");
@@ -6476,9 +6532,9 @@ export function HomeView() {
                       onClick={() => applySuggestion(suggestion)}
                     >
                       <strong>{suggestion}</strong>
-                      {getInboxQuerySuggestionPlaceholder(suggestion) ? (
+                      {getInboxQuerySuggestionPlaceholder(suggestion, t) ? (
                         <span>
-                          {getInboxQuerySuggestionPlaceholder(suggestion)}
+                          {getInboxQuerySuggestionPlaceholder(suggestion, t)}
                         </span>
                       ) : null}
                       {index === searchSuggestionIndex ? (
@@ -6498,7 +6554,7 @@ export function HomeView() {
             onClick={() => void syncInbox(days)}
           >
             <RefreshIcon />
-            <span>{isInboxSyncing ? "Syncing" : "Refresh"}</span>
+            <span>{isInboxSyncing ? t("mail.syncing") : t("mail.refresh")}</span>
           </button>
           <button
             className="refresh-mail-btn compose-open-btn"
@@ -6512,7 +6568,7 @@ export function HomeView() {
             }}
           >
             <ComposeIcon />
-            <span>Compose</span>
+            <span>{t("mail.compose")}</span>
           </button>
         </header>
 
@@ -6560,11 +6616,11 @@ export function HomeView() {
         ) : null}
 
         {mailboxView === "inbox" && filter !== "search" ? (
-          <nav className="mail-tabs" aria-label="Inbox filters">
+          <nav className="mail-tabs" aria-label={t("mail.filters")}>
             {(
               [
-                ["important", "Important", inboxSplitMessages.important.length],
-                ["other", "Other", inboxSplitMessages.other.length],
+                ["important", t("mail.important"), inboxSplitMessages.important.length],
+                ["other", t("mail.other"), inboxSplitMessages.other.length],
                 ...(state.inboxSettings.custom_categories || [])
                   .filter(
                     (split) =>
@@ -6600,15 +6656,15 @@ export function HomeView() {
             <button
               className="icon-btn mail-tabs-manage"
               type="button"
-              aria-label="Manage Splits"
-              data-tooltip="Manage Splits"
+              aria-label={t("mail.manageSplits")}
+              data-tooltip={t("mail.manageSplits")}
               onClick={() => setSplitsOpen(true)}
             >
               <PlusIcon />
             </button>
             <div className="mail-tabs-meta">
               {lastSyncedLabel ? <span>{lastSyncedLabel}</span> : null}
-              <p>{inboxRangeLabel(days)}</p>
+              <p>{inboxRangeLabel(days, t)}</p>
             </div>
           </nav>
         ) : null}
@@ -6627,34 +6683,29 @@ export function HomeView() {
         >
           {(mailboxView === "inbox" || mailboxView === "drafts") &&
           selectedListKeys.size > 0 ? (
-            <div className="inbox-selection-bar" role="toolbar" aria-label="Bulk actions">
+            <div className="inbox-selection-bar" role="toolbar" aria-label={t("mail.bulkActions")}>
               <button
                 type="button"
                 className="inbox-selection-clear"
-                aria-label="Clear selection"
-                data-tooltip="Clear"
+                aria-label={t("mail.bulk.clearSelection")}
+                data-tooltip={t("mail.bulk.clear")}
                 disabled={batchBusy}
                 onClick={clearListSelection}
               >
                 <CloseSmallIcon />
               </button>
               <span className="inbox-selection-count">
-                {selectedListKeys.size}{" "}
                 {mailboxView === "drafts"
-                  ? selectedListKeys.size === 1
-                    ? "draft"
-                    : "drafts"
-                  : selectedListKeys.size === 1
-                    ? "email"
-                    : "emails"}
+                  ? t("mail.draftCount", { count: selectedListKeys.size })
+                  : t("mail.emailCount", { count: selectedListKeys.size })}
               </span>
               <div className="inbox-selection-actions">
                 {mailboxView === "drafts" ? (
                   <button
                     type="button"
                     className="inbox-selection-icon-btn is-primary"
-                    aria-label="Send selected drafts"
-                    data-tooltip="Send"
+                    aria-label={t("mail.action.sendSelected")}
+                    data-tooltip={t("mail.action.sendShort")}
                     disabled={batchBusy || !selectedListMessages.length}
                     onClick={() => {
                       // 同步 compose 多选 id，复用既有批量发送
@@ -6673,8 +6724,8 @@ export function HomeView() {
                       <button
                         type="button"
                         className="inbox-selection-icon-btn"
-                        aria-label="More actions"
-                        data-tooltip="More"
+                        aria-label={t("mail.action.moreActions")}
+                        data-tooltip={t("mail.action.moreShort")}
                         aria-expanded={selectionMoreOpen}
                         disabled={batchBusy}
                         onClick={() => setSelectionMoreOpen((open) => !open)}
@@ -6690,7 +6741,7 @@ export function HomeView() {
                             onClick={() => void runBatchInboxAction("mark_read")}
                           >
                             <MailOpenIcon />
-                            <span>Mark as read</span>
+                            <span>{t("mail.action.markRead")}</span>
                           </button>
                           <button
                             type="button"
@@ -6699,7 +6750,7 @@ export function HomeView() {
                             onClick={() => void runBatchInboxAction("mark_unread")}
                           >
                             <AllMailIcon />
-                            <span>Mark as unread</span>
+                            <span>{t("mail.action.markUnread")}</span>
                           </button>
                           <button
                             type="button"
@@ -6708,7 +6759,7 @@ export function HomeView() {
                             onClick={() => void runBatchInboxAction("unstar")}
                           >
                             <StarIcon />
-                            <span>Remove star</span>
+                            <span>{t("mail.action.unstar")}</span>
                           </button>
                         </div>
                       ) : null}
@@ -6716,8 +6767,8 @@ export function HomeView() {
                     <button
                       type="button"
                       className="inbox-selection-icon-btn"
-                      aria-label="Batch draft with AI"
-                      data-tooltip="AI draft"
+                      aria-label={t("mail.bulk.batchAiDraft")}
+                      data-tooltip={t("mail.aiDraftShort")}
                       disabled={batchBusy}
                       onClick={() => {
                         const previousInput = state.customScanInput;
@@ -6788,13 +6839,13 @@ export function HomeView() {
           sourceMessages.length > 0 &&
           !cachedInboxBannerDismissed ? (
             <div className="mail-sync-banner">
-              <span>Sync failed. Showing cached emails.</span>
+              <span>{t("mail.syncFailed")}</span>
               <div className="mail-sync-banner-actions">
                 <button
                   className="mail-sync-banner-skip"
                   onClick={dismissCachedInboxBanner}
                 >
-                  Skip
+                  {t("mail.skip")}
                 </button>
                 <button
                   onClick={() =>
@@ -6805,8 +6856,8 @@ export function HomeView() {
                   disabled={isInboxSyncing || feedAction !== null}
                 >
                   {cachedInboxRetryAction === "load-more"
-                    ? "Retry loading older emails"
-                    : "Retry sync"}
+                    ? t("mail.retryOlder")
+                    : t("mail.retrySync")}
                 </button>
               </div>
             </div>
@@ -6817,8 +6868,8 @@ export function HomeView() {
               aria-label="Gmail authorization required"
             >
               <InboxIcon />
-              <h2>Connect your Gmail account</h2>
-              <p>Authorize Anna to read and manage your inbox.</p>
+              <h2>{t("mail.connectGmail")}</h2>
+              <p>{t("mail.authorizeHint")}</p>
               <div className="auth-guide-card">
                 <div className="auth-guide-steps">
                   <div className="auth-step">
@@ -6841,7 +6892,8 @@ export function HomeView() {
                   <div className="auth-step">
                     <span className="auth-step-num">4</span>
                     <span>
-                      Click <strong>Authorize</strong> and return here
+                      {t("mail.click")} <strong>{t("mail.authorize")}</strong>{" "}
+                      {t("mail.andReturn")}
                     </span>
                   </div>
                 </div>
@@ -6865,29 +6917,29 @@ export function HomeView() {
           ) : !localCategory && state.inboxError && !sourceMessages.length ? (
             <div className="mail-empty">
               <InboxIcon />
-              <h2>We couldn’t load Gmail</h2>
+              <h2>{t("mail.loadFailed")}</h2>
               <p>{state.inboxError}</p>
               <button
                 onClick={() => void syncInbox(days)}
                 disabled={isInboxSyncing}
               >
-                Try again
+                {t("mail.tryAgain")}
               </button>
             </div>
           ) : !grouped.some((group) => group.messages.length) ? (
             mailboxView !== "inbox" && mailboxView !== "all" ? (
               <div className="mail-empty is-category-empty">
                 <SearchIcon />
-                <h2>No matching results</h2>
+                <h2>{t("mail.noResults")}</h2>
               </div>
             ) : (
               <div className="mail-empty">
                 <InboxIcon />
-                <h2>No messages here</h2>
+                <h2>{t("mail.noMessages")}</h2>
                 <p>
                   {search
-                    ? "Try a different search."
-                    : `This filter is clear for the last ${days} days.`}
+                    ? t("mail.tryDifferentSearch")
+                    : t("mail.filterEmpty", { days })}
                 </p>
               </div>
             )
@@ -6896,11 +6948,11 @@ export function HomeView() {
               <div className="mail-group" key={group.label}>
                 {mailboxView === "inbox" && filter !== "search" ? (
                   <div className="mail-group-label">
-                    <span>{group.label}</span>
+                    <span>{group.label === "STARS" ? t("mail.group.stars") : group.label === "TODOS" ? t("mail.group.todos") : group.label}</span>
                     <i />
                     {group.label !== "STARS" && group.label !== "TODOS" ? (
                       <button
-                        title="Mark this timeline as done"
+                        title={t("mail.markTimelineDone")}
                         onClick={() => markTimelineDone(group.messages)}
                       >
                         <AllDoneIcon />
@@ -6913,6 +6965,7 @@ export function HomeView() {
                     message,
                     mailboxView,
                     mailbox,
+                    t,
                   ).email.toLowerCase();
                   return (
                     <InboxRow
@@ -6997,8 +7050,8 @@ export function HomeView() {
               disabled={isInboxSyncing || feedAction !== null}
             >
               {isInboxSyncing
-                ? "Syncing..."
-                : olderRangeButtonLabel(days, nextRangeDays)}
+                ? t("mail.syncingDots")
+                : olderRangeButtonLabel(days, nextRangeDays, t)}
             </button>
           ) : null}
           {mailboxView === "drafts" && !state.inboxLoading ? (
@@ -7008,29 +7061,27 @@ export function HomeView() {
               onClick={() => void refreshDrafts()}
               disabled={isInboxSyncing || feedAction !== null}
             >
-              {feedAction === "more" ? "Refreshing drafts..." : "Refresh drafts"}
+              {feedAction === "more" ? t("mail.refreshingDrafts") : t("mail.refreshDrafts")}
             </button>
           ) : null}
           {mailboxView === "trash" ? (
             <footer className="trash-retention-notice">
-              <p>Trash is deleted after 30 days.</p>
+              <p>{t("mail.trashRetention")}</p>
               <p>
-                To empty your trash now,{" "}
+                {t("mail.emptyTrashPrefix")}{" "}
                 <button
                   type="button"
                   onClick={() => {
                     void copyTextToClipboard(gmailTrashUrl(mailbox))
                       .then(() =>
-                        actions.showToast(
-                          "Gmail link copied. Paste it into your browser.",
-                        ),
+                        actions.showToast(t("mail.gmailLinkCopied")),
                       )
                       .catch(() =>
-                        actions.showToast("Could not copy the Gmail link."),
+                        actions.showToast(t("mail.gmailLinkCopyFailed")),
                       );
                   }}
                 >
-                  copy Gmail link
+                  {t("mail.copyGmailLink")}
                 </button>
                 .
               </p>

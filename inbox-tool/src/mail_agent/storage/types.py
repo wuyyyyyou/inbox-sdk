@@ -107,8 +107,8 @@ class InboxSettings:
     todos_limit: int = 10
     # LLM 连通性探测轮询间隔（秒）；0 表示关闭自动轮询，默认 60
     llm_status_poll_seconds: int = 60
-    # Gmail History 自动刷新间隔（秒）；0 表示只在用户手动刷新时同步，默认 5
-    auto_sync_seconds: int = 5
+    # Gmail History 自动刷新间隔（秒）；0 表示只在用户手动刷新时同步，默认 15
+    auto_sync_seconds: int = 15
     custom_categories: list[InboxCustomCategory] = field(default_factory=list)
     updated_at: str = field(default_factory=_now)
 

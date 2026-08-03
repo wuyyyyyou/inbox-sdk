@@ -23,8 +23,8 @@
 
 ## 项目基线
 
-- **App（前端）**：`2.2.3` — 位于 `anna-inbox/`
-- **Tool（Executa）**：`2.3.3` — 位于 `inbox-tool/`
+- **App（前端）**：`2.2.4` — 位于 `anna-inbox/`
+- **Tool（Executa）**：`2.3.4` — 位于 `inbox-tool/`
 
 - 唯一智能入口：Inbox Workspace + AI 侧栏；Brief 产品面下线。
 - reverse RPC 多 invoke：全链路注入 `params.context.invoke_id`；worker/connectivity/后台任务跨线程 re-bind。
@@ -102,14 +102,14 @@ App 与 Tool **版本号解耦，互不强制对齐**：
 
 | 端 | 当前版本 | 权威文件 | 须同步的文件 |
 | --- | --- | --- | --- |
-| App | `2.2.3` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
-| Tool | `2.3.3` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
+| App | `2.2.4` | `anna-inbox/app.json` | `./AGENTS.md`（项目基线） |
+| Tool | `2.3.4` | `inbox-tool/manifest.json` | `inbox-tool/src/pyproject.toml`、`anna-inbox/executas/inbox-tool/executa.json`、`anna-inbox/manifest.json#required_executas[].min_version`、`./AGENTS.md`（项目基线） |
 
 规则：
 
 - 只改前端 / App 发布：只 bump **App** 版本（`anna-inbox/app.json`），**不要**改 Tool 版本。
 - 只改后端 / Executa 发布：只 bump **Tool** 版本；平台若报「同版本已发布且内容不同」，必须再 bump Tool（不可覆盖已发布版本）。
-- Tool 线自 `2.1.1` 起独立演进，现进入 `2.3.x`；App 线自 `2.1.1` 起。当前基线：App `2.2.3` / Tool `2.3.3`。
+- Tool 线自 `2.1.1` 起独立演进，现进入 `2.3.x`；App 线自 `2.1.1` 起。当前基线：App `2.2.4` / Tool `2.3.4`。
 - `min_version` 跟随 **Tool** 版本，不跟随 App 版本。
 - 提交前审核时，若未说明只升哪一端，先与我确认，再改版本号。
 

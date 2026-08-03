@@ -794,13 +794,37 @@ INBOX_PAGE_BODY_LIMIT_STEPS = (200000, 120000, 80000, 48000, 24000, 12000, 6000,
 INBOX_PROMPT_MESSAGE_LIMIT = 4
 INBOX_PROMPT_BODY_LIMIT = 600
 # 3: needs_reply / no_reply_reason；快捷提示仅限 draft 相关
-THREAD_ASSIST_CACHE_VERSION = 3
+# 4: locale 进入缓存键与结果；overview/快捷提示跟随请求语言而非线程语言
+THREAD_ASSIST_CACHE_VERSION = 4
 # 同一线程概览在缓存落盘前只允许一个后台 run，避免详情页重渲染或重试重复 Sampling。
 INBOX_THREAD_ASSIST_INFLIGHT: dict[str, str] = {}
 
 
 def _uses_chinese_text(value: str) -> bool:
     return bool(re.search(r"[\u3400-\u9fff]", str(value or "")))
+
+
+def _normalize_assist_locale(value: Any) -> str:
+    """把 zh-CN/en-US 等 locale 收敛为 zh/en，未知值回退 en。"""
+    raw = str(value or "").strip().lower().replace("_", "-")
+    if raw.startswith("zh"):
+        return "zh"
+    return "en"
+
+
+def _assist_language_instruction(locale: str) -> str:
+    """按请求 locale 覆盖 thread assist 的语言规则（默认跟随线程语言）。"""
+    if locale == "zh":
+        return (
+            "The user requested Simplified Chinese. You MUST write the overview, "
+            "no_reply_reason, and every quick_replies label and intent in Simplified "
+            "Chinese, except untranslatable names, addresses, or identifiers. "
+            "intent MUST start with \"起草回复\"."
+        )
+    return (
+        "Write the overview, no_reply_reason, and every quick_replies label and "
+        "intent in English. intent MUST start with \"Draft a reply\"."
+    )
 
 
 def _sidebar_language_instruction(visible_prompt: str) -> str:
@@ -1069,9 +1093,11 @@ def _normalize_no_reply_reason(value: Any) -> str:
     return reason[:240]
 
 
-def _is_valid_thread_assist_cache(value: dict[str, Any]) -> bool:
+def _is_valid_thread_assist_cache(value: dict[str, Any], locale: str = "en") -> bool:
     """判断 thread assist 缓存是否可直接复用（含 needs_reply 两种分支）。"""
     if value.get("format_version") != THREAD_ASSIST_CACHE_VERSION:
+        return False
+    if str(value.get("locale") or "") != locale:
         return False
     if value.get("fallback_used"):
         return False
@@ -1604,6 +1630,7 @@ async def _generate_thread_assist_result(
     thread_id: str,
     latest_message_id: str,
     anchor_message_id: str,
+    locale: str,
     sampling_create_message: Any,
 ) -> dict[str, Any]:
     from mail_agent.llm_runtime.service import call_llm_json_safe
@@ -1611,6 +1638,7 @@ async def _generate_thread_assist_result(
     messages = _visible_thread_messages(_load_thread_messages(mailbox, thread_id))
     if not messages:
         raise ValueError(f"Thread {thread_id} not found")
+    language_instruction = _assist_language_instruction(locale)
     overview_result = await call_llm_json_safe(
         sampling_create_message,
         system_prompt=THREAD_ASSIST_SYSTEM,
@@ -1619,6 +1647,7 @@ async def _generate_thread_assist_result(
             f"Latest message subject: {messages[-1].get('subject', '')}\n"
             f"Participants: {'; '.join(_thread_participants(messages))}\n"
             f"Thread messages:\n{_thread_prompt_excerpt(messages)}\n"
+            f"\n{language_instruction}\n"
         ),
         # 概览必须是完整的模型总结；不可用时让后台 run 失败并由详情页显示
         # Retry，不能把主题、snippet 或正文片段伪装成 AI 概览。
@@ -1654,7 +1683,7 @@ async def _generate_thread_assist_result(
         if not no_reply_reason:
             no_reply_reason = (
                 "这封邮件不需要回复。"
-                if _uses_chinese_text(overview)
+                if locale == "zh"
                 else "This email does not need a reply."
             )
 
@@ -1662,6 +1691,7 @@ async def _generate_thread_assist_result(
         "format_version": THREAD_ASSIST_CACHE_VERSION,
         "thread_id": thread_id,
         "latest_message_id": latest_message_id,
+        "locale": locale,
         "overview": overview,
         "needs_reply": bool(needs_reply),
         "no_reply_reason": no_reply_reason,
@@ -1995,12 +2025,13 @@ async def _handle_inbox_thread_assist_background(run_id: str, arguments: dict[st
     thread_id = str(arguments.get("thread_id", "")).strip()
     latest_message_id = str(arguments.get("latest_message_id", "")).strip()
     anchor_message_id = str(arguments.get("anchor_message_id", "")).strip()
-    inflight_key = f"{mailbox.casefold()}:{thread_id}:{latest_message_id}"
+    locale = _normalize_assist_locale(arguments.get("locale"))
+    inflight_key = f"{mailbox.casefold()}:{thread_id}:{latest_message_id}:{locale}"
     try:
-        cached = await get_inbox_thread_assist(mailbox, thread_id, latest_message_id)
+        cached = await get_inbox_thread_assist(mailbox, thread_id, latest_message_id, locale)
         cached_value = cached.get("value") if isinstance(cached.get("value"), dict) else {}
         # 缓存命中条件：概览完整，且要么有 draft 快捷提示，要么有无需回复原因
-        if cached.get("exists") and isinstance(cached_value, dict) and _is_valid_thread_assist_cache(cached_value):
+        if cached.get("exists") and isinstance(cached_value, dict) and _is_valid_thread_assist_cache(cached_value, locale):
             MAIL_AGENT_RUNS[run_id].update(
                 status="done",
                 result={**cached_value, "cached": True},
@@ -2009,8 +2040,8 @@ async def _handle_inbox_thread_assist_background(run_id: str, arguments: dict[st
             _save_run_checkpoint(run_id)
             return
         sampling = _build_sampling_for_run(arguments, invoke_id)
-        result = await _generate_thread_assist_result(mailbox, thread_id, latest_message_id, anchor_message_id, sampling)
-        await set_inbox_thread_assist(mailbox, thread_id, latest_message_id, result)
+        result = await _generate_thread_assist_result(mailbox, thread_id, latest_message_id, anchor_message_id, locale, sampling)
+        await set_inbox_thread_assist(mailbox, thread_id, latest_message_id, result, locale=locale)
         MAIL_AGENT_RUNS[run_id].update(status="done", result=result, updated_at=beijing_now())
     except Exception as exc:
         MAIL_AGENT_RUNS[run_id].update(status="failed", error=str(exc), updated_at=beijing_now())
@@ -2571,15 +2602,16 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         latest_message_id = str(arguments.get("latest_message_id", "")).strip()
         if not mailbox or not thread_id or not latest_message_id:
             return {"error": "mailbox, thread_id, and latest_message_id are required"}
+        locale = _normalize_assist_locale(arguments.get("locale"))
         try:
             from mail_agent.storage.ops import get_inbox_thread_assist
 
-            cached = await get_inbox_thread_assist(mailbox, thread_id, latest_message_id)
+            cached = await get_inbox_thread_assist(mailbox, thread_id, latest_message_id, locale)
             cached_value = cached.get("value") if isinstance(cached.get("value"), dict) else {}
             if (
                 cached.get("exists")
-                and cached_value
-                and cached_value.get("format_version") == THREAD_ASSIST_CACHE_VERSION
+                and isinstance(cached_value, dict)
+                and _is_valid_thread_assist_cache(cached_value, locale)
             ):
                 return {
                     "success": True,
@@ -2588,7 +2620,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 }
         except Exception as exc:
             log(f"inbox thread assist cache lookup skipped: {type(exc).__name__}: {exc}")
-        inflight_key = f"{mailbox.casefold()}:{thread_id}:{latest_message_id}"
+        inflight_key = f"{mailbox.casefold()}:{thread_id}:{latest_message_id}:{locale}"
         existing_run_id = INBOX_THREAD_ASSIST_INFLIGHT.get(inflight_key)
         existing_run = MAIL_AGENT_RUNS.get(existing_run_id or "") if existing_run_id else None
         if existing_run and str(existing_run.get("status") or "") in {"queued", "running"}:

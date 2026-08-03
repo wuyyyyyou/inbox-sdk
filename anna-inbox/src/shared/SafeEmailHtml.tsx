@@ -6,6 +6,33 @@ const TEXT_FLOW_BLOCK_SELECTOR = [
   "figure", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "main", "nav",
   "ol", "p", "pre", "section", "table", "ul",
 ].join(",");
+
+export type SafeInlineImageMap = Readonly<Record<string, string>>;
+
+const EMPTY_EMAIL_MESSAGE = "This message has no display content.";
+
+export function isSafeInlineImageUrl(value: string) {
+  return /^(?:blob:|data:image\/(?:gif|jpe?g|png|webp|avif);)/i.test(value.trim());
+}
+
+export function escapeHtmlText(value: string) {
+  return value.replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[character] || character);
+}
+
+export function emailDocumentStyles() {
+  return `html,body{margin:0;padding:0;min-width:0;max-width:100%;font-family:Arial,"Helvetica Neue",Helvetica,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5;overflow-wrap:anywhere;word-break:break-word}body{overflow-x:hidden}img{max-width:100%;height:auto}pre{max-width:100%;overflow:auto;white-space:pre-wrap;word-break:break-word}.safe-email-table-wrap{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}.safe-email-table-wrap>table{margin:0;max-width:none}`;
+}
+
+export function buildEmailSrcDoc(markup: string) {
+  const content = markup.trim() || `<p>${EMPTY_EMAIL_MESSAGE}</p>`;
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${emailDocumentStyles()}</style></head><body>${content}</body></html>`;
+}
 function normalizeLinks(root: DocumentFragment | HTMLElement) {
   root.querySelectorAll("a[href]").forEach((node) => {
     node.setAttribute("target", "_blank");
@@ -37,6 +64,16 @@ function normalizeDocumentMarkup(root: HTMLElement) {
   const styles = Array.from(root.querySelectorAll("head style"));
   styles.reverse().forEach((node) => root.prepend(node));
   root.querySelectorAll("head").forEach((node) => node.remove());
+}
+
+function normalizeTables(root: HTMLElement) {
+  Array.from(root.querySelectorAll("table")).forEach((table) => {
+    if (table.parentElement?.classList.contains("safe-email-table-wrap")) return;
+    const wrapper = document.createElement("div");
+    wrapper.className = "safe-email-table-wrap";
+    table.replaceWith(wrapper);
+    wrapper.appendChild(table);
+  });
 }
 
 function isWhitespaceNode(node: ChildNode) {
@@ -138,7 +175,7 @@ function normalizeTextEmailBlocks(root: HTMLElement) {
   splitParagraphBreaks(root);
 }
 
-function splitTextParagraphs(text: string) {
+export function splitTextParagraphs(text: string) {
   return text
     .replace(/\r\n?/g, "\n")
     .split(/\n{2,}/)
@@ -146,7 +183,7 @@ function splitTextParagraphs(text: string) {
     .filter(Boolean);
 }
 
-export function SafeEmailHtml({ html, className = "", onRendered }: { html: string; className?: string; scaleToFit?: boolean; onRendered?: () => void }) {
+export function SafeEmailHtml({ html, className = "", inlineImageMap, onRendered }: { html: string; className?: string; scaleToFit?: boolean; inlineImageMap?: SafeInlineImageMap; onRendered?: () => void }) {
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const [frameHeight, setFrameHeight] = useState(160);
   const [documentRevision, setDocumentRevision] = useState(0);
@@ -163,12 +200,27 @@ export function SafeEmailHtml({ html, className = "", onRendered }: { html: stri
     container.appendChild(value as DocumentFragment);
     // DOMPurify 是主防线；这里再做一次最终节点级过滤，避免异常 HTML 变体进入 srcdoc。
     container.querySelectorAll("script, iframe, object, embed, form").forEach((node) => node.remove());
-    container.querySelectorAll('img[src^="cid:"]').forEach((node) => node.removeAttribute("src"));
+    container.querySelectorAll("img[src]").forEach((node) => {
+      const image = node as HTMLImageElement;
+      const source = image.getAttribute("src") || "";
+      if (!/^cid:/i.test(source)) return;
+      const key = source.slice(4).trim().replace(/^<|>$/g, "");
+      const mapped = inlineImageMap?.[key] || inlineImageMap?.[source];
+      // Only caller-provided local data/blob URLs may replace a cid. An absent
+      // mapping must not turn a private inline image into a network request.
+      if (mapped && isSafeInlineImageUrl(mapped)) image.setAttribute("src", mapped);
+      else image.removeAttribute("src");
+    });
     normalizeDocumentMarkup(container);
-    return container.innerHTML;
-  }, [html]);
-  const srcDoc = useMemo(() => `<!doctype html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>html,body{margin:0;padding:0;font-family:Arial,"Helvetica Neue",Helvetica,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}img{max-width:100%;height:auto}</style></head><body>${sanitized}</body></html>`, [sanitized]);
+    normalizeTables(container);
+    normalizeTextEmailBlocks(container);
+    const hasDisplayContent = Boolean(
+      container.textContent?.replace(/\u00a0/g, " ").trim()
+      || container.querySelector("img[src], table, video, audio"),
+    );
+    return hasDisplayContent ? container.innerHTML : `<p>${EMPTY_EMAIL_MESSAGE}</p>`;
+  }, [html, inlineImageMap]);
+  const srcDoc = useMemo(() => buildEmailSrcDoc(sanitized), [sanitized]);
 
   useEffect(() => {
     const frame = frameRef.current;

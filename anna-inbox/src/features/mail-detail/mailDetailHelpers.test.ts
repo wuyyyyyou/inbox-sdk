@@ -4,7 +4,9 @@ import {
   buildForwardSendBodies,
   buildForwardSubject,
   buildQuickReplyPrompt,
+  deriveReplyAllRecipients,
   estimateAttachmentPreviewMemory,
+  attachmentFallbackMetadata,
   isOutboundMessageForMailbox,
   isPreviewableAttachment,
   materializeAttachmentAccess,
@@ -34,6 +36,23 @@ describe("mailDetailHelpers", () => {
     expect(senderParts("Alice Example <alice@example.com>")).toEqual({
       name: "Alice Example",
       email: "alice@example.com",
+    });
+  });
+
+  it("derives Reply All recipients without including the active mailbox", () => {
+    expect(deriveReplyAllRecipients({
+      id: "m1",
+      thread_id: "t1",
+      internal_date: "1",
+      from: "Alice <ALICE@example.com>",
+      to: "Inbox <inbox@example.com>, Bob <bob@example.com>",
+      cc: "Carol <carol@example.com>, alice@example.com",
+      subject: "Hello",
+      label_ids: [],
+      attachments: [],
+    }, "INBOX@example.com")).toEqual({
+      to: "ALICE@example.com",
+      cc: ["bob@example.com", "carol@example.com"],
     });
   });
 
@@ -114,6 +133,24 @@ describe("mailDetailHelpers", () => {
       source: "gmail",
       downloadable: true,
     })).toBe(false);
+  });
+
+  it("classifies office, calendar, and archive downloads with fallback metadata", () => {
+    expect(attachmentFallbackMetadata({ filename: "plan.docx", mime_type: "application/octet-stream" })).toEqual({
+      category: "office", label: "Office document", previewable: false,
+    });
+    expect(attachmentFallbackMetadata({ filename: "invite.ics", mime_type: "text/calendar" })).toEqual({
+      category: "calendar", label: "Calendar file", previewable: false,
+    });
+    expect(attachmentFallbackMetadata({ filename: "backup.tar.gz", mime_type: "application/gzip" })).toEqual({
+      category: "archive", label: "Archive", previewable: false,
+    });
+  });
+
+  it("detects common media and textual extensions when MIME metadata is generic", () => {
+    expect(normalizeAttachmentKind({ filename: "camera.heic", mime_type: "application/octet-stream" })).toBe("image");
+    expect(normalizeAttachmentKind({ filename: "meeting.m4a", mime_type: "application/octet-stream" })).toBe("audio");
+    expect(normalizeAttachmentKind({ filename: "calendar.ics", mime_type: "application/octet-stream" })).toBe("text");
   });
 
   it("estimates bounded preview memory for background rendering", () => {

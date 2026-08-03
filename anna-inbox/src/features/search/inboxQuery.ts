@@ -1,4 +1,5 @@
 import type { InboxMessage } from "../../types/mail";
+import { tFallback, type TranslateFn } from "../../i18n";
 
 export type InboxQueryField = "subject" | "body" | "from" | "to" | "is" | "has" | "before" | "after";
 
@@ -31,17 +32,17 @@ const STATUS_VALUES = [
   "spam",
   "all",
 ];
-const SUGGESTION_PLACEHOLDERS: Record<string, string> = {
-  "AND": "Combine two search queries",
-  "OR": "Search for either of two queries",
-  "subject:": "Words in the subject line",
-  "body:": "Words in cached message content",
-  "from:": "Specify the sender",
-  "to:": "Specify a recipient",
-  "is:": "Sent, unread, todo, draft, trash, spam, and more",
-  "has:": "Attachments",
-  "before:": "Messages before a date (YYYY-MM-DD)",
-  "after:": "Messages after a date (YYYY-MM-DD)",
+const SUGGESTION_PLACEHOLDERS: Record<string, Parameters<TranslateFn>[0]> = {
+  "AND": "search.suggestion.and",
+  "OR": "search.suggestion.or",
+  "subject:": "search.suggestion.subject",
+  "body:": "search.suggestion.body",
+  "from:": "search.suggestion.from",
+  "to:": "search.suggestion.to",
+  "is:": "search.suggestion.is",
+  "has:": "search.suggestion.has",
+  "before:": "search.suggestion.before",
+  "after:": "search.suggestion.after",
 };
 type InboxQueryTokenKind = "field" | "value" | "operator" | "plain";
 type InboxQueryToken = { text: string; kind: InboxQueryTokenKind };
@@ -242,8 +243,9 @@ export function getInboxQuerySuggestions(input: string): string[] {
 }
 
 /** 返回建议的简短占位说明，状态值建议无需额外说明。 */
-export function getInboxQuerySuggestionPlaceholder(suggestion: string): string {
-  return SUGGESTION_PLACEHOLDERS[suggestion] || "";
+export function getInboxQuerySuggestionPlaceholder(suggestion: string, t?: TranslateFn): string {
+  const key = SUGGESTION_PLACEHOLDERS[suggestion];
+  return key ? (t ? t(key) : tFallback(key)) : "";
 }
 
 /** 将当前未完成的 token 替换为补全项，供主页搜索与 Split 查询编辑器复用。 */

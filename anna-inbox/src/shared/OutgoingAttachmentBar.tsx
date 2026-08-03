@@ -1,4 +1,5 @@
 import { useRef, type ReactNode } from "react";
+import { useI18n } from "../i18n";
 import type { OutgoingAttachmentMeta } from "../types/mail";
 import {
   formatOutgoingAttachmentSize,
@@ -27,9 +28,6 @@ export function OutgoingAttachmentList({
           return (
             <div key={item.id} className="outgoing-attachment-image-card">
               <div className="outgoing-attachment-image-toolbar">
-                <button type="button" className="outgoing-attachment-more" aria-label="Attachment options" disabled>
-                  ···
-                </button>
                 <button type="button" className="outgoing-attachment-remove-btn" onClick={() => onRemove(item.id)}>
                   Remove
                 </button>
@@ -74,14 +72,15 @@ export function OutgoingAttachButton({
   onPick: (files: FileList) => void;
   children?: ReactNode;
 }) {
+  const { t } = useI18n();
   const inputRef = useRef<HTMLInputElement | null>(null);
   return (
     <>
       <button
         type="button"
         className="mail-detail-composer-icon-btn"
-        aria-label="Attach files"
-        data-tooltip="Attach files"
+        aria-label={t("detail.attachFiles")}
+        data-tooltip={t("detail.attachFiles")}
         disabled={disabled}
         onClick={() => inputRef.current?.click()}
       >

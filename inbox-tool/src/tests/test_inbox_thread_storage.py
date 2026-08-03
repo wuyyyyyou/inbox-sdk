@@ -97,6 +97,27 @@ async def main() -> None:
     assert loaded_assist["value"]["thread_id"] == thread_id
     assert loaded_assist["value"]["latest_message_id"] == latest_message_id
 
+    # locale 隔离：中文缓存独立于英文缓存，互不覆盖。
+    zh_assist = await set_inbox_thread_assist(
+        mailbox,
+        thread_id,
+        latest_message_id,
+        {
+            "overview": "项目更新正在等待确认。",
+            "locale": "zh",
+            "quick_replies": [{"id": "confirm", "label": "确认计划", "intent": "起草回复确认时间。"}],
+        },
+        locale="zh-CN",
+    )
+    assert zh_assist.get("etag")
+    en_loaded = await get_inbox_thread_assist(mailbox, thread_id, latest_message_id, "en-US")
+    assert en_loaded["exists"] is True
+    assert en_loaded["value"]["overview"] == "Project update is waiting on confirmation."
+    zh_loaded = await get_inbox_thread_assist(mailbox, thread_id, latest_message_id, "zh-CN")
+    assert zh_loaded["exists"] is True
+    assert zh_loaded["value"]["overview"] == "项目更新正在等待确认。"
+    assert zh_loaded["value"]["locale"] == "zh"
+
     saved_draft = await set_inbox_thread_draft(
         mailbox,
         thread_id,

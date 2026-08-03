@@ -7,6 +7,7 @@ export type PendingSendToastOptions = {
 export type PendingSendOptions = {
   countdownMessage: (seconds: number) => string;
   sendingMessage: string;
+  pendingMessage?: string;
   onUndo: () => void;
   onSend: () => Promise<void>;
   onError: (reason: unknown) => void;
@@ -33,7 +34,7 @@ export class PendingSendScheduler {
   schedule(options: PendingSendOptions): boolean {
     if (this.active) {
       this.dependencies.showToast(
-        "A send is already pending. Undo it or wait for it to finish.",
+        options.pendingMessage || "A send is already pending. Undo it or wait for it to finish.",
       );
       return false;
     }

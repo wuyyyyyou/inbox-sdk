@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { InboxCustomCategory, InboxSettings } from "../../types/mail";
 import { applyInboxQuerySuggestion, getInboxQuerySuggestionPlaceholder, getInboxQuerySuggestions, parseInboxQuery, splitInboxQueryTokens } from "../search/inboxQuery";
 import { useApp } from "../../app/AppContext";
+import { useI18n } from "../../i18n";
 
 type SplitDraft = Omit<InboxCustomCategory, "id"> & { id?: string };
 
@@ -33,6 +34,7 @@ export function SplitsManager({
   onChange: (patch: Partial<InboxSettings>) => Promise<boolean>;
 }) {
   const { actions } = useApp();
+  const { t } = useI18n();
   const [draft, setDraft] = useState<SplitDraft>(EMPTY_DRAFT);
   const [screen, setScreen] = useState<"list" | "form" | "query">("list");
   const [deletingId, setDeletingId] = useState("");
@@ -88,7 +90,7 @@ export function SplitsManager({
     if (saved) {
       setScreen("form");
     }
-    else setSaveError("Could not save this Split. Please try again.");
+    else setSaveError(t("splits.saveFailed"));
   };
   const save = async () => {
     if (!canSave) return;
@@ -108,41 +110,47 @@ export function SplitsManager({
     if (saved) {
       setScreen("list");
       setDraft(EMPTY_DRAFT);
-      actions.showToast("Split saved.");
-    } else setSaveError("Could not save this Split. Please try again.");
+      actions.showToast(t("splits.saved"));
+    } else setSaveError(t("splits.saveFailed"));
   };
+
+  const title = screen === "query"
+    ? t("splits.editQuery")
+    : screen === "form"
+      ? (editing ? t("splits.edit") : t("splits.create"))
+      : t("splits.title");
 
   return <div className="splits-overlay" role="presentation" onMouseDown={onClose}>
     <section className="splits-dialog" role="dialog" aria-modal="true" aria-labelledby="splits-title" onMouseDown={(event) => event.stopPropagation()}>
-      <header><h2 id="splits-title">{screen === "query" ? "Edit split query" : screen === "form" ? (editing ? "Edit split" : "Create split") : "Splits"}</h2><button className="icon-btn" type="button" aria-label="Close Splits" onClick={onClose}>×</button></header>
+      <header><h2 id="splits-title">{title}</h2><button className="icon-btn" type="button" aria-label={t("splits.close")} onClick={onClose}>×</button></header>
       {screen === "list" ? <>
-        <p>Divide your inbox into tabs for different types of emails.</p>
-        <h3>Custom splits</h3>
-        <ul className="splits-list">{categories.map((split) => <li key={split.id}><div><strong>{split.name}</strong><span>{split.query}</span></div><button type="button" onClick={() => startEdit(split)}>Edit</button><button type="button" onClick={() => setDeletingId(split.id)}>Delete</button></li>)}</ul>
-        {!categories.length ? <p className="splits-empty">No custom splits yet.</p> : null}
-        <button className="splits-add" type="button" onClick={startCreate}>＋ Add split</button>
+        <p>{t("splits.hint")}</p>
+        <h3>{t("splits.custom")}</h3>
+        <ul className="splits-list">{categories.map((split) => <li key={split.id}><div><strong>{split.name}</strong><span>{split.query}</span></div><button type="button" onClick={() => startEdit(split)}>{t("common.edit")}</button><button type="button" onClick={() => setDeletingId(split.id)}>{t("common.delete")}</button></li>)}</ul>
+        {!categories.length ? <p className="splits-empty">{t("splits.empty")}</p> : null}
+        <button className="splits-add" type="button" onClick={startCreate}>{t("splits.add")}</button>
       </> : screen === "query" ? <>
-        <p>Splits are defined by local search queries.</p>
+        <p>{t("splits.queryHint")}</p>
         <div className="mail-search-wrap splits-query-editor-wrap">
           <label className="mail-search splits-query-editor">
             <span className="splits-query-search-icon" aria-hidden="true">⌕</span>
             <span className="mail-search-highlight" aria-hidden="true">{splitInboxQueryTokens(draft.query).map((token, index, tokens) => <span className={`is-${token.kind}${parsed.error && index === tokens.length - 1 && !/\s$/u.test(draft.query) ? " is-editing" : ""}`} key={`${token.text}-${index}`}>{token.text}</span>)}</span>
-            <input ref={queryInputRef} autoFocus value={draft.query} onChange={(event) => { setDraft((current) => ({ ...current, query: event.target.value })); setQueryFocused(true); setQuerySuggestionIndex(0); }} onFocus={() => setQueryFocused(true)} onBlur={() => window.setTimeout(() => setQueryFocused(false), 120)} onKeyDown={(event) => { if (event.key === "ArrowDown" && querySuggestions.length) { event.preventDefault(); setQuerySuggestionIndex((index) => (index + 1) % querySuggestions.length); } else if (event.key === "ArrowUp" && querySuggestions.length) { event.preventDefault(); setQuerySuggestionIndex((index) => (index - 1 + querySuggestions.length) % querySuggestions.length); } else if (event.key === "Enter") { event.preventDefault(); if (querySuggestions.length) applyQuerySuggestion(querySuggestions[querySuggestionIndex]); else if (parsed.expression && !parsed.error && !/\s$/u.test(draft.query)) { const next = `${draft.query} `; setDraft((current) => ({ ...current, query: next })); window.requestAnimationFrame(() => queryInputRef.current?.setSelectionRange(next.length, next.length)); } } }} placeholder="Type your search query" />
+            <input ref={queryInputRef} autoFocus value={draft.query} onChange={(event) => { setDraft((current) => ({ ...current, query: event.target.value })); setQueryFocused(true); setQuerySuggestionIndex(0); }} onFocus={() => setQueryFocused(true)} onBlur={() => window.setTimeout(() => setQueryFocused(false), 120)} onKeyDown={(event) => { if (event.key === "ArrowDown" && querySuggestions.length) { event.preventDefault(); setQuerySuggestionIndex((index) => (index + 1) % querySuggestions.length); } else if (event.key === "ArrowUp" && querySuggestions.length) { event.preventDefault(); setQuerySuggestionIndex((index) => (index - 1 + querySuggestions.length) % querySuggestions.length); } else if (event.key === "Enter") { event.preventDefault(); if (querySuggestions.length) applyQuerySuggestion(querySuggestions[querySuggestionIndex]); else if (parsed.expression && !parsed.error && !/\s$/u.test(draft.query)) { const next = `${draft.query} `; setDraft((current) => ({ ...current, query: next })); window.requestAnimationFrame(() => queryInputRef.current?.setSelectionRange(next.length, next.length)); } } }} placeholder={t("splits.queryPlaceholder")} />
           </label>
           {queryFocused && (querySuggestions.length > 0 || Boolean(parsed.error)) ? <div className="mail-search-suggestions splits-query-suggestions" role="listbox">{querySuggestions.length ? querySuggestions.map((suggestion, index) => <button type="button" role="option" aria-selected={index === querySuggestionIndex} className={index === querySuggestionIndex ? "is-selected" : ""} key={suggestion} onMouseDown={(event) => event.preventDefault()} onMouseMove={() => setQuerySuggestionIndex(index)} onClick={() => applyQuerySuggestion(suggestion)}><strong>{suggestion}</strong>{getInboxQuerySuggestionPlaceholder(suggestion) ? <span>{getInboxQuerySuggestionPlaceholder(suggestion)}</span> : null}{index === querySuggestionIndex ? <kbd>Enter</kbd> : null}</button>) : parsed.error ? <p role="alert">{parsed.error}</p> : null}</div> : null}
         </div>
         {saveError ? <p className="splits-error" role="alert">{saveError}</p> : null}
-        <div className="splits-actions"><button type="button" disabled={saving} onClick={() => setScreen("form")}>Cancel</button><button type="button" disabled={saving || !parsed.expression || Boolean(parsed.error)} onClick={saveQuery}>{saving ? "Saving…" : "Save"}</button></div>
+        <div className="splits-actions"><button type="button" disabled={saving} onClick={() => setScreen("form")}>{t("common.cancel")}</button><button type="button" disabled={saving || !parsed.expression || Boolean(parsed.error)} onClick={saveQuery}>{saving ? t("common.saving") : t("common.save")}</button></div>
       </> : <>
-        <label>Name<input autoFocus value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} placeholder='e.g. "High priority"' /></label>
-        <label>Query<div className="splits-query-value"><span>{draft.query || "No query set"}</span><button type="button" onClick={() => setScreen("query")}>Edit</button></div></label>
-        {getInboxQuerySuggestions(draft.query).length && draft.query ? <p className="splits-hint">Use supported fields such as subject:, from:, to:, is:, has:, before:, or after:.</p> : null}
-        <label className="splits-switch"><span>Hide when empty</span><input type="checkbox" checked={draft.hide_when_empty} onChange={(event) => setDraft((current) => ({ ...current, hide_when_empty: event.target.checked }))} /></label>
-        <label>Bundling behavior<select value={draft.bundling_behavior} onChange={(event) => setDraft((current) => ({ ...current, bundling_behavior: event.target.value as InboxCustomCategory["bundling_behavior"] }))}><option value="default">Default</option><option value="by_sender">By sender</option><option value="none">None</option></select></label>
+        <label>{t("splits.name")}<input autoFocus value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} placeholder={t("splits.namePlaceholder")} /></label>
+        <label>{t("splits.query")}<div className="splits-query-value"><span>{draft.query || t("splits.noQuery")}</span><button type="button" onClick={() => setScreen("query")}>{t("common.edit")}</button></div></label>
+        {getInboxQuerySuggestions(draft.query).length && draft.query ? <p className="splits-hint">{t("splits.fieldsHint")}</p> : null}
+        <label className="splits-switch"><span>{t("splits.hideWhenEmpty")}</span><input type="checkbox" checked={draft.hide_when_empty} onChange={(event) => setDraft((current) => ({ ...current, hide_when_empty: event.target.checked }))} /></label>
+        <label>{t("splits.bundling")}<select value={draft.bundling_behavior} onChange={(event) => setDraft((current) => ({ ...current, bundling_behavior: event.target.value as InboxCustomCategory["bundling_behavior"] }))}><option value="default">{t("splits.bundling.default")}</option><option value="by_sender">{t("splits.bundling.bySender")}</option><option value="none">{t("splits.bundling.none")}</option></select></label>
         {saveError ? <p className="splits-error" role="alert">{saveError}</p> : null}
-        <div className="splits-actions"><button type="button" disabled={saving} onClick={() => setScreen("list")}>Cancel</button><button type="button" disabled={saving || !canSave} onClick={save}>{saving ? "Saving…" : editing ? "Save" : "Create"}</button></div>
+        <div className="splits-actions"><button type="button" disabled={saving} onClick={() => setScreen("list")}>{t("common.cancel")}</button><button type="button" disabled={saving || !canSave} onClick={save}>{saving ? t("common.saving") : editing ? t("common.save") : t("common.create")}</button></div>
       </>}
-      {deletingId ? <div className="splits-confirm"><p>Delete this Split? Its saved query will be removed.</p><button type="button" onClick={() => setDeletingId("")}>Cancel</button><button type="button" onClick={async () => { const ok = await onChange({ custom_categories: categories.filter((split) => split.id !== deletingId) }); if (ok) actions.showToast("Split deleted."); setDeletingId(""); }}>Delete</button></div> : null}
+      {deletingId ? <div className="splits-confirm"><p>{t("splits.deleteConfirm")}</p><button type="button" onClick={() => setDeletingId("")}>{t("common.cancel")}</button><button type="button" onClick={async () => { const ok = await onChange({ custom_categories: categories.filter((split) => split.id !== deletingId) }); if (ok) actions.showToast(t("splits.deleted")); setDeletingId(""); }}>{t("common.delete")}</button></div> : null}
     </section>
   </div>;
 }

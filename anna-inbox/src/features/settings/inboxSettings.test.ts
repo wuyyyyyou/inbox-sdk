@@ -19,7 +19,7 @@ describe("inbox settings", () => {
       todos_enabled: true,
       todos_limit: 10,
       llm_status_poll_seconds: 60,
-      auto_sync_seconds: 5,
+      auto_sync_seconds: 15,
     });
 
     expect(clampInboxSettings({ display_range_days: 9, stars_limit: 1000, llm_status_poll_seconds: 15 as never })).toMatchObject({

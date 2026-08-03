@@ -76,6 +76,7 @@ import { buildRevisionPrompt } from "./aiRoute";
 import { resolveAiSidebarMode, type AiSidebarMode } from "./aiSidebarMode";
 import { connectedAccountsStatusMessage } from "./connectedAccounts";
 import { resolveMailboxSelection } from "./mailboxSelection";
+import { useI18n } from "../i18n";
 
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -911,7 +912,7 @@ export interface AppActions {
     includeDisplayBody?: boolean;
   }): Promise<InboxThreadPagePayload>;
   loadInboxMessageDisplayBody(mailbox: string, messageId: string): Promise<InboxMessageDisplayBodyPayload>;
-  loadInboxThreadAssist(mailbox: string, threadId: string, latestMessageId: string, anchorMessageId?: string): Promise<InboxThreadAssistPayload>;
+  loadInboxThreadAssist(mailbox: string, threadId: string, latestMessageId: string, anchorMessageId?: string, locale?: string): Promise<InboxThreadAssistPayload>;
   getInboxThreadDraft(mailbox: string, threadId: string): Promise<InboxThreadDraftPayload>;
   listInboxThreadDrafts(mailbox: string, limit?: number): Promise<InboxFeedPayload>;
   saveInboxThreadDraft(
@@ -1067,6 +1068,7 @@ export interface AppActions {
 }
 
 export function useAppController() {
+  const { t } = useI18n();
   const [state, setState] = useState<AppState>(() => createInitialState());
   const [toast, setToast] = useState<({ message: string } & ToastOptions) | null>(null);
   const [accountSwitchNotice, setAccountSwitchNotice] = useState<{ email: string; avatarUrl?: string } | null>(null);
@@ -1411,13 +1413,18 @@ export function useAppController() {
     snapshotPromise.current = null;
     // 同步置位，避免 setState 渲染前自动同步定时器读到过期「未在同步」状态。
     inboxSyncInProgress.current = true;
-    setState((s) => ({
-      ...s,
-      inboxSnapshotLoading: true,
-      inboxLoading: false,
-      // 切换后的后台同步不清理已展示缓存，失败再写 error
-      inboxError: s.mailbox === mailbox ? s.inboxError : "",
-    }));
+    setState((s) => {
+      const hasVisibleInbox = s.inboxSnapshotMessages.length > 0 || s.inboxMessages.length > 0;
+      return {
+        ...s,
+        // Keep a cached inbox interactive while History sync runs in the background.
+        // A cold sync still owns the loading state so the empty inbox shows a loader.
+        inboxSnapshotLoading: !hasVisibleInbox,
+        inboxLoading: false,
+        // 切换后的后台同步不清理已展示缓存，失败再写 error
+        inboxError: s.mailbox === mailbox ? s.inboxError : "",
+      };
+    });
     try {
       const result = await client.syncInboxCache(mailbox);
       if (snapshotRequestMailbox.current !== requestKey) return false;
@@ -1459,7 +1466,9 @@ export function useAppController() {
   // 第三方 Gmail 客户端变更只在前台、当前邮箱稳定且没有 AI/列表重任务时同步。
   // 使用递归 timeout 而不是 interval，避免平台较慢时堆叠多个 History invoke。
   useEffect(() => {
-    inboxSyncInProgress.current = state.inboxSnapshotLoading;
+    // A cached background sync deliberately leaves the UI flag down, but must
+    // still keep the auto-sync lock until its request settles.
+    if (state.inboxSnapshotLoading) inboxSyncInProgress.current = true;
   }, [state.inboxSnapshotLoading]);
 
   useEffect(() => {
@@ -1660,8 +1669,8 @@ export function useAppController() {
       // 调用方主要看 ok；count/hasMore 由后续 feed 状态自行推导
       if (ok) {
         showToast(days > 0
-          ? `Inbox synced. Showing the last ${days} days.`
-          : "Inbox synced.");
+          ? t("toast.inboxSyncedDays", { days })
+          : t("toast.inboxSynced"));
       }
       return {
         ok,
@@ -1722,7 +1731,7 @@ export function useAppController() {
           ? `${Number(boundary.cache_total || 0)} emails are indexed in the cache.`
           : `${priorityDays}-day priority cache is ready; older history is continuing in the background.`;
       }
-      showToast(`Cache rebuilt. ${count} email${count === 1 ? "" : "s"} shown for ${displayRange}. ${scanStatus}`);
+      showToast(t("toast.cacheRebuilt", { count, displayRange, status: scanStatus }));
       return { ok: true, count, hasMore, nextOffset, messages: Array.isArray(payload.messages) ? payload.messages : [] };
     } catch (error) {
       if (snapshotRequestMailbox.current !== requestKey) return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
@@ -1734,7 +1743,7 @@ export function useAppController() {
         inboxSnapshotComplete: true,
         inboxError: detail,
       }));
-      showToast(days > 7 ? `Failed to sync the last ${days} days. ${detail}` : detail);
+      showToast(days > 7 ? t("toast.syncFailedDays", { days, detail }) : detail);
       return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
     } finally {
       if (snapshotRequestMailbox.current === requestKey) {
@@ -1742,7 +1751,7 @@ export function useAppController() {
       }
     }
     return { ok: false, count: 0, hasMore: false, nextOffset: 0 };
-  }, [applyInboxSnapshotPayload, client, preloadContactAvatars, silentSyncInbox, state.mailbox, state.selectedMailboxes]);
+  }, [applyInboxSnapshotPayload, client, preloadContactAvatars, silentSyncInbox, state.mailbox, state.selectedMailboxes, t]);
 
   const clearInboxCacheAndReload = useCallback(async (days?: number) => {
     const rangeDays = Math.max(0, Number(days ?? state.inboxSettings.display_range_days) || 30);
@@ -1970,11 +1979,11 @@ export function useAppController() {
       if (result.error) throw new Error(result.error);
       setState((s) => ({ ...s, selectedMemory: null, selectedMemoryKey: "" }));
       await loadContactMemories();
-      showToast("Memory deleted.");
+      showToast(t("toast.memoryDeleted"));
     } catch (error) {
       showToast(error instanceof Error ? error.message : String(error));
     }
-  }, [client, loadContactMemories, showToast, state.storageProvider]);
+  }, [client, loadContactMemories, showToast, state.storageProvider, t]);
 
   const clearContactMemories = useCallback(async () => {
     try {
@@ -1982,11 +1991,11 @@ export function useAppController() {
       if (result.error) throw new Error(result.error);
       setState((s) => ({ ...s, selectedMemory: null, selectedMemoryKey: "", contactMemories: [] }));
       await loadContactMemories();
-      showToast(`Cleared ${result.deleted || 0} memory file${result.deleted === 1 ? "" : "s"}.`);
+      showToast(t("toast.clearedMemoryFiles", { count: result.deleted || 0 }));
     } catch (error) {
       showToast(error instanceof Error ? error.message : String(error));
     }
-  }, [client, loadContactMemories, memoryMailboxes, showToast, state.storageProvider]);
+  }, [client, loadContactMemories, memoryMailboxes, showToast, state.storageProvider, t]);
 
   const loadCustomPlans = useCallback(async (storageOverride?: string) => {
     const provider = storageOverride ?? state.storageProvider;
@@ -2158,8 +2167,8 @@ export function useAppController() {
     if (next.status !== "connected") {
       const transitionedToFail = previous.status === "connected" || previous.status === "unknown" || !previous.checked;
       if (!options?.fromPoll || transitionedToFail) {
-        showToast("Anna LLM is unavailable. Please enable sampling permission for this Executa app, then try again.", {
-          actionLabel: "Retry",
+        showToast(t("toast.llmUnavailable"), {
+          actionLabel: t("toast.retry"),
           onAction: () => {
             void refreshSamplingStatusRef.current();
           },
@@ -2168,7 +2177,7 @@ export function useAppController() {
       }
     }
     return next;
-  }, [client, showToast]);
+  }, [client, showToast, t]);
   refreshSamplingStatusRef.current = refreshSamplingStatus;
 
   const refreshGmailApiStatus = useCallback(async (options?: { fromPoll?: boolean }): Promise<AppState["gmailApiStatus"]> => {
@@ -2207,8 +2216,8 @@ export function useAppController() {
     if (next.status !== "connected") {
       const transitionedToFail = previous.status === "connected" || previous.status === "unknown" || !previous.checked;
       if (!options?.fromPoll || transitionedToFail) {
-        showToast("Gmail API is unavailable. Check network or re-authorize the mailbox, then try again.", {
-          actionLabel: "Retry",
+        showToast(t("toast.gmailUnavailable"), {
+          actionLabel: t("toast.retry"),
           onAction: () => {
             void refreshGmailApiStatusRef.current();
           },
@@ -2217,7 +2226,7 @@ export function useAppController() {
       }
     }
     return next;
-  }, [client, showToast]);
+  }, [client, showToast, t]);
   refreshGmailApiStatusRef.current = refreshGmailApiStatus;
 
   // LLM 与 Gmail API 并行探测，侧栏点击 / 轮询 / Toast Retry 共用
@@ -2247,16 +2256,16 @@ export function useAppController() {
     if (state.llmProvider !== "anna-llm") return true;
     const status = await refreshSamplingStatus();
     if (status.status === "connected") return true;
-    const message = "Anna LLM is unavailable. Please enable sampling permission for this Executa app, then try again.";
+    const message = t("toast.llmUnavailable");
     setState((s) => ({ ...s, scanError: status.message ? `${message}\n${status.message}` : message }));
     return false;
-  }, [refreshSamplingStatus, state.llmProvider]);
+  }, [refreshSamplingStatus, state.llmProvider, t]);
 
   const resolveScanRequest = useCallback(async (mailboxOverride?: string): Promise<{ mailboxesToScan: string[]; scanMode: string } | null> => {
     if (!state.runtime.connected || state.isScanning || state.isPreparingScan) return null;
     const mailboxesToScan = (mailboxOverride ? [mailboxOverride] : (state.selectedMailboxes.length ? state.selectedMailboxes : [state.mailbox])).map(normalizedMailbox).filter(Boolean);
     if (!mailboxesToScan.length) {
-      showToast("Select at least one mailbox.");
+      showToast(t("toast.selectMailbox"));
       return null;
     }
     if (!(await ensureSamplingAvailable())) return null;
@@ -2264,7 +2273,7 @@ export function useAppController() {
       mailboxesToScan,
       scanMode: state.strategyMode || DEFAULT_MODE,
     };
-  }, [ensureSamplingAvailable, showToast, state.isPreparingScan, state.isScanning, state.mailbox, state.runtime.connected, state.selectedMailboxes, state.strategyMode]);
+  }, [ensureSamplingAvailable, showToast, state.isPreparingScan, state.isScanning, state.mailbox, state.runtime.connected, state.selectedMailboxes, state.strategyMode, t]);
 
   const stopActiveScans = useCallback((reason = "switched mailbox") => {
     // 立刻抬升代际号，阻断 Brief continue 循环与后续邮箱扫描。
@@ -2470,7 +2479,7 @@ export function useAppController() {
         ? `Scan complete with ${failures.length} issue${failures.length === 1 ? "" : "s"}.`
         : "Scan complete. Showing persisted attention cards.";
       setState((s) => ({ ...s, scanStatus: statusText, scanError: s.scanError || failures.join("\n") }));
-      showToast(failures.length ? statusText : "Scan complete.");
+      showToast(failures.length ? statusText : t("toast.scanComplete"));
       window.setTimeout(() => {
         void loadActiveCards(undefined, "all", { timeoutMs: 55_000 });
         void loadRunHistory();
@@ -2494,7 +2503,7 @@ export function useAppController() {
         setState((s) => ({ ...s, isPreparingScan: false, isScanning: false }));
       }
     }
-  }, [client, loadActiveCards, loadRunHistory, loadScanPlanForRun, showToast, state.llmProvider, state.mailbox, state.storageProvider]);
+  }, [client, loadActiveCards, loadRunHistory, loadScanPlanForRun, showToast, state.llmProvider, state.mailbox, state.storageProvider, t]);
 
   const loadMailboxes = useCallback(async (storageOverride?: string): Promise<{ mailboxes: MailboxInfo[]; selected: string[]; primary: string }> => {
     const provider = storageOverride ?? state.storageProvider;
@@ -2671,7 +2680,7 @@ export function useAppController() {
         const systemAuthorized = Boolean(authResult?.authorized);
         const authWarning = (authResult as Record<string, unknown> | null | undefined)?.warning as string | undefined;
         setState((s) => ({ ...s, gmailAuthStatus: { checked: true, authorized: systemAuthorized, source: authResult?.source || "none" } }));
-        if (authWarning) showToast(`Auth notice: ${authWarning}`);
+        if (authWarning) showToast(t("toast.authNotice", { detail: authWarning }));
         // mailbox 就绪后，Gmail 探测使用当前邮箱。
         mailboxForGmailCheckRef.current = currentMailbox || mailboxForGmailCheckRef.current;
         if (!systemAuthorized) {
@@ -2722,10 +2731,10 @@ export function useAppController() {
       }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      showToast(`Init failed: ${msg}`);
+      showToast(t("toast.initFailed", { detail: msg }));
       setState((s) => ({ ...s, loading: false, inboxLoading: false, inboxError: msg }));
     }
-  }, [client, discoverMailbox, getRuntime, loadCustomPlans, loadInboxSettings, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshConnectivityStatus, showToast, state.mailbox, state.selectedMailboxes, state.storageProvider]);
+  }, [client, discoverMailbox, getRuntime, loadCustomPlans, loadInboxSettings, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshConnectivityStatus, showToast, state.mailbox, state.selectedMailboxes, state.storageProvider, t]);
 
   // 初次连接失败不会再永久缓存 mock runtime；前台保持每 5 秒尝试一次完整初始化，
   // 成功后 effect 自动停止。业务 mutation 不在此处重放，仍需用户再次确认。
@@ -2831,11 +2840,11 @@ export function useAppController() {
     setProvider(kind, value) {
       if (kind === "llm" && (value === "dashscope" || value === "anna-llm")) {
         setState((s) => ({ ...s, llmProvider: value }));
-        showToast(value === "dashscope" ? "LLM: DashScope" : "LLM: Anna sampling");
+        showToast(value === "dashscope" ? t("toast.llmDashScope") : t("toast.llmAnnaSampling"));
       }
       if (kind === "storage" && (value === "aps" || value === "local")) {
         setState((s) => ({ ...s, storageProvider: value, customPlans: [] }));
-        showToast(value === "aps" ? "Storage: APS" : "Storage: local");
+        showToast(value === "aps" ? t("toast.storageAps") : t("toast.storageLocal"));
         setTimeout(() => {
           void loadMailboxes(value);
           void loadActiveCards(value);
@@ -2977,7 +2986,7 @@ export function useAppController() {
             })),
           }));
           if (hardAuthFailed) {
-            showToast("This Gmail authorization expired. Reconnect the account and try again.");
+            showToast(t("toast.authExpired"));
           }
         }
       })();
@@ -3184,12 +3193,13 @@ export function useAppController() {
     async loadInboxMessageDisplayBody(mailbox, messageId) {
       return client.getInboxMessageDisplayBody(normalizedMailbox(mailbox), messageId);
     },
-    async loadInboxThreadAssist(mailbox, threadId, latestMessageId, anchorMessageId) {
+    async loadInboxThreadAssist(mailbox, threadId, latestMessageId, anchorMessageId, locale) {
       const started = await client.startInboxThreadAssist({
         mailbox: normalizedMailbox(mailbox),
         thread_id: threadId,
         latest_message_id: latestMessageId,
         anchor_message_id: anchorMessageId,
+        locale: locale || "en-US",
         ai_provider: state.llmProvider,
         storage_provider: state.storageProvider,
       });
@@ -3323,7 +3333,7 @@ export function useAppController() {
     async submitMailContextPrompt(request) {
       const context = request.context;
       if (!state.runtime.connected) {
-        showToast("LLM is offline. Please try again when it reconnects.");
+        showToast(t("toast.llmOffline"));
         return null;
       }
       if (
@@ -3598,7 +3608,7 @@ export function useAppController() {
             ? { ...item, label_ids: [...new Set([...(item.label_ids || []).filter((label) => label !== "INBOX"), "TRASH"])] }
             : item),
         }));
-        showToast("Moved to trash.");
+        showToast(t("toast.movedToTrash"));
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       }
@@ -3734,7 +3744,7 @@ export function useAppController() {
               inboxMessages: prevInbox,
               inboxSnapshotMessages: prevSnapshot,
             }));
-            showToast(`Restored ${n}.`);
+            showToast(t("toast.restoredCount", { count: n }));
             return true;
           } catch (error) {
             showToast(error instanceof Error ? error.message : String(error));
@@ -3779,7 +3789,7 @@ export function useAppController() {
     },
     async startScan(_reason = "manual", _mailboxOverride?: string) {
       // Brief 已下线：请用 AI 侧栏（organize / 需回复）完成扫描。
-      showToast("Brief scan is retired. Use the AI sidebar to organize or find mail that needs a reply.");
+      showToast(t("toast.briefRetired"));
     },
     async openCard(cardId) {
       const card = findCard(state.cards, cardId);
@@ -4397,7 +4407,7 @@ export function useAppController() {
 const userRequest = String(options.prompt ?? state.customScanInput).trim();
       const agentRequest = String(options.agentPrompt || userRequest).trim() || userRequest;
       if (!state.runtime.connected) {
-        showToast("LLM is offline. Please try again when it reconnects.");
+        showToast(t("toast.llmOffline"));
         return;
       }
       if (!userRequest || state.isCustomScanning || state.aiChatLoading || aiGenerationRun.current) return;
@@ -4968,7 +4978,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
     },
     retryAiMessage(messageId) {
       if (!state.runtime.connected) {
-        showToast("LLM is offline. Please try again when it reconnects.");
+        showToast(t("toast.llmOffline"));
         return;
       }
       if (state.isCustomScanning || state.aiChatLoading || aiGenerationRun.current) return;
@@ -5194,7 +5204,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
           await loadActiveCards(undefined, "all");
           await loadRunHistory();
           const deleted = result.deleted || {};
-          showToast(`Reset ${deleted.keys || 0} scan record${deleted.keys === 1 ? "" : "s"} for ${normalized}.`);
+          showToast(t("toast.resetScanRecords", { count: deleted.keys || 0, mailbox: normalized }));
         }
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
@@ -5242,7 +5252,12 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
             allCards: nextMailbox === "all" ? s.allCards : s.allCards.filter((c) => normalizedMailbox(cardMailbox(c, s.mailbox)) !== normalized),
             actionCount: actionCount(nextMailbox === "all" ? s.cards : filterCardsByMailboxes(s.allCards, remainingSelected)),
           }));
-          showToast(`Deleted ${deleted.keys || 0} records, ${deleted.cache_keys || 0} cached emails, ${deleted.history_entries || 0} history entries for ${normalized}.`);
+          showToast(t("toast.deletedRecords", {
+            keys: deleted.keys || 0,
+            cache: deleted.cache_keys || 0,
+            history: deleted.history_entries || 0,
+            mailbox: normalized,
+          }));
           await loadActiveCards();
         }
       } catch (error) {
@@ -5412,7 +5427,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
     async deleteAiMemory(memoryId) {
       try {
         await client.deleteAiMemory(memoryId);
-        showToast("Memory deleted.");
+        showToast(t("toast.memoryDeleted"));
         return true;
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));

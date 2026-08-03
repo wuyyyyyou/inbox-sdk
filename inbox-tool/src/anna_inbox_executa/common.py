@@ -632,6 +632,7 @@ DEFAULT_MANIFEST = {
                 {"name": "thread_id", "type": "string", "description": "Gmail thread ID.", "required": True},
                 {"name": "latest_message_id", "type": "string", "description": "Latest message ID used for cache invalidation.", "required": True},
                 {"name": "anchor_message_id", "type": "string", "description": "Message initially opened from the Inbox list.", "required": False},
+                {"name": "locale", "type": "string", "description": "Interface locale, e.g. zh-CN or en-US. Overview and quick replies are generated in this language and cached per locale.", "required": False},
                 {"name": "ai_provider", "type": "string", "description": "LLM provider.", "required": False},
             ],
         },

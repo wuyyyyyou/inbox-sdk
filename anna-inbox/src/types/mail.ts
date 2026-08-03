@@ -584,6 +584,8 @@ export interface QuickReplySuggestion {
 export interface InboxThreadAssistPayload {
   thread_id: string;
   latest_message_id: string;
+  /** 生成摘要使用的界面语言（zh / en） */
+  locale?: string;
   overview: string;
   /** 是否需要用户回复；false 时展示 no_reply_reason，不展示快捷 draft 提示 */
   needs_reply?: boolean;

@@ -6,6 +6,7 @@ import type {
   RenderTask,
 } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { useI18n, tFallback } from "../../i18n/I18nContext";
 
 type PdfPageProps = {
   document: PDFDocumentProxy;
@@ -62,6 +63,7 @@ function PdfPage({ document, pageNumber, width, onRendered, onError }: PdfPagePr
 }
 
 function PdfAttachmentPreviewContent({ url, onReady }: { url: string; onReady?: () => void }) {
+  const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement>(null);
   const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
   const [width, setWidth] = useState(0);
@@ -147,10 +149,10 @@ function PdfAttachmentPreviewContent({ url, onReady }: { url: string; onReady?: 
     <div className="pdf-attachment-preview" ref={containerRef}>
       {!error && (!document || renderedPages.size < document.numPages) ? (
         <p className="pdf-attachment-progress">
-          {document ? `Rendering PDF pages ${renderedPages.size}/${document.numPages}…` : "Loading PDF…"}
+          {document ? t("detail.renderingPdfPages", { rendered: renderedPages.size, total: document.numPages }) : t("detail.loadingPdf")}
         </p>
       ) : null}
-      {error ? <p className="pdf-attachment-error">Unable to render PDF: {error}</p> : null}
+      {error ? <p className="pdf-attachment-error">{t("detail.pdfRenderFailed", { error })}</p> : null}
       {document && width > 0 ? (
         <div className="pdf-attachment-pages">
           {Array.from({ length: document.numPages }, (_, index) => {
@@ -185,7 +187,7 @@ class PdfPreviewBoundary extends Component<{ children: ReactNode }, PdfPreviewBo
     if (this.state.error) {
       return (
         <div className="pdf-attachment-preview">
-          <p className="pdf-attachment-error">Unable to render PDF: {this.state.error}</p>
+          <p className="pdf-attachment-error">{tFallback("detail.pdfRenderFailed", { error: this.state.error })}</p>
         </div>
       );
     }

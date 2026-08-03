@@ -10,20 +10,22 @@ import {
   type KeyboardEvent,
   type MouseEvent,
 } from "react";
+import { useI18n } from "../../i18n/I18nContext";
 
 const FONT_SIZES = [12, 14, 16, 18, 20, 24] as const;
 const HEADING_FONT_SIZES: Record<string, number> = { p: 14, h1: 24, h2: 20, h3: 18 };
 const COLORS = ["#1f2937", "#dc2626", "#d97706", "#16a34a", "#2563eb", "#7c3aed"] as const;
-const ALLOWED_TAGS = ["p", "br", "strong", "em", "u", "span", "ul", "ol", "li", "a", "h1", "h2", "h3"];
+const ALLOWED_TAGS = ["p", "br", "strong", "em", "u", "s", "span", "ul", "ol", "li", "a", "h1", "h2", "h3", "blockquote"];
 const COLOR_NAMES: Record<(typeof COLORS)[number], string> = {
-  "#1f2937": "Dark gray",
-  "#dc2626": "Red",
-  "#d97706": "Orange",
-  "#16a34a": "Green",
-  "#2563eb": "Blue",
-  "#7c3aed": "Purple",
+  "#1f2937": "detail.color.darkGray",
+  "#dc2626": "detail.color.red",
+  "#d97706": "detail.color.orange",
+  "#16a34a": "detail.color.green",
+  "#2563eb": "detail.color.blue",
+  "#7c3aed": "detail.color.purple",
 };
-const ALLOWED_ATTR = ["href", "style"];
+const ALLOWED_ATTR = ["href", "style", "align"];
+const ALLOWED_ALIGNMENTS = ["left", "center", "right", "justify"] as const;
 const FONT_SIZE_BY_LEGACY_VALUE: Record<string, number> = {
   "1": 12,
   "2": 14,
@@ -78,9 +80,10 @@ function normalizeColor(value: string) {
   return COLORS.includes(resolved as (typeof COLORS)[number]) ? resolved : "";
 }
 
-function sanitizeStyle(value: string) {
+export function sanitizeEditorStyle(value: string) {
   let color = "";
   let fontSize = "";
+  let textAlign = "";
   for (const declaration of value.split(";")) {
     const [property, rawValue] = declaration.split(":", 2);
     if (!property || rawValue === undefined) continue;
@@ -89,8 +92,14 @@ function sanitizeStyle(value: string) {
       const size = Number.parseInt(rawValue, 10);
       if (FONT_SIZES.includes(size as (typeof FONT_SIZES)[number])) fontSize = `${size}px`;
     }
+    if (property.trim().toLowerCase() === "text-align") {
+      const alignment = rawValue.trim().toLowerCase();
+      if (ALLOWED_ALIGNMENTS.includes(alignment as (typeof ALLOWED_ALIGNMENTS)[number])) textAlign = alignment;
+    }
   }
-  return [fontSize && `font-size: ${fontSize}`, color && `color: ${color}`].filter(Boolean).join("; ");
+  return [fontSize && `font-size: ${fontSize}`, color && `color: ${color}`, textAlign && `text-align: ${textAlign}`]
+    .filter(Boolean)
+    .join("; ");
 }
 
 function isSafeHref(value: string) {
@@ -123,16 +132,26 @@ export function sanitizeEditorHtml(value: string) {
     if (style) span.setAttribute("style", style);
   }
 
+  // Browsers and office apps commonly paste alignment as an HTML attribute.
+  for (const element of Array.from(document.body.querySelectorAll("[align]"))) {
+    const alignment = element.getAttribute("align")?.trim().toLowerCase() || "";
+    element.removeAttribute("align");
+    if (ALLOWED_ALIGNMENTS.includes(alignment as (typeof ALLOWED_ALIGNMENTS)[number])) {
+      const existing = element.getAttribute("style") || "";
+      element.setAttribute("style", `${existing}${existing.trim() ? ";" : ""} text-align: ${alignment}`);
+    }
+  }
+
   const clean = DOMPurify.sanitize(document.body.innerHTML, {
     ALLOWED_TAGS,
     ALLOWED_ATTR,
     ALLOW_UNKNOWN_PROTOCOLS: false,
   });
   const cleanDocument = new DOMParser().parseFromString(clean, "text/html");
-  for (const span of Array.from(cleanDocument.body.querySelectorAll("span"))) {
-    const style = sanitizeStyle(span.getAttribute("style") || "");
-    if (style) span.setAttribute("style", style);
-    else span.removeAttribute("style");
+  for (const styledElement of Array.from(cleanDocument.body.querySelectorAll("[style]"))) {
+    const style = sanitizeEditorStyle(styledElement.getAttribute("style") || "");
+    if (style) styledElement.setAttribute("style", style);
+    else styledElement.removeAttribute("style");
   }
   for (const link of Array.from(cleanDocument.body.querySelectorAll("a"))) {
     const href = link.getAttribute("href") || "";
@@ -161,6 +180,7 @@ export const RichTextEditor = forwardRef<HTMLDivElement, RichTextEditorProps>(fu
   { value, placeholder, disabled = false, onChange },
   forwardedRef,
 ) {
+  const { t } = useI18n();
   const editorRef = useRef<HTMLDivElement | null>(null);
   const selectionRef = useRef<Range | null>(null);
   const historyRef = useRef<string[]>([]);
@@ -175,6 +195,7 @@ export const RichTextEditor = forwardRef<HTMLDivElement, RichTextEditorProps>(fu
   const [currentHeading, setCurrentHeading] = useState("p");
   const openedLinkRef = useRef<HTMLAnchorElement | null>(null);
   const linkPopoverRef = useRef<HTMLDivElement | null>(null);
+  const linkButtonRef = useRef<HTMLButtonElement | null>(null);
 
   useImperativeHandle(forwardedRef, () => editorRef.current as HTMLDivElement);
 
@@ -246,13 +267,25 @@ export const RichTextEditor = forwardRef<HTMLDivElement, RichTextEditorProps>(fu
 
   useEffect(() => {
     if (!linkOpen) return;
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      openedLinkRef.current = null;
+      setLinkOpen(false);
+      linkButtonRef.current?.focus();
+    };
     const closeOnOutsidePointerDown = (event: globalThis.MouseEvent) => {
       if (linkPopoverRef.current?.contains(event.target as Node)) return;
       openedLinkRef.current = null;
       setLinkOpen(false);
+      linkButtonRef.current?.focus();
     };
+    document.addEventListener("keydown", closeOnEscape);
     document.addEventListener("mousedown", closeOnOutsidePointerDown);
-    return () => document.removeEventListener("mousedown", closeOnOutsidePointerDown);
+    return () => {
+      document.removeEventListener("keydown", closeOnEscape);
+      document.removeEventListener("mousedown", closeOnOutsidePointerDown);
+    };
   }, [linkOpen]);
 
   const restoreSelection = () => {
@@ -306,7 +339,7 @@ export const RichTextEditor = forwardRef<HTMLDivElement, RichTextEditorProps>(fu
   const applyLink = () => {
     const href = normalizeHref(linkUrl);
     if (!isSafeHref(href)) {
-      setLinkError("Use an http, https, or mailto URL.");
+      setLinkError(t("detail.linkUrlError"));
       return;
     }
     restoreSelection();
@@ -318,7 +351,7 @@ export const RichTextEditor = forwardRef<HTMLDivElement, RichTextEditorProps>(fu
     } else if (linkText.trim()) {
       document.execCommand("insertHTML", false, `<a href="${escapeHtml(href)}">${escapeHtml(linkText.trim())}</a>`);
     } else {
-      setLinkError("Enter link text or select text in the editor.");
+      setLinkError(t("detail.linkTextError"));
       return;
     }
     emit(editorRef.current?.innerHTML || "");
@@ -340,8 +373,11 @@ export const RichTextEditor = forwardRef<HTMLDivElement, RichTextEditorProps>(fu
 
   const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
     event.preventDefault();
-    const text = event.clipboardData.getData("text/plain");
-    document.execCommand("insertText", false, text);
+    const pastedHtml = event.clipboardData.getData("text/html");
+    const pastedText = event.clipboardData.getData("text/plain");
+    const safeHtml = pastedHtml ? sanitizeEditorHtml(pastedHtml) : "";
+    if (safeHtml) document.execCommand("insertHTML", false, safeHtml);
+    else document.execCommand("insertText", false, pastedText);
     emit(editorRef.current?.innerHTML || "");
   };
 
@@ -370,19 +406,19 @@ export const RichTextEditor = forwardRef<HTMLDivElement, RichTextEditorProps>(fu
 
   return (
     <div className="rich-text-editor" data-disabled={disabled || undefined}>
-      <div className="rich-text-editor-toolbar" role="toolbar" aria-label="Text formatting">
+      <div className="rich-text-editor-toolbar" role="toolbar" aria-label={t("detail.textFormatting")}>
         <div className="rich-text-editor-group">
-          <button type="button" aria-label="Undo" data-tooltip="Undo (Ctrl/Cmd+Z)" disabled={disabled || !canUndo} onMouseDown={toolbarMouseDown} onClick={undo}>↶</button>
-          <button type="button" aria-label="Redo" data-tooltip="Redo (Ctrl/Cmd+Shift+Z)" disabled={disabled || !canRedo} onMouseDown={toolbarMouseDown} onClick={redo}>↷</button>
+          <button type="button" aria-label={t("detail.undo")} data-tooltip={t("detail.undoTooltip")} disabled={disabled || !canUndo} onMouseDown={toolbarMouseDown} onClick={undo}>↶</button>
+          <button type="button" aria-label={t("detail.redo")} data-tooltip={t("detail.redoTooltip")} disabled={disabled || !canRedo} onMouseDown={toolbarMouseDown} onClick={redo}>↷</button>
         </div>
         <div className="rich-text-editor-group">
-          <button type="button" className={active("bold") ? "is-active" : ""} aria-label="Bold" data-tooltip="Bold (Ctrl/Cmd+B)" disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("bold")}><strong>B</strong></button>
-          <button type="button" className={active("italic") ? "is-active" : ""} aria-label="Italic" data-tooltip="Italic (Ctrl/Cmd+I)" disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("italic")}><em>I</em></button>
-          <button type="button" className={active("underline") ? "is-active" : ""} aria-label="Underline" data-tooltip="Underline (Ctrl/Cmd+U)" disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("underline")}><u>U</u></button>
+          <button type="button" className={active("bold") ? "is-active" : ""} aria-label={t("detail.bold")} data-tooltip={t("detail.boldTooltip")} disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("bold")}><strong>B</strong></button>
+          <button type="button" className={active("italic") ? "is-active" : ""} aria-label={t("detail.italic")} data-tooltip={t("detail.italicTooltip")} disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("italic")}><em>I</em></button>
+          <button type="button" className={active("underline") ? "is-active" : ""} aria-label={t("detail.underline")} data-tooltip={t("detail.underlineTooltip")} disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("underline")}><u>U</u></button>
         </div>
         <div className="rich-text-editor-group rich-text-editor-select-group">
-          <label className="sr-only" htmlFor="rich-text-font-size">Font size</label>
-          <select id="rich-text-font-size" aria-label="Font size" disabled={disabled} defaultValue="" onMouseDown={saveSelection} onChange={(event) => {
+          <label className="sr-only" htmlFor="rich-text-font-size">{t("detail.fontSize")}</label>
+          <select id="rich-text-font-size" aria-label={t("detail.fontSize")} title={t("detail.fontSize")} disabled={disabled} defaultValue="" onMouseDown={saveSelection} onChange={(event) => {
             if (event.target.value) applyFontSize(Number(event.target.value) as (typeof FONT_SIZES)[number]);
             event.currentTarget.value = "";
           }}>
@@ -392,40 +428,46 @@ export const RichTextEditor = forwardRef<HTMLDivElement, RichTextEditorProps>(fu
         </div>
         <div className="rich-text-editor-group rich-text-editor-colors">
           {COLORS.map((color) => (
-            <button key={color} type="button" className="rich-text-editor-color" aria-label={`Text color ${COLOR_NAMES[color]}`} data-tooltip={COLOR_NAMES[color]} disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("foreColor", color)}>
+            <button key={color} type="button" className="rich-text-editor-color" aria-label={t("detail.textColor", { color: t(COLOR_NAMES[color] as "detail.color.darkGray") })} data-tooltip={t(COLOR_NAMES[color] as "detail.color.darkGray")} disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("foreColor", color)}>
               <span style={{ backgroundColor: color }} />
             </button>
           ))}
         </div>
         <div className="rich-text-editor-group rich-text-editor-select-group">
-          <label className="sr-only" htmlFor="rich-text-heading">Heading</label>
-          <select id="rich-text-heading" aria-label="Heading" disabled={disabled} value={currentHeading} onMouseDown={saveSelection} onChange={(event) => {
+          <label className="sr-only" htmlFor="rich-text-heading">{t("detail.heading")}</label>
+          <select id="rich-text-heading" aria-label={t("detail.heading")} title={t("detail.heading")} disabled={disabled} value={currentHeading} onMouseDown={saveSelection} onChange={(event) => {
             runCommand("formatBlock", `<${event.target.value}>`);
             setCurrentHeading(event.target.value);
           }}>
-            <option value="p">Normal</option>
+            <option value="p">{t("detail.normal")}</option>
             <option value="h1">H1</option>
             <option value="h2">H2</option>
             <option value="h3">H3</option>
           </select>
         </div>
         <div className="rich-text-editor-group">
-          <button type="button" className={active("insertUnorderedList") ? "is-active" : ""} aria-label="Bulleted list" data-tooltip="Bulleted list" disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("insertUnorderedList")}>•≡</button>
-          <button type="button" className={active("insertOrderedList") ? "is-active" : ""} aria-label="Numbered list" data-tooltip="Numbered list" disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("insertOrderedList")}>1≡</button>
+          <button type="button" className={active("insertUnorderedList") ? "is-active" : ""} aria-label={t("detail.bulletedList")} data-tooltip={t("detail.bulletedList")} disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("insertUnorderedList")}>•≡</button>
+          <button type="button" className={active("insertOrderedList") ? "is-active" : ""} aria-label={t("detail.numberedList")} data-tooltip={t("detail.numberedList")} disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("insertOrderedList")}>1≡</button>
         </div>
         <div className="rich-text-editor-group">
-          <button type="button" className={active("createLink") ? "is-active" : ""} aria-label="Link" data-tooltip="Link" disabled={disabled} onMouseDown={toolbarMouseDown} onClick={openLink}>↗</button>
+          <button type="button" className={active("justifyLeft") ? "is-active" : ""} aria-label={t("detail.alignLeft")} data-tooltip={t("detail.alignLeft")} disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("justifyLeft")}>L</button>
+          <button type="button" className={active("justifyCenter") ? "is-active" : ""} aria-label={t("detail.alignCenter")} data-tooltip={t("detail.alignCenter")} disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("justifyCenter")}>C</button>
+          <button type="button" className={active("justifyRight") ? "is-active" : ""} aria-label={t("detail.alignRight")} data-tooltip={t("detail.alignRight")} disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("justifyRight")}>R</button>
+          <button type="button" className={active("justifyFull") ? "is-active" : ""} aria-label={t("detail.justify")} data-tooltip={t("detail.justify")} disabled={disabled} onMouseDown={toolbarMouseDown} onClick={() => runCommand("justifyFull")}>J</button>
+        </div>
+        <div className="rich-text-editor-group">
+          <button ref={linkButtonRef} type="button" className={active("createLink") ? "is-active" : ""} aria-label={t("detail.link")} data-tooltip={t("detail.link")} disabled={disabled} onMouseDown={toolbarMouseDown} onClick={openLink}>↗</button>
         </div>
       </div>
       {linkOpen ? (
-        <div ref={linkPopoverRef} className="rich-text-editor-link-popover" role="dialog" aria-label="Edit link">
-          <input value={linkText} onChange={(event) => setLinkText(event.target.value)} placeholder="Link text" aria-label="Link text" />
-          <input value={linkUrl} onChange={(event) => setLinkUrl(event.target.value)} onBlur={(event) => setLinkUrl(normalizeHref(event.target.value))} placeholder="https://" aria-label="Link URL" autoFocus />
-          {linkError ? <p role="alert">{linkError}</p> : null}
+        <div ref={linkPopoverRef} className="rich-text-editor-link-popover" role="dialog" aria-label={t("detail.editLink")}>
+          <input value={linkText} onChange={(event) => setLinkText(event.target.value)} placeholder={t("detail.linkText")} aria-label={t("detail.linkText")} />
+          <input value={linkUrl} onChange={(event) => setLinkUrl(event.target.value)} onBlur={(event) => setLinkUrl(normalizeHref(event.target.value))} placeholder="https://" aria-label={t("detail.linkUrl")} aria-describedby={linkError ? "rich-text-link-error" : undefined} autoFocus />
+          {linkError ? <p id="rich-text-link-error" role="alert">{linkError}</p> : null}
           <div>
-            <button type="button" onClick={applyLink}>Apply</button>
-            <button type="button" onClick={removeLink}>Remove</button>
-            <button type="button" onClick={() => { openedLinkRef.current = null; setLinkOpen(false); }}>Cancel</button>
+            <button type="button" onClick={applyLink}>{t("detail.apply")}</button>
+            <button type="button" onClick={removeLink}>{t("detail.remove")}</button>
+            <button type="button" onClick={() => { openedLinkRef.current = null; setLinkOpen(false); }}>{t("detail.cancel")}</button>
           </div>
         </div>
       ) : null}

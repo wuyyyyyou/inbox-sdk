@@ -17,6 +17,14 @@ export type { AddressParts };
 
 export type AttachmentKind = "pdf" | "image" | "text" | "audio" | "video" | "download";
 
+const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "heic", "heif", "ico", "tif", "tiff"];
+const TEXT_EXTENSIONS = ["txt", "json", "csv", "tsv", "log", "md", "markdown", "xml", "html", "htm", "css", "ics", "ifb", "vcf", "yaml", "yml", "toml", "ini", "rtf"];
+const AUDIO_EXTENSIONS = ["mp3", "wav", "ogg", "oga", "m4a", "aac", "flac", "opus", "weba"];
+const VIDEO_EXTENSIONS = ["mp4", "webm", "mov", "m4v", "avi", "mkv", "ogv", "mpeg", "mpg", "3gp"];
+const OFFICE_EXTENSIONS = ["doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp"];
+const CALENDAR_EXTENSIONS = ["ics", "ifb", "ical", "vcs"];
+const ARCHIVE_EXTENSIONS = ["zip", "7z", "rar", "tar", "gz", "bz2", "xz", "tgz"];
+
 export interface ResolvedAttachmentAccess {
   kind: "url" | "blob";
   url: string;
@@ -40,10 +48,10 @@ export function parseMessageDate(value?: string) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-export function formatAbsoluteDateTime(value?: string) {
+export function formatAbsoluteDateTime(value?: string, locale = "en-US") {
   const date = parseMessageDate(value);
   if (!date) return "";
-  return date.toLocaleString("en-US", {
+  return date.toLocaleString(locale, {
     month: "short",
     day: "numeric",
     year: "numeric",
@@ -84,29 +92,46 @@ export function normalizeAttachmentKind(attachment: Pick<MailAttachmentMeta, "fi
   const extension = attachmentExtension(attachment.filename);
   const useExtensionFallback = !mime || mime === "application/octet-stream";
   if (mime === "application/pdf" || (useExtensionFallback && extension === "pdf")) return "pdf";
-  if (
-    mime.startsWith("image/")
-    || (useExtensionFallback && ["png", "jpg", "jpeg", "gif", "webp"].includes(extension))
-  ) return "image";
+  if (mime.startsWith("image/") || (useExtensionFallback && IMAGE_EXTENSIONS.includes(extension))) return "image";
   if (
     mime.startsWith("text/")
     || mime === "application/json"
     || mime === "text/csv"
-    || (useExtensionFallback && ["txt", "json", "csv", "log", "md"].includes(extension))
+    || mime === "application/rtf"
+    || (useExtensionFallback && TEXT_EXTENSIONS.includes(extension))
   ) return "text";
   if (
     mime.startsWith("audio/")
-    || (useExtensionFallback && ["mp3", "wav"].includes(extension))
+    || (useExtensionFallback && AUDIO_EXTENSIONS.includes(extension))
   ) return "audio";
   if (
     mime.startsWith("video/")
-    || (useExtensionFallback && ["mp4", "webm"].includes(extension))
+    || (useExtensionFallback && VIDEO_EXTENSIONS.includes(extension))
   ) return "video";
   return "download";
 }
 
 export function isPreviewableAttachment(attachment: MailAttachmentMeta) {
   return normalizeAttachmentKind(attachment) !== "download";
+}
+
+/** Human-readable information for binary formats that intentionally remain download-only. */
+export function attachmentFallbackMetadata(
+  attachment: Pick<MailAttachmentMeta, "filename" | "mime_type">,
+) {
+  const extension = attachmentExtension(attachment.filename);
+  if (OFFICE_EXTENSIONS.includes(extension)) return { category: "office", label: "Office document", previewable: false } as const;
+  if (CALENDAR_EXTENSIONS.includes(extension)) return { category: "calendar", label: "Calendar file", previewable: false } as const;
+  if (ARCHIVE_EXTENSIONS.includes(extension)) return { category: "archive", label: "Archive", previewable: false } as const;
+  const mime = String(attachment.mime_type || "").trim().toLowerCase();
+  if (mime.includes("word") || mime.includes("excel") || mime.includes("powerpoint") || mime.includes("opendocument")) {
+    return { category: "office", label: "Office document", previewable: false } as const;
+  }
+  if (mime.includes("calendar") || mime === "text/calendar") return { category: "calendar", label: "Calendar file", previewable: false } as const;
+  if (mime.includes("zip") || mime.includes("compressed") || mime.includes("archive")) {
+    return { category: "archive", label: "Archive", previewable: false } as const;
+  }
+  return { category: "file", label: "Download file", previewable: false } as const;
 }
 
 export function estimateAttachmentPreviewMemory(attachment: Pick<MailAttachmentMeta, "filename" | "mime_type" | "size">) {
@@ -204,6 +229,28 @@ export function deriveReplyToAddress(message: InboxThreadMessage | undefined, ma
   if (from.email && from.email.toLowerCase() !== normalizedMailbox) return from.email;
   const recipients = splitAddresses(message.to).map(senderParts);
   return recipients.find((item) => item.email.toLowerCase() !== normalizedMailbox)?.email || from.email || "";
+}
+
+export function deriveReplyAllRecipients(message: InboxThreadMessage | undefined, mailbox: string) {
+  const mailboxAddress = mailbox.trim().toLowerCase();
+  const sender = senderParts(message?.from).email;
+  const seen = new Set<string>();
+  const collect = (value: string | undefined) => splitAddresses(value)
+    .map(senderParts)
+    .map((item) => item.email)
+    .filter((email) => {
+      const normalized = email.toLowerCase();
+      if (!normalized || normalized === mailboxAddress || seen.has(normalized)) return false;
+      seen.add(normalized);
+      return true;
+    });
+
+  // Put the original sender in To and retain the other visible participants in Cc.
+  const to = collect(sender)[0] || deriveReplyToAddress(message, mailbox);
+  const cc = [...collect(message?.to), ...collect(message?.cc)].filter(
+    (email) => email.toLowerCase() !== to.toLowerCase(),
+  );
+  return { to, cc };
 }
 
 /** 界面语言：后期接中英文切换；当前先跟浏览器语言。 */

@@ -1,11 +1,13 @@
 import { useEffect } from "react";
 import { Drawers } from "../features/drawers/Drawers";
 import { HomeView } from "../features/home/HomeView";
+import { I18nProvider, useI18n } from "../i18n";
 import { AppContext } from "./AppContext";
 import { useAppController } from "./useAppController";
 
-export function App() {
+function AppShell() {
   const controller = useAppController();
+  const { t } = useI18n();
   const { state, actions, toast, dismissToast, accountSwitchNotice, accountSwitchNoticeVisible, closeAccountSwitchNotice, initialize } = controller;
   useEffect(() => {
     void initialize();
@@ -24,8 +26,8 @@ export function App() {
               {accountSwitchNotice.avatarUrl
                 ? <img src={accountSwitchNotice.avatarUrl} alt="" referrerPolicy="no-referrer" />
                 : <span className="account-switch-notice-avatar">{(accountSwitchNotice.email.split("@")[0]?.charAt(0) || "A").toUpperCase()}</span>}
-              <span><strong>Switched account</strong><small>{accountSwitchNotice.email}</small></span>
-              <button type="button" aria-label="Dismiss account switch notice" onClick={closeAccountSwitchNotice}>
+              <span><strong>{t("account.switched")}</strong><small>{accountSwitchNotice.email}</small></span>
+              <button type="button" aria-label={t("account.dismissSwitch")} onClick={closeAccountSwitchNotice}>
                 <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg>
               </button>
             </div>
@@ -56,5 +58,13 @@ export function App() {
         </main>
       </div>
     </AppContext.Provider>
+  );
+}
+
+export function App() {
+  return (
+    <I18nProvider>
+      <AppShell />
+    </I18nProvider>
   );
 }

@@ -32,10 +32,10 @@ describe("inbox startup settings", () => {
 describe("Manage Splits tooltip", () => {
   it("uses only the custom tooltip instead of a browser title tooltip", () => {
     const manageSplitsButton = homeViewSource.match(
-      /<button[\s\S]*?aria-label="Manage Splits"[\s\S]*?<\/button>/,
+      /<button[\s\S]*?aria-label=\{t\("mail\.manageSplits"\)\}[\s\S]*?<\/button>/,
     )?.[0];
 
-    expect(manageSplitsButton).toContain('data-tooltip="Manage Splits"');
+    expect(manageSplitsButton).toContain('data-tooltip={t("mail.manageSplits")}');
     expect(manageSplitsButton).not.toContain('title="Manage Splits"');
   });
 });
@@ -168,6 +168,13 @@ describe("mailbox switching", () => {
     expect(controllerSource).not.toMatch(
       /await preloadMailboxSnapshot\(primary, rangeDays, true, \{ skipLiveGmail: true \}\)/,
     );
+  });
+
+  it("keeps cached messages visible while the background History sync runs", () => {
+    expect(controllerSource).toContain(
+      "const hasVisibleInbox = s.inboxSnapshotMessages.length > 0 || s.inboxMessages.length > 0;",
+    );
+    expect(controllerSource).toContain("inboxSnapshotLoading: !hasVisibleInbox,");
   });
 
   it("invalidates mail and draft requests when switching mailboxes", () => {
