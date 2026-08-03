@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from .context import inject_reverse_rpc_context
 from .sampling import _write_frame
 
 METHOD_CREDENTIALS_LIST_ACCOUNTS = "credentials/listAccounts"
@@ -128,7 +129,9 @@ class CredentialsClient:
         with self._lock:
             self._pending[request_id] = _Pending(future=future)
         try:
-            self._write_frame({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+            # 多 invoke 并发时 Host 要求 params.context.invoke_id 才能路由 reverse RPC。
+            wire_params = inject_reverse_rpc_context(params)
+            self._write_frame({"jsonrpc": "2.0", "id": request_id, "method": method, "params": wire_params})
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError as exc:
             with self._lock:

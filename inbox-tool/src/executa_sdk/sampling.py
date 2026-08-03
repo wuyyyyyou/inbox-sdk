@@ -41,6 +41,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from .context import inject_reverse_rpc_context
+
 
 # ─── Constants — keep in sync with matrix/src/executa/protocol.py ─────
 
@@ -229,6 +231,9 @@ class SamplingClient:
             params["responseFormat"] = response_format
         if on_unsupported:
             params["onUnsupported"] = on_unsupported
+        # 多 invoke 并发时 Host 要求 params.context.invoke_id；metadata 内的
+        # executa_invoke_id 仅作调试，不能替代路由键。
+        params = inject_reverse_rpc_context(params)
 
         future: asyncio.Future[dict] = loop.create_future()
         with self._lock:

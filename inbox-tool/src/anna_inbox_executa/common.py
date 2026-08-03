@@ -56,6 +56,7 @@ def data_root() -> Path:
 
 from executa_sdk import PROTOCOL_VERSION_V2, SamplingClient, SamplingError
 from executa_sdk.credentials import CredentialsClient, CredentialsError
+from executa_sdk.context import get_current_invoke_id, run_with_invoke_id
 from executa_sdk.storage import StorageClient, FilesClient, StorageError, make_response_router
 from executa_sdk.host_upload import HostUploadClient
 from anna_inbox_executa.diagnostics import record_span
@@ -1382,8 +1383,14 @@ def refresh_platform_google_accounts(timeout_seconds: float = 12.0) -> list[dict
     started = time.monotonic()
     try:
         timeout = max(0.1, float(timeout_seconds))
+        # 跨线程提交到 loop 时重绑 invoke_id，避免并发 reverse RPC 缺路由键。
+        invoke_id = get_current_invoke_id()
         future = asyncio.run_coroutine_threadsafe(
-            platform_credentials.list_accounts(provider="google", timeout=timeout), loop,
+            run_with_invoke_id(
+                invoke_id,
+                platform_credentials.list_accounts(provider="google", timeout=timeout),
+            ),
+            loop,
         )
         payload = future.result(timeout=timeout)
     except CredentialsError as exc:
@@ -1461,8 +1468,16 @@ def resolve_platform_google_token(account_id: str, timeout_seconds: float = 35.0
     with _PLATFORM_GET_TOKEN_LOCK:
         try:
             timeout = max(0.1, float(timeout_seconds))
+            # 调用线程的 invoke_id 必须带到 loop，credentials reverse RPC 才能注入 context。
+            invoke_id = get_current_invoke_id()
             future = asyncio.run_coroutine_threadsafe(
-                platform_credentials.get_token(provider="google", account_id=account_id, timeout=timeout), loop,
+                run_with_invoke_id(
+                    invoke_id,
+                    platform_credentials.get_token(
+                        provider="google", account_id=account_id, timeout=timeout,
+                    ),
+                ),
+                loop,
             )
             payload = future.result(timeout=timeout)
         except CredentialsError as exc:
@@ -1833,7 +1848,9 @@ def _run_storage_query(coro: Any, timeout: float = 60.0) -> Any:
             return new_loop.run_until_complete(coro)
         finally:
             new_loop.close()
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    # APS reverse RPC 必须在 loop 任务上携带当前 invoke_id。
+    invoke_id = get_current_invoke_id()
+    future = asyncio.run_coroutine_threadsafe(run_with_invoke_id(invoke_id, coro), loop)
     return future.result(timeout=timeout)
 
 

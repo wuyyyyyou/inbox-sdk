@@ -144,8 +144,10 @@ def start_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, An
         "partial": {},
     }
     _save_run_checkpoint(run_id)
+    # 后台任务在 loop 线程重绑 invoke_id，供 sampling reverse RPC 注入。
+    from executa_sdk.context import run_with_invoke_id
     future = asyncio.run_coroutine_threadsafe(
-        _start_custom_scan_async(run_id, arguments, invoke_id),
+        run_with_invoke_id(invoke_id, _start_custom_scan_async(run_id, arguments, invoke_id)),
         loop,
     )
     # 默认 60s 初等等待后返回可轮询状态；与前端 wait_timeout / invoke 余量对齐。
@@ -334,8 +336,9 @@ def re_run_custom_scan(arguments: dict[str, Any], invoke_id: str) -> dict[str, A
         "partial": {},
     }
     _save_run_checkpoint(run_id)
+    from executa_sdk.context import run_with_invoke_id
     future = asyncio.run_coroutine_threadsafe(
-        _re_run_custom_scan_async(run_id, plan_id, arguments, invoke_id),
+        run_with_invoke_id(invoke_id, _re_run_custom_scan_async(run_id, plan_id, arguments, invoke_id)),
         loop,
     )
     # 复跑与首扫同一合同：默认 60s 初等，超时后可轮询。

@@ -11,6 +11,7 @@ from anna_inbox_executa.contact_memory_flow import *
 from anna_inbox_executa.mailbox_tools import *
 from anna_inbox_executa.card_tools import *
 from anna_inbox_executa.v2_tools import *
+from executa_sdk.context import invoke_id_scope, resolve_invoke_id, run_with_invoke_id
 
 async def _handle_ai_personalization_tool(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """阶段 B 个性化与确认执行工具分发。"""
@@ -80,11 +81,21 @@ def _resolve_connectivity_future(future: Any, *, tool: str, started: float) -> d
         }
 
 
+def _schedule_coro(coro: Any, invoke_id: str):
+    """把协程提交到共享 event loop，并在 loop 线程重新绑定 invoke_id。
+
+    worker / connectivity 线程的 ContextVar 不会自动传到 loop 线程；
+    reverse RPC 的 inject 依赖 loop 侧当前 invoke_id。
+    """
+    return asyncio.run_coroutine_threadsafe(run_with_invoke_id(invoke_id, coro), loop)
+
+
 def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     tool = params.get("tool")
     arguments = dict(params.get("arguments") or {})
     context = params.get("context") or {}
-    invoke_id = str(params.get("invoke_id") or "")
+    # Host 可能把 id 放在 context.invoke_id（新）或顶层 invoke_id（旧）。
+    invoke_id = resolve_invoke_id(params if isinstance(params, dict) else {})
     # 预算授权只能来自 Host 的 invoke context，不能相信前端工具参数。
     grant = context.get("sampling_grant") if isinstance(context, dict) else None
     if isinstance(grant, dict):
@@ -95,10 +106,22 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     _apply_storage_provider(arguments)
     apply_runtime_credentials(context)
 
+    # 整个 invoke 生命周期绑定 invoke_id，供 credentials/sampling/storage reverse RPC 注入。
+    with invoke_id_scope(invoke_id):
+        return _handle_invoke_bound(tool, arguments, context, invoke_id)
+
+
+def _handle_invoke_bound(
+    tool: Any,
+    arguments: dict[str, Any],
+    context: Any,
+    invoke_id: str,
+) -> dict[str, Any]:
+    """在已绑定 invoke_id 的作用域内分发工具。"""
     if tool == "check_google_oauth":
         return {"success": True, "tool": tool, "data": check_google_oauth(context)}
     if tool == "test_aps_storage":
-        future = asyncio.run_coroutine_threadsafe(run_aps_storage_smoke(arguments), loop)
+        future = _schedule_coro(run_aps_storage_smoke(arguments), invoke_id)
         return {"success": True, "tool": tool, "data": future.result(timeout=60.0)}
     if tool == "read_primary_emails":
         return {"success": True, "tool": tool, "data": read_primary_emails(arguments.get("mailbox", ""), arguments.get("limit", 5))}
@@ -146,32 +169,38 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "tool": tool, "data": _check_gmail_auth(arguments.get("mailbox", ""))}
     if tool == "check_gmail_api_status":
         # 专用池限制并发探测数；stdin 主线程会直接分发反向 RPC 响应，不能再被本等待阻塞。
+        # connectivity 线程必须重新绑定 invoke_id（pool 线程无外层 scope）。
         mailbox = str(arguments.get("mailbox") or "")
         started = time.monotonic()
-        future = CONNECTIVITY_POOL.submit(
-            _check_gmail_api_status,
-            mailbox,
-            timeout_seconds=CONNECTIVITY_CHECK_TIMEOUT_SECONDS,
-        )
+
+        def _run_gmail_status_check() -> dict[str, Any]:
+            with invoke_id_scope(invoke_id):
+                return _check_gmail_api_status(
+                    mailbox,
+                    timeout_seconds=CONNECTIVITY_CHECK_TIMEOUT_SECONDS,
+                )
+
+        future = CONNECTIVITY_POOL.submit(_run_gmail_status_check)
         return {"success": True, "tool": tool, "data": _resolve_connectivity_future(future, tool=tool, started=started)}
     if tool == "check_sampling_status":
         # 在专用池等待 sampling，业务 worker 仅等待最多 12 秒的结构化探测结果。
         def _run_sampling_status_check() -> dict[str, Any]:
-            coro_future = asyncio.run_coroutine_threadsafe(
-                _check_sampling_status(arguments, invoke_id),
-                loop,
-            )
-            try:
-                return coro_future.result(timeout=CONNECTIVITY_CHECK_TIMEOUT_SECONDS - 0.5)
-            except FutureTimeoutError:
-                # 取消尚未完成的 sampling 请求，避免外层已返回而 Host 侧仍保留无主检测。
-                coro_future.cancel()
-                return {
-                    "ok": False,
-                    "status": "error",
-                    "message": "Anna LLM connectivity check timed out.",
-                    "elapsed_ms": int((CONNECTIVITY_CHECK_TIMEOUT_SECONDS - 0.5) * 1000),
-                }
+            with invoke_id_scope(invoke_id):
+                coro_future = _schedule_coro(
+                    _check_sampling_status(arguments, invoke_id),
+                    invoke_id,
+                )
+                try:
+                    return coro_future.result(timeout=CONNECTIVITY_CHECK_TIMEOUT_SECONDS - 0.5)
+                except FutureTimeoutError:
+                    # 取消尚未完成的 sampling 请求，避免外层已返回而 Host 侧仍保留无主检测。
+                    coro_future.cancel()
+                    return {
+                        "ok": False,
+                        "status": "error",
+                        "message": "Anna LLM connectivity check timed out.",
+                        "elapsed_ms": int((CONNECTIVITY_CHECK_TIMEOUT_SECONDS - 0.5) * 1000),
+                    }
 
         started = time.monotonic()
         future = CONNECTIVITY_POOL.submit(_run_sampling_status_check)
@@ -183,10 +212,10 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         info["executa_version"] = VERSION
         return {"success": True, "tool": tool, "data": info}
     if tool == "test_sampling":
-        future = asyncio.run_coroutine_threadsafe(_test_sampling(arguments, invoke_id), loop)
+        future = _schedule_coro(_test_sampling(arguments, invoke_id), invoke_id)
         return {"success": True, "tool": tool, "data": future.result(timeout=120.0)}
     if tool == "test_sampling_brief":
-        future = asyncio.run_coroutine_threadsafe(_test_sampling_brief(arguments, invoke_id), loop)
+        future = _schedule_coro(_test_sampling_brief(arguments, invoke_id), invoke_id)
         return {"success": True, "tool": tool, "data": future.result(timeout=180.0)}
     if tool == "test_sampling_async":
         return {"success": True, "tool": tool, "data": _start_test_sampling_async(arguments, invoke_id)}
@@ -202,9 +231,9 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "tool": tool, "data": start_ai_turn(arguments, invoke_id)}
     # Host Agent 侧栏白名单工具：选型在 Host，执行本地（不含 mutation）
     if tool in AI_AGENT_TOOL_NAMES:
-        future = asyncio.run_coroutine_threadsafe(
+        future = _schedule_coro(
             handle_ai_agent_tool(tool, arguments, invoke_id),
-            loop,
+            invoke_id,
         )
         try:
             # 搜邮 / 草稿可能较长；与 start_ai_turn 同量级超时
@@ -224,9 +253,9 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         "add_ai_memory",
         "delete_ai_memory",
     ):
-        future = asyncio.run_coroutine_threadsafe(
+        future = _schedule_coro(
             _handle_ai_personalization_tool(tool, arguments),
-            loop,
+            invoke_id,
         )
         try:
             return {"success": True, "tool": tool, "data": future.result(timeout=120.0)}
@@ -261,7 +290,7 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
     if tool == "start_contact_memory_run":
         return {"success": True, "tool": tool, "data": _start_contact_memory_run(arguments)}
     if tool == "continue_contact_memory_run":
-        future = asyncio.run_coroutine_threadsafe(_continue_contact_memory_run_async(arguments, invoke_id), loop)
+        future = _schedule_coro(_continue_contact_memory_run_async(arguments, invoke_id), invoke_id)
         return {"success": True, "tool": tool, "data": _resolve_continue_future(
             future,
             run_id=str(arguments.get("run_id") or ""),
@@ -303,9 +332,9 @@ def handle_invoke(params: dict[str, Any]) -> dict[str, Any]:
         "begin_stage_outgoing_attachment", "complete_stage_outgoing_attachment", "delete_staged_outgoing_attachment",
         "prepare_staged_outgoing_attachment_access",
     ):
-        future = asyncio.run_coroutine_threadsafe(
+        future = _schedule_coro(
             _handle_v2_tool(tool, arguments, invoke_id),
-            loop,
+            invoke_id,
         )
         try:
             return {"success": True, "tool": tool, "data": future.result(timeout=180.0)}

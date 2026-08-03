@@ -12,6 +12,7 @@ from anna_inbox_executa.common import *
 import anna_inbox_executa.common as common
 from anna_inbox_executa.diagnostics import activate_trace, create_trace, deactivate_trace, record_span, snapshot
 from anna_inbox_executa.dispatcher import handle_invoke
+from executa_sdk.context import resolve_invoke_id
 
 
 def _attach_diagnostics(result: dict[str, Any], trace: dict[str, Any]) -> dict[str, Any]:
@@ -63,9 +64,10 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
             )
         if method == "invoke":
             invoke_params = params if isinstance(params, dict) else {}
+            # context.invoke_id 优先；与 reverse RPC 路由键保持一致。
             trace = create_trace(
                 operation=str(invoke_params.get("tool") or "invoke"),
-                invoke_id=str(invoke_params.get("invoke_id") or ""),
+                invoke_id=resolve_invoke_id(invoke_params),
             )
             started = time.monotonic()
             trace_token = activate_trace(trace)

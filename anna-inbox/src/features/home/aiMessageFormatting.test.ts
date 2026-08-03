@@ -125,6 +125,35 @@ describe("parseAiMessageMarkdown", () => {
       },
     ]);
   });
+
+  it("normalizes host selected-email dumps into one list item per email", () => {
+    const raw = [
+      "你现在选择了以下 4 封邮件：",
+      "",
+      "**Re: New Event: kate zhou",
+      "11:45am Wed, 22 Jul 2026",
+      "Discovery Call**",
+      "Security alert",
+      "Your Google data is ready to download",
+      "Re: Update on the Advanced AI and Automation Solutions feature for Anna AI",
+    ].join("\n");
+    expect(parseAiMessageMarkdown(raw)).toEqual([
+      {
+        type: "paragraph",
+        content: [{ type: "text", value: "你现在选择了以下 4 封邮件：" }],
+      },
+      {
+        type: "unordered_list",
+        indent: 0,
+        items: [
+          [{ type: "text", value: "Re: New Event: kate zhou 11:45am Wed, 22 Jul 2026 Discovery Call" }],
+          [{ type: "text", value: "Security alert" }],
+          [{ type: "text", value: "Your Google data is ready to download" }],
+          [{ type: "text", value: "Re: Update on the Advanced AI and Automation Solutions feature for Anna AI" }],
+        ],
+      },
+    ]);
+  });
 });
 
 describe("sliceAiMessageBlocks", () => {

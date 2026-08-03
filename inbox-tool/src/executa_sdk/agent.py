@@ -31,6 +31,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
+from .context import inject_reverse_rpc_context
 from .sampling import (
     SAMPLING_ERR_NOT_NEGOTIATED,
     SAMPLING_ERR_TIMEOUT,
@@ -226,6 +227,8 @@ class AgentSessionClient:
         self._loop = loop
         req_id = uuid.uuid4().hex
         clean = {k: v for k, v in (params or {}).items() if v is not None}
+        # 多 invoke 并发时 Host 要求 params.context.invoke_id 路由 reverse RPC。
+        clean = inject_reverse_rpc_context(clean)
         future: asyncio.Future[dict] = loop.create_future()
         with self._lock:
             self._pending[req_id] = _Pending(future=future)

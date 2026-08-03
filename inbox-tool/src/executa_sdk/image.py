@@ -52,6 +52,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
+from .context import inject_reverse_rpc_context
 from .sampling import _write_frame
 
 
@@ -268,11 +269,13 @@ class ImageClient:
         with self._lock:
             self._pending[req_id] = _Pending(future=future)
 
+        # 多 invoke 并发时 Host 要求 params.context.invoke_id 路由 reverse RPC。
+        wire_params = inject_reverse_rpc_context(params)
         envelope = {
             "jsonrpc": "2.0",
             "id": req_id,
             "method": method,
-            "params": params,
+            "params": wire_params,
         }
         try:
             self._write_frame(envelope)

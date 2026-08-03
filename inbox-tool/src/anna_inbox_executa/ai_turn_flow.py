@@ -153,8 +153,10 @@ def start_ai_turn(arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
         "diagnostics": current_trace(),
     }
     _save_run_checkpoint(run_id)
+    # 后台任务在 loop 线程重绑 invoke_id，供 sampling reverse RPC 注入。
+    from executa_sdk.context import run_with_invoke_id
     future = asyncio.run_coroutine_threadsafe(
-        _start_ai_turn_async(run_id, arguments, invoke_id),
+        run_with_invoke_id(invoke_id, _start_ai_turn_async(run_id, arguments, invoke_id)),
         loop,
     )
     # 首个 invoke 只负责快速建立后台 run；完整邮件分析由前端轮询 run_id。

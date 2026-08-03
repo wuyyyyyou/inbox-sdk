@@ -57,7 +57,17 @@ from .embeddings import (  # noqa: F401
     EmbeddingsError,
     METHOD_EMBEDDINGS_CREATE,
 )
-from .context import InvokeContext  # noqa: F401
+from .context import (  # noqa: F401
+    InvokeContext,
+    resolve_invoke_id,
+    get_current_invoke_id,
+    set_current_invoke_id,
+    reset_current_invoke_id,
+    invoke_id_scope,
+    async_invoke_id_scope,
+    run_with_invoke_id,
+    inject_reverse_rpc_context,
+)
 
 __all__ = [
     "SamplingClient",
@@ -78,6 +88,14 @@ __all__ = [
     "EmbeddingsClient",
     "EmbeddingsError",
     "InvokeContext",
+    "resolve_invoke_id",
+    "get_current_invoke_id",
+    "set_current_invoke_id",
+    "reset_current_invoke_id",
+    "invoke_id_scope",
+    "async_invoke_id_scope",
+    "run_with_invoke_id",
+    "inject_reverse_rpc_context",
     "PROTOCOL_VERSION_V1",
     "PROTOCOL_VERSION_V2",
     "METHOD_INITIALIZE",

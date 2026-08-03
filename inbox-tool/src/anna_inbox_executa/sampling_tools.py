@@ -607,7 +607,12 @@ def _start_test_sampling_async(arguments: dict[str, Any], invoke_id: str) -> dic
         "error": "",
         "partial": {"invoke_id": invoke_id},
     }
-    asyncio.run_coroutine_threadsafe(_run_test_sampling_async(run_id, arguments, invoke_id), loop)
+    # 后台任务在 loop 线程重绑 invoke_id，供 sampling reverse RPC 注入。
+    from executa_sdk.context import run_with_invoke_id
+    asyncio.run_coroutine_threadsafe(
+        run_with_invoke_id(invoke_id, _run_test_sampling_async(run_id, arguments, invoke_id)),
+        loop,
+    )
     return {
         "run_id": run_id,
         "status": "queued",

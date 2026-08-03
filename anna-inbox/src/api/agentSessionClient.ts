@@ -8,7 +8,11 @@ export type AgentTurnResult = {
 };
 
 export function stripTerminalDoneMarker(text: string): string {
-  return text.replace(/^[ \t]*\[DONE\][ \t]*$/gim, "").trimEnd();
+  // Host 可能输出独立 [DONE] 行，也可能把 [DONE] 直接粘在最后一行末尾。
+  return text
+    .replace(/^[ \t]*\[DONE\][ \t]*$/gim, "")
+    .replace(/\[DONE\][ \t]*$/i, "")
+    .trimEnd();
 }
 
 type AgentSessionHandle = {

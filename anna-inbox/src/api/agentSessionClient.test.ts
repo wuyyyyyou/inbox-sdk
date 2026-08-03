@@ -24,8 +24,9 @@ describe("AI sidebar Host Agent contract", () => {
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("base conclusions on bodyFull evidence");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never describe it as a 7/30/60-day search");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never call start_ai_turn");
-    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("each confirmed email must be its own list item");
-expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never add a detached reference list");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("each email must be its own single-line Markdown list item");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never append [DONE]");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never add a detached reference list");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Two-step reply drafting is mandatory");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("do NOT call ai_draft_reply yet");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Only after the user clearly confirms");
@@ -60,10 +61,14 @@ expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never add a detached reference list"
     expect(tools).not.toContain(`${prefix}send_mail`);
   });
 
-  it("removes only a terminal standalone DONE marker", () => {
+  it("removes only a terminal standalone or trailing DONE marker", () => {
     expect(stripTerminalDoneMarker("Answer\n[DONE]")).toBe("Answer");
     expect(stripTerminalDoneMarker("Answer\n[DONE]\nMore detail")).toBe("Answer\n\nMore detail");
     expect(stripTerminalDoneMarker("[DONE] means complete.")).toBe("[DONE] means complete.");
+    expect(stripTerminalDoneMarker("Re: Update on Anna AI[DONE]")).toBe("Re: Update on Anna AI");
+    expect(stripTerminalDoneMarker("Security alert\nYour Google data is ready to download[DONE]")).toBe(
+      "Security alert\nYour Google data is ready to download",
+    );
   });
 
   it("keeps confirmed evidence from a JSON-encoded tool_end output", async () => {

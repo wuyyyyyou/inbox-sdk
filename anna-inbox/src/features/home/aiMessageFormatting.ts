@@ -95,6 +95,74 @@ function normalizeInlineHeadings(text: string): string {
   return text.replace(/([^\n])\s+(#{1,4}\s+)/g, "$1\n\n$2");
 }
 
+function normalizeMultilineBold(text: string): string {
+  // Host 偶发把多行主题包进同一个 **...**，折叠成单行避免段落/加粗错乱。
+  return text.replace(/\*\*([^*]+)\*\*/g, (_match, inner: string) => {
+    const collapsed = String(inner).replace(/\s*\n\s*/g, " ").trim();
+    return collapsed ? `**${collapsed}**` : "";
+  });
+}
+
+function isStructuralMarkdownLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  return Boolean(
+    headingPattern.test(trimmed)
+    || unorderedListPattern.test(line)
+    || orderedListPattern.test(line)
+    || quotePattern.test(trimmed)
+    || codeFencePattern.test(trimmed)
+    || dividerPattern.test(trimmed)
+    || metadataRowsFromLine(trimmed),
+  );
+}
+
+function stripWrappingBold(line: string): string {
+  const trimmed = line.trim();
+  const wrapped = trimmed.match(/^\*\*(.+)\*\*$/);
+  return wrapped ? wrapped[1].trim() : trimmed;
+}
+
+function normalizeSelectedEmailListing(text: string): string {
+  // Host 列出“已选邮件”时常输出裸主题行；在选择引导语后把连续裸行收成列表项。
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const result: string[] = [];
+  const selectionIntro = /选择了以下\s*\d*\s*封邮件|已选择\s*\d*\s*封邮件|you (?:have )?selected (?:the following )?\d*\s*emails?/i;
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    result.push(line);
+    if (!selectionIntro.test(line)) {
+      index += 1;
+      continue;
+    }
+    index += 1;
+    while (index < lines.length && !lines[index].trim()) {
+      result.push(lines[index]);
+      index += 1;
+    }
+    const bare: string[] = [];
+    while (index < lines.length) {
+      const current = lines[index];
+      const trimmed = current.trim();
+      if (!trimmed) {
+        let lookAhead = index + 1;
+        while (lookAhead < lines.length && !lines[lookAhead].trim()) lookAhead += 1;
+        if (lookAhead >= lines.length || isStructuralMarkdownLine(lines[lookAhead])) break;
+        index += 1;
+        continue;
+      }
+      if (isStructuralMarkdownLine(current)) break;
+      bare.push(stripWrappingBold(current));
+      index += 1;
+    }
+    if (bare.length >= 1) {
+      for (const item of bare) result.push(`- ${item}`);
+    }
+  }
+  return result.join("\n");
+}
+
 function normalizePipedRanking(text: string): string {
   return text.replace(/^([^\n]*?(?:排序|优先级|Priority|Ranking)[^\n]*\|[^\n]*)$/gim, (line) => {
     const cells = line.split("|").map((cell) => cell.trim()).filter(Boolean);
@@ -166,7 +234,13 @@ function parseMetadataInline(text: string): AiMessageInline[] {
 }
 
 export function parseAiMessageMarkdown(text: string): AiMessageBlock[] {
-  const lines = normalizeInlineHeadings(normalizeMarkdownTables(normalizePipedRanking(text))).replace(/\r\n?/g, "\n").split("\n");
+  const lines = normalizeInlineHeadings(
+    normalizeSelectedEmailListing(
+      normalizeMultilineBold(
+        normalizeMarkdownTables(normalizePipedRanking(text)),
+      ),
+    ),
+  ).replace(/\r\n?/g, "\n").split("\n");
   const blocks: AiMessageBlock[] = [];
   let index = 0;
 
