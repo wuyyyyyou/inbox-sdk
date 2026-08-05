@@ -109,14 +109,16 @@ def _sanitize_value(obj: Any) -> Any:
 
 
 def _fix_json_string_escapes(text: str) -> str:
-    """修复字符串内非法或截断的 \\u 转义，避免 Invalid \\uXXXX escape。
+    """修复字符串内非法或截断的 Unicode 转义，避免 Invalid escape。
 
     常见来源：
     1. max_tokens 截断落在 `\\uXXXX` 中间（尾部 `\\u` / `\\u4e`）；
     2. 模型把中文错误写成非法转义（如 `\\u606v`，息应为 `\\u606f`）。
+    3. Python 风格的 `\\U0001f680` 被模型误用在 JSON 字符串中。
 
-    策略：合法完整 `\\uXXXX` 原样保留；尾部不完整转义直接丢弃以便闭合；
-    中段非法则把反斜杠再转义为 `\\\\`，保留字面内容，不编造码点。
+    策略：合法完整 `\\uXXXX` 原样保留；有效标量 `\\UXXXXXXXX` 转成真实字符；
+    尾部不完整转义直接丢弃以便闭合；中段非法则把反斜杠再转义为 `\\\\`，
+    保留字面内容，不编造码点。 surrogate 不是 JSON Unicode 标量，按非法转义处理。
     """
     out: list[str] = []
     i = 0
@@ -152,6 +154,26 @@ def _fix_json_string_escapes(text: str) -> str:
                 # 中段非法（如 \\u606v）：\\ → \\\\，保留后面的 u…
                 out.append("\\\\")
                 out.append("u")
+                i += 2
+                continue
+            if nxt == "U":
+                hexpart = text[i + 2 : i + 10]
+                if (
+                    len(hexpart) == 8
+                    and all(c in "0123456789abcdefABCDEF" for c in hexpart)
+                ):
+                    codepoint = int(hexpart, 16)
+                    if codepoint <= 0x10FFFF and not 0xD800 <= codepoint <= 0xDFFF:
+                        # Python 的大写 U 转义不是 JSON 语法，转换成真实标量字符。
+                        out.append(chr(codepoint))
+                        i += 10
+                        continue
+                # 尾部残缺的 \\U… 直接丢弃，避免闭合后产生 Invalid escape。
+                if len(hexpart) < 8 and (i + 2 + len(hexpart)) >= n:
+                    break
+                # 非法码点或中段非法转义按字面保留，保证输出仍是合法 JSON。
+                out.append("\\\\")
+                out.append("U")
                 i += 2
                 continue
             # 其它转义对原样保留（含 \" \\ \/ \n 以及未知双字符转义）。
@@ -212,6 +234,11 @@ def _escape_raw_quotes_inside_strings(text: str) -> str:
 
 def _repair_json(text: str) -> str:
     """Fix common LLM JSON mistakes so json.loads has a better chance."""
+
+    # Gemini 偶发在对象首尾重复输出花括号，例如 `{{"emails": [...]}}`。
+    # 这不是嵌套对象，去除各一层重复分隔符即可恢复原始 payload。
+    text = re.sub(r"^\s*\{\s*\{", "{", text)
+    text = re.sub(r"\}\s*\}\s*$", "}", text)
 
     # ── Step 0: 字符串内非法/截断 \\u 转义（须尽早，否则后续扫描会踩 Invalid escape）──
     text = _fix_json_string_escapes(text)

@@ -23,7 +23,8 @@ const orderedListPattern = /^(\s*)(\d+)[.)]\s+(.+)$/;
 const quotePattern = /^>\s?(.*)$/;
 const codeFencePattern = /^```([^\s`]*)\s*$/;
 const dividerPattern = /^(?:-{3,}|\*{3,}|_{3,})\s*$/;
-const inlinePattern = /\[THREAD_REF_([^\]\s]+)\]|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*|~~([^~]+)~~|`([^`]+)`|\*([^*]+)\*|_([^_]+)_/g;
+const inlinePattern = /\[(?:THREAD_REF|THREADREF)_([^\]\s]+)\]|\[(?:THREAD_REF|THREADREF)_[^\]]*\]|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*|~~([^~]+)~~|`([^`]+)`|\*([^*]+)\*|_([^_]+)_/g;
+const threadRefTokenPattern = /\[(?:THREAD_REF|THREADREF)_[^\]\s]+\]/g;
 const metadataLabelPattern = /(发件人|主题|时间|寄件人|Sender|Subject|Date|Time)\s*[：:]/gi;
 
 function metadataRowsFromLine(line: string): Array<{ label: string; value: string }> | null {
@@ -163,6 +164,32 @@ function normalizeSelectedEmailListing(text: string): string {
   return result.join("\n");
 }
 
+function normalizeDateListContinuations(text: string): string {
+  // 模型偶尔把同一封邮件的预约时间拆成下一条列表项：
+  // "... Tue Jul 21" / "2026 7:30am" / "- 8am (GMT+8)"。
+  // 这些行不是新的邮件，必须在 Markdown 解析前合并回上一条。
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const result: string[] = [];
+  const dateContinuationPattern = /^\s+\d{4}\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b.*$/i;
+  const timeOnlyItemPattern = /^([ \t]*)([-*])\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b.*$/i;
+  const dateTimePattern = /\b(?:mon|tue|wed|thu|fri|sat|sun)\b.*\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\b\d{4}\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i;
+
+  for (const line of lines) {
+    const previous = result[result.length - 1];
+    if (previous && dateContinuationPattern.test(line) && /^\s*[-*]\s+/.test(previous)) {
+      result[result.length - 1] = `${previous.trimEnd()} ${line.trim()}`;
+      continue;
+    }
+    const timeItem = line.match(timeOnlyItemPattern);
+    if (previous && timeItem && dateTimePattern.test(previous)) {
+      result[result.length - 1] = `${previous.trimEnd()} ${line.trim().replace(/^[-*]\s+/, "")}`;
+      continue;
+    }
+    result.push(line);
+  }
+  return result.join("\n");
+}
+
 function normalizePipedRanking(text: string): string {
   return text.replace(/^([^\n]*?(?:排序|优先级|Priority|Ranking)[^\n]*\|[^\n]*)$/gim, (line) => {
     const cells = line.split("|").map((cell) => cell.trim()).filter(Boolean);
@@ -204,6 +231,8 @@ export function parseAiMessageInline(text: string): AiMessageInline[] {
     if (matchIndex > index) nodes.push({ type: "text", value: text.slice(index, matchIndex) });
     if (match[1]) {
       nodes.push({ type: "thread_ref", threadId: match[1] });
+    } else if (/^\[(?:THREAD_REF|THREADREF)_/.test(match[0])) {
+      // 无法提取有效 thread id 的 token 不应作为普通文本展示。
     } else if (match[2] && match[3] && isSupportedUrl(match[3])) {
       nodes.push({ type: "link", label: match[2], href: match[3] });
     } else if (match[4]) {
@@ -237,7 +266,7 @@ export function parseAiMessageMarkdown(text: string): AiMessageBlock[] {
   const lines = normalizeInlineHeadings(
     normalizeSelectedEmailListing(
       normalizeMultilineBold(
-        normalizeMarkdownTables(normalizePipedRanking(text)),
+        normalizeDateListContinuations(normalizeMarkdownTables(normalizePipedRanking(text))),
       ),
     ),
   ).replace(/\r\n?/g, "\n").split("\n");
@@ -253,8 +282,8 @@ export function parseAiMessageMarkdown(text: string): AiMessageBlock[] {
     const metadataRows = metadataRowsFromLine(line);
     if (metadataRows) {
       for (const row of metadataRows) {
-        const threadRefs = row.value.match(/\[THREAD_REF_[^\]\s]+\]/g) || [];
-        const value = row.value.replace(/\s*\|?\s*\[THREAD_REF_[^\]\s]+\]\s*/g, "").trim();
+        const threadRefs = row.value.match(threadRefTokenPattern) || [];
+        const value = row.value.replace(new RegExp(`\\s*\\|?\\s*${threadRefTokenPattern.source}\\s*`, "g"), "").trim();
         if (value) blocks.push({ type: "metadata", label: row.label, content: parseMetadataInline(value) });
         for (const threadRef of threadRefs) {
           blocks.push({ type: "metadata", label: "", content: parseAiMessageInline(threadRef) });

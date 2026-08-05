@@ -24,6 +24,7 @@ export function SettingsView({ settings, loading, error, focusSavedPromptsReques
   const [memoryText, setMemoryText] = useState("");
   const [personalizationLoading, setPersonalizationLoading] = useState(false);
   const [cacheClearing, setCacheClearing] = useState(false);
+  const [cacheRepairing, setCacheRepairing] = useState(false);
   const settingsContentRef = useRef<HTMLDivElement | null>(null);
   const savedPromptsSectionRef = useRef<HTMLElement | null>(null);
 
@@ -127,7 +128,24 @@ export function SettingsView({ settings, loading, error, focusSavedPromptsReques
       <button
         className="settings-action-btn"
         type="button"
-        disabled={cacheClearing || loading}
+        disabled={cacheClearing || cacheRepairing || loading}
+        onClick={() => {
+          void (async () => {
+            setCacheRepairing(true);
+            try {
+              await actions.repairInboxCache(settings.display_range_days);
+            } finally {
+              setCacheRepairing(false);
+            }
+          })();
+        }}
+      >
+        {cacheRepairing ? t("settings.repairingCache") : t("settings.repairCache")}
+      </button>
+      <button
+        className="settings-action-btn"
+        type="button"
+        disabled={cacheClearing || cacheRepairing || loading}
         onClick={() => {
           void (async () => {
             setCacheClearing(true);

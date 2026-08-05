@@ -284,6 +284,23 @@ async def _start_ai_turn_async(run_id: str, arguments: dict[str, Any], invoke_id
             ][:20]
             if not result_data.get("artifact") and result_data["artifacts"]:
                 result_data["artifact"] = result_data["artifacts"][0]
+        if isinstance(outcome.get("compose_artifacts"), list):
+            compose_items = [item for item in outcome["compose_artifacts"] if isinstance(item, dict)]
+            if len(compose_items) <= 1:
+                result_data["compose_artifacts"] = compose_items
+            else:
+                # 批量正文已经通过逐封 partial 事件发送，最终 RPC 只保留计数。
+                result_data["batch_compose_completed"] = len(compose_items)
+                result_data["batch_compose_total"] = len(compose_items)
+            if not result_data.get("artifact") and compose_items:
+                result_data["artifact"] = compose_items[0]
+        if isinstance(outcome.get("batch_compose_continuation"), dict):
+            continuation = outcome["batch_compose_continuation"]
+            result_data["batch_compose_continuation"] = {
+                "source_prompt": str(continuation.get("source_prompt") or "")[:12000],
+                "offset": int(continuation.get("offset") or 0),
+                "remaining": int(continuation.get("remaining") or 0),
+            }
         if isinstance(outcome.get("batch_failures"), list):
             result_data["batch_failures"] = outcome["batch_failures"][:20]
         if kind == "propose" and isinstance(outcome.get("proposed_actions"), dict):

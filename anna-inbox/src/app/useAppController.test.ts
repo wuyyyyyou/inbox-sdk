@@ -48,6 +48,31 @@ describe("AI scan invocation", () => {
     expect(controllerSource).toContain("artifacts: found");
   });
 
+  it("keeps completed batch drafts on the pending message while the next draft is generating", () => {
+    expect(controllerSource).toContain("function partialBatchDraftArtifacts");
+    expect(controllerSource).toContain("partialBatchDraftArtifacts(status.partial)");
+    expect(controllerSource).toContain("artifacts: partialDrafts");
+  });
+
+  it("renders every final batch draft artifact even when a primary artifact is present", () => {
+    expect(homeViewSource).toContain("const batchArtifacts =");
+    expect(homeViewSource).toContain("Array.isArray(message.artifacts) && message.artifacts.length");
+    expect(homeViewSource).not.toContain("Array.isArray(message.artifacts) && message.artifacts.length > 1");
+  });
+
+  it("keeps every completed batch compose artifact while the batch is still running", () => {
+    expect(controllerSource).toContain("function partialBatchComposeArtifacts");
+    expect(controllerSource.match(/composeArtifacts: streamedComposeArtifacts/g)?.length || 0).toBeGreaterThanOrEqual(2);
+    expect(controllerSource).toMatch(/value\.batch_compose_draft \? \[value\.batch_compose_draft\]/);
+  });
+
+  it("merges final compose artifacts with streamed partials and preserves cards on error", () => {
+    expect(controllerSource).toContain("const finalComposeArtifacts = resolvedComposeArtifacts.length");
+    expect(controllerSource).toContain("composeArtifacts: finalComposeArtifacts.length ? finalComposeArtifacts : undefined");
+    expect(controllerSource).toContain("composeArtifacts: streamedComposeArtifacts.length ? streamedComposeArtifacts : undefined");
+    expect(controllerSource).toContain("回复“继续”可继续生成");
+  });
+
   it("leaves draft card creation to the Host artifact", () => {
     expect(controllerSource).not.toContain("function isThreadDraftRequest");
     expect(controllerSource).not.toContain("function canRecoverThreadDraft");
@@ -70,6 +95,8 @@ describe("AI scan invocation", () => {
     expect(controllerSource).toMatch(/const \{ display_range_days: _displayRangeDays, \.\.\.sidebarUiContext \} = uiContext/);
     expect(controllerSource).toMatch(/recent_conversation: recentConversation/);
     expect(controllerSource).toMatch(/\.slice\(-4\)/);
+    expect(controllerSource).toMatch(/recent_conversation: _recentConversation/);
+    expect(controllerSource).toMatch(/Host Session 自己维护多轮对话/);
   });
 
   it("uses the Inbox display range as the AI scan time range", () => {
@@ -117,6 +144,18 @@ describe("AI scan invocation", () => {
     expect(threadReferencesSource).toContain("THREAD_?REF_?");
   });
 
+  it("allows the current mail context thread before cleaning assistant references", () => {
+    expect(controllerSource).toContain("function currentMailContextThread");
+    expect(controllerSource).toMatch(
+      /String\(payload\.kind \|\| \"\"\) !== \"mail_context\"[\s\S]*?String\(context\.kind \|\| \"\"\) !== \"thread\"/,
+    );
+    expect(controllerSource).toMatch(
+      /const confirmedThreadIds = confirmedEvidenceThreadIds\(payload\);[\s\S]*?const currentMailContextThreadRef = currentMailContextThread\(payload\);[\s\S]*?confirmedThreadIds\.add\(currentMailContextThreadRef\.threadId\);[\s\S]*?ensureConfirmedThreadReference\(/,
+    );
+    expect(controllerSource).toContain('context.subject || "").replace(/\\s+/g, " ").trim().slice(0, 160)');
+    expect(controllerSource).toContain('subject || "Open email"');
+  });
+
   it("does not append an unrelated confirmed candidate after an inline evidence reference", () => {
     const result = ensureConfirmedThreadReference(
       "该收据的实付金额为 **$11.00**。 [THREAD_REF_eleven]",
@@ -142,6 +181,17 @@ describe("AI scan invocation", () => {
     expect(detailPromptHandler).toContain("client.startAiTurn(");
     expect(detailPromptHandler).not.toContain("client.startInboxMailPrompt(");
     expect(detailPromptHandler).toContain("requested_artifact: requestedArtifact");
+  });
+
+  it("persists every normalized draft artifact with the submitted source prompt", () => {
+    const detailPromptHandler = controllerSource.match(
+      /async submitMailContextPrompt\(request\)[\s\S]*?async sendInboxThreadReply/,
+    )?.[0] || "";
+
+    expect(detailPromptHandler).toContain("const artifacts: DraftReplyArtifact[] = isDraftRequest");
+    expect(detailPromptHandler).toContain("(payload.artifacts || []).map((artifact) => ({");
+    expect(detailPromptHandler).toContain("source_prompt: request.visiblePrompt");
+    expect(detailPromptHandler).toContain("artifacts: artifacts.length ? artifacts : undefined");
   });
 
   it("clears the Host session when a sidebar conversation is discarded", () => {

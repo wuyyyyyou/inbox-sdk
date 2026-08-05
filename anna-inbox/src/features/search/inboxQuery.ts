@@ -74,6 +74,8 @@ function parseTermToken(token: string): { term: Extract<InboxQueryExpression, { 
   if (!raw || raw === "-") {
     return { term: null, error: "The - operator needs a search term after it." };
   }
+  const quoted = raw.match(/^([\s\S]*?)"([\s\S]*)"$/u);
+  if (quoted) raw = `${quoted[1]}${quoted[2]}`;
 
   const separator = raw.indexOf(":");
   let field: InboxQueryField | "any" = "any";
@@ -107,6 +109,27 @@ function parseTermToken(token: string): { term: Extract<InboxQueryExpression, { 
   };
 }
 
+function queryTokens(input: string): string[] {
+  const tokens: string[] = [];
+  let start = 0;
+  let quoted = false;
+  const flush = (end: number) => { const value = input.slice(start, end).trim(); if (value) tokens.push(value); };
+  for (let i = 0; i < input.length; i += 1) {
+    if (input[i] === '"') { quoted = !quoted; continue; }
+    if (quoted) continue;
+    if (input[i] === "(" || input[i] === ")") {
+      flush(i); tokens.push(input[i]); start = i + 1; continue;
+    }
+    const match = /^(AND|OR)(?=\s|$)/iu.exec(input.slice(i));
+    const before = i === 0 ? "" : input[i - 1];
+    if (match && (!before || /\s/u.test(before)) && (i + match[0].length === input.length || /\s/u.test(input[i + match[0].length]))) {
+      flush(i); tokens.push(match[1].toUpperCase()); i += match[1].length - 1; start = i + 1;
+    }
+  }
+  flush(input.length);
+  return tokens;
+}
+
 /**
  * 解析 Inbox 本地查询。
  * - 空格属于搜索词内容；多个条件需用 AND/OR 连接（AND 优先于 OR）
@@ -115,30 +138,34 @@ function parseTermToken(token: string): { term: Extract<InboxQueryExpression, { 
 export function parseInboxQuery(input: string): ParsedInboxQuery {
   const raw = String(input || "").trim();
   if (!raw) return { expression: null, error: "" };
-  const groups: InboxQueryExpression[] = [];
-  let andTerms: InboxQueryExpression[] = [];
-  let termStart = 0;
-
-  for (const operator of findQueryOperators(raw)) {
-    const token = raw.slice(termStart, operator.index).trim();
-    if (!token) return { expression: null, error: `The ${operator.text} operator needs a term before and after it.` };
-    const parsed = parseTermToken(token);
-    if (!parsed.term) return { expression: null, error: parsed.error };
-    andTerms.push(parsed.term);
-    if (operator.text === "OR") {
-      groups.push(joinExpression("and", andTerms));
-      andTerms = [];
+  if ((raw.match(/"/gu) || []).length % 2) return { expression: null, error: "Quoted search phrases must be closed." };
+  const tokens = queryTokens(raw);
+  let index = 0;
+  let parseError = "Invalid parentheses or operator placement.";
+  const parseOr = (): InboxQueryExpression | null => {
+    const terms: InboxQueryExpression[] = [];
+    const first = parseAnd(); if (!first) return null; terms.push(first);
+    while (tokens[index]?.toUpperCase() === "OR") { index++; const next = parseAnd(); if (!next) return null; terms.push(next); }
+    return joinExpression("or", terms);
+  };
+  const parseAnd = (): InboxQueryExpression | null => {
+    const terms: InboxQueryExpression[] = [];
+    while (index < tokens.length && tokens[index] !== ")" && tokens[index].toUpperCase() !== "OR") {
+      if (tokens[index].toUpperCase() === "AND") {
+        index += 1;
+        if (!terms.length || !tokens[index] || tokens[index] === ")" || tokens[index].toUpperCase() === "OR" || tokens[index].toUpperCase() === "AND") return null;
+        continue;
+      }
+      let node: InboxQueryExpression | null;
+      if (tokens[index] === "(") { index++; node = parseOr(); if (tokens[index] !== ")") return null; index++; }
+      else { const parsed = parseTermToken(tokens[index++]); if (!parsed.term) { parseError = parsed.error; return null; } node = parsed.term; }
+      if (node) terms.push(node);
     }
-    termStart = operator.index + operator.text.length;
-  }
-
-  const finalToken = raw.slice(termStart).trim();
-  if (!finalToken) return { expression: null, error: "The final operator needs a search term after it." };
-  const parsed = parseTermToken(finalToken);
-  if (!parsed.term) return { expression: null, error: parsed.error };
-  andTerms.push(parsed.term);
-  groups.push(joinExpression("and", andTerms));
-  return { expression: joinExpression("or", groups), error: "" };
+    return terms.length ? joinExpression("and", terms) : null;
+  };
+  const expression = parseOr();
+  if (!expression || index !== tokens.length) return { expression: null, error: parseError };
+  return { expression, error: "" };
 }
 
 function hasMatch(value: string | null | undefined, term: string): boolean {

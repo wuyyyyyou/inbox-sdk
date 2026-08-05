@@ -19,8 +19,11 @@ _logger = logging.getLogger(__name__)
 
 _BODY_LIMIT = 2000
 _DRAFT_LIMIT = 8000
-# 批量写稿上限：控制 Sampling 次数与前端展示体积
+# 收件箱回复和新邮件外联均限制为每批 5 封，控制 Sampling 与 RPC 载荷。
 _BATCH_MAX_THREADS = 5
+_BATCH_MAX_COMPOSE_NEW = 5
+# 批量草稿经轮询 RPC 逐封返回；限制单封正文，保证单批总载荷处于安全范围。
+_BATCH_COMPOSE_DRAFT_BODY_LIMIT = 1_800
 _THREAD_EVIDENCE_LIMIT = 32_000
 _THREAD_MESSAGE_BODY_LIMIT = 5_000
 
@@ -82,6 +85,31 @@ def _mark_unsent_draft(artifact: dict[str, Any]) -> dict[str, Any]:
     artifact["delivery_status"] = "not_sent"
     artifact["requires_user_review"] = True
     return artifact
+
+
+def _normalize_compose_payload(payload: dict[str, Any]) -> tuple[str, str, list[str]]:
+    """兼容新邮件 Sampling 返回的单对象与数组两种草稿结构。"""
+    candidates: list[dict[str, Any]] = [payload]
+    # Sampling 可能把草稿包在 drafts/emails 数组中；按固定顺序取第一个可用草稿。
+    for key in ("drafts", "emails"):
+        items = payload.get(key)
+        if isinstance(items, list):
+            candidates.extend(item for item in items if isinstance(item, dict))
+
+    for item in candidates:
+        # 只接受实际存在的正文，避免空字符串或缺失字段误生成 compose artifact。
+        draft_body = str(item.get("draft_body") or item.get("body") or "").strip()
+        if not draft_body:
+            continue
+        subject = str(item.get("subject") or "").strip()[:200]
+        raw_recipients = item.get("recipients")
+        recipients = [
+            str(recipient).strip()
+            for recipient in (raw_recipients if isinstance(raw_recipients, list) else [])
+            if str(recipient).strip()
+        ][:50]
+        return draft_body[:_DRAFT_LIMIT], subject, recipients
+    return "", "", []
 
 
 def _uses_chinese(text: str) -> bool:
@@ -164,14 +192,11 @@ def _draft_party_context(
     reply_to_headers: list[str] = []
     if last_from and owner not in _extract_email_addresses(last_from):
         reply_to_headers.append(last_from[:180])
-    for addr in counterparties[:4]:
-        if not any(addr in item.lower() for item in reply_to_headers):
-            reply_to_headers.append(addr)
 
     return {
         "owner_email": owner,
         "owner_display": owner_display,
-        "reply_to": "; ".join(reply_to_headers[:4]) if reply_to_headers else "(counterparty in thread)",
+        "reply_to": "; ".join(reply_to_headers) if reply_to_headers else "(counterparty in thread)",
         "last_message_from": last_from[:180],
         "owner_name_ban": owner_display,
     }
@@ -183,7 +208,8 @@ def _draft_identity_block(parties: dict[str, str]) -> str:
     return (
         f"Mailbox owner (you write AS this person): {parties.get('owner_email') or ''} "
         f"(display: {parties.get('owner_display') or ''})\n"
-        f"Reply to (address these people, not the owner): {parties.get('reply_to') or ''}\n"
+        f"Default reply recipient (Reply, not Reply All): {parties.get('reply_to') or ''}\n"
+        "Do not add other To/CC participants unless the user explicitly asks for Reply All.\n"
         f"Last_message_from (data only, not your voice): {parties.get('last_message_from') or ''}\n"
         f"Do not open the draft with Hi/Dear/{ban} addressing the owner. "
         f"Sign off as the owner, never as Last_message_from.\n"
@@ -568,13 +594,7 @@ async def tool_compose_new(
         max_attempts=1,
     )
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
-    draft_body = str(payload.get("draft_body") or "").strip()[:_DRAFT_LIMIT]
-    subject = str(payload.get("subject") or "").strip()[:200]
-    recipients = [
-        str(item).strip()
-        for item in (payload.get("recipients") if isinstance(payload.get("recipients"), list) else [])
-        if str(item).strip()
-    ][:50]
+    draft_body, subject, recipients = _normalize_compose_payload(payload)
     assistant_text = str(payload.get("assistant_text") or fallback_text).strip()
     if not draft_body:
         return {
@@ -897,6 +917,120 @@ async def tool_propose_inbox_actions(
     }
 
 
+async def tool_batch_compose_new(
+    user_text: str,
+    ui_context: dict[str, Any],
+    arguments: dict[str, Any],
+    *,
+    language: str,
+    sampling_create_message: Any,
+    memory_summary: str = "",
+    confirmed: bool = False,
+    batch_offset: int = 0,
+    progress_callback: Any = None,
+) -> dict[str, Any]:
+    """为多个明确邮箱地址逐封创建独立的新邮件草稿。"""
+    all_recipients = list(dict.fromkeys(re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", user_text, re.IGNORECASE)))
+    offset = max(0, int(batch_offset or 0))
+    recipients = all_recipients[offset:offset + _BATCH_MAX_COMPOSE_NEW]
+    # 首批必须明确至少两个收件人；但续批可能只剩最后一位，不能因此中断。
+    if len(all_recipients) < 2 or not recipients:
+        return {
+            "kind": "clarify",
+            "assistant_text": "请提供至少两个收件人邮箱后再生成批量新邮件草稿。" if language == "zh" else "Provide at least two recipient email addresses to create a batch of new drafts.",
+        }
+    if not confirmed:
+        return {
+            "kind": "batch_compose_preview",
+            "assistant_text": (f"我会为 {len(recipients)} 位收件人分别生成新邮件草稿。请确认后开始生成。" if language == "zh" else f"I will create separate new-email drafts for {len(recipients)} recipients. Confirm to begin."),
+            "requires_user_confirmation": True,
+        }
+    artifacts: list[dict[str, Any]] = []
+    ordered_artifacts: dict[int, dict[str, Any]] = {}
+    failures: list[dict[str, str]] = []
+
+    async def _compose_for_recipient(index: int, recipient: str) -> tuple[int, str, dict[str, Any]]:
+        # 子任务不能继续携带其它收件人，否则模型会把整批重新合成一个 emails 数组。
+        isolated_request = re.sub(
+            r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
+            lambda match: recipient if match.group(0).casefold() == recipient.casefold() else "[other recipient omitted]",
+            user_text,
+            flags=re.IGNORECASE,
+        )
+        result = await tool_compose_new(
+            f"{isolated_request}\n\nCreate exactly one email for this recipient only: {recipient}",
+            ui_context,
+            arguments,
+            language=language,
+            sampling_create_message=sampling_create_message,
+            memory_summary=memory_summary,
+        )
+        return index, recipient, result
+
+    # 新邮件之间没有共享依赖，按完成顺序发布卡片，避免等待前一封的 Sampling。
+    for completed in asyncio.as_completed([
+        _compose_for_recipient(index, recipient)
+        for index, recipient in enumerate(recipients)
+    ]):
+        index, recipient, result = await completed
+        artifact = result.get("artifact") if isinstance(result.get("artifact"), dict) else None
+        if artifact and str(artifact.get("body") or "").strip():
+            # 收件人以本批已确认的目标为准，禁止模型返回的合并地址污染其它草稿。
+            artifact = {
+                **artifact,
+                "body": str(artifact.get("body") or "")[:_BATCH_COMPOSE_DRAFT_BODY_LIMIT],
+                "recipients": [recipient],
+            }
+            artifacts.append(artifact)
+            ordered_artifacts[index] = artifact
+        else:
+            # 本批目标已调度但未生成成功；不能伪装成“下一批尚未开始”。
+            failures.append({"recipient": recipient, "error": str(result.get("error") or "compose_empty")[:80]})
+        if callable(progress_callback):
+            # 仅向当前 run 的 transient partial 发布已完成草稿，禁止写入持久化会话状态。
+            progress_callback("draft", {
+                "stage": "batch_compose",
+                "batch_completed": len(artifacts),
+                "batch_total": len(recipients),
+                # 每个 RPC 只携带当前一封，避免累计正文导致载荷随批次增长。
+                "partial": {
+                    "batch_compose_draft": {
+                        "batch_index": index,
+                        "recipient": recipient,
+                        "artifact": artifact,
+                    },
+                },
+            })
+    # 最终卡片顺序与用户输入的地址顺序一致；生成期间仍按先完成先展示。
+    artifacts = [ordered_artifacts[index] for index in sorted(ordered_artifacts)]
+    remaining = len(all_recipients) - offset - len(recipients)
+    if language == "zh":
+        assistant_text = f"已生成 {len(artifacts)} 封新邮件草稿。"
+        if failures:
+            assistant_text += f" 本批另有 {len(failures)} 位收件人未能生成草稿，请稍后重试。"
+        if remaining > 0:
+            assistant_text += f" 还有 {remaining} 位收件人未生成。回复“继续”后再生成下一批，单批最多 {_BATCH_MAX_COMPOSE_NEW} 封。"
+    else:
+        assistant_text = f"Prepared {len(artifacts)} new email drafts."
+        if failures:
+            assistant_text += f" {len(failures)} recipient(s) in this batch could not be drafted; please retry them later."
+        if remaining > 0:
+            assistant_text += f" {remaining} recipients remain. Reply \"continue\" to generate the next batch, up to {_BATCH_MAX_COMPOSE_NEW} at a time."
+    return {
+        "kind": "draft",
+        "assistant_text": assistant_text,
+        "artifact": artifacts[0] if artifacts else None,
+        "compose_artifacts": artifacts,
+        "batch_failures": failures,
+        "batch_compose_continuation": {
+            "source_prompt": user_text,
+            "offset": offset + len(recipients),
+            "remaining": remaining,
+        } if remaining > 0 else None,
+        "fallback_used": False,
+    }
+
+
 def _selected_thread_refs(ui_context: dict[str, Any]) -> list[dict[str, Any]]:
     """从 ui_context.selected_threads 提取去重后的线程引用（上限 _BATCH_MAX_THREADS）。"""
     raw = ui_context.get("selected_threads")
@@ -938,6 +1072,7 @@ async def _draft_one_thread(
     sampling_create_message: Any,
     memory_summary: str,
     mode: str,
+    preview: bool = False,
 ) -> dict[str, Any]:
     """为单封邮件生成 draft 证据隔离（不跨线程复用正文）。"""
     excerpt = await _load_thread_excerpt(mailbox, message_id, thread_id)
@@ -949,6 +1084,23 @@ async def _draft_one_thread(
         else f"Draft ready for “{subject or 'this email'}”."
     )
     if sampling_create_message is None:
+        if preview:
+            # 没有 Sampling 时采取保守分类：不擅自生成正文，留待用户确认后再尝试起草。
+            return {
+                "ok": True,
+                "skipped_no_action": False,
+                "assistant_line": (
+                    f"「{subject or '邮件'}」看起来需要我方回复；确认后再生成草稿。"
+                    if language == "zh"
+                    else f"“{subject or 'This email'}” appears to need a reply; confirm before drafting."
+                ),
+                "action_summary": "reply_needed",
+                "mailbox": mailbox,
+                "thread_id": thread_id,
+                "message_id": message_id,
+                "subject": subject,
+                "fallback_used": True,
+            }
         draft_body = (
             f"您好，\n\n关于「{subject or '该邮件'}」，我已收到。\n\n此致"
             if language == "zh"
@@ -969,7 +1121,7 @@ async def _draft_one_thread(
             "fallback_used": True,
         }
 
-    system = batch_draft_system_prompt(language, mode=mode)
+    system = batch_draft_system_prompt(language, mode=mode, preview=preview)
     user_message = (
         f"User request: {user_text}\n"
         f"Mode: {mode}\n"
@@ -994,8 +1146,23 @@ async def _draft_one_thread(
         max_attempts=1,
     )
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
-    draft_body = str(payload.get("draft_body") or "").strip()[:_DRAFT_LIMIT]
+    # 预览轮即使模型违规返回正文也必须丢弃，避免正文通过结果或日志外泄。
+    draft_body = "" if preview else str(payload.get("draft_body") or "").strip()[:_DRAFT_LIMIT]
     assistant_line = str(payload.get("assistant_line") or fallback_text).strip()
+    skipped_no_action = bool(payload.get("skipped_no_action"))
+    action_summary = str(payload.get("action_summary") or assistant_line).strip()[:500]
+    if preview:
+        return {
+            "ok": True,
+            "skipped_no_action": skipped_no_action,
+            "assistant_line": action_summary,
+            "action_summary": action_summary,
+            "mailbox": mailbox,
+            "thread_id": thread_id,
+            "message_id": message_id,
+            "subject": subject,
+            "fallback_used": bool(result.get("fallback_used")),
+        }
     if not draft_body:
         return {
             "ok": False,
@@ -1035,6 +1202,10 @@ async def tool_batch_draft(
     sampling_create_message: Any,
     memory_summary: str = "",
     mode: str = "batch_draft",
+    confirmed: bool = False,
+    skip_thread_keys: set[str] | None = None,
+    skipped_subjects: list[str] | None = None,
+    progress_callback: Any = None,
 ) -> dict[str, Any]:
     """对多选线程逐封起草回复；每封独立 evidence，禁止串上下文。
 
@@ -1051,10 +1222,46 @@ async def tool_batch_draft(
         )
         return {"kind": "clarify", "assistant_text": clarify, "clarify": clarify}
 
+    # 首轮默认是预览；只有 runner 依据同一会话的明确确认传入 confirmed=True。
+    preview = not confirmed
+    skip_keys = skip_thread_keys or set()
+    if confirmed:
+        # 确认轮只起草首轮分类为需要操作的线程；跳过项仍在结果摘要中明确回显。
+        refs = [
+            ref for ref in refs
+            if f"{ref['mailbox']}|{ref['thread_id']}" not in skip_keys
+        ]
+        if not refs:
+            subjects = skipped_subjects or []
+            if language == "zh":
+                text = f"已确认。{len(subjects)} 封邮件无需我方操作，未生成草稿。"
+                if subjects:
+                    text += " 跳过主题：" + "、".join(subjects) + "。"
+            else:
+                text = f"Confirmed. No drafts generated because {len(subjects)} email(s) need no action from you."
+                if subjects:
+                    text += " Skipped subjects: " + ", ".join(subjects) + "."
+            return {
+                "kind": "batch_draft",
+                "assistant_text": text,
+                "artifacts": [],
+                "skipped_no_action": [
+                    {"subject": subject, "skipped_no_action": True} for subject in subjects
+                ],
+                "results": [],
+                "match_status": "confirmed",
+                "fallback_used": False,
+            }
     artifacts: list[dict[str, Any]] = []
+    previews: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    ordered_artifacts: dict[int, dict[str, Any]] = {}
+    ordered_previews: dict[int, dict[str, Any]] = {}
+    ordered_failures: dict[int, dict[str, Any]] = {}
     any_fallback = False
-    for ref in refs:
+    async def _draft_ref(index: int, ref: dict[str, Any]) -> tuple[int, dict[str, Any], dict[str, Any]]:
+        """每封草稿独立 Sampling；并发执行但仍保留各自的上下文隔离。"""
         item = await _draft_one_thread(
             user_text,
             mailbox=ref["mailbox"],
@@ -1065,19 +1272,110 @@ async def tool_batch_draft(
             sampling_create_message=sampling_create_message,
             memory_summary=memory_summary,
             mode=mode,
+            preview=preview,
         )
+        return index, ref, item
+
+    # 每封草稿互不依赖，按完成顺序消费结果，使先完成的草稿立刻通过 progress 展示。
+    for completed in asyncio.as_completed([_draft_ref(index, ref) for index, ref in enumerate(refs)]):
+        index, ref, item = await completed
         if item.get("fallback_used"):
             any_fallback = True
-        if item.get("ok") and isinstance(item.get("artifact"), dict):
+        if preview and item.get("ok"):
+            preview_item = {
+                "mailbox": ref["mailbox"],
+                "thread_id": ref["thread_id"],
+                "message_id": ref["message_id"],
+                "subject": str(item.get("subject") or ref.get("subject") or "")[:200],
+                # 供前端把批量预览逐封渲染成可点击的线程跳转入口。
+                "thread_ref": f"THREAD_REF_{ref['thread_id']}",
+                "skipped_no_action": bool(item.get("skipped_no_action")),
+                "action_summary": str(item.get("action_summary") or item.get("assistant_line") or "")[:500],
+            }
+            previews.append(preview_item)
+            ordered_previews[index] = preview_item
+            if preview_item["skipped_no_action"]:
+                skipped.append(preview_item)
+        elif item.get("ok") and isinstance(item.get("artifact"), dict):
             artifacts.append(item["artifact"])
+            ordered_artifacts[index] = item["artifact"]
         else:
-            failures.append({
+            failure = {
                 "mailbox": ref["mailbox"],
                 "thread_id": ref["thread_id"],
                 "message_id": ref["message_id"],
                 "subject": ref.get("subject") or "",
                 "error": str(item.get("error") or "failed"),
-            })
+            }
+            failures.append(failure)
+            ordered_failures[index] = failure
+        if confirmed and callable(progress_callback):
+            # 增量草稿仅驻留本次运行的 transient progress，供前端在后续 LLM 生成前立即展示。
+            progress_callback(
+                "draft",
+                {
+                    "stage": mode,
+                    "batch_completed": len(artifacts) + len(failures),
+                    "batch_total": len(refs),
+                    "partial": {"batch_drafts": list(artifacts)},
+                },
+            )
+
+    # 增量事件按完成顺序展示；最终摘要和卡片按用户选中的原始顺序呈现。
+    artifacts = [ordered_artifacts[index] for index in sorted(ordered_artifacts)]
+    previews = [ordered_previews[index] for index in sorted(ordered_previews)]
+    skipped = [item for item in previews if item["skipped_no_action"]]
+    failures = [ordered_failures[index] for index in sorted(ordered_failures)]
+
+    if preview:
+        actionable = len(previews) - len(skipped)
+        # 可操作邮件逐封列出摘要与线程引用，让预览回复也带可点击跳转入口。
+        actionable_items = [item for item in previews if not item["skipped_no_action"]]
+        if language == "zh":
+            assistant_text = f"已逐封评估 {len(previews)} 封邮件：{actionable} 封可能需要回复，{len(skipped)} 封无需我方操作。"
+            if actionable_items:
+                assistant_text += " 待处理邮件："
+                for item in actionable_items:
+                    summary = str(item.get("action_summary") or "").strip()
+                    assistant_text += f"\n- [THREAD_REF_{item['thread_id']}]"
+                    if summary:
+                        assistant_text += f" {summary}"
+            if skipped:
+                subjects = "、".join(item["subject"] or "（无主题）" for item in skipped)
+                assistant_text += f" 跳过主题：{subjects}。"
+            assistant_text += "\n请明确回复“确认生成草稿”后，我才生成需要回复的草稿。"
+        else:
+            assistant_text = f"I assessed {len(previews)} emails: {actionable} may need a reply and {len(skipped)} need no action from you."
+            if actionable_items:
+                assistant_text += " Actionable emails:"
+                for item in actionable_items:
+                    summary = str(item.get("action_summary") or "").strip()
+                    assistant_text += f"\n- [THREAD_REF_{item['thread_id']}]"
+                    if summary:
+                        assistant_text += f" {summary}"
+            if skipped:
+                assistant_text += " Skipped subjects: " + ", ".join(item["subject"] or "(no subject)" for item in skipped) + "."
+            assistant_text += "\nExplicitly confirm to generate drafts for the actionable emails."
+        return {
+            "kind": "batch_draft_preview",
+            "assistant_text": assistant_text,
+            "batch_preview": previews,
+            "skipped_no_action": skipped,
+            # 预览中的选中线程即为本轮已确认范围：前端据此把 THREAD_REF 保留为可点击入口。
+            "results": [
+                {
+                    "mailbox": item["mailbox"],
+                    "message_id": item["message_id"],
+                    "thread_id": item["thread_id"],
+                    "thread_ref": f"THREAD_REF_{item['thread_id']}",
+                    "subject": str(item.get("subject") or ""),
+                }
+                for item in previews
+            ],
+            "match_status": "confirmed",
+            "requires_user_confirmation": True,
+            "fallback_used": any_fallback,
+        }
 
     if not artifacts:
         return {
@@ -1095,6 +1393,8 @@ async def tool_batch_draft(
     fail_n = len(failures)
     if language == "zh":
         assistant_text = f"我已根据邮件内容整理 {n} 封回复草稿（证据按封隔离，请逐封核对邮件内容、收件人和主题）。"
+        if skipped_subjects:
+            assistant_text += f" 另有 {len(skipped_subjects)} 封无需我方操作，已跳过：" + "、".join(skipped_subjects) + "。"
         if fail_n:
             assistant_text += f" 另有 {fail_n} 封未能生成。"
         if mode == "batch_outreach":
@@ -1108,6 +1408,8 @@ async def tool_batch_draft(
         )
         if fail_n:
             assistant_text += f" {fail_n} could not be generated."
+        if skipped_subjects:
+            assistant_text += f" Skipped {len(skipped_subjects)} no-action email(s): " + ", ".join(skipped_subjects) + "."
         if mode == "batch_outreach":
             assistant_text = (
                 f"Prepared {n} personalized outreach draft{'s' if n != 1 else ''} "
@@ -1116,6 +1418,15 @@ async def tool_batch_draft(
             if fail_n:
                 assistant_text += f" {fail_n} failed."
 
+    # 草稿逐封挂上线程引用：确认摘要同样带可点击跳转入口（按钮标题即邮件主题）。
+    draft_ref_lines = [
+        f"- [THREAD_REF_{art.get('thread_id') or ''}]"
+        for art in artifacts
+        if (art.get("thread_id") or "").strip()
+    ]
+    if draft_ref_lines:
+        assistant_text += "\n" + "\n".join(draft_ref_lines)
+
     return {
         "kind": "draft",
         "assistant_text": assistant_text,
@@ -1123,6 +1434,19 @@ async def tool_batch_draft(
         "artifact": artifacts[0],
         "artifacts": artifacts,
         "batch_failures": failures,
+        # 已生成草稿的线程即为本轮已确认范围：前端据此保留 THREAD_REF 跳转入口。
+        "results": [
+            {
+                "mailbox": str(art.get("mailbox") or ""),
+                "message_id": str(art.get("message_id") or ""),
+                "thread_id": str(art.get("thread_id") or ""),
+                "thread_ref": f"THREAD_REF_{art.get('thread_id') or ''}",
+                "subject": str(art.get("subject") or ""),
+            }
+            for art in artifacts
+            if (art.get("thread_id") or "").strip()
+        ],
+        "match_status": "confirmed",
         "fallback_used": any_fallback,
     }
 
@@ -1134,8 +1458,16 @@ async def tool_batch_outreach(
     language: str,
     sampling_create_message: Any,
     memory_summary: str = "",
+    confirmed: bool = False,
+    skip_thread_keys: set[str] | None = None,
+    skipped_subjects: list[str] | None = None,
+    progress_callback: Any = None,
 ) -> dict[str, Any]:
-    """批量个性化 outreach；内部复用 batch_draft 隔离逻辑。"""
+    """批量个性化 outreach；内部复用 batch_draft 隔离逻辑。
+
+    确认轮必须继续透传首轮分类得到的跳过主题，保证外联结果不会遗漏
+    “无需我方操作”的邮件说明，同时不把邮件正文写入会话状态。
+    """
     return await tool_batch_draft(
         user_text,
         ui_context,
@@ -1143,6 +1475,10 @@ async def tool_batch_outreach(
         sampling_create_message=sampling_create_message,
         memory_summary=memory_summary,
         mode="batch_outreach",
+        confirmed=confirmed,
+        skip_thread_keys=skip_thread_keys,
+        skipped_subjects=skipped_subjects,
+        progress_callback=progress_callback,
     )
 
 
@@ -1268,6 +1604,7 @@ async def apply_proposed_actions(
 __all__ = [
     "apply_proposed_actions",
     "tool_batch_draft",
+    "tool_batch_compose_new",
     "tool_batch_outreach",
     "tool_compose_new",
     "tool_draft_reply",

@@ -145,8 +145,21 @@ def _handle_invoke_bound(
                 arguments.get("offset", 0),
             ),
         }
+    if tool == "search_indexed_emails":
+        return {"success": True, "tool": tool, "data": search_indexed_emails(
+            arguments.get("mailbox", ""),
+            arguments.get("query", ""),
+            arguments.get("todo_message_ids", []),
+            arguments.get("done_message_ids", []),
+            arguments.get("snoozed_message_ids", []),
+            arguments.get("limit", 50),
+            arguments.get("offset", 0),
+        )}
     if tool == "sync_inbox_cache":
-        return {"success": True, "tool": tool, "data": sync_inbox_cache(arguments.get("mailbox", ""))}
+        return {"success": True, "tool": tool, "data": sync_inbox_cache(
+            arguments.get("mailbox", ""),
+            arguments.get("repair_missing", False),
+        )}
     if tool == "list_gmail_emails_page":
         return {
             "success": True,

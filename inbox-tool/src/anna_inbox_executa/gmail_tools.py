@@ -918,8 +918,102 @@ def list_cached_emails(
     }
 
 
-def sync_inbox_cache(mailbox_arg: str) -> dict[str, Any]:
-    """同步 Gmail History、续订 Watch，并推进可续跑的缓存基线/历史回填。"""
+def search_indexed_emails(
+    mailbox_arg: str,
+    query_arg: str,
+    todo_message_ids_arg: Any = None,
+    done_message_ids_arg: Any = None,
+    snoozed_message_ids_arg: Any = None,
+    limit_arg: Any = 50,
+    offset_arg: Any = 0,
+) -> dict[str, Any]:
+    """只搜索完整本地索引；这个 RPC 永远不触发 Gmail 请求。"""
+    from mail_agent.local_query import filter_cached_messages, match_local_query
+    from mail_agent.mail_providers.gmail.adapter import (
+        list_messages,
+        normalize_mailbox as adapter_normalize_mailbox,
+    )
+
+    result: dict[str, Any] = {
+        "messages": [],
+        "query": str(query_arg or ""),
+        "error": "",
+        "total": 0,
+        "has_more": False,
+        "offset": 0,
+        "next_offset": 0,
+    }
+    try:
+        # 先验证上限，避免调用方用一个过大的 limit 绕过 RPC 响应预算。
+        limit = int(50 if limit_arg in (None, "") else limit_arg)
+        if limit < 1 or limit > 200:
+            result["error"] = "limit must be between 1 and 200"
+            return result
+        offset = int(0 if offset_arg in (None, "") else offset_arg)
+        if offset < 0:
+            result["error"] = "offset must be non-negative"
+            return result
+        result["offset"] = offset
+        mailbox = adapter_normalize_mailbox(str(mailbox_arg or ""))
+        raw_rows = [item for item in list_messages(mailbox) if isinstance(item, dict)]
+        # 搜索和响应必须使用同一份索引，避免 lite 索引与旧缓存快照的 ID 对不上而丢信。
+        cached_messages: list[dict[str, Any]] = []
+        for item in raw_rows:
+            row = dict(item)
+            message_id = str(row.get("id") or row.get("message_id") or "").strip()
+            if not message_id:
+                continue
+            row["id"] = message_id
+            row["thread_id"] = str(row.get("thread_id") or row.get("threadId") or "")
+            # 旧索引可能只有 body_text；本地查询器把 body 映射到 body_preview。
+            if not row.get("body_preview") and row.get("body_text"):
+                row["body_preview"] = row["body_text"]
+            cached_messages.append(row)
+        todo_ids = todo_message_ids_arg if isinstance(todo_message_ids_arg, list) else []
+        done_ids = done_message_ids_arg if isinstance(done_message_ids_arg, list) else []
+        snoozed_ids = snoozed_message_ids_arg if isinstance(snoozed_message_ids_arg, list) else []
+
+        # 统一调用本地查询过滤器取得返回结果，并保留规范化查询/语法错误。
+        _hits, parsed = filter_cached_messages(
+            cached_messages,
+            str(query_arg or ""),
+            todo_ids=todo_ids,
+            done_ids=done_ids,
+            snoozed_ids=snoozed_ids,
+            limit=limit,
+        )
+        result["query"] = parsed.display
+        if parsed.error:
+            result["error"] = parsed.error
+            return result
+
+        # 过滤器为保护其他调用方最多返回 200 条；这里遍历完整索引，再按稳定顺序分页。
+        matched_rows = [
+            message
+            for message in cached_messages
+            if parsed.expression and match_local_query(
+                message,
+                parsed,
+                todo_ids=todo_ids,
+                done_ids=done_ids,
+                snoozed_ids=snoozed_ids,
+            )
+        ]
+        matched_rows.sort(key=_inbox_message_sort_key)
+        result["total"] = len(matched_rows)
+        page = matched_rows[offset:offset + limit]
+        result["next_offset"] = offset + len(page)
+        result["has_more"] = result["next_offset"] < result["total"]
+        result["messages"] = [_compact_inbox_message(message, mailbox) for message in page]
+        return result
+    except Exception as exc:
+        # 统一返回业务错误，协议层仍能稳定拿到约定字段。
+        result["error"] = str(exc)[:300] or type(exc).__name__
+        return result
+
+
+def sync_inbox_cache(mailbox_arg: str, repair_missing_arg: Any = False) -> dict[str, Any]:
+    """同步 Gmail History、续订 Watch，并可立即补齐已记录的 metadata 缺口。"""
     from mail_agent.mail_providers.gmail.adapter import (
         gmail_request,
         normalize_mailbox as adapter_normalize_mailbox,
@@ -928,11 +1022,14 @@ def sync_inbox_cache(mailbox_arg: str) -> dict[str, Any]:
     from mail_agent.mail_providers.gmail.mailbox_sync import (
         ensure_gmail_watch,
         get_mailbox_sync_boundary,
+        repair_pending_metadata,
         run_mailbox_sync_tick,
         schedule_background_sync,
     )
 
     mailbox = adapter_normalize_mailbox(mailbox_arg)
+    repair_missing = repair_missing_arg is True
+    repair: dict[str, Any] | None = None
     result = sync_cached_mailbox_history(mailbox)
     profile_history_id = ""
     try:
@@ -943,28 +1040,25 @@ def sync_inbox_cache(mailbox_arg: str) -> dict[str, Any]:
         profile_history_id = ""
 
     bootstrap = None
-    if result.get("resync_required"):
-        # cursor 缺失/过期不再只报错等待 UI 清缓存：直接重新推进 180 天优先基线。
-        try:
-            bootstrap = run_mailbox_sync_tick(
-                mailbox,
-                profile_history_id=profile_history_id,
-                run_priority=True,
-                run_backfill=True,
-                ensure_watch=True,
-            )
-            schedule_background_sync(mailbox, profile_history_id=profile_history_id)
-        except Exception as exc:
-            result["bootstrap_error"] = type(exc).__name__
-    else:
-        try:
-            ensure_gmail_watch(mailbox)
-            schedule_background_sync(mailbox, profile_history_id=profile_history_id)
-        except Exception:
-            pass
+    try:
+        # 无论 History 是否有新变更，自动同步都推进同一个节拍：补齐缺口、继续
+        # priority/backfill 分页并续订 Watch。这样“没有新邮件”也不会跳过缓存修复。
+        bootstrap = run_mailbox_sync_tick(
+            mailbox,
+            profile_history_id=profile_history_id,
+            run_priority=True,
+            run_backfill=True,
+            ensure_watch=True,
+            force_pending_repair=repair_missing,
+        )
+        repair = bootstrap.get("repair") if isinstance(bootstrap, dict) else None
+        schedule_background_sync(mailbox, profile_history_id=profile_history_id)
+    except Exception as exc:
+        result["bootstrap_error"] = type(exc).__name__
     return {
         **result,
         "bootstrap": bootstrap,
+        "repair": repair if repair is not None else (bootstrap or {}).get("repair"),
         "sync_boundary": get_mailbox_sync_boundary(mailbox),
     }
 
@@ -1234,8 +1328,15 @@ def _check_gmail_api_status(
         }
     except Exception as exc:
         message = str(exc) or "Gmail API check failed."
+        error_code = ""
         if isinstance(exc, _urlerr.HTTPError):
+            error_code = str(exc.code)
             message = f"Gmail API request failed: {exc.code}"
+        else:
+            # token 刷新错误通常已经被 adapter 包装成 ValueError，只能从安全的错误文本提取 HTTP 状态码。
+            import re as _re
+            code_match = _re.search(r"\bHTTP\s+(\d{3})\b", message, _re.IGNORECASE)
+            error_code = code_match.group(1) if code_match else ""
         # 鉴权类失败标 unavailable，其余标 error（含超时/网络）
         lowered = message.lower()
         status = "unavailable" if any(
@@ -1245,6 +1346,7 @@ def _check_gmail_api_status(
             "ok": False,
             "status": status,
             "message": message[:240],
+            "error_code": error_code,
             "elapsed_ms": int((_time.monotonic() - started) * 1000),
             "mailbox": target,
         }

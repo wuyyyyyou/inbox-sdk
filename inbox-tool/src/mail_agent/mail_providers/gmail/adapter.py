@@ -6,6 +6,7 @@ import base64
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 import hashlib
+import http.client
 import html as html_lib
 from html.parser import HTMLParser
 import json
@@ -61,6 +62,19 @@ _gmail_request_token: ContextVar[tuple[str, str] | None] = ContextVar("gmail_req
 _gmail_request_token_scope_active: ContextVar[bool] = ContextVar("gmail_request_token_scope_active", default=False)
 _history_sync_locks: dict[str, threading.RLock] = {}
 _history_sync_locks_guard = threading.Lock()
+
+# Gmail 瞬时网络错误（连接被对端重置 / 读超时 / SSL 抖动）的有限重试次数与退避基数。
+_GMAIL_REQUEST_NETWORK_RETRIES = 2
+_GMAIL_REQUEST_NETWORK_BACKOFF_SECONDS = 0.5
+# urlopen 偶发会把连接错误包装成 URLError，也可能直接抛出底层异常，两类都要兜住。
+_GMAIL_TRANSIENT_NETWORK_ERRORS: tuple[type[Exception], ...] = (
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    TimeoutError,
+    ssl.SSLError,
+    urllib.error.URLError,
+    ConnectionError,
+)
 
 
 class GmailApiError(ValueError):
@@ -1560,6 +1574,9 @@ def gmail_request(
 
     未显式传入 access_token 时，若收到 HTTP 401，会清空当前 ContextVar 中的短期
     token、force_refresh 换票后仅重试一次；调用方显式传入 token 时不自动换票。
+    对 RemoteDisconnected / 读超时等瞬时网络故障做有限退避重试，避免偶发断连
+    直接穿透到上层使整次 invoke 失败；gmail_request 的调用均为幂等语义
+    （GET 读取与 Watch 注册），重试不会产生重复副作用。
     短期 token 仅在 _gmail_request_token_scope 内按 mailbox 复用，禁止跨邮箱/跨 invoke 泄漏。
     """
     # 调用方可在一个受限业务请求内复用已取得的短期 token，减少平台
@@ -1572,6 +1589,7 @@ def gmail_request(
     if http_method not in {"GET", "POST"}:
         raise ValueError(f"Unsupported Gmail HTTP method: {http_method}")
     retried_auth = False
+    network_retries_left = _GMAIL_REQUEST_NETWORK_RETRIES
     endpoint = _gmail_endpoint_kind(path)
     normalized_mailbox = str(mailbox or "").strip().lower()
     while True:
@@ -1643,6 +1661,27 @@ def gmail_request(
             )
             raise GmailApiError(exc.code, f"Gmail API request failed: {exc.code} {detail_json}") from exc
         except Exception as exc:
+            # 对 RemoteDisconnected / 读超时 / SSL 抖动这类瞬时网络故障做有限退避
+            # 重试，避免偶发断连直接穿透到上层使整次 invoke 失败。gmail_request
+            # 的调用均为幂等语义（GET 读取与 Watch 注册），重试无重复副作用；
+            # 401 换票已在上面单独处理，这里只处理非 HTTP 状态的传输层异常。
+            if network_retries_left > 0 and isinstance(exc, _GMAIL_TRANSIENT_NETWORK_ERRORS):
+                network_retries_left -= 1
+                logging.getLogger("mail_agent.gmail").warning(
+                    "Gmail transient network error on %s; retrying (left=%d, type=%s)",
+                    endpoint,
+                    network_retries_left,
+                    type(exc).__name__,
+                )
+                _record_diagnostic_span(
+                    "gmail.http",
+                    started,
+                    outcome="retry",
+                    endpoint=endpoint,
+                    error_type=type(exc).__name__,
+                )
+                time.sleep(_GMAIL_REQUEST_NETWORK_BACKOFF_SECONDS)
+                continue
             _record_diagnostic_span("gmail.http", started, outcome="error", endpoint=endpoint, error_type=type(exc).__name__)
             raise
         _record_diagnostic_span(

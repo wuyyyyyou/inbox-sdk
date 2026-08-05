@@ -1,9 +1,31 @@
 import { describe, expect, it } from "vitest";
 import {
   measureAiMessageBlocks,
+  parseAiMessageInline,
   parseAiMessageMarkdown,
   sliceAiMessageBlocks,
 } from "./aiMessageFormatting";
+
+describe("parseAiMessageInline", () => {
+  it.each([
+    ["[THREAD_REF_thread-123]", "thread-123"],
+    ["[THREADREF_thread-456]", "thread-456"],
+  ])("parses %s as a thread_ref instead of text", (token, threadId) => {
+    expect(parseAiMessageInline(`Before ${token} after`)).toEqual([
+      { type: "text", value: "Before " },
+      { type: "thread_ref", threadId },
+      { type: "text", value: " after" },
+    ]);
+    expect(parseAiMessageInline(`Before ${token} after`).some((node) => node.type === "text" && node.value.includes(token))).toBe(false);
+  });
+
+  it("silently removes unavailable thread reference tokens", () => {
+    const nodes = parseAiMessageInline("Before [THREADREF_] [THREAD_REF_bad id] after");
+    expect(nodes.filter((node) => node.type === "text").map((node) => node.value).join(""))
+      .toBe("Before   after");
+    expect(nodes.some((node) => node.type === "text" && /\[THREAD(?:_REF)?_/.test(node.value))).toBe(false);
+  });
+});
 
 describe("parseAiMessageMarkdown", () => {
   it("parses the supported blocks and inline content", () => {
@@ -151,6 +173,34 @@ describe("parseAiMessageMarkdown", () => {
           [{ type: "text", value: "Your Google data is ready to download" }],
           [{ type: "text", value: "Re: Update on the Advanced AI and Automation Solutions feature for Anna AI" }],
         ],
+      },
+    ]);
+  });
+
+  it("keeps appointment date and time in the same email list item", () => {
+    const raw = [
+      "已逐封评估 3 封邮件：1 封可能需要回复，2 封无需我方操作。待处理邮件:",
+      "",
+      "- **Founding Full-Stack Engineer Available** 回复 Monika 表示已收到信息，并会在有相关需求或合适人选时进行引荐。跳过主题：Getting started with Claude Cowork, Appointment booked: 1stColab Intro (Kate Zhou) @ Tue Jul 21",
+      "  2026 7:30am",
+      "- 8am (GMT+8) (kate@anna.partners)。",
+    ].join("\n");
+
+    expect(parseAiMessageMarkdown(raw)).toEqual([
+      {
+        type: "paragraph",
+        content: [{ type: "text", value: "已逐封评估 3 封邮件：1 封可能需要回复，2 封无需我方操作。待处理邮件:" }],
+      },
+      {
+        type: "unordered_list",
+        indent: 0,
+        items: [[{
+          type: "bold",
+          value: "Founding Full-Stack Engineer Available",
+        }, {
+          type: "text",
+          value: " 回复 Monika 表示已收到信息，并会在有相关需求或合适人选时进行引荐。跳过主题：Getting started with Claude Cowork, Appointment booked: 1stColab Intro (Kate Zhou) @ Tue Jul 21 2026 7:30am 8am (GMT+8) (kate@anna.partners)。",
+        }]],
       },
     ]);
   });

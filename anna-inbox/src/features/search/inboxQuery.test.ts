@@ -53,6 +53,19 @@ describe("Inbox query language", () => {
     ]);
   });
 
+  it("parses field-qualified quoted phrases and parentheses", () => {
+    expect(parseInboxQuery('subject:"project alpha" AND body:"paid invoice"')).toMatchObject({
+      expression: {
+        kind: "and",
+        terms: [
+          { kind: "term", field: "subject", value: "project alpha" },
+          { kind: "term", field: "body", value: "paid invoice" },
+        ],
+      },
+    });
+    expect(parseInboxQuery('(subject:"project alpha" OR body:"paid invoice") AND invoice').error).toBe("");
+  });
+
   it("reports invalid expressions and offers only operator suggestions", () => {
     expect(parseInboxQuery("subject:").error).toContain("subject");
     expect(parseInboxQuery("foo AND OR bar").error).toContain("operator");

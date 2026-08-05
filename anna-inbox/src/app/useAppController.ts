@@ -43,6 +43,7 @@ import type {
   ComposeDraftListPayload,
   CustomRunResult,
   CustomRunResultItem,
+  DraftReplyArtifact,
   DraftPreferenceField,
   DraftReplyGoal,
   FrontendCard,
@@ -50,11 +51,13 @@ import type {
   InboxFeedPayload,
   InboxMessage,
   InboxMessageDisplayBodyPayload,
+  IndexedEmailSearchPayload,
   InboxThreadAssistPayload,
   InboxThreadDraftPayload,
   InboxThreadPagePayload,
   InboxThreadStateOperation,
   InboxSettings,
+  InboxWorkflowState,
   MailPromptRunResult,
   MailboxInfo,
   RunStatus,
@@ -315,6 +318,40 @@ function prefersChinese(input: string) {
   return /[\u3400-\u9fff]/.test(input);
 }
 
+function localDraftTemplateFromMessages(messages: AiChatMessage[]) {
+  for (const message of [...messages].reverse()) {
+    if (message.role !== "user") continue;
+    const content = String(message.content || "").trim();
+    if (!content) continue;
+    if (
+      /(?:先不要|暂不|暂时不要).{0,24}(?:draft|草稿|起草|生成)/i.test(content)
+      && /(?:模板|template|标题|subject|正文|body)/i.test(content)
+    ) return content;
+  }
+  return "";
+}
+
+function localDraftTemplateAwaitingDetails(messages: AiChatMessage[]) {
+  return messages.some((message) => message.role === "user" && /(?:接下来|之后|后续).{0,40}(?:输入|提供).{0,80}(?:生成|draft|草稿|卡片)|(?:输入|提供).{0,80}(?:之后|后).{0,40}(?:生成|draft|草稿|卡片)/i.test(String(message.content || "")));
+}
+
+function isBatchComposeMessage(userText: string, messages: AiChatMessage[]): boolean {
+  const emailCount = (text: string) => new Set(text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).size;
+  if (emailCount(userText) >= 2) return true;
+  if (!/^(?:yes|sure|confirm|continue|好的?|可以|确认|继续)[.!。！？\s]*$/i.test(userText)) return false;
+  return messages.some((message) => message.role === "user" && emailCount(message.content) >= 2);
+}
+
+function pendingBatchComposeContinuation(messages: AiChatMessage[]) {
+  for (const message of [...messages].reverse()) {
+    if (message.role !== "assistant") continue;
+    const continuation = message.batchComposeContinuation;
+    if (!continuation?.sourcePrompt || continuation.offset < 1 || continuation.remaining < 1) continue;
+    return continuation;
+  }
+  return undefined;
+}
+
 function buildAiTurnUiContext(args: {
   mailbox: string;
   selectedMailboxes: string[];
@@ -386,6 +423,8 @@ function buildAiTurnUiContext(args: {
       role: message.role,
       content: String(message.content || "").trim().slice(0, 1200),
     }));
+  const localDraftTemplate = localDraftTemplateFromMessages(args.messages || []);
+  const batchComposeContinuation = pendingBatchComposeContinuation(args.messages || []);
   return {
     conversation_id: args.conversationId,
     mailbox,
@@ -404,6 +443,20 @@ function buildAiTurnUiContext(args: {
     routing_intent: args.routingIntent || "",
     search_field: args.searchField || "",
     recent_conversation: recentConversation,
+    // 批量续批是确定性任务状态；“继续”不可再交给 Agent 猜测或重新搜索邮件。
+    batch_compose_continuation: batchComposeContinuation
+      ? {
+          source_prompt: batchComposeContinuation.sourcePrompt,
+          offset: batchComposeContinuation.offset,
+          remaining: batchComposeContinuation.remaining,
+        }
+      : undefined,
+    // local_session 没有 Host Session 的完整 transcript；完整模板只能从当前会话消息中派生，
+    // 不写入会被长度截断的 AI Memory，也不发送给 Host 路径。
+    local_draft_template: localDraftTemplate,
+    local_draft_template_awaiting_details: Boolean(
+      localDraftTemplate && localDraftTemplateAwaitingDetails(args.messages || []),
+    ),
     // 工作流状态只传 message_id，不传邮件正文；详情/旧入口未给列表快照时保留 Todo 兼容读取。
     todo_message_ids: listContext?.todo_message_ids || readTodoMessageIds(mailbox),
     done_message_ids: listContext?.done_message_ids || [],
@@ -417,9 +470,15 @@ function buildAiTurnUiContext(args: {
 }
 
 function buildAiAgentContent(userText: string, uiContext: Record<string, unknown>): string {
-  // ui_context 是用户输入中的只读事实，不能覆盖 session 的 systemPrompt。
-  // display_range_days 是 Inbox 渲染偏好，不是 AI 检索边界；不得让 Host 据此臆造时间范围。
-  const { display_range_days: _displayRangeDays, ...agentContext } = uiContext;
+  // Host Session 自己维护多轮对话；不要把前端 transcript 作为每轮 prompt 重复传输。
+  // ui_context 只保留会随界面变化的只读事实。display_range_days 不是检索边界。
+  const {
+    display_range_days: _displayRangeDays,
+    recent_conversation: _recentConversation,
+    local_draft_template: _localDraftTemplate,
+    local_draft_template_awaiting_details: _localDraftTemplateAwaitingDetails,
+    ...agentContext
+  } = uiContext;
   return `[ui_context]\n${JSON.stringify(agentContext)}\n\n[user]\n${userText}`;
 }
 
@@ -461,6 +520,53 @@ export function normalizeAiArtifactPayload(payload: Record<string, unknown>): Re
     artifact: found[0],
     artifacts: found,
   };
+}
+
+function partialBatchDraftArtifacts(partial: unknown): import("../types/mail").DraftReplyArtifact[] {
+  if (!partial || typeof partial !== "object") return [];
+  const raw = (partial as Record<string, unknown>).batch_drafts;
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((item) => {
+    if (!isDraftReplyArtifact(item)) return [];
+    return [{
+      type: "draft_reply" as const,
+      mailbox: String(item.mailbox || ""),
+      thread_id: String(item.thread_id || ""),
+      message_id: String(item.message_id || ""),
+      subject: String(item.subject || ""),
+      body: String(item.body || ""),
+      source_prompt: String(item.source_prompt || ""),
+      recipients: Array.isArray(item.recipients)
+        ? item.recipients.filter((recipient): recipient is string => typeof recipient === "string")
+        : [],
+      composer_mode: item.composer_mode === "forward" ? "forward" : "reply",
+    }];
+  });
+}
+
+function partialBatchComposeArtifacts(partial: unknown): import("../types/mail").ComposeDraftArtifact[] {
+  if (!partial || typeof partial !== "object") return [];
+  const value = partial as Record<string, unknown>;
+  const raw = Array.isArray(value.batch_compose_drafts)
+    ? value.batch_compose_drafts
+    : value.batch_compose_draft ? [value.batch_compose_draft] : [];
+  return raw.flatMap((item) => {
+    const source = item && typeof item === "object" && "artifact" in item
+      ? (item as Record<string, unknown>).artifact
+      : item;
+    if (!source || typeof source !== "object") return [];
+    const draft = source as Record<string, unknown>;
+    if (String(draft.type || "") !== "compose_draft" || !String(draft.body || "").trim()) return [];
+    return [{
+      type: "compose_draft" as const,
+      mailbox: String(draft.mailbox || ""),
+      body: String(draft.body || ""),
+      source_prompt: String(draft.source_prompt || ""),
+      mode: draft.mode === "replace" ? "replace" : "insert",
+      recipients: Array.isArray(draft.recipients) ? draft.recipients.map(String).filter(Boolean) : [],
+      subject: String(draft.subject || ""),
+    }];
+  });
 }
 
 function latestDraftOutcome(outcomes: AgentToolOutcome[]): Record<string, unknown> | null {
@@ -619,6 +725,18 @@ function confirmedEvidenceThreadLabels(payload: Record<string, unknown>, allowed
   return Object.fromEntries(Object.entries(labels).filter(([threadId]) => allowedThreadIds.has(threadId)));
 }
 
+function currentMailContextThread(payload: Record<string, unknown>): { threadId: string; label: string } | undefined {
+  if (String(payload.kind || "") !== "mail_context") return undefined;
+  const mailContext = payload.mail_context;
+  if (!mailContext || typeof mailContext !== "object") return undefined;
+  const context = mailContext as Record<string, unknown>;
+  if (String(context.kind || "") !== "thread") return undefined;
+  const threadId = String(context.thread_id || "").trim().replace(/^THREAD_REF_/, "");
+  if (!threadId) return undefined;
+  const subject = String(context.subject || "").replace(/\s+/g, " ").trim().slice(0, 160);
+  return { threadId, label: subject || "Open email" };
+}
+
 /** 从 Host tool 结果中提取 start_ai_turn / custom scan 的 run_id。 */
 function findBackgroundRunId(outcomes: AgentToolOutcome[]): string {
   for (const outcome of [...outcomes].reverse()) {
@@ -640,6 +758,52 @@ function readTodoMessageIds(mailbox: string): string[] {
   } catch {
     return [];
   }
+}
+
+function normalizeWorkflowState(value: unknown): InboxWorkflowState {
+  const source = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const ids = (candidate: unknown) => Array.isArray(candidate)
+    ? [...new Set(candidate.map((item) => String(item || "").trim()).filter(Boolean))].slice(0, 500)
+    : [];
+  const snoozedUntil: Record<string, string> = {};
+  if (source.snoozedUntil && typeof source.snoozedUntil === "object") {
+    for (const [id, until] of Object.entries(source.snoozedUntil as Record<string, unknown>)) {
+      const normalizedId = id.trim();
+      const normalizedUntil = String(until || "").trim();
+      if (normalizedId && normalizedUntil) snoozedUntil[normalizedId] = normalizedUntil;
+    }
+  }
+  return {
+    todos: ids(source.todos),
+    done: ids(source.done),
+    snoozed: ids(source.snoozed),
+    snoozedUntil,
+    ...(Number.isFinite(Number(source.version)) ? { version: Number(source.version) } : {}),
+    ...(source.updated_at ? { updated_at: String(source.updated_at) } : {}),
+  };
+}
+
+function workflowStateHasData(state: InboxWorkflowState): boolean {
+  return state.todos.length > 0 || state.done.length > 0 || state.snoozed.length > 0
+    || Object.keys(state.snoozedUntil).length > 0;
+}
+
+/** Read the pre-backend mailbox flags once so existing Todo state is not lost during migration. */
+function readLegacyWorkflowState(mailbox: string): InboxWorkflowState {
+  if (typeof window === "undefined" || !mailbox) return normalizeWorkflowState(null);
+  try {
+    const raw = window.localStorage.getItem(`anna-inbox:mail-flags:${mailbox}`);
+    return normalizeWorkflowState(raw ? JSON.parse(raw) : null);
+  } catch {
+    return normalizeWorkflowState(null);
+  }
+}
+
+function isWorkflowEtagConflict(error: unknown): boolean {
+  const candidate = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const status = Number(candidate.status || candidate.statusCode || candidate.code);
+  const message = error instanceof Error ? error.message : String(error);
+  return status === 409 || /(?:etag|if[-_ ]match|version).*(?:conflict|mismatch)|conflict.*(?:etag|version)/i.test(message);
 }
 
 function isTransientConnectionError(error: unknown) {
@@ -885,6 +1049,8 @@ export interface AppActions {
   closeSettings(): void;
   loadInboxSettings(mailbox?: string): Promise<InboxSettings | null>;
   saveInboxSettings(patch: Partial<InboxSettings>): Promise<boolean>;
+  loadInboxWorkflowState(mailbox?: string): Promise<InboxWorkflowState | null>;
+  saveInboxWorkflowState(state: InboxWorkflowState, mailbox?: string): Promise<boolean>;
   checkGmailAuth(mailboxOverride?: string): Promise<{ authorized: boolean; source: string }>;
   checkAnyGmailAuth(): Promise<{ authorized: boolean; source: string }>;
   closeGmailErrorPopup(): void;
@@ -893,11 +1059,15 @@ export interface AppActions {
   setBriefMailboxFilter(mailboxes: string[]): void;
   loadActiveCards(): Promise<void>;
   loadInboxEmails(category?: string, days?: number, force?: boolean): Promise<boolean>;
+  searchIndexedEmails(query: string): Promise<IndexedEmailSearchPayload>;
+  loadMoreIndexedEmails(): Promise<IndexedEmailSearchPayload | null>;
   refreshInboxEmails(category?: string, days?: number, clearCache?: boolean): Promise<InboxPageResult>;
   /** 与自动同步相同：History 增量 + 静默合并快照，不整表清空 */
   silentSyncInbox(days?: number): Promise<boolean>;
   /** 设置页：清空本地缓存并硬重载当前邮箱 */
   clearInboxCacheAndReload(days?: number): Promise<boolean>;
+  /** 设置页：仅补齐已记录的 metadata 缺口，不删除本地缓存 */
+  repairInboxCache(days?: number): Promise<boolean>;
   /** 扩大 All mail 时间窗并只追加新邮件，不清空已有快照 */
   expandInboxFeedWindow(days: number): Promise<InboxPageResult>;
   loadCachedInboxEmails(category?: string, days?: number, offset?: number, append?: boolean): Promise<InboxPageResult>;
@@ -1068,7 +1238,7 @@ export interface AppActions {
 }
 
 export function useAppController() {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const [state, setState] = useState<AppState>(() => createInitialState());
   const [toast, setToast] = useState<({ message: string } & ToastOptions) | null>(null);
   const [accountSwitchNotice, setAccountSwitchNotice] = useState<{ email: string; avatarUrl?: string } | null>(null);
@@ -1102,6 +1272,7 @@ export function useAppController() {
   const aiSidebarBackendModeRef = useRef<AiSidebarMode>("host");
   /** 每个会话首轮固定 AI 执行路径，避免追问在 Host/local 间切换。 */
   const aiSidebarModeByConversationRef = useRef(new Map<string, AiSidebarMode>());
+  const workflowMigrationRef = useRef(new Set<string>());
 
   const getRuntime = useCallback(async () => {
     if (!runtimePromise.current) {
@@ -1134,6 +1305,55 @@ export function useAppController() {
   }, [getRuntime]);
 
   const client = useMemo(() => new MailAgentClient(getRuntime, reconnectRuntime), [getRuntime, reconnectRuntime]);
+
+  const searchIndexedEmails = useCallback(async (query: string): Promise<IndexedEmailSearchPayload> => {
+    const mailbox = state.selectedMailboxes[0] || state.mailbox;
+    if (!mailbox) {
+      const empty = { messages: [], query, error: "No mailbox selected.", total: 0, has_more: false, offset: 0, next_offset: 0 };
+      setState((current) => ({ ...current, indexedSearchMessages: [], indexedSearchQuery: query, indexedSearchLoading: false, indexedSearchError: empty.error, indexedSearchHasMore: false, indexedSearchNextOffset: 0 }));
+      return empty;
+    }
+    setState((current) => ({ ...current, indexedSearchLoading: true, indexedSearchError: "", indexedSearchQuery: query, indexedSearchHasMore: false, indexedSearchNextOffset: 0 }));
+    try {
+      const payload = await client.searchIndexedEmails(mailbox, query, {
+        todo_message_ids: state.inboxWorkflowState.todos,
+        done_message_ids: state.inboxWorkflowState.done,
+        snoozed_message_ids: state.inboxWorkflowState.snoozed,
+      });
+      setState((current) => ({ ...current, indexedSearchMessages: payload.messages || [], indexedSearchQuery: query, indexedSearchLoading: false, indexedSearchError: payload.error || "", indexedSearchHasMore: Boolean(payload.has_more), indexedSearchNextOffset: payload.next_offset ?? (payload.messages || []).length }));
+      return payload;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setState((current) => ({ ...current, indexedSearchMessages: [], indexedSearchLoading: false, indexedSearchError: message, indexedSearchHasMore: false, indexedSearchNextOffset: 0 }));
+      throw error;
+    }
+  }, [client, state.inboxWorkflowState.done, state.inboxWorkflowState.snoozed, state.inboxWorkflowState.todos, state.mailbox, state.selectedMailboxes]);
+
+  const loadMoreIndexedEmails = useCallback(async (): Promise<IndexedEmailSearchPayload | null> => {
+    const query = state.indexedSearchQuery;
+    const mailbox = state.selectedMailboxes[0] || state.mailbox;
+    if (!mailbox || !state.indexedSearchHasMore || state.indexedSearchLoading) return null;
+    const offset = state.indexedSearchNextOffset;
+    setState((current) => ({ ...current, indexedSearchLoading: true, indexedSearchError: "" }));
+    try {
+      const payload = await client.searchIndexedEmails(mailbox, query, {
+        todo_message_ids: state.inboxWorkflowState.todos,
+        done_message_ids: state.inboxWorkflowState.done,
+        snoozed_message_ids: state.inboxWorkflowState.snoozed,
+      }, 200, offset);
+      setState((current) => {
+        if (current.indexedSearchQuery !== query) return { ...current, indexedSearchLoading: false };
+        const existing = new Set(current.indexedSearchMessages.map((message) => message.id));
+        const appended = (payload.messages || []).filter((message) => !existing.has(message.id));
+        return { ...current, indexedSearchMessages: [...current.indexedSearchMessages, ...appended], indexedSearchLoading: false, indexedSearchError: payload.error || "", indexedSearchHasMore: Boolean(payload.has_more), indexedSearchNextOffset: payload.next_offset ?? offset + (payload.messages || []).length };
+      });
+      return payload;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setState((current) => ({ ...current, indexedSearchLoading: false, indexedSearchError: message }));
+      throw error;
+    }
+  }, [client, state.indexedSearchHasMore, state.indexedSearchLoading, state.indexedSearchNextOffset, state.indexedSearchQuery, state.inboxWorkflowState.done, state.inboxWorkflowState.snoozed, state.inboxWorkflowState.todos, state.mailbox, state.selectedMailboxes]);
 
   const showToast = useCallback((message: string, options?: ToastOptions) => {
     setToast({ message, ...options });
@@ -1429,8 +1649,9 @@ export function useAppController() {
       const result = await client.syncInboxCache(mailbox);
       if (snapshotRequestMailbox.current !== requestKey) return false;
       if (result.resync_required) {
-        // History 游标失效或附件摘要版本升级时重建缓存；常规增量同步不重新抓取 All-mail。
-        await client.listInboxEmails(mailbox, rangeDays, ALL_MAIL_CACHE_FETCH_LIMIT, "all", true);
+        // History 游标失效后由后端保留现有索引并续跑基线；不能清空本地缓存，
+        // 否则一次临时故障会丢失可检索邮件并迫使用户等待全量重建。
+        await client.listInboxEmails(mailbox, rangeDays, ALL_MAIL_CACHE_FETCH_LIMIT, "all", false);
         if (snapshotRequestMailbox.current !== requestKey) return false;
       }
       const loaded = await loadMailboxSnapshotFromCache(mailbox, rangeDays, requestKey, { soft: true });
@@ -1759,6 +1980,33 @@ export function useAppController() {
     return Boolean(result.ok);
   }, [refreshInboxEmails, state.inboxSettings.display_range_days]);
 
+  const repairInboxCache = useCallback(async (days?: number) => {
+    const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
+    if (!mailbox || mailbox === "all") return false;
+    const rangeDays = Math.max(0, Number(days ?? state.inboxSettings.display_range_days) || 30);
+    const requestKey = `${mailbox}#repair:${++inboxRequestSequence.current}`;
+    snapshotRequestMailbox.current = requestKey;
+    setState((s) => ({ ...s, inboxSnapshotLoading: true, inboxError: "" }));
+    try {
+      await client.syncInboxCache(mailbox, true);
+      if (snapshotRequestMailbox.current !== requestKey) return false;
+      const loaded = await loadMailboxSnapshotFromCache(mailbox, rangeDays, requestKey, { soft: true });
+      if (snapshotRequestMailbox.current !== requestKey) return false;
+      await preloadContactAvatars(mailbox, loaded.messages || []);
+      setState((s) => ({
+        ...s,
+        inboxSnapshotLoading: false,
+        inboxError: loaded.ok ? "" : s.inboxError,
+      }));
+      return Boolean(loaded.ok);
+    } catch (error) {
+      if (snapshotRequestMailbox.current !== requestKey) return false;
+      const detail = error instanceof Error ? error.message : String(error);
+      setState((s) => ({ ...s, inboxSnapshotLoading: false, inboxError: detail }));
+      return false;
+    }
+  }, [client, loadMailboxSnapshotFromCache, preloadContactAvatars, state.inboxSettings.display_range_days, state.mailbox, state.selectedMailboxes]);
+
   const expandInboxFeedWindow = useCallback(async (days = 30): Promise<InboxPageResult> => {
     const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
     if (!mailbox || mailbox === "all") {
@@ -2060,6 +2308,67 @@ export function useAppController() {
     }
   }, [client, showToast, state.inboxSettings, state.inboxSettingsEtag, state.mailbox, state.storageProvider]);
 
+  const loadInboxWorkflowState = useCallback(async (mailboxOverride?: string): Promise<InboxWorkflowState | null> => {
+    const mailbox = normalizedMailbox(mailboxOverride || state.mailbox);
+    if (!mailbox) return null;
+    setState((s) => ({ ...s, inboxWorkflowStateLoading: true, inboxWorkflowStateError: "" }));
+    try {
+      const payload = await client.getInboxWorkflowState(mailbox);
+      const backendState = normalizeWorkflowState(payload.state);
+      let nextState = backendState;
+      const migrationKey = `anna-inbox:workflow-migrated:${mailbox}`;
+      const alreadyMigrated = workflowMigrationRef.current.has(mailbox)
+        || (typeof window !== "undefined" && window.localStorage.getItem(migrationKey) === "1");
+      if (!payload.exists || !workflowStateHasData(backendState)) {
+        const legacy = readLegacyWorkflowState(mailbox);
+        if (!alreadyMigrated && workflowStateHasData(legacy)) {
+          const migrated = await client.saveInboxWorkflowState(mailbox, legacy, payload.etag || undefined);
+          nextState = normalizeWorkflowState(migrated.state || legacy);
+          workflowMigrationRef.current.add(mailbox);
+          try { window.localStorage.setItem(migrationKey, "1"); } catch { /* migration marker is best effort */ }
+          setState((s) => ({ ...s, inboxWorkflowStateEtag: migrated.etag || payload.etag || "" }));
+        }
+      }
+      setState((s) => ({
+        ...s,
+        inboxWorkflowState: nextState,
+        inboxWorkflowStateEtag: s.inboxWorkflowStateEtag || payload.etag || "",
+        inboxWorkflowStateLoading: false,
+      }));
+      return nextState;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setState((s) => ({ ...s, inboxWorkflowStateLoading: false, inboxWorkflowStateError: message }));
+      return null;
+    }
+  }, [client, state.mailbox]);
+
+  const saveInboxWorkflowState = useCallback(async (next: InboxWorkflowState, mailboxOverride?: string): Promise<boolean> => {
+    const mailbox = normalizedMailbox(mailboxOverride || state.mailbox);
+    if (!mailbox) return false;
+    const desired = normalizeWorkflowState(next);
+    const previous = state.inboxWorkflowState;
+    const previousEtag = state.inboxWorkflowStateEtag;
+    // Reflect the user's action immediately; a failed request restores the prior value.
+    setState((s) => ({ ...s, inboxWorkflowState: desired, inboxWorkflowStateSaving: true, inboxWorkflowStateError: "" }));
+    try {
+      let payload;
+      try {
+        payload = await client.saveInboxWorkflowState(mailbox, desired, previousEtag || undefined);
+      } catch (error) {
+        if (!isWorkflowEtagConflict(error)) throw error;
+        const latest = await client.getInboxWorkflowState(mailbox);
+        payload = await client.saveInboxWorkflowState(mailbox, desired, latest.etag || undefined);
+      }
+      setState((s) => ({ ...s, inboxWorkflowState: normalizeWorkflowState(payload.state || desired), inboxWorkflowStateEtag: payload.etag || s.inboxWorkflowStateEtag, inboxWorkflowStateSaving: false }));
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setState((s) => ({ ...s, inboxWorkflowState: previous, inboxWorkflowStateEtag: previousEtag, inboxWorkflowStateSaving: false, inboxWorkflowStateError: message }));
+      return false;
+    }
+  }, [client, state.inboxWorkflowState, state.inboxWorkflowStateEtag, state.mailbox]);
+
   const loadScanPlanForRun = useCallback(async (mailbox: string): Promise<Required<Pick<ScanPlan, "scan_window_days" | "max_messages">>> => {
     const normalized = normalizedMailbox(mailbox);
     const visiblePlanMailbox = normalizedMailbox(state.configMailbox || state.mailbox);
@@ -2199,6 +2508,7 @@ export function useAppController() {
         status: status === "connected" ? "connected" : status === "error" ? "error" : "unavailable",
         checked: true,
         message: result.message || (status === "connected" ? "Gmail API is connected." : "Gmail API is unavailable."),
+        error_code: result.error_code,
         elapsed_ms: result.elapsed_ms,
         mailbox: result.mailbox,
       };
@@ -2216,7 +2526,23 @@ export function useAppController() {
     if (next.status !== "connected") {
       const transitionedToFail = previous.status === "connected" || previous.status === "unknown" || !previous.checked;
       if (!options?.fromPoll || transitionedToFail) {
-        showToast(t("toast.gmailUnavailable"), {
+        const code = String(next.error_code || "");
+        const toastKey = code === "400"
+          ? "toast.gmailBadRequest"
+          : code === "401"
+            ? "toast.gmailUnauthorized"
+            : code === "403"
+              ? "toast.gmailForbidden"
+              : code === "404"
+                ? "toast.gmailNotFound"
+                : code === "429"
+                  ? "toast.gmailRateLimited"
+                  : /^5\d\d$/.test(code)
+                    ? "toast.gmailServerError"
+                    : /timeout|timed out|network|fetch|connection|enotfound|econnreset/i.test(next.message || "")
+                      ? "toast.gmailNetworkError"
+                      : "toast.gmailUnavailable";
+        showToast(t(toastKey), {
           actionLabel: t("toast.retry"),
           onAction: () => {
             void refreshGmailApiStatusRef.current();
@@ -2878,6 +3204,8 @@ export function useAppController() {
     closeSettings() { setState((s) => ({ ...s, settingsOpen: false })); },
     loadInboxSettings,
     saveInboxSettings,
+    loadInboxWorkflowState,
+    saveInboxWorkflowState,
     minimize(value) {
       setState((s) => ({ ...s, minimized: value }));
     },
@@ -3030,6 +3358,8 @@ export function useAppController() {
       });
     },
     loadActiveCards,
+    searchIndexedEmails,
+    loadMoreIndexedEmails,
     async loadInboxEmails(category = "inbox", days = 30, force = false) {
       // 强制刷新时统一预热 All mail 快照
       if (force && (category === "inbox" || category === "all")) {
@@ -3040,6 +3370,7 @@ export function useAppController() {
     refreshInboxEmails,
     silentSyncInbox,
     clearInboxCacheAndReload,
+    repairInboxCache,
     expandInboxFeedWindow,
     async loadCachedInboxEmails(category = "inbox", days = 30, offset = 0, append = false): Promise<InboxPageResult> {
       const mailbox = normalizedMailbox(state.selectedMailboxes[0] || state.mailbox);
@@ -3342,12 +3673,12 @@ export function useAppController() {
         !request.visiblePrompt.trim() ||
         aiGenerationRun.current
       ) return null;
-      const generationRun = {
+  const generationRun = {
         runId: createId("generation"),
         cancelled: false,
         controller: new AbortController(),
       };
-      aiGenerationRun.current = generationRun;
+  aiGenerationRun.current = generationRun;
       const isCurrentGeneration = () => aiGenerationRun.current === generationRun && !generationRun.cancelled;
       const conversationId = request.forceNewConversation ? createId("chat") : state.aiChatConversationId || createId("chat");
       const userMessage: AiChatMessage = request.retryUserMessage ?? {
@@ -3446,6 +3777,12 @@ export function useAppController() {
         const payload = normalizeAiArtifactPayload(
           (completed.result || {}) as unknown as Record<string, unknown>,
         ) as unknown as MailPromptRunResult;
+        const artifacts: DraftReplyArtifact[] = isDraftRequest
+          ? (payload.artifacts || []).map((artifact) => ({
+              ...artifact,
+              source_prompt: request.visiblePrompt,
+            }))
+          : [];
         const summaryTitle = String(payload.thread_title || request.contextTitle || "").trim();
         const finalMessages: AiChatMessage[] = [
           ...messagesWithUser,
@@ -3459,6 +3796,7 @@ export function useAppController() {
             artifact: isDraftRequest && payload.artifact
               ? { ...payload.artifact, source_prompt: request.visiblePrompt }
               : null,
+            artifacts: artifacts.length ? artifacts : undefined,
             replyGaps: context.kind === "compose" ? payload.compose_gaps : payload.reply_gaps,
             mailContext: context,
             mailSummaryLink: !isDraftRequest && context.kind === "gmail_thread" ? {
@@ -3913,7 +4251,7 @@ export function useAppController() {
       const stateKey = `${key}::${attachmentId}`;
       if (state.attachmentDownloads[stateKey] === "preparing") return;
       setState((s) => ({ ...s, attachmentDownloads: { ...s.attachmentDownloads, [stateKey]: "preparing" } }));
-      showToast("Preparing download...");
+      showToast(t("toast.preparingDownload"));
       try {
         const result = await client.prepareAttachmentDownload(cardMailbox(card, state.mailbox), card.id, attachmentId, state.storageProvider);
         if (!result.ok) {
@@ -4007,7 +4345,7 @@ export function useAppController() {
       if (!draftGenerationRun.current) return;
       draftGenerationRun.current.cancelled = true;
       setState((s) => ({ ...s, generatingDraft: false, draftDots: "" }));
-      showToast("Draft generation stopped.");
+      showToast(t("toast.draftGenerationStopped"));
     },
     clearDraft(cardId) {
       const card = cardId ? findCard(state.allCards, cardId) || findCard(state.cards, cardId) : state.selectedCard;
@@ -4049,7 +4387,7 @@ export function useAppController() {
           statusByCardId: { ...s.statusByCardId, [key]: "Read" },
         };
       });
-      showToast("Card removed from this briefing.");
+      showToast(t("toast.cardRemoved"));
       void client.markCardRead({
         mailbox: cardMailbox(card, state.mailbox),
         card_id: cid,
@@ -4069,7 +4407,7 @@ export function useAppController() {
         setState((s) => ({ ...s, originalOpen: false, selectedCard: null, expandedDetails: { ...s.expandedDetails, [key]: false } }));
         await loadActiveCards();
         await loadRunHistory();
-        showToast("Card removed from this briefing.");
+        showToast(t("toast.cardRemoved"));
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       } finally {
@@ -4081,7 +4419,7 @@ export function useAppController() {
       const key = state.selectedCard.uiKey || cardUiKey(state.selectedCard, state.mailbox);
       const draft = state.draftById[key] || "";
       if (!draft.trim()) {
-        showToast("Draft is empty. Generate a draft first.");
+        showToast(t("toast.draftEmptyGenerate"));
         return;
       }
       setState((s) => ({ ...s, pendingAction: `reply:${state.selectedCard!.id}` }));
@@ -4094,7 +4432,7 @@ export function useAppController() {
           dry_run: false,
         });
         setState((s) => ({ ...s, originalOpen: false, selectedCard: null }));
-        showToast("Reply sent successfully.");
+        showToast(t("toast.replySentSuccessfully"));
         await loadActiveCards();
         await loadRunHistory();
       } catch (error) {
@@ -4110,7 +4448,7 @@ export function useAppController() {
           await client.clearActiveCards(mailbox, state.storageProvider);
         }
         setState((s) => ({ ...s, cards: [], actionCount: 0, scanState: null, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, attachmentDownloads: {} }));
-        showToast("All cards cleared.");
+        showToast(t("toast.allCardsCleared"));
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       }
@@ -4146,7 +4484,7 @@ export function useAppController() {
         setState((s) => ({ ...s, markingReadIds: { ...s.markingReadIds, [targetKey]: true } }));
         const result = await client.markCleanupRead({ mailbox: cardMailbox(card, state.mailbox), card_id: card.id, message_ids: messageIds, storage_provider: state.storageProvider });
         if (!result.ok) {
-          showToast(result.gmail_error || "Failed to mark as read in Gmail.");
+          showToast(result.gmail_error || t("toast.markAsReadFailed"));
           return;
         }
         setState((s) => {
@@ -4185,7 +4523,7 @@ export function useAppController() {
         await client.restoreCard(card ? cardMailbox(card, mailboxOverride || state.mailbox) : (mailboxOverride || state.mailbox), cid, state.storageProvider);
         await loadActiveCards();
         await loadRunHistory();
-        showToast("Card restored.");
+        showToast(t("toast.cardRestored"));
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       }
@@ -4199,7 +4537,7 @@ export function useAppController() {
         setState((s) => ({ ...s, snoozeMenuCardId: "", snoozeReasonsKey: "" }));
         await loadActiveCards();
         await loadRunHistory();
-        showToast(option === "dont-prioritize" ? "Preference saved." : "Card snoozed.");
+        showToast(option === "dont-prioritize" ? t("toast.preferenceSaved") : t("toast.cardSnoozed"));
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       }
@@ -4422,6 +4760,7 @@ const userRequest = String(options.prompt ?? state.customScanInput).trim();
       };
       aiGenerationRun.current = generationRun;
       const isCurrentGeneration = () => aiGenerationRun.current === generationRun && !generationRun.cancelled;
+      let streamedComposeArtifacts: import("../types/mail").ComposeDraftArtifact[] = [];
       const userMessage: AiChatMessage = options.retryUserMessage ?? {
         id: createId("msg"),
         role: "user",
@@ -4470,7 +4809,8 @@ const userRequest = String(options.prompt ?? state.customScanInput).trim();
           scanPlan: state.scanPlan,
           displayRangeDays: state.inboxSettings?.display_range_days,
           currentMailContext: options.currentMailContext,
-          languageHint: prefersChinese(userRequest) ? "zh" : "en",
+          // “继续”不含语言信息；必须沿用界面语言，不能退回英文。
+          languageHint: locale === "zh-CN" ? "zh" : "en",
           messages: messagesWithUser,
           savedPromptId: options.savedPromptId,
           selectedThreads: options.selectedThreads,
@@ -4481,8 +4821,9 @@ const userRequest = String(options.prompt ?? state.customScanInput).trim();
         // local 兼容环也不能收到列表展示时间窗；复合 Evidence 始终扫描全量索引缓存。
         const { display_range_days: _displayRangeDays, ...sidebarUiContext } = uiContext;
         // local：本地 Router + Sampling；host：Host Agent Session。localStorage 覆盖后端默认。
-        const sidebarMode = aiSidebarModeByConversationRef.current.get(conversationId)
+        let sidebarMode = aiSidebarModeByConversationRef.current.get(conversationId)
           ?? resolveAiSidebarMode(aiSidebarBackendModeRef.current);
+        if (isBatchComposeMessage(userRequest, messagesWithUser) || pendingBatchComposeContinuation(messagesWithUser)) sidebarMode = "local";
         aiSidebarModeByConversationRef.current.set(conversationId, sidebarMode);
         let payload: Record<string, unknown>;
         if (sidebarMode === "local") {
@@ -4510,9 +4851,32 @@ const userRequest = String(options.prompt ?? state.customScanInput).trim();
             if (!isCurrentGeneration()) return;
             const stage = String(status.stage || "");
             const progress = (status.progress || {}) as Record<string, unknown>;
+            const partialDrafts = partialBatchDraftArtifacts(status.partial);
+            const partialComposeDrafts = partialBatchComposeArtifacts(status.partial);
+            if (partialComposeDrafts.length) {
+              const seen = new Set(streamedComposeArtifacts.map((item) => `${item.recipients?.join(",") || ""}|${item.subject}|${item.body}`));
+              streamedComposeArtifacts = [...streamedComposeArtifacts, ...partialComposeDrafts.filter((item) => !seen.has(`${item.recipients?.join(",") || ""}|${item.subject}|${item.body}`))];
+            }
+            const batchCompleted = Number(progress.batch_completed || 0);
+            const batchTotal = Number(progress.batch_total || 0);
             const scanQ = String(progress.scan_query || "").trim();
             setState((s) => ({
               ...s,
+              aiChatMessages: (partialDrafts.length || partialComposeDrafts.length) ? s.aiChatMessages.map((message) => message.id === pendingMessage.id
+                ? {
+                    ...message,
+                    artifact: partialDrafts[0],
+                    artifacts: partialDrafts,
+                    composeArtifacts: streamedComposeArtifacts,
+                    content: batchCompleted < batchTotal
+                      ? (prefersChinese(userRequest)
+                        ? `已生成 ${batchCompleted} / ${batchTotal} 封草稿，正在生成第 ${batchCompleted + 1} 封...`
+                        : `Draft ${batchCompleted} of ${batchTotal} is ready. Generating draft ${batchCompleted + 1}...`)
+                      : (prefersChinese(userRequest)
+                        ? `已生成 ${batchCompleted} / ${batchTotal} 封草稿，正在整理结果...`
+                        : `Drafts ${batchCompleted} of ${batchTotal} are ready. Finalizing...`),
+                  }
+                : message) : s.aiChatMessages,
               scanStatus: stage ? `Working: ${stage}` : s.scanStatus,
               customRunProgress: {
                 runId: runId || s.customRunProgress?.runId || "local_router",
@@ -4616,9 +4980,32 @@ onToolOutcome: (outcome) => {
               if (!isCurrentGeneration()) break;
               const stage = String(lastStatus.stage || "");
               const progress = (lastStatus.progress || {}) as Record<string, unknown>;
+              const partialDrafts = partialBatchDraftArtifacts(lastStatus.partial);
+              const partialComposeDrafts = partialBatchComposeArtifacts(lastStatus.partial);
+              if (partialComposeDrafts.length) {
+                const seen = new Set(streamedComposeArtifacts.map((item) => `${item.recipients?.join(",") || ""}|${item.subject}|${item.body}`));
+                streamedComposeArtifacts = [...streamedComposeArtifacts, ...partialComposeDrafts.filter((item) => !seen.has(`${item.recipients?.join(",") || ""}|${item.subject}|${item.body}`))];
+              }
+              const batchCompleted = Number(progress.batch_completed || 0);
+              const batchTotal = Number(progress.batch_total || 0);
               const scanQ = String(progress.scan_query || "").trim();
               setState((s) => ({
                 ...s,
+                aiChatMessages: (partialDrafts.length || partialComposeDrafts.length) ? s.aiChatMessages.map((message) => message.id === pendingMessage.id
+                  ? {
+                      ...message,
+                      artifact: partialDrafts[0],
+                      artifacts: partialDrafts,
+                       composeArtifacts: streamedComposeArtifacts,
+                      content: batchCompleted < batchTotal
+                        ? (prefersChinese(userRequest)
+                          ? `已生成 ${batchCompleted} / ${batchTotal} 封草稿，正在生成第 ${batchCompleted + 1} 封...`
+                          : `Draft ${batchCompleted} of ${batchTotal} is ready. Generating draft ${batchCompleted + 1}...`)
+                        : (prefersChinese(userRequest)
+                          ? `已生成 ${batchCompleted} / ${batchTotal} 封草稿，正在整理结果...`
+                          : `Drafts ${batchCompleted} of ${batchTotal} are ready. Finalizing...`),
+                    }
+                  : message) : s.aiChatMessages,
                 scanStatus: stage ? `Working: ${stage}` : s.scanStatus,
                 customRunProgress: {
                   runId: backgroundRunId,
@@ -4680,7 +5067,12 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
         )
           || "";
         const confirmedThreadIds = confirmedEvidenceThreadIds(payload);
+        const currentMailContextThreadRef = currentMailContextThread(payload);
+        if (currentMailContextThreadRef) confirmedThreadIds.add(currentMailContextThreadRef.threadId);
         const threadReferenceLabels = confirmedEvidenceThreadLabels(payload, confirmedThreadIds);
+        if (currentMailContextThreadRef && !threadReferenceLabels[currentMailContextThreadRef.threadId]) {
+          threadReferenceLabels[currentMailContextThreadRef.threadId] = currentMailContextThreadRef.label;
+        }
         const assistantText = ensureConfirmedThreadReference(
           rawAssistantText,
           confirmedThreadIds,
@@ -4765,6 +5157,38 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
           return list.length ? list : undefined;
         };
 
+        const parseComposeArtifacts = (): import("../types/mail").ComposeDraftArtifact[] | undefined => {
+          const rawList = payload.compose_artifacts;
+          if (!Array.isArray(rawList)) return undefined;
+          const list: import("../types/mail").ComposeDraftArtifact[] = [];
+          for (const item of rawList) {
+            if (!item || typeof item !== "object") continue;
+            const art = item as Record<string, unknown>;
+            if (String(art.type || "") !== "compose_draft" || !String(art.body || "").trim()) continue;
+            list.push({
+              type: "compose_draft" as const, mailbox: String(art.mailbox || scanMailbox), body: String(art.body || ""),
+              source_prompt: String(art.source_prompt || userRequest), mode: art.mode === "replace" ? "replace" as const : "insert" as const,
+              recipients: Array.isArray(art.recipients) ? art.recipients.map(String).filter(Boolean) : [], subject: String(art.subject || ""),
+            });
+          }
+          return list.length ? list : undefined;
+        };
+
+        const parseBatchComposeContinuation = (): AiChatMessage["batchComposeContinuation"] => {
+          const raw = payload.batch_compose_continuation;
+          if (!raw || typeof raw !== "object") return undefined;
+          const value = raw as Record<string, unknown>;
+          const offset = Number(value.offset || 0);
+          const remaining = Number(value.remaining || 0);
+          return Number.isInteger(offset) && offset > 0 && Number.isInteger(remaining) && remaining > 0
+            ? {
+                sourcePrompt: String(value.source_prompt || userRequest).trim() || userRequest,
+                offset,
+                remaining,
+              }
+            : undefined;
+        };
+
         const parseClarification = (): AiClarificationPayload | undefined => {
           const raw = payload.clarification;
           if (!raw || typeof raw !== "object") return undefined;
@@ -4828,7 +5252,21 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
           upsertAiConversationHistory(conversationId, finalMessages, { kind: "chat", query: userRequest });
         } else if (kind === "draft") {
           const artifacts = parseArtifacts();
-          const primary = parseArtifact() || (artifacts && artifacts[0]) || null;
+          const resolvedComposeArtifacts = parseComposeArtifacts() || [];
+          // 最终 RPC 结果只携带轻量计数，批量正文通过逐封 partial 事件下发；
+          // 把最终携带的 artifact 与已流式累积的草稿合并去重，避免清空已渲染卡片。
+          const finalComposeArtifacts = resolvedComposeArtifacts.length
+            ? resolvedComposeArtifacts.concat(
+                streamedComposeArtifacts.filter((streamed) =>
+                  !resolvedComposeArtifacts.some((existing) =>
+                    `${existing.recipients?.join(",") || ""}|${existing.subject}|${existing.body}`
+                      === `${streamed.recipients?.join(",") || ""}|${streamed.subject}|${streamed.body}`,
+                  ),
+                ),
+              )
+            : streamedComposeArtifacts;
+          const primary = parseArtifact() || (artifacts && artifacts[0]) || finalComposeArtifacts[0] || null;
+          const batchComposeContinuation = parseBatchComposeContinuation();
           const finalMessages: AiChatMessage[] = [
             ...messagesWithUser,
             {
@@ -4838,6 +5276,8 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
               content: assistantText,
               artifact: primary,
               artifacts,
+              composeArtifacts: finalComposeArtifacts.length ? finalComposeArtifacts : undefined,
+              batchComposeContinuation,
               mailContext: parseMailContext(),
               sourcePrompt: userRequest,
               timestamp: new Date().toISOString(),
@@ -4943,7 +5383,17 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
         setState((s) => ({ ...s, scanStatus: "", customRunProgress: null }));
       } catch (error) {
         if (!isCurrentGeneration() || isAbortError(error)) return;
-        const message = sanitizeToolError(error, userRequest);
+        const baseMessage = sanitizeToolError(error, userRequest);
+        const partialComposeCount = streamedComposeArtifacts.length;
+        // 批量草稿已逐封渲染：失败提示必须说明已生成数量，并保留“继续”续批入口。
+        let message = baseMessage;
+        if (partialComposeCount > 0 && isTransientConnectionError(error)) {
+          const partialNote = prefersChinese(userRequest)
+            ? `已生成 ${partialComposeCount} 封草稿，连接 Anna 服务时出现问题，剩余草稿未生成。回复“继续”可继续生成。`
+            : `${partialComposeCount} ${partialComposeCount === 1 ? "draft was" : "drafts were"} prepared before a connection problem. Reply "continue" to generate the rest.`;
+          const diagnostics = safeDiagnosticsFromError(error);
+          message = diagnostics ? `${partialNote}\n\n${diagnostics}` : partialNote;
+        }
         const failedMessages: AiChatMessage[] = [
           ...messagesWithUser,
           {
@@ -4952,6 +5402,8 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
             kind: "error",
             content: message,
             timestamp: new Date().toISOString(),
+            composeArtifacts: streamedComposeArtifacts.length ? streamedComposeArtifacts : undefined,
+            artifact: streamedComposeArtifacts[0] || undefined,
           },
         ];
         upsertAiConversationHistory(conversationId, failedMessages, {
@@ -4990,7 +5442,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
         .reverse()
         .find(({ message }) => message.role === "user")?.index;
       if (userIndex === undefined) {
-        showToast("This message can't be retried.");
+        showToast(t("toast.retryUnavailable"));
         return;
       }
       const userMessage = state.aiChatMessages[userIndex];
@@ -5120,7 +5572,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
           persistAskHistory(nextHistory);
           return { ...s, scanStatus: "", askHistory: nextHistory, customRunProgress: null };
         });
-        showToast("Re-run complete.");
+        showToast(t("toast.reRunComplete"));
       } catch (error) {
         const message = sanitizeToolError(error, question);
         setState((s) => ({ ...s, scanError: message }));
@@ -5133,7 +5585,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
       try {
         await client.deleteCustomPlan(planId, state.storageProvider);
         setState((s) => ({ ...s, customPlans: s.customPlans.filter((p) => p.plan_id !== planId) }));
-        showToast("Plan deleted.");
+        showToast(t("toast.planDeleted"));
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       }
@@ -5144,7 +5596,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
       try {
         const result = await client.clearCards(mailbox, category);
         if (result.ok) {
-          showToast(`${result.removed} card${result.removed !== 1 ? "s" : ""} cleared from ${category}.`);
+          showToast(t("toast.cardsCleared", { count: result.removed, category }));
           await loadActiveCards();
         }
       } catch (error) {
@@ -5157,7 +5609,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
         if (result.ok) {
           persistAskHistory([]);
           setState((s) => ({ ...s, askHistory: [], aiChatMessages: [], aiChatConversationId: "" }));
-          showToast("History cleared.");
+          showToast(t("toast.historyCleared"));
         }
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
@@ -5169,7 +5621,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
         if (result.ok) {
           persistAskHistory([]);
           setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], aiChatMessages: [], aiChatConversationId: "", customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, attachmentDownloads: {}, askItemActions: {}, askEditDraft: {}, askGapAnswers: {}, askDraftsByKey: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, draftPreferencesById: {}, replyIntentById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
-          showToast("All data reset. Ready for a fresh start.");
+          showToast(t("toast.allDataReset"));
           window.location.reload();
         }
       } catch (error) {
@@ -5226,7 +5678,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
           actionCount: 0,
           scanStatus: "",
         }));
-        showToast("Brief data cleared. Use the AI sidebar for inbox scan.");
+        showToast(t("toast.briefDataCleared"));
       } catch (error) {
         setState((s) => ({ ...s, isPreparingScan: false }));
         throw error;
@@ -5302,7 +5754,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
     async sendAskDraft(key, threadId, to, mailboxOverride, draftOverride) {
       const draft = ((draftOverride ?? state.askEditDraft[key]) || "").trim();
       if (!draft) {
-        showToast("Draft is empty.");
+        showToast(t("toast.draftEmpty"));
         return;
       }
       setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [key]: { ...s.askItemActions[key], sending: true } } }));
@@ -5314,7 +5766,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
             delete askEditDraft[key];
             return { ...s, askEditDraft, askItemActions: { ...s.askItemActions, [key]: { ...s.askItemActions[key], sending: false, replied: true } } };
           });
-          showToast("Reply sent.");
+          showToast(t("toast.replySent"));
         } else {
           throw new Error(result.error || "Failed to send reply.");
         }
@@ -5329,9 +5781,9 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
     async copyDraft(text) {
       try {
         await navigator.clipboard.writeText(text);
-        showToast("Draft copied");
+        showToast(t("toast.draftCopied"));
       } catch {
-        showToast("Copy failed");
+        showToast(t("toast.copyFailed"));
       }
     },
     async applyProposedActions({ action, items }) {
@@ -5344,10 +5796,10 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
         const count = items.length;
         // 文案语言由调用方 toast 覆盖；此处保持中性短提示
         const label = action === "trash"
-          ? (count === 1 ? "Moved 1 email to trash." : `Moved ${count} emails to trash.`)
+          ? t("toast.movedEmailsToTrash", { count })
           : action === "archive"
-            ? (count === 1 ? "Archived 1 email." : `Archived ${count} emails.`)
-            : (count === 1 ? "Marked 1 email as done." : `Marked ${count} emails as done.`);
+            ? t("toast.archivedEmails", { count })
+            : t("toast.markedEmailsDone", { count });
         showToast(label);
         const localDone = result.local_done || (result.requires_local_done ? items : []);
         // 通知 Inbox 工作台写入本地 Done 标记（与 HomeView Done 语义对齐）
@@ -5379,10 +5831,10 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
       try {
         const result = await client.saveSavedPrompt(args);
         if (!result.success) {
-          showToast(result.error || "Failed to save prompt.");
+          showToast(result.error || t("toast.operationFailed", { detail: "Failed to save prompt." }));
           return false;
         }
-        showToast("Prompt saved.");
+        showToast(t("toast.promptSaved"));
         return true;
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
@@ -5392,7 +5844,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
     async deleteSavedPrompt(promptId) {
       try {
         await client.deleteSavedPrompt(promptId);
-        showToast("Prompt deleted.");
+        showToast(t("toast.promptDeleted"));
         return true;
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
@@ -5414,10 +5866,10 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
       try {
         const result = await client.addAiMemory(text, "settings");
         if (!result.success) {
-          showToast(result.error || "Failed to add memory.");
+          showToast(result.error || t("toast.operationFailed", { detail: "Failed to add memory." }));
           return false;
         }
-        showToast("Memory saved.");
+        showToast(t("toast.memorySaved"));
         return true;
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
@@ -5467,7 +5919,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
           askItemActions: { ...s.askItemActions, [actionKey]: { ...s.askItemActions[actionKey], sending: false } },
         }));
         if (result.fallback_used) {
-          showToast("Draft generation fell back — result may be incomplete.");
+          showToast(t("toast.draftFallback"));
         }
       } catch (error) {
         setState((s) => ({ ...s, askItemActions: { ...s.askItemActions, [actionKey]: { ...s.askItemActions[actionKey], sending: false } } }));

@@ -283,6 +283,62 @@ def test_stale_scoped_token_without_scope_is_ignored() -> None:
     assert auth_headers == ["Bearer fresh-riazm4777@gmail.com"]
 
 
+def test_gmail_request_retries_transient_network_errors() -> None:
+    """RemoteDisconnected 等瞬时网络错误必须退避重试后成功。"""
+    from mail_agent.mail_providers.gmail import adapter
+    import http.client
+
+    attempts: list[str] = []
+
+    def fake_get_token(_mailbox: str, **_kwargs) -> str:
+        return "short-lived-token"
+
+    def fake_urlopen(req, timeout=60):
+        attempts.append(req.full_url)
+        if len(attempts) <= 2:
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+        return FakeResponse(b'{"emailAddress":"user@example.com"}')
+
+    with (
+        patch.object(adapter, "get_access_token", side_effect=fake_get_token),
+        patch("urllib.request.urlopen", side_effect=fake_urlopen),
+        patch("mail_agent.mail_providers.gmail.adapter.time.sleep") as sleep_mock,
+    ):
+        payload = adapter.gmail_request("user@example.com", "/users/me/profile")
+
+    assert payload == {"emailAddress": "user@example.com"}
+    assert len(attempts) == 3
+    assert sleep_mock.call_count == 2
+
+
+def test_gmail_request_transient_network_errors_exhaust_retries() -> None:
+    """瞬时网络错误持续发生且用尽重试次数时必须向上抛出。"""
+    from mail_agent.mail_providers.gmail import adapter
+    import http.client
+
+    attempts: list[str] = []
+
+    def fake_get_token(_mailbox: str, **_kwargs) -> str:
+        return "short-lived-token"
+
+    def fake_urlopen(req, timeout=60):
+        attempts.append(req.full_url)
+        raise http.client.RemoteDisconnected("Remote end closed connection without response")
+
+    with (
+        patch.object(adapter, "get_access_token", side_effect=fake_get_token),
+        patch("urllib.request.urlopen", side_effect=fake_urlopen),
+        patch("mail_agent.mail_providers.gmail.adapter.time.sleep"),
+    ):
+        try:
+            adapter.gmail_request("user@example.com", "/users/me/profile")
+            raise AssertionError("expected RemoteDisconnected")
+        except http.client.RemoteDisconnected:
+            pass
+
+    assert len(attempts) == adapter._GMAIL_REQUEST_NETWORK_RETRIES + 1
+
+
 if __name__ == "__main__":
     test_scoped_gmail_requests_resolve_platform_token_once()
     test_ask_full_message_workers_inherit_request_token()
@@ -292,4 +348,6 @@ if __name__ == "__main__":
     test_scoped_token_does_not_leak_across_mailboxes()
     test_platform_force_refresh_waits_and_reissues_token()
     test_stale_scoped_token_without_scope_is_ignored()
+    test_gmail_request_retries_transient_network_errors()
+    test_gmail_request_transient_network_errors_exhaust_retries()
     print("Gmail request token reuse: OK")

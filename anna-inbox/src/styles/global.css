@@ -332,11 +332,16 @@ body.is-resizing-ai-sidebar {
   border-radius: 16px;
   color: #303548;
   background: rgba(210, 216, 233, 0.75);
+  white-space: pre-wrap;
 }
 
 .ai-message.is-assistant {
   align-self: flex-start;
   width: auto;
+}
+
+.ai-message.is-assistant.has-draft-artifact {
+  width: 100%;
 }
 
 .ai-message.is-thinking-inline {
@@ -14236,6 +14241,13 @@ body,
   animation: aiDraftArtifactIn 220ms ease-out both;
 }
 
+.ai-draft-artifact-body {
+  min-height: 144px;
+  max-height: 260px;
+  resize: vertical;
+  overflow-y: auto;
+}
+
 .ai-draft-artifact pre,
 .attachment-preview-body pre {
   margin: 0;
@@ -14274,8 +14286,9 @@ body,
 
 .ai-draft-artifact-field textarea {
   min-height: 34px;
+  max-height: 260px;
   padding: 8px;
-  overflow: hidden;
+  overflow-y: auto;
   resize: none;
 }
 

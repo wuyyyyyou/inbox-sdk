@@ -70,14 +70,18 @@ def test_local_empty_search_describes_cache_coverage_not_search_range() -> None:
     """未命中时必须说明全量当前缓存，日期边界不能伪装成检索范围。"""
     from anna_inbox_executa.local_agent_session import (
         _LOCAL_AGENT_SYSTEM_PROMPT,
-        _force_final_text,
+        _force_final_text_with_status,
     )
 
-    assert "earliest/latest indexed dates the search range" in _LOCAL_AGENT_SYSTEM_PROMPT
-    assert "180-day priority metadata sync is running" in _LOCAL_AGENT_SYSTEM_PROMPT
-    source = _force_final_text.__code__.co_consts
+    assert "say all current cache was searched" in _LOCAL_AGENT_SYSTEM_PROMPT
+    assert "Mention incomplete 180-day priority sync only when the boundary says so" in _LOCAL_AGENT_SYSTEM_PROMPT
+    source = _force_final_text_with_status.__code__.co_consts
     assert any(
         isinstance(value, str) and "never as the search range" in value
+        for value in source
+    )
+    assert any(
+        isinstance(value, str) and "180-day priority metadata sync is still running" in value
         for value in source
     )
 

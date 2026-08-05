@@ -22,6 +22,7 @@ AI_TURN_ALLOWED_TOOLS = frozenset({
     "revise_draft",
     "summarize_then_draft",
     "compose_new",
+    "batch_compose",
     "batch_draft",
     "batch_outreach",
     "propose_inbox_actions",
@@ -102,17 +103,36 @@ def _has_inbox_search_intent(user_text: str) -> bool:
     )
 
 
+def _explicit_current_thread_request(user_text: str) -> bool:
+    """仅把明确指向当前邮件的指代词视为当前线程请求。"""
+    lowered = (user_text or "").casefold()
+    return bool(re.search(
+        r"(?:this\s+(?:email|mail|message|thread)|current\s+(?:email|thread)|"
+        r"the\s+(?:email|message|thread)\s+(?:above|here)|"
+        r"这封(?:邮件|信)?|当前(?:邮件|线程)|上面的(?:邮件|信)|该(?:邮件|信)|此(?:邮件|信))",
+        lowered,
+    ))
+
+
 def _fallback_route(user_text: str, ui_context: dict[str, Any], reason: str) -> dict[str, Any]:
     """Router 失败时的确定性降级，保证 turn 仍可执行。"""
     language = "zh" if _uses_chinese(user_text) else "en"
     has_thread = _has_thread(ui_context)
     has_draft = _has_last_draft(ui_context)
     lowered = (user_text or "").casefold()
+    current_thread_request = _explicit_current_thread_request(user_text)
+
+    deferred_draft_hint = bool(re.search(
+        r"(?:先不要|暂不|暂时不要|不要先|稍后|之后|接下来).{0,24}(?:draft|草稿|起草|生成)|"
+        r"(?:加入上下文|添加到上下文|记住|保存模板).{0,32}(?:不要|暂不|稍后|之后|接下来)",
+        lowered,
+        flags=re.IGNORECASE,
+    ))
 
     remember_hint = bool(
         re.search(r"\bremember(?:\s+to)?\b|记住", lowered)
     )
-    if remember_hint:
+    if remember_hint or deferred_draft_hint:
         return {
             "language": language,
             "use_current_thread": False,
@@ -161,6 +181,23 @@ def _fallback_route(user_text: str, ui_context: dict[str, Any], reason: str) -> 
             "起草", "回复", "写回信", "写回复",
         )
     )
+    compose_hint = any(
+        token in lowered
+        for token in (
+            "compose", "new email", "write an email", "write email", "fyi", "outline",
+            "写一封", "写封邮件", "写邮件", "新邮件", "大纲",
+        )
+    )
+    compose_recipient_count = len(set(re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", user_text, re.IGNORECASE)))
+    if compose_hint and compose_recipient_count >= 2:
+        return {
+            "language": language,
+            "use_current_thread": False,
+            "clarify": None,
+            "steps": [{"tool": "batch_compose", "params": {}}],
+            "router_fallback": True,
+            "router_reason": reason[:200],
+        }
     # 多选 + 批量/多封意图 → batch；outreach 优先于普通 batch_draft
     if selected_count >= 2 and (batch_hint or draft_hint or outreach_hint):
         tool = "batch_outreach" if outreach_hint else "batch_draft"
@@ -200,7 +237,7 @@ def _fallback_route(user_text: str, ui_context: dict[str, Any], reason: str) -> 
             "router_fallback": True,
             "router_reason": reason[:200],
         }
-    if has_thread and draft_hint:
+    if has_thread and draft_hint and current_thread_request:
         return {
             "language": language,
             "use_current_thread": True,
@@ -210,10 +247,33 @@ def _fallback_route(user_text: str, ui_context: dict[str, Any], reason: str) -> 
             "router_reason": reason[:200],
         }
 
-    compose_hint = any(
+    explicit_search_action = any(
         token in lowered
-        for token in ("compose", "new email", "fyi", "outline", "写一封", "新邮件", "大纲")
+        for token in ("find", "search", "inbox", "urgent", "unread", "找", "搜索", "收件箱", "紧急", "未读")
     )
+    if compose_hint and not explicit_search_action:
+        return {
+            "language": language,
+            "use_current_thread": False,
+            "clarify": None,
+            "steps": [{"tool": "compose_new", "params": {}}],
+            "router_fallback": True,
+            "router_reason": reason[:200],
+        }
+
+    if draft_hint:
+        return {
+            "language": language,
+            "use_current_thread": False,
+            "clarify": None,
+            "steps": [
+                {"tool": "search_mail", "params": {}},
+                {"tool": "compose_new", "params": {}},
+            ],
+            "router_fallback": True,
+            "router_reason": reason[:200],
+        }
+
     scan_hint = _has_inbox_search_intent(user_text)
     summary_hint = any(
         token in lowered
@@ -293,15 +353,19 @@ def _fast_local_route(user_text: str, ui_context: dict[str, Any]) -> dict[str, A
     """
     lowered = (user_text or "").casefold().strip()
     has_thread = _has_thread(ui_context)
+    compose_hint = any(
+        token in lowered
+        for token in ("compose", "new email", "write an email", "write email", "写一封", "写封邮件", "写邮件", "新邮件")
+    )
     # 复用同一意图判断，避免快速路径和 fallback 各自维护关键词导致待回复邮件误入聊天。
     explicit_inbox_search = _has_inbox_search_intent(user_text)
-    thread_action = has_thread and any(
-        token in lowered
-        for token in ("summar", "总结", "概括", "this email", "this thread", "这封", "待办", "reply", "回复", "起草")
+    thread_action = has_thread and (
+        _explicit_current_thread_request(user_text)
+        or any(token in lowered for token in ("summar", "总结", "概括", "待办"))
     )
     greeting = bool(re.fullmatch(r"(?:hi|hello|hey|你好|嗨|在吗)[!！。,.?？\s]*", lowered))
     explicit_preference = bool(re.search(r"\bremember(?:\s+to)?\b|记住", lowered))
-    if explicit_inbox_search or thread_action or greeting or explicit_preference:
+    if (explicit_inbox_search and not compose_hint) or thread_action or greeting or explicit_preference:
         return _fallback_route(user_text, ui_context, "fast_local_route")
     return None
 
@@ -464,6 +528,7 @@ def _normalize_route(payload: dict[str, Any], user_text: str, ui_context: dict[s
     has_thread = _has_thread(ui_context)
     has_draft = _has_last_draft(ui_context)
     selected_count = _selected_threads_count(ui_context)
+    current_thread_request = _explicit_current_thread_request(user_text)
 
     if use_current and not has_thread:
         clarify = clarify or (
@@ -484,6 +549,21 @@ def _normalize_route(payload: dict[str, Any], user_text: str, ui_context: dict[s
                 else "Open an email first, then try again."
             )
         steps = filtered
+
+    if has_thread and not current_thread_request:
+        use_current = False
+        if any(s["tool"] in {"draft_reply", "summarize_then_draft"} for s in steps):
+            steps = [s for s in steps if s["tool"] not in _THREAD_REQUIRED_TOOLS]
+            if not any(s["tool"] == "search_mail" for s in steps):
+                steps.insert(0, {"tool": "search_mail", "params": {}})
+            if not any(s["tool"] == "compose_new" for s in steps):
+                steps.append({"tool": "compose_new", "params": {}})
+        elif any(s["tool"] == "summarize_thread" for s in steps):
+            steps = [s for s in steps if s["tool"] != "summarize_thread"]
+            if not any(s["tool"] == "search_mail" for s in steps):
+                steps.insert(0, {"tool": "search_mail", "params": {}})
+            if not any(s["tool"] == "rank_answer" for s in steps):
+                steps.append({"tool": "rank_answer", "params": {}})
 
     # 批量工具：无多选时剔除并 clarify（单封走 draft_reply）
     if selected_count < 2:

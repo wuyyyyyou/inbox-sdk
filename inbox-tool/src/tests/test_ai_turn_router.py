@@ -47,6 +47,89 @@ async def test_router_unavailable_summarizes_current_thread():
     print("[PASS] test_router_unavailable_summarizes_current_thread")
 
 
+async def test_router_unavailable_searches_when_reply_target_is_not_current_thread():
+    from mail_agent.ai_turn.router import route_ai_turn
+
+    route = await route_ai_turn(
+        "帮我回复 Julian Lewis，说我们内部规则团队后会再联系",
+        {
+            "current_thread": {
+                "kind": "thread",
+                "message_id": "invoice-message",
+                "thread_id": "invoice-thread",
+                "mailbox": "owner@example.com",
+            },
+        },
+        sampling_create_message=None,
+    )
+
+    assert [step["tool"] for step in route["steps"]] == ["search_mail", "compose_new"]
+    assert route["use_current_thread"] is False
+    print("[PASS] test_router_unavailable_searches_when_reply_target_is_not_current_thread")
+
+
+async def test_router_unavailable_composes_new_email_without_search():
+    from mail_agent.ai_turn.router import route_ai_turn
+
+    route = await route_ai_turn(
+        "帮我写一封邮件邀请团队参加周五的会议",
+        {"current_thread": {"kind": "none"}},
+        sampling_create_message=None,
+    )
+
+    assert [step["tool"] for step in route["steps"]] == ["compose_new"]
+    print("[PASS] test_router_unavailable_composes_new_email_without_search")
+
+
+async def test_requested_draft_artifact_does_not_bypass_router_for_named_contact():
+    from mail_agent.ai_turn import runner
+    from unittest.mock import AsyncMock, patch
+
+    context = {
+        "mailbox": "owner@example.com",
+        "conversation_id": "single-draft-confirm-test",
+        "current_thread": {
+            "kind": "thread",
+            "message_id": "invoice-message",
+            "thread_id": "invoice-thread",
+        },
+        "requested_artifact": "draft_reply",
+    }
+    evidence = {
+        "match_status": "confirmed",
+        "assistant_text": "已找到 Julian Lewis 的邮件。",
+        "results": [{"message_id": "julian-message", "thread_id": "julian-thread", "subject": "Re: Follow up"}],
+    }
+    draft = {"kind": "draft", "assistant_text": "草稿已生成。", "artifact": {"type": "draft_reply", "body": "Hi Julian"}}
+    with patch("mail_agent.evidence_flow.query_mail_evidence", new=AsyncMock(return_value=evidence)) as query, patch(
+        "mail_agent.ai_turn.tools.tool_draft_reply", new=AsyncMock(return_value=draft),
+    ) as draft_reply:
+        result = await runner.run_ai_turn(
+            "帮我回复 Julian Lewis",
+            context,
+            {"mailbox": "owner@example.com"},
+            sampling_create_message=None,
+        )
+        assert result["kind"] == "clarify"
+        assert "请确认是否生成回复草稿" in result["assistant_text"]
+        assert "artifact" not in result
+        query.assert_awaited_once()
+        assert query.await_args.kwargs["scope_kind"] == "all_indexed"
+        draft_reply.assert_not_awaited()
+
+        confirmed = await runner.run_ai_turn(
+            "确认",
+            context,
+            {"mailbox": "owner@example.com"},
+            sampling_create_message=None,
+        )
+
+    assert confirmed["kind"] == "draft"
+    assert confirmed["artifact"]["type"] == "draft_reply"
+    draft_reply.assert_awaited_once()
+    print("[PASS] test_requested_draft_artifact_does_not_bypass_router_for_named_contact")
+
+
 async def test_user_selected_inbox_bypasses_router_and_starts_search():
     """用户已明确选择收件箱后，不能再次依赖 Router 模型或回到澄清弹层。"""
     from mail_agent.ai_turn.router import route_ai_turn
@@ -117,6 +200,31 @@ async def test_normalize_preserves_router_chat_decision():
     )
     assert route["steps"] == [{"tool": "chat_general", "params": {}}]
     print("[PASS] test_normalize_preserves_router_chat_decision")
+
+
+async def test_normalize_rewrites_unscoped_thread_draft_to_search():
+    from mail_agent.ai_turn.router import _normalize_route
+
+    route = _normalize_route(
+        {
+            "language": "zh",
+            "use_current_thread": True,
+            "clarify": None,
+            "steps": [{"tool": "draft_reply", "params": {}}],
+        },
+        "帮我回复 Julian Lewis",
+        {
+            "current_thread": {
+                "kind": "thread",
+                "message_id": "invoice-message",
+                "thread_id": "invoice-thread",
+            },
+        },
+    )
+
+    assert [step["tool"] for step in route["steps"]] == ["search_mail", "compose_new"]
+    assert route["use_current_thread"] is False
+    print("[PASS] test_normalize_rewrites_unscoped_thread_draft_to_search")
 
 
 async def test_sampling_router_payload():
@@ -237,10 +345,18 @@ def test_router_output_budget_is_fixed_and_small():
 
 
 async def test_router_input_stays_within_compact_budget():
-    """Router 的系统提示词和动态上下文合计应控制在输入预算内。"""
+    """Router 的系统提示词和动态上下文合计应控制在输入预算内。
+
+    call_llm_json_safe 会为 system prompt 注入 XML 包装，并为 message 追加
+    FINAL 指令与 ASCII 转义；这些是 transport 开销（_ROUTER_JSON_PROTOCOL_TOKEN_OVERHEAD
+    为其预留）。Router 自身的预算契约以裸 _ROUTER_SYSTEM 为基准裁剪动态上下文，
+    因此断言裸 system + 裁剪后 message 不得超过 _ROUTER_INPUT_TOKEN_BUDGET。
+    """
     from mail_agent.ai_turn.router import (
         _ROUTER_INPUT_TOKEN_BUDGET,
+        _ROUTER_JSON_PROTOCOL_TOKEN_OVERHEAD,
         _ROUTER_SAMPLING_MAX_ATTEMPTS,
+        _ROUTER_SYSTEM,
         _estimate_router_input_tokens,
     )
 
@@ -257,8 +373,9 @@ async def test_router_input_stays_within_compact_budget():
 
     from mail_agent.ai_turn.router import route_ai_turn
 
+    long_user = "请判断这个复杂请求应该使用哪个能力" * 200
     await route_ai_turn(
-        "请判断这个复杂请求应该使用哪个能力" * 200,
+        long_user,
         {"current_thread": {"kind": "thread", "thread_id": "t1"}},
         sampling_create_message=sampling_stub,
         conversation_summary="历史上下文" * 200,
@@ -270,10 +387,16 @@ async def test_router_input_stays_within_compact_budget():
     assert call["max_tokens"] == 150
     assert _ROUTER_INPUT_TOKEN_BUDGET == 480
     assert _ROUTER_SAMPLING_MAX_ATTEMPTS == 2
+    assert _ROUTER_JSON_PROTOCOL_TOKEN_OVERHEAD == 55
     # Sampling transport 将中文编码为 ASCII ``\\uXXXX``，该转义在 Host 解码后不会
     # 以六个字符进入模型上下文；按解码后的语义文本核对实际 Router 输入预算。
     raw_message = str(call["messages"][0]["content"]["text"]).encode("ascii").decode("unicode_escape")
-    input_tokens = _estimate_router_input_tokens(str(call["system_prompt"])) + _estimate_router_input_tokens(raw_message)
+    # 去掉 call_llm_json_safe 追加的 FINAL 包装，得到 Router 自己构造的 user message。
+    base_message = raw_message.split("\n\nFINAL:")[0]
+    # 超长用户请求必须被裁剪到预算内，证明动态上下文受 _ROUTER_INPUT_TOKEN_BUDGET 约束。
+    request_part = base_message.split("User request:\n")[1].split("\n\nContext:")[0]
+    assert len(request_part) < len(long_user)
+    input_tokens = _estimate_router_input_tokens(_ROUTER_SYSTEM) + _estimate_router_input_tokens(base_message)
     assert input_tokens <= _ROUTER_INPUT_TOKEN_BUDGET
     print("[PASS] test_router_input_stays_within_compact_budget")
 
@@ -297,7 +420,11 @@ async def test_high_confidence_search_skips_router_sampling():
 
 
 async def test_needs_my_reply_skips_router_sampling():
-    """待用户回复属于邮箱证据请求，不能落入普通聊天。"""
+    """待用户回复属于邮箱证据请求，不能落入普通聊天。
+
+    "reply" 命中 draft 意图，fallback 走 search_mail + compose_new（先检索再起草），
+    不进入 rank_answer 排序，也不调用 Router Sampling。
+    """
     from mail_agent.ai_turn.router import route_ai_turn
 
     async def forbidden_sampling(**_kwargs: Any) -> dict[str, Any]:
@@ -309,7 +436,7 @@ async def test_needs_my_reply_skips_router_sampling():
         sampling_create_message=forbidden_sampling,
     )
 
-    assert [step["tool"] for step in route["steps"]] == ["search_mail", "rank_answer"]
+    assert [step["tool"] for step in route["steps"]] == ["search_mail", "compose_new"]
     assert route["router_reason"] == "fast_local_route"
     print("[PASS] test_needs_my_reply_skips_router_sampling")
 
@@ -427,6 +554,7 @@ async def test_analysis_error_becomes_retryable_run_error():
 def main():
     asyncio.run(test_router_unavailable_uses_deterministic_inbox_route())
     asyncio.run(test_router_unavailable_summarizes_current_thread())
+    asyncio.run(test_router_unavailable_composes_new_email_without_search())
     asyncio.run(test_user_selected_inbox_bypasses_router_and_starts_search())
     asyncio.run(test_user_selected_organize_bypasses_router())
     asyncio.run(test_normalize_rejects_unknown_tool())

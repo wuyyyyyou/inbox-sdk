@@ -72,6 +72,10 @@ def _parse_term_token(token: str) -> tuple[LocalQueryTerm | None, str]:
         raw = raw[1:]
     if not raw or raw == "-":
         return None, "The - operator needs a search term after it."
+    if raw.startswith('"') and raw.endswith('"'):
+        raw = raw[1:-1]
+    elif '"' in raw:
+        raw = raw.replace('"', '')
     if ":" in raw:
         field, value = raw.split(":", 1)
         field = field.lower()
@@ -106,38 +110,79 @@ def parse_local_query(input_text: str) -> ParsedLocalQuery:
     raw = str(input_text or "").strip()
     if not raw:
         return ParsedLocalQuery(expression=None, error="", display="")
-    groups: list[LocalQueryNode] = []
-    and_terms: list[LocalQueryNode] = []
-    term_start = 0
-    for operator_index, operator in _find_query_operators(raw):
-        token = raw[term_start:operator_index].strip()
-        if not token:
-            return ParsedLocalQuery(
-                expression=None,
-                error=f"The {operator} operator needs a term before and after it.",
-                display=raw,
-            )
-        term, err = _parse_term_token(token)
-        if term is None:
-            return ParsedLocalQuery(expression=None, error=err, display=raw)
-        and_terms.append(LocalQueryNode(kind="term", term=term))
-        if operator == "OR":
-            groups.append(_join("and", and_terms))
-            and_terms = []
-        term_start = operator_index + len(operator)
-    token = raw[term_start:].strip()
-    if not token:
-        return ParsedLocalQuery(
-            expression=None,
-            error="The final operator needs a search term after it.",
-            display=raw,
-        )
-    term, err = _parse_term_token(token)
-    if term is None:
-        return ParsedLocalQuery(expression=None, error=err, display=raw)
-    and_terms.append(LocalQueryNode(kind="term", term=term))
-    groups.append(_join("and", and_terms))
-    return ParsedLocalQuery(expression=_join("or", groups), error="", display=raw)
+    if raw.count('"') % 2:
+        return ParsedLocalQuery(None, "Quoted search phrases must be closed.", raw)
+    # Keep a field prefix attached to its quoted value (for example
+    # subject:"project alpha"), while still treating parentheses outside
+    # quotes as syntax and preserving the existing bare-word behavior.
+    tokens: list[str] = []
+    start = 0
+    quoted = False
+    def flush(end: int) -> None:
+        token = raw[start:end].strip()
+        if token:
+            tokens.append(token)
+    position = 0
+    while position < len(raw):
+        character = raw[position]
+        if character == '"':
+            quoted = not quoted
+        elif not quoted and character in "()":
+            flush(position)
+            tokens.append(character)
+            start = position + 1
+        elif not quoted and (match := _QUERY_OPERATOR_RE.match(raw, position)):
+            before = raw[position - 1] if position else ""
+            end = match.end()
+            after = raw[end] if end < len(raw) else ""
+            if (not before or before.isspace()) and (not after or after.isspace()):
+                flush(position)
+                tokens.append(match.group(1).upper())
+                start = end
+                position = end
+                continue
+        position += 1
+    flush(len(raw))
+    index = 0
+    def parse_or() -> LocalQueryNode | None:
+        nonlocal index
+        nodes = []
+        node = parse_and()
+        if node is None: return None
+        nodes.append(node)
+        while index < len(tokens) and tokens[index].upper() == "OR":
+            index += 1; node = parse_and()
+            if node is None: return None
+            nodes.append(node)
+        return _join("or", nodes)
+    def parse_and() -> LocalQueryNode | None:
+        nonlocal index
+        nodes = []
+        while index < len(tokens) and tokens[index] not in (")",) and tokens[index].upper() != "OR":
+            if tokens[index].upper() == "AND":
+                index += 1
+                if (
+                    not nodes
+                    or index >= len(tokens)
+                    or tokens[index] in (")", "(")
+                    or tokens[index].upper() in _OPERATORS
+                ):
+                    return None
+                continue
+            if tokens[index] == "(":
+                index += 1; node = parse_or()
+                if node is None or index >= len(tokens) or tokens[index] != ")": return None
+                index += 1
+            else:
+                term, err = _parse_term_token(tokens[index]); index += 1
+                if term is None: return None
+                node = LocalQueryNode(kind="term", term=term)
+            nodes.append(node)
+        return _join("and", nodes) if nodes else None
+    expression = parse_or()
+    if expression is None or index != len(tokens):
+        return ParsedLocalQuery(None, "Invalid parentheses or operator placement.", raw)
+    return ParsedLocalQuery(expression=expression, error="", display=raw)
 
 
 def _has_match(value: str | None, term: str) -> bool:
@@ -489,7 +534,8 @@ def build_local_query_from_plan(plan: Any) -> str:
     for topic in getattr(plan, "topics", None) or []:
         if not isinstance(topic, dict):
             continue
-        terms = topic.get("search_terms") if isinstance(topic.get("search_terms"), list) else []
+        raw_terms = topic.get("search_terms")
+        terms: list[Any] = list(raw_terms) if isinstance(raw_terms, list) else []
         for term in terms:
             text = str(term or "").strip()
             if text:

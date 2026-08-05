@@ -137,6 +137,43 @@ def _user_text(arguments: dict[str, Any]) -> str:
     ).strip()
 
 
+def _selected_thread_count(ui_context: dict[str, Any]) -> int:
+    selected = ui_context.get("selected_threads")
+    return sum(1 for item in selected if isinstance(item, dict)) if isinstance(selected, list) else 0
+
+
+def _is_draft_confirmation(user_text: str, ui_context: dict[str, Any]) -> bool:
+    text = str(user_text or "").strip().casefold()
+    if not text or not re.fullmatch(
+        r"(?:yes|y|sure|ok|okay|continue|confirm|go ahead|好的?|可以|开始吧|开始生成|确认|同意|继续|就这样|用这个|生成卡片|生成草稿)[.!。！？\s]*",
+        text,
+    ):
+        return False
+    recent = ui_context.get("recent_conversation")
+    if not isinstance(recent, list):
+        return False
+    for item in reversed(recent):
+        if not isinstance(item, dict) or str(item.get("role") or "") != "assistant":
+            continue
+        content = str(item.get("content") or "")
+        return bool(re.search(r"(?:确认|是否生成|生成草稿|草稿卡片|draft|confirm)", content, re.IGNORECASE))
+    return False
+
+
+def _is_batch_draft_request(user_text: str, ui_context: dict[str, Any]) -> bool:
+    if _selected_thread_count(ui_context) < 2:
+        return False
+    if _is_draft_confirmation(user_text, ui_context):
+        return True
+    return bool(re.search(r"(?:draft|reply|respond|起草|草稿|回复|回信|写回|邮件)", user_text, re.IGNORECASE))
+
+
+def _has_multiple_recipients(user_text: str) -> bool:
+    """新邮件按明确收件人分批；不依赖模型是否正确选择 ai_batch_draft。"""
+    emails = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", user_text, re.IGNORECASE)
+    return len({email.casefold() for email in emails}) >= 2
+
+
 def _reserve_search_limit(requested_limit: Any) -> int:
     """限制单次搜索返回量；不同搜索调用之间不共享额度。"""
     try:
@@ -501,7 +538,13 @@ def _propose_inbox_actions(arguments: dict[str, Any], ui_context: dict[str, Any]
 
 
 def _language(arguments: dict[str, Any], user_text: str) -> str:
-    hint = str(arguments.get("language") or arguments.get("language_hint") or "").strip().lower()
+    context = arguments.get("ui_context") if isinstance(arguments.get("ui_context"), dict) else {}
+    hint = str(
+        arguments.get("language")
+        or arguments.get("language_hint")
+        or context.get("language_hint")
+        or ""
+    ).strip().lower()
     if hint.startswith("zh"):
         return "zh"
     if hint.startswith("en"):
@@ -518,7 +561,10 @@ _PUBLIC_OUTCOME_KEYS = (
     "clarification",
     "artifact",
     "artifacts",
+    "compose_artifacts",
     "batch_failures",
+    # 下一批是确定性状态，不能在 local session 汇总时被过滤，否则“继续”会回退到 Planner。
+    "batch_compose_continuation",
     "mail_context",
     "proposed_actions",
     "requires_user_confirmation",
@@ -571,7 +617,13 @@ def _public_outcome(outcome: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
-async def handle_ai_agent_tool(tool: str, arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
+async def handle_ai_agent_tool(
+    tool: str,
+    arguments: dict[str, Any],
+    invoke_id: str,
+    *,
+    progress_callback: Any = None,
+) -> dict[str, Any]:
     """执行 Host 选定的细粒度工具；内部可继续用 Sampling 生成正文。"""
     from mail_agent.ai_turn.personalization import format_memory_summary_for_prompt
     from mail_agent.ai_turn.runner import tool_summarize_thread
@@ -682,6 +734,33 @@ async def handle_ai_agent_tool(tool: str, arguments: dict[str, Any], invoke_id: 
         return {"success": outcome.get("kind") != "error", "tool": tool, "data": _public_outcome(outcome)}
 
     if tool == "ai_compose_new":
+        if _has_multiple_recipients(user_text):
+            from mail_agent.ai_turn.tools import tool_batch_compose_new
+
+            outcome = await tool_batch_compose_new(
+                user_text,
+                ui_context,
+                arguments,
+                language=language,
+                sampling_create_message=sampling,
+                memory_summary=memory_summary,
+                confirmed=True,
+                progress_callback=progress_callback,
+            )
+            return {"success": outcome.get("kind") != "error", "tool": tool, "data": _public_outcome(outcome)}
+        if _is_batch_draft_request(user_text, ui_context):
+            from mail_agent.ai_turn.tools import tool_batch_draft
+
+            outcome = await tool_batch_draft(
+                user_text,
+                ui_context,
+                language=language,
+                sampling_create_message=sampling,
+                memory_summary=memory_summary,
+                confirmed=_is_draft_confirmation(user_text, ui_context),
+                progress_callback=progress_callback,
+            )
+            return {"success": outcome.get("kind") != "error", "tool": "ai_batch_draft", "data": _public_outcome(outcome)}
         outcome = await tool_compose_new(
             user_text,
             ui_context,
@@ -693,6 +772,20 @@ async def handle_ai_agent_tool(tool: str, arguments: dict[str, Any], invoke_id: 
         return {"success": outcome.get("kind") != "error", "tool": tool, "data": _public_outcome(outcome)}
 
     if tool == "ai_batch_draft":
+        if _has_multiple_recipients(user_text):
+            from mail_agent.ai_turn.tools import tool_batch_compose_new
+
+            outcome = await tool_batch_compose_new(
+                user_text,
+                ui_context,
+                arguments,
+                language=language,
+                sampling_create_message=sampling,
+                memory_summary=memory_summary,
+                confirmed=True,
+                progress_callback=progress_callback,
+            )
+            return {"success": outcome.get("kind") != "error", "tool": tool, "data": _public_outcome(outcome)}
         mode = str(arguments.get("mode") or "batch_draft").strip()
         if mode == "batch_outreach":
             from mail_agent.ai_turn.tools import tool_batch_outreach
@@ -703,6 +796,8 @@ async def handle_ai_agent_tool(tool: str, arguments: dict[str, Any], invoke_id: 
                 language=language,
                 sampling_create_message=sampling,
                 memory_summary=memory_summary,
+                confirmed=_is_draft_confirmation(user_text, ui_context),
+                progress_callback=progress_callback,
             )
         else:
             outcome = await tool_batch_draft(
@@ -711,6 +806,8 @@ async def handle_ai_agent_tool(tool: str, arguments: dict[str, Any], invoke_id: 
                 language=language,
                 sampling_create_message=sampling,
                 memory_summary=memory_summary,
+                confirmed=_is_draft_confirmation(user_text, ui_context),
+                progress_callback=progress_callback,
             )
         return {"success": outcome.get("kind") != "error", "tool": tool, "data": _public_outcome(outcome)}
 

@@ -50,6 +50,7 @@ export interface GmailApiStatus {
   status: ConnectivityStatusValue;
   checked: boolean;
   message?: string;
+  error_code?: string;
   elapsed_ms?: number;
   mailbox?: string;
 }
@@ -221,6 +222,7 @@ export interface InboxEmailDetailPayload {
 export interface InboxSyncBoundary {
   priority_days?: number;
   cache_total?: number;
+  pending_metadata_count?: number;
   initial_sync_complete?: boolean;
   backfill_complete?: boolean;
   sync_stage?: string;
@@ -243,6 +245,16 @@ export interface InboxFeedPayload {
   updated_at?: string;
 }
 
+export interface IndexedEmailSearchPayload {
+  messages: InboxMessage[];
+  query: string;
+  error?: string;
+  total: number;
+  has_more: boolean;
+  offset?: number;
+  next_offset?: number;
+}
+
 export interface InboxCacheSyncPayload {
   mailbox?: string;
   mode?: "history" | "baseline_required" | "history_expired";
@@ -254,6 +266,13 @@ export interface InboxCacheSyncPayload {
   resync_required?: boolean;
   resync_reason?: "cursor_missing" | "history_expired";
   updated_at?: string;
+  repair?: {
+    attempted?: number;
+    repaired?: number;
+    pending?: number;
+    deferred?: number;
+  };
+  sync_boundary?: InboxSyncBoundary;
 }
 
 export interface ContactAvatarPayload {
@@ -427,6 +446,23 @@ export interface InboxCustomCategory {
 
 export interface InboxSettingsPayload {
   settings: InboxSettings;
+  etag?: string;
+}
+
+/** Mailbox-scoped Todo workflow state. The backend is the source of truth. */
+export interface InboxWorkflowState {
+  todos: string[];
+  done: string[];
+  snoozed: string[];
+  snoozedUntil: Record<string, string>;
+  version?: number;
+  updated_at?: string;
+}
+
+export interface InboxWorkflowStatePayload {
+  mailbox?: string;
+  exists?: boolean;
+  state: InboxWorkflowState;
   etag?: string;
 }
 
@@ -655,6 +691,7 @@ export interface MailPromptRunResult {
   assistant_text: string;
   assistant_followup_text?: string;
   artifact?: DraftReplyArtifact | ComposeDraftArtifact | SendPlanArtifact | null;
+  artifacts?: DraftReplyArtifact[];
   reply_gaps?: ReplyGaps;
   compose_gaps?: ReplyGaps;
   fallback_used?: boolean;
@@ -856,6 +893,11 @@ export interface AppState {
   inboxSettingsEtag: string;
   inboxSettingsLoading: boolean;
   inboxSettingsError: string;
+  inboxWorkflowState: InboxWorkflowState;
+  inboxWorkflowStateEtag: string;
+  inboxWorkflowStateLoading: boolean;
+  inboxWorkflowStateSaving: boolean;
+  inboxWorkflowStateError: string;
   sourcesOpen: boolean;
   historyOpen: boolean;
   memoryOpen: boolean;
@@ -910,6 +952,12 @@ export interface AppState {
   inboxLoading: boolean;
   inboxError: string;
   inboxUpdatedAt: string;
+  indexedSearchMessages: InboxMessage[];
+  indexedSearchQuery: string;
+  indexedSearchLoading: boolean;
+  indexedSearchError: string;
+  indexedSearchHasMore: boolean;
+  indexedSearchNextOffset: number;
   askItemActions: Record<string, { read?: boolean; trashed?: boolean; replied?: boolean; sending?: boolean }>;
   askEditDraft: Record<string, string>;
   askHistory: AskHistoryEntry[];
@@ -997,6 +1045,13 @@ export interface AiChatMessage {
   artifact?: DraftReplyArtifact | ComposeDraftArtifact | SendPlanArtifact | null;
   /** 批量写稿：一条消息内多份 draft_reply（按封隔离） */
   artifacts?: DraftReplyArtifact[];
+  composeArtifacts?: ComposeDraftArtifact[];
+  /** 批量新邮件的下一批游标；必须结构化保存，不能依赖“继续”文本重新路由。 */
+  batchComposeContinuation?: {
+    sourcePrompt: string;
+    offset: number;
+    remaining: number;
+  };
   proposedActions?: ProposedInboxActions | null;
   replyGaps?: ReplyGaps;
   mailContext?: AiMailContextRef;
@@ -1082,4 +1137,3 @@ export interface SendAiMessageOptions {
   /** 侧栏当前列表范围，仅作为 Host Agent 的只读事实。 */
   inboxListContext?: AiInboxListContext;
 }
-

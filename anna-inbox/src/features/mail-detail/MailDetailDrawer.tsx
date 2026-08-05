@@ -1195,9 +1195,9 @@ export function MailDetailDrawer({
         });
     };
     const loadFullAnchorMessage = (visiblePage: InboxThreadPagePayload) => {
-      // 首屏仍保持受限预览，选中邮件若被截断则立即经 body_url 加载完整正文。
-      // THREAD_REF 初始只有 thread id 时，回退到线程最新邮件；仍只加载一封，
-      // 避免打开长线程时并发请求全部历史正文。
+      // 选中邮件若被截断则立即经 body_url 加载完整正文，其余截断消息由下方
+      // “历史正文补全”逻辑逐封串行补齐。THREAD_REF 初始只有 thread id 时，
+      // 回退到线程最新邮件。仍只并发加载一封，避免打开长线程时并发请求全部历史正文。
       const anchorItem = visiblePage.messages.find((item) => item.id === messageId)
         || visiblePage.messages.find((item) => item.id === visiblePage.latest_message_id)
         || visiblePage.messages.at(-1);
@@ -1578,7 +1578,7 @@ export function MailDetailDrawer({
     const { artifact, mode, nonce } = insertRequest;
     if (!matchesDraftArtifact(mailbox, threadId, artifact)) {
       onConsumeInsertRequest(nonce);
-      showToast("Open the matching email thread before applying this draft.");
+      showToast(t("toast.openThreadFirst"));
       return;
     }
     onConsumeInsertRequest(nonce);
@@ -1707,17 +1707,18 @@ export function MailDetailDrawer({
 
   useEffect(() => {
     if (!open || !page || historicalBodyHydrationRef.current) return;
+    // 截断消息统一走全文补全：正文就绪前只展示骨架，不展示被截断的文本预览，
+    // 避免原始 URL/编码串组成的“乱码”闪屏以及正文高度变化造成的滚动条抖动。
     const pendingMessage = page.messages.find((item) => (
       item.body_truncated
-      && !item.body_html?.trim()
-      && !item.body_text?.trim()
       && !displayBodyLoading.has(item.id)
       && !displayBodyLoaded.has(item.id)
       && !displayBodyErrors[item.id]
     ));
     if (!pendingMessage) return;
 
-    // 历史消息可能只有缓存摘要。逐封补全文，避免展开长线程时并发请求 Gmail。
+    // 历史消息可能只有截断预览或缓存摘要。逐封串行补全文，
+    // 避免展开长线程时并发请求 Gmail。
     const task = loadFullDisplayBody(pendingMessage).finally(() => {
       historicalBodyHydrationRef.current = null;
     });
@@ -1745,7 +1746,7 @@ export function MailDetailDrawer({
     let access: ResolvedAttachmentAccess | null = null;
     attachmentDownloadsRef.current.add(stateKey);
     setAttachmentDownloads((current) => ({ ...current, [stateKey]: true }));
-    showToast("Preparing download...");
+    showToast(t("toast.preparingDownload"));
     try {
       access = await prepareAttachmentAccess(item, "download");
       triggerAttachmentDownload(access, item.attachment.filename);
@@ -2135,13 +2136,13 @@ export function MailDetailDrawer({
   const sendReply = async () => {
     if (!message || !threadId || !draft.trim() || !latestMessage) return;
     if (composerAttachments.some((item) => item.status === "uploading")) {
-      showToast("Wait for attachments to finish uploading.");
+      showToast(t("toast.waitAttachments"));
       return;
     }
     const readyAttachments = toPersistedOutgoingAttachments(composerAttachments);
     if (composerMode === "forward") {
       if (!forwardTo.length) {
-        showToast("Add at least one recipient to forward.");
+        showToast(t("toast.addForwardRecipient"));
         return;
       }
       setSending(true);
@@ -2184,7 +2185,7 @@ export function MailDetailDrawer({
     }
     const to = effectiveReplyToAddress;
     if (!to) {
-      showToast("Reply recipient is unavailable.");
+      showToast(t("toast.replyRecipientUnavailable"));
       return;
     }
     setSending(true);
@@ -2355,8 +2356,9 @@ export function MailDetailDrawer({
           {error ? <div className="mail-detail-error">{t("detail.threadLoadFailed")} {error}</div> : null}
           {(visibleThreadMessages.length ? visibleThreadMessages : []).map((item) => {
             const hasDisplayBody = Boolean(item.body_html?.trim() || item.body_text?.trim());
-            const waitForFullBody = !hasDisplayBody
-              && item.body_truncated
+            // 截断消息在全文加载完成前一律展示加载骨架，避免先出现截断文本预览
+            // （大段原始链接/编码串）再被完整正文替换造成的乱码闪屏与滚动条抖动。
+            const waitForFullBody = item.body_truncated
               && !displayBodyLoaded.has(item.id)
               && !displayBodyErrors[item.id];
             return (
@@ -2390,7 +2392,7 @@ export function MailDetailDrawer({
               {displayBodyErrors[item.id] ? (
                 <p className="mail-thread-message-notice is-error">
                   <span>{displayBodyErrors[item.id]}</span>
-                  {waitForFullBody ? <button onClick={() => void loadFullDisplayBody(item)}>Retry</button> : null}
+                  {item.body_truncated && !displayBodyLoaded.has(item.id) ? <button onClick={() => void loadFullDisplayBody(item, true)}>Retry</button> : null}
                 </p>
               ) : null}
               <AttachmentSection
@@ -2444,7 +2446,7 @@ export function MailDetailDrawer({
                   onClick={() => {
                     const recipients = deriveReplyAllRecipients(latestMessage, mailbox);
                     if (!recipients.to) {
-                      showToast("Reply All recipients are unavailable.");
+                      showToast(t("toast.replyAllRecipientsUnavailable"));
                       return;
                     }
                     setComposerClosing(false);
@@ -2504,7 +2506,7 @@ export function MailDetailDrawer({
                             onClick={() => {
                               const recipients = deriveReplyAllRecipients(latestMessage, mailbox);
                               if (!recipients.to) {
-                                showToast("Reply All recipients are unavailable.");
+                                showToast(t("toast.replyAllRecipientsUnavailable"));
                                 return;
                               }
                               setComposerMode("reply");

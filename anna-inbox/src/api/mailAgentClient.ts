@@ -19,6 +19,8 @@ import type {
   InboxThreadPagePayload,
   InboxSettingsPayload,
   InboxSettings,
+  InboxWorkflowState,
+  InboxWorkflowStatePayload,
   MailboxListPayload,
   MailboxInfo,
   RunHistoryEntry,
@@ -26,6 +28,7 @@ import type {
   RuntimeState,
   RuntimeDiagnostics,
   ScanPlan,
+  IndexedEmailSearchPayload,
 
 } from "../types/mail";
 import appManifest from "../../manifest.json";
@@ -182,6 +185,7 @@ export class MailAgentClient {
       ok?: boolean;
       status?: string;
       message?: string;
+      error_code?: string;
       elapsed_ms?: number;
       mailbox?: string;
     }>("check_gmail_api_status", { mailbox }, { timeoutMs: 15_000 });
@@ -261,8 +265,8 @@ export class MailAgentClient {
     return this.invoke<InboxFeedPayload>("list_cached_emails", { mailbox, days, limit, category, offset }, { timeoutMs: 30_000 });
   }
 
-  syncInboxCache(mailbox: string) {
-    return this.invoke<InboxCacheSyncPayload>("sync_inbox_cache", { mailbox }, { timeoutMs: 60_000, retry: "safe" });
+  syncInboxCache(mailbox: string, repairMissing = false) {
+    return this.invoke<InboxCacheSyncPayload>("sync_inbox_cache", { mailbox, repair_missing: repairMissing }, { timeoutMs: 60_000, retry: "safe" });
   }
 
   listGmailEmailsPage(mailbox: string, days = 30, limit = 100, category = "all", pageToken = "", pageOffset = 0, excludeMessageIds: string[] = []) {
@@ -561,6 +565,27 @@ export class MailAgentClient {
   /** 统一 AI 侧栏 turn：后端本地 Router + 白名单工具，可轮询 run。 */
   startAiTurn(args: Record<string, unknown>) {
     return this.invoke<RunStatus>("start_ai_turn", args, { timeoutMs: CUSTOM_SCAN_INVOKE_TIMEOUT_MS, retry: "safe" });
+  }
+
+  searchIndexedEmails(mailbox: string, query: string, context: {
+    todo_message_ids?: string[];
+    done_message_ids?: string[];
+    snoozed_message_ids?: string[];
+  } = {}, limit = 200, offset = 0) {
+    return this.invoke<IndexedEmailSearchPayload>("search_indexed_emails", {
+      mailbox, query, ...context, limit, offset,
+    }, { timeoutMs: 55_000 });
+  }
+
+  getInboxWorkflowState(mailbox: string) {
+    return this.invoke<InboxWorkflowStatePayload>("get_inbox_workflow_state", { mailbox });
+  }
+
+  saveInboxWorkflowState(mailbox: string, state: InboxWorkflowState, ifMatch?: string) {
+    return this.invoke<InboxWorkflowStatePayload & { ok?: boolean }>(
+      "save_inbox_workflow_state",
+      { mailbox, state, if_match: ifMatch || undefined },
+    );
   }
 
   draftAiReply(args: Record<string, unknown>) {

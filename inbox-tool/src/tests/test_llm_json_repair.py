@@ -114,6 +114,14 @@ async def test_local_json_repair_missing_colon_between_key_value() -> None:
     assert payload == {"action": "final"}
 
 
+async def test_local_json_repair_duplicate_outer_braces() -> None:
+    """批量新邮件偶发 `{{...}}`，应恢复为一个 JSON 对象。"""
+    from mail_agent.llm_runtime.service import parse_json_response
+
+    payload = parse_json_response('{{"emails":[{"recipients":["one@example.com"]}]}}')
+    assert payload["emails"][0]["recipients"] == ["one@example.com"]
+
+
 async def test_local_json_repair_invalid_and_truncated_unicode_escapes() -> None:
     """截断/非法 \\uXXXX：尾部残缺丢弃，中段非法转义字面化后仍可解析。"""
     from mail_agent.llm_runtime.service import parse_json_response
@@ -133,6 +141,28 @@ async def test_local_json_repair_invalid_and_truncated_unicode_escapes() -> None
     assert payload["tool"] == "query_mail_evidence"
     assert payload["arguments"]["user_text"] == "find"
     assert "\\u606v" in payload["arguments"]["recent"]
+
+
+async def test_local_json_repair_python_unicode_scalar_escape() -> None:
+    """Python 风格的有效标量转义应转换为真实 Unicode 字符。"""
+    from mail_agent.llm_runtime.service import parse_json_response
+
+    assert parse_json_response(r'{"text":"\U0001f680"}') == {"text": "🚀"}
+
+
+async def test_local_json_repair_tool_call_python_escape_with_truncation() -> None:
+    """tool_call 中的大段上下文即使含 Python 转义并在尾部截断，也应保留工具计划。"""
+    from mail_agent.llm_runtime.service import parse_json_response
+
+    broken = (
+        r'{"action":"tool_call","tool":"query_mail_evidence",'
+        r'"arguments":{"user_text":"find","recent_conversation":"rocket \U0001f680 '
+        r'with a long echoed context that was cut at the end\U0001f'
+    )
+    payload = parse_json_response(broken)
+    assert payload["action"] == "tool_call"
+    assert payload["tool"] == "query_mail_evidence"
+    assert payload["arguments"]["user_text"] == "find"
 
 
 async def test_local_json_repair_mail_links_missing_commas() -> None:
@@ -388,7 +418,10 @@ async def main() -> None:
     await test_local_json_repair_does_not_trigger_llm_repair()
     await test_local_json_repair_unescaped_quotes_in_query_string()
     await test_local_json_repair_missing_colon_between_key_value()
+    await test_local_json_repair_duplicate_outer_braces()
     await test_local_json_repair_invalid_and_truncated_unicode_escapes()
+    await test_local_json_repair_python_unicode_scalar_escape()
+    await test_local_json_repair_tool_call_python_escape_with_truncation()
     await test_local_json_repair_mail_links_missing_commas()
     await test_truncated_json_is_salvaged_by_closing_brackets()
     await test_length_stop_reason_retries_even_for_valid_json()

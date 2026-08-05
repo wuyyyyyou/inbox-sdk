@@ -56,6 +56,25 @@ describe("AI sidebar collapse", () => {
   });
 });
 
+describe("AI user messages", () => {
+  it("preserves line breaks in sent chat content", () => {
+    const userMessageRule = styles.match(/\.ai-message\.is-user \{[\s\S]*?\r?\n}\r?\n/)?.[0];
+
+    expect(userMessageRule).toContain("white-space: pre-wrap;");
+  });
+});
+
+describe("AI draft artifact body", () => {
+  it("keeps long draft bodies scrollable within the card", () => {
+    const textareaRule = styles.match(
+      /\.ai-draft-artifact-field textarea \{\r?\n  min-height:[\s\S]*?\r?\n}\r?\n/,
+    )?.[0];
+
+    expect(textareaRule).toContain("max-height: 260px;");
+    expect(textareaRule).toContain("overflow-y: auto;");
+  });
+});
+
 describe("mail detail composer controls", () => {
   it("keeps compose header tooltips above the header content", () => {
     const composeHeaderRule = styles.match(

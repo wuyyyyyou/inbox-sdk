@@ -74,6 +74,27 @@ def test_draft_party_context_separates_owner_from_counterparty() -> None:
     print("[PASS] test_draft_party_context_separates_owner_from_counterparty")
 
 
+def test_draft_party_context_defaults_to_last_sender_only() -> None:
+    """群发邮件的默认回复对象是最后发件人，不把其他 To/CC 参与者扩成 Reply All。"""
+    from mail_agent.ai_turn.tools import _draft_party_context
+
+    parties = _draft_party_context(
+        "owner@example.com",
+        {
+            "from_addr": "Dora Lin <dora@example.com>",
+            "body": (
+                "From: Dora Lin <dora@example.com>\n"
+                "To: owner@example.com, kate@example.com\n"
+                "Cc: candy@example.com\n"
+                "Body:\n请周三前反馈。\n"
+            ),
+        },
+        {},
+    )
+    assert parties["reply_to"] == "Dora Lin <dora@example.com>"
+    print("[PASS] test_draft_party_context_defaults_to_last_sender_only")
+
+
 def test_host_agent_tool_schemas_are_decision_compact() -> None:
     """Host 选型 schema 必须短且含 when/never 约束，减少 session 犹豫与 input tokens。"""
     from anna_inbox_executa.common import AI_AGENT_DEFAULT_TOOLS, load_manifest
@@ -381,6 +402,7 @@ if __name__ == "__main__":
     test_host_agent_tool_whitelist_excludes_mutations()
     test_flat_thread_fields_merge_into_readonly_context()
     test_draft_party_context_separates_owner_from_counterparty()
+    test_draft_party_context_defaults_to_last_sender_only()
     test_host_agent_tool_schemas_are_decision_compact()
     test_public_outcome_strips_internal_fields()
     test_public_evidence_omits_raw_coverage_note()

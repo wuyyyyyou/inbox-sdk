@@ -84,6 +84,26 @@ npm run build
 
 Anna App 本地启动使用 `anna-inbox/app.json` 和 `anna-inbox/executas/inbox-tool/executa.json`。旧的 `dev-wsl.sh` 不是当前权威启动入口。
 
+### Python 虚拟环境
+
+WSL 与 Windows 不能共用 Python 虚拟环境：其中的解释器和依赖二进制与操作系统绑定。仓库将两端分别置于 `inbox-tool/src/.venv-wsl` 与 `inbox-tool/src/.venv-windows`，均为本地忽略文件。
+
+在 WSL 中通过包装脚本执行后端命令：
+
+```sh
+scripts/dev/uv-wsl.sh run python tests/test_inbox_feed.py
+scripts/dev/uv-wsl.sh run anna-inbox-executa
+```
+
+在 Windows PowerShell 中使用：
+
+```powershell
+.\scripts\dev\uv-windows.ps1 run python tests/test_inbox_feed.py
+.\scripts\dev\uv-windows.ps1 run anna-inbox-executa
+```
+
+两端首次执行会由 `uv` 各自创建环境。不要直接使用未指定 `UV_PROJECT_ENVIRONMENT` 的 `uv` 命令，以免重新创建共享的 `.venv`。
+
 ## 测试
 
 前端：
@@ -118,8 +138,8 @@ App 与 Tool **版本解耦**（当前基线）：
 
 | 端 | 版本 | 权威文件 |
 | --- | --- | --- |
-| App | `2.2.4` | `anna-inbox/app.json` |
-| Tool | `2.3.4` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
+| App | `2.2.5` | `anna-inbox/app.json` |
+| Tool | `2.3.5` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
 
 Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Tool 版本后运行：
 
@@ -134,6 +154,6 @@ python scripts/sync/sync_executa_identity.py --check
 
 当前文档索引见 [`anna-inbox/docs/README.md`](anna-inbox/docs/README.md)。
 
-- [2.3.4 架构与发布基线](anna-inbox/docs/2.3.4架构与发布基线.md)
+- [2.3.5 架构与发布基线](anna-inbox/docs/2.3.5架构与发布基线.md)
 - [邮箱同步 P0：缓存优先](anna-inbox/docs/邮箱同步P0缓存优先方案.md)
 - [平台超时诊断与反馈流程](anna-inbox/docs/平台超时诊断与反馈流程.md)

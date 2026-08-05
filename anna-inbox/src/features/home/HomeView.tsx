@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -26,6 +27,7 @@ import type {
   CustomRunResult,
   InboxMessage,
   InboxThreadStateOperation,
+  InboxWorkflowState,
   OutgoingAttachmentMeta,
   SendAiMessageOptions,
 } from "../../types/mail";
@@ -85,6 +87,7 @@ type MailboxView =
   | "spam"
   | "all";
 type MailUiFlags = {
+  /** Legacy cache fields are retained only for migration compatibility. */
   todos: string[];
   snoozed: string[];
   snoozedUntil?: Record<string, string>;
@@ -93,6 +96,7 @@ type MailUiFlags = {
   drafts: string[];
   saved: Record<string, InboxMessage>;
 };
+type CompatibleInboxWorkflow = InboxWorkflowState & { doneRemoved: string[] };
 type CategoryFlag = "todos" | "snoozed" | "done" | "drafts";
 type InboxFeedWindow = {
   days: number;
@@ -888,10 +892,72 @@ export function mergeDraftOverlayMessages(
 
 export function isDoneMessage(
   message: InboxMessage,
-  flags: Pick<MailUiFlags, "done" | "doneRemoved">,
+  workflow: Pick<InboxWorkflowState, "done"> & { doneRemoved?: string[] },
 ) {
-  if (flags.doneRemoved.includes(message.id)) return false;
-  return flags.done.includes(message.id) || isSentMessage(message);
+  if ((workflow.doneRemoved || []).includes(message.id)) return false;
+  return workflow.done.includes(message.id) || isSentMessage(message);
+}
+
+/** Apply one workflow mutation without relying on a React state updater. */
+export function transitionInboxWorkflow(
+  current: InboxWorkflowState,
+  kind: "todos" | "snoozed" | "done",
+  ids: Iterable<string>,
+  enabled: boolean,
+  snoozeUntil?: string,
+): InboxWorkflowState {
+  const idSet = new Set([...ids].filter(Boolean));
+  const next: InboxWorkflowState = {
+    ...current,
+    todos: current.todos.filter((id) => !idSet.has(id)),
+    snoozed: current.snoozed.filter((id) => !idSet.has(id)),
+    done: current.done.filter((id) => !idSet.has(id)),
+    snoozedUntil: { ...(current.snoozedUntil || {}) },
+  };
+  if (enabled) next[kind] = [...next[kind], ...idSet];
+  for (const id of idSet) delete next.snoozedUntil[id];
+  if (enabled && kind === "snoozed" && snoozeUntil) {
+    for (const id of idSet) next.snoozedUntil[id] = snoozeUntil;
+  }
+  return next;
+}
+
+/** Restore only the ids touched by an optimistic action; unrelated workflow state wins. */
+export function restoreInboxWorkflow(
+  current: InboxWorkflowState,
+  previous: InboxWorkflowState,
+  ids: Iterable<string>,
+): InboxWorkflowState {
+  const affected = new Set([...ids].filter(Boolean));
+  const next: InboxWorkflowState = {
+    ...current,
+    todos: current.todos.filter((id) => !affected.has(id)),
+    snoozed: current.snoozed.filter((id) => !affected.has(id)),
+    done: current.done.filter((id) => !affected.has(id)),
+    snoozedUntil: { ...(current.snoozedUntil || {}) },
+  };
+  for (const kind of ["todos", "snoozed", "done"] as const) {
+    next[kind].push(...previous[kind].filter((id) => affected.has(id)));
+  }
+  for (const id of affected) {
+    if (Object.prototype.hasOwnProperty.call(previous.snoozedUntil || {}, id)) {
+      next.snoozedUntil[id] = previous.snoozedUntil[id];
+    } else {
+      delete next.snoozedUntil[id];
+    }
+  }
+  return next;
+}
+
+export function expandInboxThreadMessages(
+  selected: InboxMessage[],
+  messagesInThread: (message: InboxMessage) => InboxMessage[],
+) {
+  const byId = new Map<string, InboxMessage>();
+  for (const message of selected) {
+    for (const item of messagesInThread(message)) byId.set(item.id, item);
+  }
+  return [...byId.values()];
 }
 
 export function resolveSourceMessages(
@@ -899,6 +965,7 @@ export function resolveSourceMessages(
   inboxMessages: InboxMessage[],
   inboxSnapshotMessages: InboxMessage[],
   flags: MailUiFlags,
+  workflow: Omit<InboxWorkflowState, "snoozedUntil"> & { snoozedUntil?: Record<string, string>; doneRemoved?: string[] } = { todos: [], done: [], snoozed: [] },
 ) {
   const source = inboxSnapshotMessages.length
     ? inboxSnapshotMessages
@@ -913,7 +980,7 @@ export function resolveSourceMessages(
   }
   if (mailboxView === "todos" || mailboxView === "snoozed") {
     return uniqueLatestInboxThreads(
-      flags[mailboxView]
+      workflow[mailboxView]
         .map((id) => currentMessages.get(id))
         .filter(
           (message): message is InboxMessage =>
@@ -922,9 +989,9 @@ export function resolveSourceMessages(
     );
   }
   if (mailboxView === "done") {
-    const doneIds = new Set(flags.done);
+    const doneIds = new Set(workflow.done);
     for (const message of currentMessages.values()) {
-      if (isDoneMessage(message, flags)) doneIds.add(message.id);
+      if (isDoneMessage(message, workflow)) doneIds.add(message.id);
     }
     return uniqueLatestInboxThreads(
       [...doneIds]
@@ -999,12 +1066,14 @@ export function mergeInboxSearchSourceMessages(
   inboxMessages: InboxMessage[],
   inboxSnapshotMessages: InboxMessage[],
   flags: MailUiFlags,
+  workflow: Omit<InboxWorkflowState, "snoozedUntil"> & { snoozedUntil?: Record<string, string>; doneRemoved?: string[] } = { todos: [], done: [], snoozed: [] },
 ) {
   const inboxResolved = resolveSourceMessages(
     "inbox",
     inboxMessages,
     inboxSnapshotMessages,
     flags,
+    workflow,
   );
   const byId = new Map(inboxResolved.map((message) => [message.id, message]));
   const currentMessages = new Map<string, InboxMessage>();
@@ -1015,10 +1084,10 @@ export function mergeInboxSearchSourceMessages(
   ]) {
     if (message?.id) currentMessages.set(message.id, message);
   }
-  for (const id of [...flags.todos, ...flags.snoozed]) {
+  for (const id of [...workflow.todos, ...workflow.snoozed]) {
     if (byId.has(id)) continue;
     const message = currentMessages.get(id);
-    if (!message || isTrashMessage(message) || isDoneMessage(message, flags))
+    if (!message || isTrashMessage(message) || isDoneMessage(message, workflow))
       continue;
     byId.set(id, message);
   }
@@ -1029,6 +1098,7 @@ function InboxRow({
   message,
   selected,
   flags,
+  workflow,
   mailboxView,
   mailbox,
   onSelect,
@@ -1046,6 +1116,7 @@ function InboxRow({
   message: InboxMessage;
   selected: boolean;
   flags: MailUiFlags;
+  workflow: CompatibleInboxWorkflow;
   mailboxView: MailboxView;
   mailbox: string;
   onSelect: () => void;
@@ -1075,13 +1146,13 @@ function InboxRow({
   const sentView = participant.outgoing;
   const sentMessage = isSentMessage(message);
   const unread = isUnreadMessage(message);
-  const isDone = isDoneMessage(message, flags);
-  const isTodo = flags.todos.includes(message.id);
-  const isSnoozed = flags.snoozed.includes(message.id);
+  const isDone = isDoneMessage(message, workflow);
+  const isTodo = workflow.todos.includes(message.id);
+  const isSnoozed = workflow.snoozed.includes(message.id);
   const trashed = isTrashMessage(message);
   const snoozeLabel =
     !trashed && mailboxView === "snoozed"
-      ? snoozeUntilLabel(flags.snoozedUntil?.[message.id], t)
+      ? snoozeUntilLabel(workflow.snoozedUntil?.[message.id], t)
       : "";
   const important = isImportantMessage(message);
   const starred = isStarredMessage(message);
@@ -1482,6 +1553,15 @@ function truncateThreadReferenceLabel(subject: string) {
   return normalized.length > limit ? `${normalized.slice(0, limit - 3).trimEnd()}...` : normalized;
 }
 
+export function renderAiUserMessageContent(text: string) {
+  return String(text || "").split(/\r\n?|\n/).map((line, index) => (
+    <Fragment key={`user-line-${index}`}>
+      {index ? <br /> : null}
+      {line}
+    </Fragment>
+  ));
+}
+
 function AiMessageInlineContent({
   content,
   onOpenThread,
@@ -1718,9 +1798,9 @@ function DraftReplyArtifactCard({
 
   return (
     <div className="ai-draft-artifact">
-      <strong className="ai-draft-artifact-title">{isForward ? "Forward draft" : "Reply draft"}</strong>
+      <strong className="ai-draft-artifact-title">{isForward ? t("ai.forwardDraft") : t("ai.replyDraft")}</strong>
       <label className="ai-draft-artifact-field">
-        <span>To</span>
+        <span>{t("ai.draftTo")}</span>
         <input
           value={(isForward ? (draft.recipients || []) : []).join(", ")}
           placeholder={isForward ? t("ai.addRecipient") : t("ai.replyRecipientFromThread")}
@@ -1732,11 +1812,11 @@ function DraftReplyArtifactCard({
         />
       </label>
       <label className="ai-draft-artifact-field">
-        <span>Subject</span>
+        <span>{t("ai.draftSubject")}</span>
         <input value={draft.subject || ""} placeholder={t("ai.threadSubject")} readOnly />
       </label>
       <label className="ai-draft-artifact-field">
-        <span>Message</span>
+        <span>{t("ai.draftMessage")}</span>
         <textarea
           ref={messageRef}
           value={draft.body}
@@ -1774,10 +1854,73 @@ function ComposeDraftArtifactCard({
       </label>
       <label className="ai-draft-artifact-field">
         <span>{t("compose.content")}</span>
-        <textarea value={draft.body} onChange={(event) => setDraft((current) => ({ ...current, body: event.target.value }))} />
+        <textarea className="ai-draft-artifact-body" rows={8} value={draft.body} onChange={(event) => setDraft((current) => ({ ...current, body: event.target.value }))} />
       </label>
       <div className="ai-draft-artifact-actions">
         <button className="is-primary" onClick={() => onUse(draft)}>{t("ai.insertNewEmail")}</button>
+      </div>
+    </div>
+  );
+}
+
+function BatchComposeDraftArtifacts({
+  artifacts,
+  onSave,
+}: {
+  artifacts: ComposeDraftArtifact[];
+  onSave: (drafts: ComposeDraftArtifact[]) => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const [drafts, setDrafts] = useState(artifacts);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    setDrafts(artifacts);
+    setSaved(false);
+  }, [artifacts]);
+
+  const updateDraft = (index: number, patch: Partial<ComposeDraftArtifact>) => {
+    setDrafts((current) => current.map((draft, currentIndex) => (
+      currentIndex === index ? { ...draft, ...patch } : draft
+    )));
+    setSaved(false);
+  };
+
+  const saveAll = async () => {
+    setSaving(true);
+    try {
+      await onSave(drafts);
+      setSaved(true);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="ai-batch-draft-artifacts">
+      {drafts.map((draft, index) => (
+        <div className="ai-draft-artifact" key={`${draft.recipients?.join("-") || "compose"}-${index}`}>
+          <strong className="ai-draft-artifact-title">{t("ai.draftFallbackTitle", { number: index + 1 })}</strong>
+          <label className="ai-draft-artifact-field">
+            <span>{t("compose.to")}</span>
+            <input value={(draft.recipients || []).join(", ")} onChange={(event) => updateDraft(index, { recipients: event.target.value.split(",").map((value) => value.trim()).filter(Boolean) })} />
+          </label>
+          <label className="ai-draft-artifact-field">
+            <span>{t("compose.subject")}</span>
+            <input value={draft.subject || ""} onChange={(event) => updateDraft(index, { subject: event.target.value })} />
+          </label>
+          <label className="ai-draft-artifact-field">
+            <span>{t("compose.content")}</span>
+            <textarea className="ai-draft-artifact-body" rows={8} value={draft.body} onChange={(event) => updateDraft(index, { body: event.target.value })} />
+          </label>
+        </div>
+      ))}
+      <div className="ai-draft-artifact-actions">
+        <button className="is-primary" onClick={() => void saveAll()} disabled={saving || saved}>
+          {saving ? t("ai.saveDraftsSaving") : t("ai.saveDrafts")}
+        </button>
+        {saved ? <span>{t("ai.saveDraftsSaved", { count: drafts.length })}</span> : null}
       </div>
     </div>
   );
@@ -1788,6 +1931,7 @@ function AiAssistantMessage({
   currentMailContext,
   onUseArtifact,
   onUseComposeArtifact,
+  onSaveComposeArtifacts,
   onOpenMail,
   onConfirmSendPlan,
   onTextComplete,
@@ -1803,6 +1947,7 @@ function AiAssistantMessage({
     artifact: ComposeDraftArtifact,
     context: AiComposeContextRef | null,
   ) => void;
+  onSaveComposeArtifacts: (artifacts: ComposeDraftArtifact[]) => Promise<void>;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
   onTextComplete?: () => void;
@@ -1884,7 +2029,7 @@ function AiAssistantMessage({
     const context = message.mailContext || currentMailContext;
     const referenceMailbox = context?.mailbox || state.mailbox;
     if (!referenceMailbox) {
-      actions.showToast("This email reference is unavailable.");
+      actions.showToast(t("toast.emailReferenceUnavailable"));
       return;
     }
     onOpenMail({
@@ -1896,15 +2041,27 @@ function AiAssistantMessage({
   };
 
   if (message.pending) {
+    const pendingDraftArtifacts = message.artifacts || [];
+    const pendingComposeArtifacts = message.composeArtifacts || [];
     const executionSteps = message.kind === "scan" && state.customRunProgress
       ? customExecutionSteps(state.customRunProgress.stage, state.customRunProgress.progress)
       : [];
     return (
       <div
-        className="ai-message is-assistant is-thinking-inline"
+        className="ai-message is-assistant is-thinking-inline has-draft-artifact"
         aria-live="polite"
         aria-busy="true"
       >
+        {pendingDraftArtifacts.map((item, index) => (
+          <DraftReplyArtifactCard
+            key={`${item.thread_id}-${index}`}
+            artifact={item}
+            onUse={onUseArtifact}
+          />
+        ))}
+        {pendingComposeArtifacts.map((item, index) => (
+          <ComposeDraftArtifactCard key={`${item.recipients?.join("-") || "compose"}-${index}`} artifact={item} onUse={(artifact) => onUseComposeArtifact(artifact, null)} />
+        ))}
         {executionSteps.length ? executionSteps.map((step) => (
           <p key={step.label}>{step.status === "complete" ? "Completed: " : step.status === "active" ? "In progress: " : ""}{step.label}</p>
         )) : <p>{t("ai.thinking")}</p>}
@@ -1936,6 +2093,14 @@ function AiAssistantMessage({
       (!animate || assistantTextComplete)
         ? message.artifact
         : null;
+    const composeArtifacts = message.composeArtifacts || (composeArtifact ? [composeArtifact] : []);
+    // 草稿卡片存在时，把回答文字置于末尾，保证侧栏自动滚动后仍能看到状态与续批提示。
+    const hasDraftArtifacts = Boolean(
+      message.artifacts?.length ||
+      composeArtifacts.length ||
+      message.artifact?.type === "draft_reply" ||
+      message.artifact?.type === "compose_draft",
+    );
     const sendPlan =
       message.artifact?.type === "send_plan" &&
       (!animate || assistantTextComplete)
@@ -2016,7 +2181,7 @@ function AiAssistantMessage({
           !String(answers[question.id] || "").trim(),
       );
       if (missingRequired.length) {
-        actions.showToast("Answer the required questions first.");
+        actions.showToast(t("toast.answerQuestionsFirst"));
         return;
       }
       setSubmittingGap(true);
@@ -2047,7 +2212,7 @@ function AiAssistantMessage({
     };
     return (
       <div
-        className={`ai-message is-assistant ${message.kind === "error" ? "is-error" : ""} ${message.kind === "stopped" ? "is-stopped" : ""}`}
+        className={`ai-message is-assistant ${message.kind === "error" ? "is-error" : ""} ${message.kind === "stopped" ? "is-stopped" : ""} ${(message.artifacts?.length || composeArtifacts.length) ? "has-draft-artifact" : ""}`}
       >
         {scanQuery ? (
           <AiScanQueryChip
@@ -2069,16 +2234,18 @@ function AiAssistantMessage({
             </button>
           </div>
         ) : null}
-        <AnimatedAssistantText
-          text={text}
-          animate={animate}
-          onComplete={() => {
-            setAssistantTextComplete(true);
-            onTextComplete?.();
-          }}
-          onOpenThread={openThreadReference}
-          threadReferenceLabels={message.threadReferenceLabels}
-        />
+        {!hasDraftArtifacts ? (
+          <AnimatedAssistantText
+            text={text}
+            animate={animate}
+            onComplete={() => {
+              setAssistantTextComplete(true);
+              onTextComplete?.();
+            }}
+            onOpenThread={openThreadReference}
+            threadReferenceLabels={message.threadReferenceLabels}
+          />
+        ) : null}
         {clarification && clarification.status === "pending" ? (
           <div className="ai-clarification ai-routing-dialog" role="group" aria-label={clarification.question}>
             {!selectedSearchField ? <p>{clarification.question}</p> : null}
@@ -2352,7 +2519,7 @@ function AiAssistantMessage({
         {(() => {
           // 批量写稿：优先 artifacts；单封仍用 artifact
           const batchArtifacts =
-            Array.isArray(message.artifacts) && message.artifacts.length > 1
+            Array.isArray(message.artifacts) && message.artifacts.length
               ? message.artifacts
               : cardDraftArtifact
                 ? [cardDraftArtifact]
@@ -2372,21 +2539,21 @@ function AiAssistantMessage({
                   <DraftReplyArtifactCard artifact={item} onUse={onUseArtifact} />
                 ) : (
                   <div className="ai-draft-artifact">
-                    <strong className="ai-draft-artifact-title">{item.subject || item.thread_id || `Draft ${index + 1}`}</strong>
+                    <strong className="ai-draft-artifact-title">{item.subject || item.thread_id || t("ai.draftFallbackTitle", { number: index + 1 })}</strong>
                     <pre>{item.body}</pre>
                     <div className="ai-draft-artifact-actions">
                     <button
                       className="is-primary"
                       onClick={() =>
                         onOpenMail({
-                          label: item.subject || "Draft email",
+                          label: item.subject || t("ai.draftEmailLabel"),
                           mailbox: item.mailbox,
                           thread_id: item.thread_id,
                           message_id: item.message_id || "",
                         })
                       }
                     >
-                      Go to email
+                      {t("ai.goToEmail")}
                     </button>
                     <button className="is-secondary" onClick={() => void actions.copyDraft(item.body)}>{t("ai.copyDraft")}</button>
                     </div>
@@ -2396,15 +2563,18 @@ function AiAssistantMessage({
             );
           });
         })()}
-        {composeArtifact ? (
+        {composeArtifacts.length > 1 ? (
+          <BatchComposeDraftArtifacts artifacts={composeArtifacts} onSave={onSaveComposeArtifacts} />
+        ) : composeArtifacts.map((item, index) => (
           <ComposeDraftArtifactCard
-            artifact={composeArtifact}
+            key={`${item.recipients?.join("-") || "compose"}-${index}`}
+            artifact={item}
             onUse={(artifact) => onUseComposeArtifact(
               artifact,
               message.mailContext?.kind === "compose" ? message.mailContext : null,
             )}
           />
-        ) : null}
+        ))}
         {sendPlan ? (
           <div className="ai-draft-artifact ai-send-plan">
             <strong>{t("ai.reviewBeforeSending")}</strong>
@@ -2457,10 +2627,22 @@ function AiAssistantMessage({
             </button>
           </div>
         ) : null}
+        {hasDraftArtifacts ? (
+          <AnimatedAssistantText
+            text={text}
+            animate={animate}
+            onComplete={() => {
+              setAssistantTextComplete(true);
+              onTextComplete?.();
+            }}
+            onOpenThread={openThreadReference}
+            threadReferenceLabels={message.threadReferenceLabels}
+          />
+        ) : null}
         <div className="ai-message-footer">
           <time>{aiTimeLabel(message.timestamp)}</time>
           {message.thinkingStartedAt ? <span className="ai-thinking-elapsed">{aiThinkingElapsedLabel(message.thinkingStartedAt, new Date(message.timestamp).getTime())}</span> : null}
-          {message.kind === "error" ? (
+          {message.kind === "error" && !hasDraftArtifacts ? (
             <button
               type="button"
               className="ai-retry-button"
@@ -2581,6 +2763,7 @@ function AiMessageBubble({
   currentMailContext,
   onUseArtifact,
   onUseComposeArtifact,
+  onSaveComposeArtifacts,
   onOpenMail,
   onConfirmSendPlan,
   onTextComplete,
@@ -2596,13 +2779,14 @@ function AiMessageBubble({
     artifact: ComposeDraftArtifact,
     context: AiComposeContextRef | null,
   ) => void;
+  onSaveComposeArtifacts: (artifacts: ComposeDraftArtifact[]) => Promise<void>;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
   onTextComplete?: () => void;
   onApplyScanQuery?: (query: string) => void;
 }) {
   if (message.role === "user") {
-    return <div className="ai-message is-user">{message.content}</div>;
+    return <div className="ai-message is-user">{renderAiUserMessageContent(message.content)}</div>;
   }
   return (
     <AiAssistantMessage
@@ -2610,6 +2794,7 @@ function AiMessageBubble({
       currentMailContext={currentMailContext}
       onUseArtifact={onUseArtifact}
       onUseComposeArtifact={onUseComposeArtifact}
+      onSaveComposeArtifacts={onSaveComposeArtifacts}
       onOpenMail={onOpenMail}
       onConfirmSendPlan={onConfirmSendPlan}
       onTextComplete={onTextComplete}
@@ -2626,6 +2811,7 @@ function AiSidebar({
   inboxListContext,
   onUseArtifact,
   onUseComposeArtifact,
+  onSaveComposeArtifacts,
   onOpenMail,
   onConfirmSendPlan,
   onApplyScanQuery,
@@ -2649,6 +2835,7 @@ function AiSidebar({
     artifact: ComposeDraftArtifact,
     context: AiComposeContextRef | null,
   ) => void;
+  onSaveComposeArtifacts: (artifacts: ComposeDraftArtifact[]) => Promise<void>;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
   onApplyScanQuery?: (query: string) => void;
@@ -2870,6 +3057,7 @@ function AiSidebar({
                 currentMailContext={currentMailContext}
                 onUseArtifact={onUseArtifact}
                 onUseComposeArtifact={onUseComposeArtifact}
+                onSaveComposeArtifacts={onSaveComposeArtifacts}
                 onOpenMail={onOpenMail}
                 onConfirmSendPlan={onConfirmSendPlan}
                 onTextComplete={scrollConversationToBottom}
@@ -3406,6 +3594,20 @@ export function HomeView() {
     () => parseInboxQuery(activeSearch),
     [activeSearch],
   );
+  // 输入稳定后由控制器查询完整本地索引，组件不直接调用工具。
+  useEffect(() => {
+    const value = search.trim();
+    if (!value || parsedSearch.error) {
+      setActiveSearch("");
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setActiveSearch(value);
+      setFilter("search");
+      void searchIndexedEmailsRef.current(value).catch(() => undefined);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [parsedSearch.error, search]);
   useLayoutEffect(() => {
     const position = searchCaretPositionRef.current;
     const input = searchInputRef.current;
@@ -3568,6 +3770,8 @@ export function HomeView() {
   const bodyPreheatSession = useRef(0);
   const bodyPreheatSeen = useRef(new Set<string>());
   const loadInboxEmailBodyRef = useRef(actions.loadInboxEmailBody);
+  const searchIndexedEmailsRef = useRef(actions.searchIndexedEmails);
+  const loadInboxWorkflowStateRef = useRef(actions.loadInboxWorkflowState);
   const pageLoadInFlight = useRef(false);
   const requestedGmailCursors = useRef(new Set<string>());
   const mailFeedRef = useRef<HTMLElement | null>(null);
@@ -3589,6 +3793,14 @@ export function HomeView() {
     drafts: [],
     saved: {},
   });
+  const workflow = state.inboxWorkflowState;
+  const compatibleWorkflow = useMemo<CompatibleInboxWorkflow>(
+    () => ({ ...workflow, doneRemoved: flags.doneRemoved }),
+    [flags.doneRemoved, workflow],
+  );
+  const workflowRef = useRef(workflow);
+  workflowRef.current = workflow;
+  const workflowMutationQueue = useRef(Promise.resolve());
   const [contactAvatars, setContactAvatars] = useState<Record<string, string>>(
     {},
   );
@@ -3621,6 +3833,12 @@ export function HomeView() {
   useEffect(() => {
     loadInboxEmailBodyRef.current = actions.loadInboxEmailBody;
   }, [actions.loadInboxEmailBody]);
+  useEffect(() => {
+    searchIndexedEmailsRef.current = actions.searchIndexedEmails;
+  }, [actions.searchIndexedEmails]);
+  useEffect(() => {
+    loadInboxWorkflowStateRef.current = actions.loadInboxWorkflowState;
+  }, [actions.loadInboxWorkflowState]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -3696,6 +3914,7 @@ export function HomeView() {
     });
     setContactAvatars({});
     avatarMisses.current = new Set();
+    void loadInboxWorkflowStateRef.current(mailbox);
     void getMailFlags(mailbox, flagsKey).then((saved) => {
       if (cancelled || !saved) return;
       setFlags(saved);
@@ -3771,19 +3990,19 @@ export function HomeView() {
       important: state.inboxMessages.filter(
         (message) =>
           isImportantMessage(message) &&
-          !flags.todos.includes(message.id) &&
-          !isDoneMessage(message, flags) &&
-          !flags.snoozed.includes(message.id),
+          !workflow.todos.includes(message.id) &&
+          !isDoneMessage(message, compatibleWorkflow) &&
+          !workflow.snoozed.includes(message.id),
       ).length,
       other: state.inboxMessages.filter(
         (message) =>
           !isImportantMessage(message) &&
-          !flags.todos.includes(message.id) &&
-          !isDoneMessage(message, flags) &&
-          !flags.snoozed.includes(message.id),
+          !workflow.todos.includes(message.id) &&
+          !isDoneMessage(message, compatibleWorkflow) &&
+          !workflow.snoozed.includes(message.id),
       ).length,
     }),
-    [flags, state.inboxMessages],
+    [state.inboxMessages, workflow],
   );
   const localCategory = isLocalMailboxView(mailboxView);
 
@@ -3807,9 +4026,11 @@ export function HomeView() {
         inboxMessagesWithDrafts,
         inboxSnapshotMessagesWithDrafts,
         flags,
-      ).filter((message) => !isDoneMessage(message, flags)),
+        compatibleWorkflow,
+      ).filter((message) => !isDoneMessage(message, compatibleWorkflow)),
     [
       flags,
+      compatibleWorkflow,
       inboxMessagesWithDrafts,
       inboxSnapshotMessagesWithDrafts,
     ],
@@ -3819,13 +4040,18 @@ export function HomeView() {
     const useWorkflowSource =
       mailboxView === "inbox" &&
       (filter === "search" || filter.startsWith("category:"));
-    const resolved = useWorkflowSource
-      ? workflowAwareInboxMessages
+    const resolved = filter === "search"
+      ? state.indexedSearchQuery === activeSearch
+        ? state.indexedSearchMessages
+        : []
+      : useWorkflowSource
+        ? workflowAwareInboxMessages
       : resolveSourceMessages(
           mailboxView,
           inboxMessagesWithDrafts,
           inboxSnapshotMessagesWithDrafts,
           flags,
+          compatibleWorkflow,
         );
     if (mailboxView !== "drafts") return resolved;
     const composeMessages: InboxMessage[] = composeDrafts.map((draft) => ({
@@ -3852,20 +4078,22 @@ export function HomeView() {
     mailbox,
     mailboxView,
     workflowAwareInboxMessages,
+    compatibleWorkflow,
+    state.indexedSearchMessages,
   ]);
   const inboxSplitMessages = useMemo(() => {
     // Important/Other 仍排除 todos/snoozed（由置顶区展示）；自定义 Split 与 is:unread 同数据源
     const plainInbox = workflowAwareInboxMessages.filter(
       (message) =>
-        !flags.todos.includes(message.id) &&
-        !flags.snoozed.includes(message.id),
+        !workflow.todos.includes(message.id) &&
+        !workflow.snoozed.includes(message.id),
     );
     return splitInboxMessages(
       plainInbox,
       state.inboxSettings,
       workflowAwareInboxMessages,
     );
-  }, [flags.snoozed, flags.todos, state.inboxSettings, workflowAwareInboxMessages]);
+  }, [workflow, state.inboxSettings, workflowAwareInboxMessages]);
   const [splitsOpen, setSplitsOpen] = useState(false);
 
   const messagesInThread = useCallback(
@@ -3893,35 +4121,41 @@ export function HomeView() {
       enabled: boolean,
       snoozeUntil?: string,
     ) => {
-      const ids = new Set(messages.map((item) => item.id));
-      setFlags((current) => {
-        const next = {
-          ...current,
-          saved: { ...current.saved },
-          snoozedUntil: { ...(current.snoozedUntil || {}) },
-        };
-        for (const workflowKind of ["todos", "snoozed", "done"] as const) {
-          const retained = current[workflowKind].filter((id) => !ids.has(id));
-          next[workflowKind] =
-            enabled && workflowKind === kind ? [...retained, ...ids] : retained;
+      const snapshot: InboxWorkflowState = {
+        ...workflowRef.current,
+        todos: [...workflowRef.current.todos],
+        snoozed: [...workflowRef.current.snoozed],
+        done: [...workflowRef.current.done],
+        snoozedUntil: { ...workflowRef.current.snoozedUntil },
+      };
+      const ids = messages.map((item) => item.id);
+      workflowMutationQueue.current = workflowMutationQueue.current.then(async () => {
+        const nextWorkflow = transitionInboxWorkflow(workflowRef.current, kind, ids, enabled, snoozeUntil);
+        workflowRef.current = nextWorkflow;
+        const sentIds = kind === "done" ? messages.filter(isSentMessage).map((item) => item.id) : [];
+        setFlags((current) => {
+          const doneRemoved = enabled
+            ? current.doneRemoved.filter((id) => !ids.includes(id))
+            : [...current.doneRemoved.filter((id) => !ids.includes(id)), ...sentIds];
+          const next = {
+            ...current,
+            // Only saved/doneRemoved remain in this compatibility cache.
+            doneRemoved: [...new Set(doneRemoved)],
+            saved: { ...current.saved, ...Object.fromEntries(messages.map((item) => [item.id, item])) },
+          };
+          void setMailFlags(mailbox, next);
+          return next;
+        });
+        const saved = await actions.saveInboxWorkflowState(nextWorkflow, mailbox);
+        if (saved === false) {
+          const reloaded = await actions.loadInboxWorkflowState(mailbox);
+          if (reloaded) workflowRef.current = reloaded;
+          actions.showToast(t("toast.workflowSaveFailed"));
         }
-        for (const id of ids) delete next.snoozedUntil[id];
-        if (enabled && kind === "snoozed" && snoozeUntil) {
-          for (const id of ids) next.snoozedUntil[id] = snoozeUntil;
-        }
-        if (kind === "done") {
-          const sentIds = messages.filter(isSentMessage).map((item) => item.id);
-          const removed = current.doneRemoved.filter((id) => !ids.has(id));
-          next.doneRemoved = enabled ? removed : [...removed, ...sentIds];
-        } else {
-          next.doneRemoved = current.doneRemoved;
-        }
-        for (const item of messages) next.saved[item.id] = item;
-        void setMailFlags(mailbox, next);
-        return next;
-      });
+      }).catch(() => undefined);
+      return snapshot;
     },
-    [mailbox],
+    [actions, mailbox],
   );
 
   // AI 整理确认：后端 mark_read 后由事件写入本地 Done（与 Inbox Done 对齐）
@@ -3963,34 +4197,20 @@ export function HomeView() {
   }, [mailbox, setWorkflowFlag, state.inboxMessages]);
 
   const restoreWorkflowFlags = useCallback(
-    (messages: InboxMessage[], previous: MailUiFlags) => {
+    (messages: InboxMessage[], previous: InboxWorkflowState) => {
       const ids = new Set(messages.map((item) => item.id));
-      setFlags((current) => {
-        const next = {
-          ...current,
-          saved: { ...current.saved },
-          snoozedUntil: { ...(current.snoozedUntil || {}) },
-        };
-        for (const workflowKind of ["todos", "snoozed", "done"] as const) {
-          next[workflowKind] = [
-            ...current[workflowKind].filter((id) => !ids.has(id)),
-            ...previous[workflowKind].filter((id) => ids.has(id)),
-          ];
+      const next = restoreInboxWorkflow(workflowRef.current, previous, ids);
+      workflowRef.current = next;
+      workflowMutationQueue.current = workflowMutationQueue.current.then(async () => {
+        const saved = await actions.saveInboxWorkflowState(next, mailbox);
+        if (saved === false) {
+          const reloaded = await actions.loadInboxWorkflowState(mailbox);
+          if (reloaded) workflowRef.current = reloaded;
+          actions.showToast(t("toast.workflowSaveFailed"));
         }
-        for (const id of ids) {
-          if (previous.snoozedUntil?.[id])
-            next.snoozedUntil[id] = previous.snoozedUntil[id];
-          else delete next.snoozedUntil[id];
-        }
-        next.doneRemoved = [
-          ...current.doneRemoved.filter((id) => !ids.has(id)),
-          ...previous.doneRemoved.filter((id) => ids.has(id)),
-        ];
-        void setMailFlags(mailbox, next);
-        return next;
-      });
+      }).catch(() => undefined);
     },
-    [mailbox],
+    [actions, mailbox],
   );
 
   const prefetchMessageBody = async (message: InboxMessage) => {
@@ -4118,19 +4338,23 @@ export function HomeView() {
     const includeWorkflowInInbox =
       filter === "search" || filter.startsWith("category:");
     return sourceMessages.filter((message) => {
-      const matchesView =
+      // 索引搜索已经在后端对全部本地缓存完成过滤；不能再按当前文件夹
+      // 的 Todo/Done 投影二次排除，否则 is:done 等查询会丢失合法结果。
+      const matchesView = filter === "search"
+        ? true
+        :
         mailboxView === "inbox"
           ? includeWorkflowInInbox
-            ? !isDoneMessage(message, flags)
-            : !flags.todos.includes(message.id) &&
-              !isDoneMessage(message, flags) &&
-              !flags.snoozed.includes(message.id)
+            ? !isDoneMessage(message, compatibleWorkflow)
+            : !workflow.todos.includes(message.id) &&
+              !isDoneMessage(message, compatibleWorkflow) &&
+              !workflow.snoozed.includes(message.id)
           : mailboxView === "todos"
-            ? flags.todos.includes(message.id)
+            ? workflow.todos.includes(message.id)
             : mailboxView === "snoozed"
-              ? flags.snoozed.includes(message.id)
+              ? workflow.snoozed.includes(message.id)
               : mailboxView === "done"
-                ? isDoneMessage(message, flags)
+                ? isDoneMessage(message, compatibleWorkflow)
                 : mailboxView === "starred"
                   ? isStarredMessage(message)
                   : true;
@@ -4144,9 +4368,10 @@ export function HomeView() {
               : Boolean(splitMessageIds?.has(message.id));
       if (!matchesView) return false;
       if (!matchesFilter) return false;
+      if (filter === "search") return true;
       if (!activeSearch.trim() || parsedActiveSearch.error) return true;
       return matchInboxQuery(message, parsedActiveSearch, undefined, {
-        todoIds: flags.todos,
+        todoIds: workflow.todos,
       });
     });
   }, [
@@ -4157,6 +4382,7 @@ export function HomeView() {
     mailboxView,
     parsedActiveSearch,
     sourceMessages,
+    state.indexedSearchMessages,
   ]);
 
   useEffect(() => {
@@ -4230,12 +4456,12 @@ export function HomeView() {
     return uniqueLatestInboxThreads(
       [...byId.values()].filter(
         (message) =>
-          isStarredMessage(message) || flags.todos.includes(message.id),
+          isStarredMessage(message) || workflow.todos.includes(message.id),
       ),
     );
   }, [
     flags.saved,
-    flags.todos,
+    workflow.todos,
     state.inboxMessages,
     state.inboxSnapshotMessages,
   ]);
@@ -4547,7 +4773,7 @@ export function HomeView() {
             0,
             excludeMessageIds,
           );
-          if (loadedAll) actions.showToast("Loaded all inbox emails.");
+          if (loadedAll) actions.showToast(t("toast.loadedAllEmails"));
           return loadedAll;
         }
         const result = await actions.refreshInboxEmails(
@@ -4874,7 +5100,7 @@ export function HomeView() {
     }
     const normalImportant = displayedVisible.filter(
       (message) =>
-        !isStarredMessage(message) && !flags.todos.includes(message.id),
+        !isStarredMessage(message) && !workflow.todos.includes(message.id),
     );
     // pinned（星标/Todo）与列表最新条可能是同 thread 不同 message_id，合并后先按 thread 折叠
     const source =
@@ -4885,7 +5111,7 @@ export function HomeView() {
               ...normalImportant,
             ]),
             state.inboxSettings,
-            new Set(flags.todos),
+            new Set(workflow.todos),
           ).flatMap((group) =>
             group.kind === "important"
               ? group.messages
@@ -4912,7 +5138,7 @@ export function HomeView() {
   }, [
     displayedVisible,
     filter,
-    flags.todos,
+    workflow.todos,
     locale,
     mailboxView,
     pinnedImportantMessages,
@@ -4926,9 +5152,9 @@ export function HomeView() {
           (category) => category.id === filter.slice("category:".length),
         )
       : undefined;
-    const doneIds = new Set(flags.done);
+    const doneIds = new Set(workflow.done);
     for (const message of sourceMessages) {
-      if (isDoneMessage(message, flags)) doneIds.add(message.id);
+      if (isDoneMessage(message, compatibleWorkflow)) doneIds.add(message.id);
     }
     for (const id of flags.doneRemoved) doneIds.delete(id);
     const compactIds = (ids: Iterable<string>) => Array.from(new Set(ids))
@@ -4940,9 +5166,9 @@ export function HomeView() {
       inbox_group: filter,
       search_input: search.slice(0, 500),
       active_search: activeSearch.slice(0, 500),
-      todo_message_ids: compactIds(flags.todos),
+      todo_message_ids: compactIds(workflow.todos),
       done_message_ids: compactIds(doneIds),
-      snoozed_message_ids: compactIds(flags.snoozed),
+      snoozed_message_ids: compactIds(workflow.snoozed),
       ...(customCategory ? {
         custom_category: {
           id: customCategory.id,
@@ -5015,15 +5241,15 @@ export function HomeView() {
 
   const detailFlags = useMemo(
     () => ({
-      todos: flags.todos,
-      snoozed: flags.snoozed,
+      todos: workflow.todos,
+      snoozed: workflow.snoozed,
       done: [
         ...new Set([
-          ...flags.done,
+          ...workflow.done,
           ...sourceMessages
-            .filter((message) => isDoneMessage(message, flags))
+            .filter((message) => isDoneMessage(message, compatibleWorkflow))
             .map((message) => message.id),
-          ...(selectedMessage && isDoneMessage(selectedMessage, flags)
+          ...(selectedMessage && isDoneMessage(selectedMessage, compatibleWorkflow)
             ? [selectedMessage.id]
             : []),
         ]),
@@ -5186,7 +5412,8 @@ export function HomeView() {
       setBatchBusy(true);
       setSelectionMoreOpen(false);
       try {
-        const ids = selectedInboxMessages.map((message) => message.id);
+        const expandedMessages = expandInboxThreadMessages(selectedInboxMessages, messagesInThread);
+        const ids = expandedMessages.map((message) => message.id);
         const toastMessage = (count: number) =>
           action === "trash" ? t("toast.movedCountTrash", { count })
             : action === "mark_done" ? t("toast.markedCountDone", { count })
@@ -5196,15 +5423,15 @@ export function HomeView() {
                     : t("toast.markedCountRead", { count });
         const showUndoToast = (
           result: { count: number; undo?: () => Promise<boolean> },
-          previousFlags?: MailUiFlags,
+          previousWorkflow?: InboxWorkflowState,
         ) => {
           actions.showToast(toastMessage(result.count), {
             actionLabel: t("toast.undo"),
             durationMs: 6_000,
             onAction: () => {
               void result.undo?.().then((restored) => {
-                if (restored && previousFlags) {
-                  restoreWorkflowFlags(selectedInboxMessages, previousFlags);
+                if (restored && previousWorkflow) {
+                  restoreWorkflowFlags(expandedMessages, previousWorkflow);
                 }
               });
             },
@@ -5212,13 +5439,13 @@ export function HomeView() {
         };
         if (action === "mark_done") {
           // Gmail mark_read / 移出 INBOX 成功后再写本地 Done 样式
-          const previous = flags;
+          const previous = workflow;
           const result = await actions.batchInboxActions(ids, "mark_done");
           if (!result.ok) {
             actions.showToast(t("toast.failedMarkDone"));
             return;
           }
-          setWorkflowFlag("done", selectedInboxMessages, true);
+          setWorkflowFlag("done", expandedMessages, true);
           clearListSelection();
           showUndoToast(result, previous);
           return;
@@ -5293,7 +5520,7 @@ export function HomeView() {
           artifact.mailbox.trim().toLowerCase() ||
         currentMailContext.thread_id !== artifact.thread_id
       ) {
-        actions.showToast("Open the matching email before applying this draft.");
+        actions.showToast(t("toast.openEmailFirst"));
         return;
       }
       if (drawerCloseTimer.current) {
@@ -5369,6 +5596,7 @@ export function HomeView() {
           t("toast.willSendIn", { seconds }),
         sendingMessage: t("toast.sending"),
         pendingMessage: t("toast.pendingSend"),
+        undoLabel: t("toast.undo"),
         onUndo: () => {
           setExternalDetailMessage(args.message);
           setReplyDraftRestore({
@@ -5401,7 +5629,7 @@ export function HomeView() {
           }
           void actions.silentSyncInbox();
           await actions.deleteInboxThreadDraft(args.mailbox, args.threadId);
-          actions.showToast("Email sent.");
+          actions.showToast(t("toast.emailSent"));
         },
         onError: (reason) =>
           {
@@ -5447,6 +5675,7 @@ export function HomeView() {
           t("toast.willSendIn", { seconds }),
         sendingMessage: t("toast.sending"),
         pendingMessage: t("toast.pendingSend"),
+        undoLabel: t("toast.undo"),
         onUndo: () => {
           setExternalDetailMessage(args.message);
           setReplyDraftRestore({
@@ -5479,7 +5708,7 @@ export function HomeView() {
             throw new Error(result?.error || "Failed to forward email");
           }
           void actions.silentSyncInbox();
-          actions.showToast("Email sent.");
+          actions.showToast(t("toast.emailSent"));
         },
         onError: (reason) =>
           actions.showToast(
@@ -5642,7 +5871,7 @@ export function HomeView() {
     async (target: AskMailLink) => {
       const targetMailbox = target.mailbox.trim().toLowerCase();
       if (!targetMailbox || !target.thread_id) {
-        actions.showToast("This email reference is incomplete.");
+        actions.showToast(t("toast.emailReferenceIncomplete"));
         return;
       }
       const openToken = ++aiDetailOpenTokenRef.current;
@@ -5753,14 +5982,14 @@ export function HomeView() {
         untrash: "trash",
       };
       const notices: Record<InboxThreadStateOperation, string> = {
-        mark_read: "Marked as read.",
-        mark_unread: "Marked as unread.",
-        star: "Thread starred.",
-        unstar: "Stars removed.",
-        mark_important: "Marked as important.",
-        mark_not_important: "Marked as not important.",
-        trash: "Moved to trash.",
-        untrash: "Removed from trash.",
+        mark_read: t("toast.markedAsRead"),
+        mark_unread: t("toast.markedAsUnread"),
+        star: t("toast.threadStarred"),
+        unstar: t("toast.starsRemoved"),
+        mark_important: t("toast.markedImportant"),
+        mark_not_important: t("toast.markedNotImportant"),
+        trash: t("toast.movedToTrash"),
+        untrash: t("toast.removedFromTrash"),
       };
       // Gmail 成功后再改本地样式（含 STARS/TODOS 的 flags.saved）
       const applyLocalAfterGmail = () => {
@@ -5808,7 +6037,7 @@ export function HomeView() {
         applyLocalAfterGmail();
         if (message.thread_id) closeDetailDrawer();
         actions.showToast(notices[operation], {
-          actionLabel: "Undo",
+          actionLabel: t("toast.undo"),
           onAction: () => {
             void (async () => {
               try {
@@ -5917,8 +6146,8 @@ export function HomeView() {
 
   const toggleDoneState = useCallback(
     (message: InboxMessage, closeAfter = false) => {
-      const wasDone = isDoneMessage(message, flags);
-      const previous = flags;
+      const wasDone = isDoneMessage(message, compatibleWorkflow);
+      const previous = workflow;
       const messages = messagesInThread(message);
       setWorkflowFlag("done", messages, !wasDone);
       if (!wasDone) {
@@ -5930,7 +6159,7 @@ export function HomeView() {
       actions.showToast(wasDone ? t("toast.movedToInbox") : t("toast.markedDone"), {
         actionLabel: t("toast.undo"),
         onAction: () => restoreWorkflowFlags(messages, previous),
-        secondaryActionLabel: "View",
+        secondaryActionLabel: t("toast.view"),
         onSecondaryAction: () => {
           setMailboxView(wasDone ? "inbox" : "done");
           setFilter(isImportantMessage(message) ? "important" : "other");
@@ -5958,15 +6187,15 @@ export function HomeView() {
         return;
       }
       const messages = messagesInThread(message);
-      const enabled = flags[kind].includes(message.id);
+      const enabled = workflow[kind].includes(message.id);
       if (kind === "todos") {
         if (enabled) return;
-        const previous = flags;
+        const previous = workflow;
         setWorkflowFlag("todos", messages, true);
-        actions.showToast("Added to Todo.", {
-          actionLabel: "Undo",
+        actions.showToast(t("toast.addedTodo"), {
+          actionLabel: t("toast.undo"),
           onAction: () => restoreWorkflowFlags(messages, previous),
-          secondaryActionLabel: "View",
+          secondaryActionLabel: t("toast.view"),
           onSecondaryAction: () => {
             setMailboxView("todos");
             setFolderOpen(false);
@@ -5989,15 +6218,15 @@ export function HomeView() {
 
   const handleTodoFromDetail = useCallback(
     (message: InboxMessage) => {
-      if (flags.todos.includes(message.id)) return;
-      const previous = flags;
+      if (workflow.todos.includes(message.id)) return;
+      const previous = workflow;
       const messages = messagesInThread(message);
       setWorkflowFlag("todos", messages, true);
       closeDetailDrawer();
-      actions.showToast("Added to Todo.", {
-        actionLabel: "Undo",
+      actions.showToast(t("toast.addedTodo"), {
+        actionLabel: t("toast.undo"),
         onAction: () => restoreWorkflowFlags(messages, previous),
-        secondaryActionLabel: "View",
+        secondaryActionLabel: t("toast.view"),
         onSecondaryAction: () => {
           setMailboxView("todos");
           setFolderOpen(false);
@@ -6024,12 +6253,12 @@ export function HomeView() {
 
   const openSnoozePicker = useCallback(
     (message: InboxMessage) => {
-      if (mailboxView === "snoozed" || flags.snoozed.includes(message.id)) {
-        const previous = flags;
+      if (mailboxView === "snoozed" || workflow.snoozed.includes(message.id)) {
+        const previous = workflow;
         const messages = messagesInThread(message);
         setWorkflowFlag("snoozed", messages, false);
-        actions.showToast("Snooze removed.", {
-          actionLabel: "Undo",
+        actions.showToast(t("toast.snoozeRemoved"), {
+          actionLabel: t("toast.undo"),
           onAction: () => restoreWorkflowFlags(messages, previous),
         });
         return;
@@ -6050,13 +6279,17 @@ export function HomeView() {
     (isoTime: string) => {
       const target = snoozeTarget;
       if (!target) return;
-      const previous = flags;
+      const previous = workflow;
       // 多选延后：若当前有勾选且包含目标，对全部勾选生效
-      const bulk =
+      const bulk = expandInboxThreadMessages(
+        (
         selectedInboxMessages.length > 1 &&
         selectedInboxMessages.some((message) => message.id === target.id)
           ? selectedInboxMessages
-          : messagesInThread(target);
+          : [target]
+        ),
+        messagesInThread,
+      );
       setSnoozeTarget(null);
       setWorkflowFlag("snoozed", bulk, true, isoTime);
       if (bulk.some((message) => message.id === selectedId)) {
@@ -6160,13 +6393,13 @@ export function HomeView() {
   };
 
   const markTimelineDone = (messages: InboxMessage[]) => {
-    const previous = flags;
+    const previous = workflow;
     setWorkflowFlag("done", messages, true);
     void syncDoneMessagesRead(messages);
-    actions.showToast("Marked as done.", {
-      actionLabel: "Undo",
+    actions.showToast(t("toast.markedDone"), {
+      actionLabel: t("toast.undo"),
       onAction: () => restoreWorkflowFlags(messages, previous),
-      secondaryActionLabel: "View",
+      secondaryActionLabel: t("toast.view"),
       onSecondaryAction: () => {
         setMailboxView("done");
         setFolderOpen(false);
@@ -6182,6 +6415,7 @@ export function HomeView() {
           t("toast.willSendIn", { seconds }),
         sendingMessage: t("toast.sending"),
         pendingMessage: t("toast.pendingSend"),
+        undoLabel: t("toast.undo"),
         onUndo: () => {
           void actions.deleteComposeDraft(mailbox, draft.id).catch(() => undefined);
           if (composeCloseTimer.current)
@@ -6237,7 +6471,7 @@ export function HomeView() {
         selectedComposeDraftIds.has(`compose:${draft.id}`),
       );
       if (!selected.length) {
-        actions.showToast("Select a Compose draft to send.");
+        actions.showToast(t("toast.selectComposeDraft"));
         return;
       }
       const incomplete = selected.filter(
@@ -6262,6 +6496,7 @@ export function HomeView() {
           t("toast.batchWillSendIn", { count: selected.length, seconds }),
         sendingMessage: t("toast.sendingDrafts"),
         pendingMessage: t("toast.pendingSend"),
+        undoLabel: t("toast.undo"),
         onUndo: () => undefined,
         onSend: async () => {
           const results = await actions.sendComposeEmails(mailbox, selected);
@@ -6311,6 +6546,27 @@ export function HomeView() {
     [actions, mailbox, scheduleComposeSend],
   );
 
+  const saveBatchComposeArtifacts = useCallback(
+    async (artifacts: ComposeDraftArtifact[]) => {
+      const valid = artifacts.filter((artifact) =>
+        artifact.recipients?.length && artifact.subject?.trim() && artifact.body.trim(),
+      );
+      if (valid.length !== artifacts.length) {
+        throw new Error("请先补全每封草稿的收件人、主题和正文。");
+      }
+      const saved = await Promise.all(valid.map((artifact) => actions.saveComposeDraft(
+        artifact.mailbox || mailbox,
+        { recipients: artifact.recipients || [], subject: artifact.subject || "", body: artifact.body },
+      )));
+      setComposeDrafts((current) => [
+        ...saved,
+        ...current.filter((draft) => !saved.some((item) => item.id === draft.id)),
+      ]);
+      actions.showToast(t("ai.saveDraftsSaved", { count: saved.length }));
+    },
+    [actions, mailbox, t],
+  );
+
   useEffect(
     () => () => {
       pendingSendScheduler.current?.dispose();
@@ -6356,6 +6612,7 @@ export function HomeView() {
           }
           setComposeInsertRequest({ nonce: crypto.randomUUID(), artifact });
         }}
+        onSaveComposeArtifacts={saveBatchComposeArtifacts}
         onOpenMail={(target) => void openMailDetailFromAi(target)}
         onConfirmSendPlan={confirmAiSendPlan}
         composerFocusKey={aiComposerFocusKey}
@@ -6776,11 +7033,11 @@ export function HomeView() {
                         setSidebarCollapsed(false);
                         actions.setInput(
                           "customScanInput",
-                          "Draft short replies for each selected email",
+                          t("mail.bulk.batchAiDraftPrompt"),
                         );
                         setAiComposerFocusKey((key) => key + 1);
-                        actions.showToast("AI draft prompt is ready.", {
-                          actionLabel: "Undo",
+                        actions.showToast(t("toast.aiDraftPromptReady"), {
+                          actionLabel: t("toast.undo"),
                           onAction: () => {
                             actions.setInput("customScanInput", previousInput);
                             setSidebarCollapsed(wasSidebarCollapsed);
@@ -6862,6 +7119,11 @@ export function HomeView() {
               </div>
             </div>
           ) : null}
+          {filter === "search" && activeSearch && state.indexedSearchHasMore ? (
+            <div className="mail-sync-banner" role="status">
+              <span>Showing the first 200 matches from the local mail index. Refine your search to narrow the results.</span>
+            </div>
+          ) : null}
           {gmailAuthorizationRequired ? (
             <div
               className="mail-empty mail-auth-guide"
@@ -6908,6 +7170,21 @@ export function HomeView() {
                 {gmailAuthorizationError(state.gmailAuthStatus.source)}
               </p>
             </div>
+          ) : filter === "search" && activeSearch && state.indexedSearchLoading ? (
+            <div className="mail-loading" aria-label="Searching the local mail index">
+              {[1, 2, 3].map((item) => (
+                <span key={item} />
+              ))}
+            </div>
+          ) : filter === "search" && activeSearch && state.indexedSearchError ? (
+            <div className="mail-empty">
+              <SearchIcon />
+              <h2>Search could not be completed</h2>
+              <p>{state.indexedSearchError}</p>
+              <button onClick={() => void searchIndexedEmailsRef.current(activeSearch).catch(() => undefined)}>
+                {t("mail.tryAgain")}
+              </button>
+            </div>
           ) : !localCategory && state.inboxLoading && !sourceMessages.length ? (
             <div className="mail-loading">
               {[1, 2, 3, 4, 5, 6].map((item) => (
@@ -6927,6 +7204,13 @@ export function HomeView() {
               </button>
             </div>
           ) : !grouped.some((group) => group.messages.length) ? (
+            filter === "search" && activeSearch ? (
+              <div className="mail-empty">
+                <SearchIcon />
+                <h2>{t("mail.noResults")}</h2>
+                <p>Searches cover the local indexed mailbox and do not fetch Gmail while you type.</p>
+              </div>
+            ) :
             mailboxView !== "inbox" && mailboxView !== "all" ? (
               <div className="mail-empty is-category-empty">
                 <SearchIcon />
@@ -6974,6 +7258,7 @@ export function HomeView() {
                       mailboxView={mailboxView}
                       mailbox={mailbox}
                       flags={flags}
+                      workflow={compatibleWorkflow}
                       selected={selectedId === message.id}
                       avatarUrl={contactAvatars[avatarEmail]}
                       onPrefetch={() => void prefetchMessageBody(message)}

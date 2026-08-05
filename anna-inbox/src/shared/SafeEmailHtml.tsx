@@ -98,6 +98,29 @@ function copyAttributes(from: Element, to: Element) {
   });
 }
 
+function normalizeImages(root: HTMLElement, inlineImageMap?: SafeInlineImageMap) {
+  root.querySelectorAll("img[src]").forEach((node) => {
+    const image = node as HTMLImageElement;
+    const source = image.getAttribute("src") || "";
+    if (/^cid:/i.test(source)) {
+      const key = source.slice(4).trim().replace(/^<|>$/g, "");
+      const mapped = inlineImageMap?.[key] || inlineImageMap?.[source];
+      if (mapped && isSafeInlineImageUrl(mapped)) image.setAttribute("src", mapped);
+      else replaceWithAltText(image);
+      return;
+    }
+
+    // 邮件中的远程图片可能已过期或要求特定 Cookie/Referer。提前移除它们，避免
+    // 失效的 CDN 请求污染控制台，同时只允许已下载到本地的内嵌图片继续展示。
+    if (!isSafeInlineImageUrl(source)) replaceWithAltText(image);
+  });
+}
+
+function replaceWithAltText(image: HTMLImageElement) {
+  const alt = image.getAttribute("alt")?.trim();
+  image.replaceWith(alt ? document.createTextNode(alt) : document.createComment("blocked email image"));
+}
+
 function paragraphFrom(nodes: ChildNode[], attributesFrom?: Element) {
   const paragraph = document.createElement("p");
   if (attributesFrom) copyAttributes(attributesFrom, paragraph);
@@ -186,7 +209,9 @@ export function splitTextParagraphs(text: string) {
 export function SafeEmailHtml({ html, className = "", inlineImageMap, onRendered }: { html: string; className?: string; scaleToFit?: boolean; inlineImageMap?: SafeInlineImageMap; onRendered?: () => void }) {
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const [frameHeight, setFrameHeight] = useState(160);
+  const [frameReady, setFrameReady] = useState(false);
   const [documentRevision, setDocumentRevision] = useState(0);
+  const loadedRef = useRef(false);
   const sanitized = useMemo(() => {
     const value = DOMPurify.sanitize(html, {
       USE_PROFILES: { html: true },
@@ -200,17 +225,7 @@ export function SafeEmailHtml({ html, className = "", inlineImageMap, onRendered
     container.appendChild(value as DocumentFragment);
     // DOMPurify 是主防线；这里再做一次最终节点级过滤，避免异常 HTML 变体进入 srcdoc。
     container.querySelectorAll("script, iframe, object, embed, form").forEach((node) => node.remove());
-    container.querySelectorAll("img[src]").forEach((node) => {
-      const image = node as HTMLImageElement;
-      const source = image.getAttribute("src") || "";
-      if (!/^cid:/i.test(source)) return;
-      const key = source.slice(4).trim().replace(/^<|>$/g, "");
-      const mapped = inlineImageMap?.[key] || inlineImageMap?.[source];
-      // Only caller-provided local data/blob URLs may replace a cid. An absent
-      // mapping must not turn a private inline image into a network request.
-      if (mapped && isSafeInlineImageUrl(mapped)) image.setAttribute("src", mapped);
-      else image.removeAttribute("src");
-    });
+    normalizeImages(container, inlineImageMap);
     normalizeDocumentMarkup(container);
     normalizeTables(container);
     normalizeTextEmailBlocks(container);
@@ -221,6 +236,13 @@ export function SafeEmailHtml({ html, className = "", inlineImageMap, onRendered
     return hasDisplayContent ? container.innerHTML : `<p>${EMPTY_EMAIL_MESSAGE}</p>`;
   }, [html, inlineImageMap]);
   const srcDoc = useMemo(() => buildEmailSrcDoc(sanitized), [sanitized]);
+
+  // 正文内容变化时先隐藏 iframe，待新文档加载并完成测高后再显示，
+  // 避免以错误高度（初始 160 逐步增长）渲染造成外层滚动条抖动。
+  useEffect(() => {
+    loadedRef.current = false;
+    setFrameReady(false);
+  }, [srcDoc]);
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -239,6 +261,8 @@ export function SafeEmailHtml({ html, className = "", inlineImageMap, onRendered
           1,
         );
         setFrameHeight((current) => (current === nextHeight ? current : nextHeight));
+        // 仅当当前 srcDoc 已加载完成才显示，避免瞬时暴露旧文档或未完成布局的内容。
+        if (loadedRef.current) setFrameReady(true);
       });
     };
 
@@ -276,8 +300,9 @@ export function SafeEmailHtml({ html, className = "", inlineImageMap, onRendered
       srcDoc={srcDoc}
       sandbox="allow-same-origin allow-popups"
       title="Email content"
-      style={{ height: frameHeight }}
+      style={{ height: frameHeight, visibility: frameReady ? "visible" : "hidden" }}
       onLoad={() => {
+        loadedRef.current = true;
         setDocumentRevision((current) => current + 1);
         onRendered?.();
       }}

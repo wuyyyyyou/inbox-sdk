@@ -1,8 +1,15 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { PlusIcon, accountDisplayName, aiSearchStatus, aiThinkingElapsedLabel, formatInboxTabCount, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, inboxLastSyncedLabel, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isMailFeedNearBottom, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, resolveSourceMessages, senderParts, shouldShowImportantIcon } from "./HomeView";
+import { PlusIcon, accountDisplayName, aiSearchStatus, aiThinkingElapsedLabel, formatInboxTabCount, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, inboxLastSyncedLabel, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isMailFeedNearBottom, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, renderAiUserMessageContent, resolveSourceMessages, restoreInboxWorkflow, senderParts, shouldShowImportantIcon, transitionInboxWorkflow } from "./HomeView";
 
 const homeViewSource = readFileSync(new URL("./HomeView.tsx", import.meta.url), "utf8");
+const workflowOf = (flags: { todos: string[]; snoozed: string[]; done: string[]; doneRemoved?: string[] }) => ({
+  todos: flags.todos,
+  snoozed: flags.snoozed,
+  done: flags.done,
+  snoozedUntil: {},
+  doneRemoved: flags.doneRemoved || [],
+});
 
 describe("display range switching", () => {
   it("reprojects the cached inbox instead of triggering a Gmail rescan", () => {
@@ -62,6 +69,38 @@ describe("mail detail complete body", () => {
   });
 });
 
+describe("AI user message rendering", () => {
+  it("renders submitted line breaks as explicit break elements", () => {
+    const nodes = renderAiUserMessageContent("first line\nsecond line\n\nthird line");
+
+    expect(nodes).toHaveLength(4);
+    expect(nodes[1].props.children[0].type).toBe("br");
+    expect(nodes[2].props.children[0].type).toBe("br");
+    expect(nodes[3].props.children[0].type).toBe("br");
+  });
+});
+
+describe("workflow transitions", () => {
+  const base = { todos: ["todo-1", "unrelated"], snoozed: ["snooze-1"], done: ["done-1"], snoozedUntil: { "snooze-1": "2026-01-01T00:00:00Z" } };
+
+  it("moves affected ids without overwriting unrelated ids", () => {
+    const next = transitionInboxWorkflow(base, "done", ["todo-1"], true);
+    expect(next.todos).toEqual(["unrelated"]);
+    expect(next.done).toEqual(["done-1", "todo-1"]);
+    expect(next.snoozed).toEqual(["snooze-1"]);
+  });
+
+  it("restores only affected ids and preserves newer unrelated changes", () => {
+    const changed = transitionInboxWorkflow(base, "snoozed", ["todo-1"], true, "2026-02-01T00:00:00Z");
+    const newer = transitionInboxWorkflow(changed, "done", ["unrelated"], true);
+    const restored = restoreInboxWorkflow(newer, base, ["todo-1"]);
+    expect(restored.todos).toEqual(["todo-1"]);
+    expect(restored.done).toEqual(["done-1", "unrelated"]);
+    expect(restored.snoozed).toEqual(["snooze-1"]);
+    expect(restored.snoozedUntil).toEqual(base.snoozedUntil);
+  });
+});
+
 describe("legacy AI draft preview", () => {
   it("only renders structured draft artifacts after confirmation", () => {
     expect(homeViewSource).not.toContain("parseLegacyDraftPreview(message)");
@@ -79,6 +118,43 @@ describe("legacy AI draft preview", () => {
 });
 
 describe("AI draft card layout", () => {
+  it("renders completed batch cards while the assistant is still generating", () => {
+    expect(homeViewSource).toContain("const pendingDraftArtifacts = message.artifacts || [];");
+    expect(homeViewSource).toContain("DraftReplyArtifactCard artifact={item} onUse={onUseArtifact}");
+  });
+
+  it("places draft cards before generation status and completed assistant text", () => {
+    const pendingStart = homeViewSource.indexOf("if (message.pending) {");
+    const pendingEnd = homeViewSource.indexOf("const result = message.result;", pendingStart);
+    const pendingBlock = homeViewSource.slice(pendingStart, pendingEnd);
+    expect(pendingBlock.indexOf("pendingComposeArtifacts.map")).toBeLessThan(pendingBlock.indexOf('t("ai.thinking")'));
+
+    const draftStart = homeViewSource.indexOf("const hasDraftArtifacts = Boolean(");
+    const draftEnd = homeViewSource.indexOf('<div className="ai-message-footer">', draftStart);
+    const draftBlock = homeViewSource.slice(draftStart, draftEnd);
+    expect(draftBlock.indexOf("BatchComposeDraftArtifacts")).toBeLessThan(draftBlock.lastIndexOf("<AnimatedAssistantText"));
+  });
+
+  it("does not offer retry after a response already produced draft artifacts", () => {
+    expect(homeViewSource).toContain('message.kind === "error" && !hasDraftArtifacts');
+  });
+
+  it("renders every batch compose card with a scrollable message body", () => {
+    expect(homeViewSource).toContain("message.composeArtifacts || []");
+    expect(homeViewSource).toContain("className=\"ai-draft-artifact-body\"");
+  });
+
+  it("localizes batch drafting prompts and draft artifact labels", () => {
+    expect(homeViewSource).toContain('t("mail.bulk.batchAiDraftPrompt")');
+    expect(homeViewSource).not.toContain("Draft short replies for each selected email");
+    expect(homeViewSource).toContain('t("ai.goToEmail")');
+    expect(homeViewSource).toContain('t("ai.draftFallbackTitle", { number: index + 1 })');
+    expect(homeViewSource).toContain('t("ai.replyDraft")');
+    expect(homeViewSource).toContain('t("ai.draftTo")');
+    expect(homeViewSource).toContain('t("ai.draftSubject")');
+    expect(homeViewSource).toContain('t("ai.draftMessage")');
+  });
+
   it("auto-expands the message editor and omits the second assistant follow-up", () => {
     expect(homeViewSource).toContain("textarea.style.height = \"auto\";");
     expect(homeViewSource).toContain("textarea.style.height = `${textarea.scrollHeight}px`;");
@@ -347,11 +423,11 @@ describe("mergeInboxSearchSourceMessages", () => {
       saved: { [todoOnly.id]: todoOnly },
     };
 
-    expect(resolveSourceMessages("inbox", [inboxMail], [inboxMail, todoOnly], flags).map((m) => m.id)).toEqual([
+    expect(resolveSourceMessages("inbox", [inboxMail], [inboxMail, todoOnly], flags, workflowOf(flags)).map((m) => m.id)).toEqual([
       "inbox-1",
     ]);
     expect(
-      mergeInboxSearchSourceMessages([inboxMail], [inboxMail, todoOnly], flags).map((m) => m.id),
+      mergeInboxSearchSourceMessages([inboxMail], [inboxMail, todoOnly], flags, workflowOf(flags)).map((m) => m.id),
     ).toEqual(["todo-1", "inbox-1"]);
   });
 
@@ -375,7 +451,7 @@ describe("mergeInboxSearchSourceMessages", () => {
       drafts: [],
       saved: { [saved.id]: saved },
     };
-    const merged = mergeInboxSearchSourceMessages([live], [live], flags);
+    const merged = mergeInboxSearchSourceMessages([live], [live], flags, workflowOf(flags));
     expect(merged).toHaveLength(1);
     expect(isUnreadMessage(merged[0])).toBe(false);
   });
@@ -398,9 +474,9 @@ describe("resolveSourceMessages", () => {
     };
 
     expect(isTrashMessage(trashed)).toBe(true);
-    expect(resolveSourceMessages("trash", [], [trashed], flags)).toEqual([trashed]);
+    expect(resolveSourceMessages("trash", [], [trashed], flags, workflowOf(flags))).toEqual([trashed]);
     for (const view of ["inbox", "todos", "starred", "snoozed", "done", "drafts", "sent", "all"] as const) {
-      expect(resolveSourceMessages(view, [], [trashed], flags)).toEqual([]);
+      expect(resolveSourceMessages(view, [], [trashed], flags, workflowOf(flags))).toEqual([]);
     }
     expect(trashed.label_ids).toEqual(["TRASH", "STARRED", "IMPORTANT", "SENT"]);
   });
@@ -410,7 +486,7 @@ describe("resolveSourceMessages", () => {
     const localDraft = { id: "local-draft", label_ids: ["TRASH"], internal_date: "200", draft_local: true };
     const flags = { todos: [], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: {} };
 
-    expect(resolveSourceMessages("trash", [], [gmailDraft, localDraft], flags)).toEqual([]);
+    expect(resolveSourceMessages("trash", [], [gmailDraft, localDraft], flags, workflowOf(flags))).toEqual([]);
   });
 
   it("uses current Gmail state instead of a stale saved workflow copy", () => {
@@ -418,7 +494,7 @@ describe("resolveSourceMessages", () => {
     const current = { ...saved, label_ids: ["TRASH", "STARRED"] };
     const flags = { todos: [saved.id], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: { [saved.id]: saved } };
 
-    expect(resolveSourceMessages("todos", [], [current], flags)).toEqual([]);
+    expect(resolveSourceMessages("todos", [], [current], flags, workflowOf(flags))).toEqual([]);
   });
 
   it("keeps a drafted starred message in both category projections", () => {
@@ -572,9 +648,9 @@ describe("resolveSourceMessages", () => {
     ];
     const flags = { todos: [], snoozed: [], done: ["done-1"], doneRemoved: [], drafts: [], saved: {} };
 
-    expect(resolveSourceMessages("done", [], snapshot, flags).map((message) => message.id)).toEqual(["sent-1", "done-1"]);
+    expect(resolveSourceMessages("done", [], snapshot, flags, workflowOf(flags)).map((message) => message.id)).toEqual(["sent-1", "done-1"]);
     expect(isSentMessage(snapshot[0])).toBe(true);
-    expect(isDoneMessage(snapshot[0], flags)).toBe(true);
+    expect(isDoneMessage(snapshot[0], workflowOf(flags))).toBe(true);
   });
 
   it("treats mailbox-authored mail as sent even without an explicit SENT label", () => {
@@ -588,15 +664,16 @@ describe("resolveSourceMessages", () => {
     const flags = { todos: [], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: {} };
 
     expect(isSentMessage(sentMessage)).toBe(true);
-    expect(isDoneMessage(sentMessage, flags)).toBe(true);
+    expect(isDoneMessage(sentMessage, workflowOf(flags))).toBe(true);
   });
 
   it("lets sent mail be moved back out of done", () => {
     const sentMessage = { id: "sent-1", label_ids: ["SENT"], internal_date: "300" };
     const flags = { todos: [], snoozed: [], done: [], doneRemoved: ["sent-1"], drafts: [], saved: {} };
 
-    expect(resolveSourceMessages("done", [], [sentMessage], flags)).toEqual([]);
-    expect(isDoneMessage(sentMessage, flags)).toBe(false);
+    expect(resolveSourceMessages("done", [], [sentMessage], flags, workflowOf(flags))).toEqual([]);
+    expect(resolveSourceMessages("all", [], [sentMessage], flags, workflowOf(flags))).toEqual([sentMessage]);
+    expect(isDoneMessage(sentMessage, workflowOf(flags))).toBe(false);
   });
 });
 

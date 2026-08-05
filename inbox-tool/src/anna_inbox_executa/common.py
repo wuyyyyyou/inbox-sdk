@@ -332,10 +332,24 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
-            "name": "sync_inbox_cache",
-            "description": "Incrementally synchronize third-party Gmail changes into the existing All-mail cache using Gmail History API. Does not modify Gmail.",
+            "name": "search_indexed_emails",
+            "description": "Search the complete local indexed email cache only; never calls Gmail.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
+                {"name": "query", "type": "string", "description": "Local email query.", "required": True},
+                {"name": "todo_message_ids", "type": "array", "description": "Frontend todo message ids for is:todo.", "required": False},
+                {"name": "done_message_ids", "type": "array", "description": "Frontend done message ids for is:done.", "required": False},
+                {"name": "snoozed_message_ids", "type": "array", "description": "Frontend snoozed message ids for is:snoozed.", "required": False},
+                {"name": "limit", "type": "integer", "description": "Maximum results, from 1 to 200.", "required": False},
+                {"name": "offset", "type": "integer", "description": "Zero-based offset within the complete matched index.", "required": False},
+            ],
+        },
+        {
+            "name": "sync_inbox_cache",
+            "description": "Incrementally synchronize Gmail changes into the existing All-mail cache and optionally repair recorded metadata gaps. Does not modify Gmail.",
+            "parameters": [
+                {"name": "mailbox", "type": "string", "description": "Mailbox email.", "required": True},
+                {"name": "repair_missing", "type": "boolean", "description": "Immediately retry recorded missing metadata without clearing the mailbox cache.", "required": False},
             ],
         },
         {
@@ -1517,6 +1531,23 @@ def _merge_partial(run_id: str, partial_update: dict[str, Any]) -> None:
     """合并 run 的 partial 进度字段（嵌套 dict 浅合并）。"""
     target = MAIL_AGENT_RUNS[run_id].setdefault("partial", {})
     for key, value in partial_update.items():
+        if key == "batch_compose_draft" and isinstance(value, dict):
+            # 前端轮询可能错过多次进度更新；在严格 5 封/1800 字符边界内累积，
+            # 既不漏卡片，也不会把大正文写入最终 result。
+            current = target.setdefault("batch_compose_drafts", [])
+            if isinstance(current, list):
+                signature = (
+                    str(value.get("recipient") or ""),
+                    str((value.get("artifact") or {}).get("body") or ""),
+                )
+                known = {
+                    (str(item.get("recipient") or ""), str((item.get("artifact") or {}).get("body") or ""))
+                    for item in current
+                    if isinstance(item, dict)
+                }
+                if signature not in known and len(current) < 5:
+                    current.append(value)
+            continue
         if isinstance(value, dict) and isinstance(target.get(key), dict):
             target[key].update(value)
         else:

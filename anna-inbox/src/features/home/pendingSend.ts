@@ -8,6 +8,7 @@ export type PendingSendOptions = {
   countdownMessage: (seconds: number) => string;
   sendingMessage: string;
   pendingMessage?: string;
+  undoLabel?: string;
   onUndo: () => void;
   onSend: () => Promise<void>;
   onError: (reason: unknown) => void;
@@ -63,7 +64,7 @@ export class PendingSendScheduler {
         Math.ceil((deadline - (this.dependencies.now?.() ?? Date.now())) / 1000),
       );
       this.dependencies.showToast(options.countdownMessage(seconds), {
-        actionLabel: "Undo",
+        actionLabel: options.undoLabel || "Undo",
         onAction: undo,
         durationMs: 1_100,
       });

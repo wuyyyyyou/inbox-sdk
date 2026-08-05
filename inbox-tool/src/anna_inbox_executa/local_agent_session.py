@@ -33,8 +33,10 @@ _P0_ANSWER_POLICY = (
     "For credential, ownership, access, payment, or verification requests, recommend an independently opened official site/support channel, never email links or supplied contacts, and never request credentials/codes.\n"
     "- Automated invoice, receipt, delivery, and no-reply mail normally needs no reply. If explicitly asked to reply, identify it as informational and offer only a brief acknowledgement. "
     "Refuse password sharing or money transfers; direct the user to official channels.\n"
+    "- For reply advice, address the latest inbound sender directly by default. Do not recommend Reply All merely because other people are in To/CC; use Reply All only when the user explicitly asks for it or says every recipient must receive the response.\n"
+    "- Keep the answer scoped to the user's request. Unless the user asks for them, omit unrelated automated pushes, newsletters, and informational mail; do not append a no-action explanation for those messages.\n"
     "- For time-window counts/lists, use only the matching evidence query and prefer its assistant_text. "
-    "For batch drafts, state the 20-mail limit before results. For each requested thread, keep its evidence and THREAD_REF separate; state exactly one of 等待我方处理, 等待对方回复, 我方无需操作. "
+    "For batch drafts, state the 20-mail limit before results. Keep each requested thread's evidence and THREAD_REF separate. "
     "If ownership, mapping, or evidence is ambiguous, say so instead of guessing."
 )
 
@@ -88,6 +90,121 @@ _DRAFT_PROPOSAL_HINT_RE = re.compile(
     r"(?:草稿正文|回复草稿|draft body|please confirm|请确认|是否生成|生成卡片|生成草稿)",
     re.IGNORECASE,
 )
+_BATCH_COMPOSE_CONFIRM_RE = re.compile(
+    r"^(?:yes|y|sure|ok|okay|continue|confirm|go ahead|do it|"
+    r"好的?|可以|开始吧|开始生成|确认|同意|继续|生成草稿|确认生成草稿)"
+    r"(?:[.!。！？\s]|确认|按此方案|生成|这|三|封|邮件|草稿)*$",
+    re.IGNORECASE,
+)
+_BATCH_COMPOSE_PROPOSAL_RE = re.compile(
+    r"(?:是否|请|可以)?确认.*(?:生成|准备).*(?:新)?(?:邮件|草稿)|"
+    r"(?:generate|prepare).*(?:new )?(?:emails?|drafts?).*(?:confirm|confirmation)",
+    re.IGNORECASE | re.DOTALL,
+)
+_EMAIL_ADDRESS_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+_DEFERRED_TEMPLATE_RE = re.compile(
+    r"(?:先不要|暂不|暂时不要).{0,24}(?:draft|草稿|起草|生成).*(?:模板|template|标题|subject|正文|body)|"
+    r"(?:模板|template).*(?:先不要|暂不|暂时不要).{0,24}(?:draft|草稿|起草|生成)",
+    re.IGNORECASE | re.DOTALL,
+)
+_TEMPLATE_USE_RE = re.compile(
+    r"(?:使用|用|根据|按照).{0,32}(?:模板|template|最开始|之前)|"
+    r"(?:替换|填充).{0,32}(?:方括号|占位符)|"
+    r"(?:生成|create|draft).{0,32}(?:草稿|draft|卡片)",
+    re.IGNORECASE,
+)
+_TEMPLATE_WAIT_FOR_DETAILS_RE = re.compile(
+    r"(?:接下来|之后|后续).{0,40}(?:输入|提供).{0,80}(?:生成|draft|草稿|卡片)|"
+    r"(?:输入|提供).{0,80}(?:之后|后).{0,40}(?:生成|draft|草稿|卡片)",
+    re.IGNORECASE,
+)
+_BATCH_COMPOSE_CONTINUE_RE = re.compile(
+    r"^(?:继续|下一批|继续生成|continue|next batch|go on)[.!。！？\s]*$",
+    re.IGNORECASE,
+)
+_SELECTED_BATCH_DRAFT_RE = re.compile(
+    r"(?:selected|each selected|选中|所选|每封).*(?:draft|reply|respond|起草|草稿|回复|回信)|"
+    r"(?:draft|reply|respond|起草|草稿|回复|回信).*(?:selected|选中|所选|每封)",
+    re.IGNORECASE,
+)
+
+
+def _local_draft_template(ui_context: dict[str, Any]) -> str:
+    """读取前端从完整本地会话派生的模板，拒绝模型伪造的上下文字段。"""
+    return str(ui_context.get("local_draft_template") or "").strip()
+
+
+def _is_deferred_template_capture_request(user_text: str) -> bool:
+    """判断本轮是否只登记模板而非立即生成，避免模型把未来时态误作执行指令。"""
+    return bool(_DEFERRED_TEMPLATE_RE.search(str(user_text or "")))
+
+
+def _is_local_template_compose_request(user_text: str, ui_context: dict[str, Any]) -> bool:
+    """仅在已暂存模板、用户声明等待资料且本轮提供联系人时直接进入新邮件起草。"""
+    if not _local_draft_template(ui_context):
+        return False
+    if not bool(ui_context.get("local_draft_template_awaiting_details")):
+        return False
+    if not _EMAIL_ADDRESS_RE.search(str(user_text or "")):
+        return False
+    return bool(_TEMPLATE_USE_RE.search(str(user_text or "")))
+
+
+def _is_local_template_waiting_request(user_text: str, ui_context: dict[str, Any]) -> bool:
+    """用户声明稍后提供资料时只进入等待态，不能让 Planner 提前生成草稿。"""
+    return bool(
+        _local_draft_template(ui_context)
+        and not _EMAIL_ADDRESS_RE.search(str(user_text or ""))
+        and _TEMPLATE_WAIT_FOR_DETAILS_RE.search(str(user_text or ""))
+    )
+
+
+def _continuation_batch_request(user_text: str, ui_context: dict[str, Any]) -> tuple[str, int] | None:
+    """从上一轮批量结果恢复原始请求和下一批偏移，不让 Sampling 重新猜测收件人。"""
+    if not _BATCH_COMPOSE_CONTINUE_RE.fullmatch(str(user_text or "").strip()):
+        return None
+    structured = ui_context.get("batch_compose_continuation")
+    if isinstance(structured, dict):
+        source = str(structured.get("source_prompt") or "").strip()
+        try:
+            offset = int(structured.get("offset") or 0)
+            remaining = int(structured.get("remaining") or 0)
+        except (TypeError, ValueError):
+            offset = remaining = 0
+        if source and offset > 0 and remaining > 0:
+            return source, offset
+    recent = ui_context.get("recent_conversation")
+    if not isinstance(recent, list):
+        return None
+    remaining = -1
+    for item in reversed(recent):
+        if not isinstance(item, dict) or str(item.get("role") or "") != "assistant":
+            continue
+        content = str(item.get("content") or "")
+        # 同时兼容“还有 6 位未生成”和“6 recipients remain”。
+        match = re.search(r"(?:还有\s*|remain(?:ing)?\s*)(\d+)|(\d+)\s+recipients?\s+remain", content, re.IGNORECASE)
+        if match:
+            remaining = int(match.group(1) or match.group(2))
+            break
+    if remaining <= 0:
+        return None
+    for item in reversed(recent):
+        if not isinstance(item, dict) or str(item.get("role") or "") != "user":
+            continue
+        source = str(item.get("content") or "").strip()
+        count = len(set(_EMAIL_ADDRESS_RE.findall(source)))
+        if count > remaining:
+            return source, count - remaining
+    return None
+
+
+def _is_multi_recipient_compose_request(user_text: str) -> bool:
+    """识别明确给出多个外部邮箱的新邮件任务，禁止交给 Planner 猜工具类型。"""
+    recipients = {
+        address.casefold()
+        for address in _EMAIL_ADDRESS_RE.findall(str(user_text or ""))
+    }
+    return len(recipients) >= 2
 
 _PLAN_FALLBACK: dict[str, Any] = {
     "action": "final",
@@ -144,6 +261,57 @@ def _is_draft_confirmation(user_text: str, ui_context: dict[str, Any]) -> bool:
     return _recent_assistant_proposed_draft(ui_context)
 
 
+def _confirmed_batch_compose_request(user_text: str, ui_context: dict[str, Any]) -> str | None:
+    """从相邻确认方案恢复原始收件人与模板分配，避免确认词被模型误路由为检索。"""
+    if not _BATCH_COMPOSE_CONFIRM_RE.fullmatch(str(user_text or "").strip()):
+        return None
+    recent = ui_context.get("recent_conversation")
+    if not isinstance(recent, list) or not recent:
+        return None
+    proposal = ""
+    # 前端会先把本次「确认」加入 recent_conversation；跳过该用户消息，寻找紧邻的方案。
+    for item in reversed(recent):
+        if not isinstance(item, dict) or str(item.get("role") or "") != "assistant":
+            continue
+        candidate = str(item.get("content") or "").strip()
+        if _BATCH_COMPOSE_PROPOSAL_RE.search(candidate):
+            proposal = candidate
+            break
+    if not proposal:
+        return None
+    for item in reversed(recent):
+        if not isinstance(item, dict) or str(item.get("role") or "") != "user":
+            continue
+        source = str(item.get("content") or "").strip()
+        if len(set(_EMAIL_ADDRESS_RE.findall(source))) >= 2:
+            return f"{source}\n\n已确认的模板分配方案：\n{proposal}"
+    return None
+
+
+def _selected_batch_draft_confirmed(user_text: str, ui_context: dict[str, Any]) -> bool:
+    """仅对上一轮批量回复预览的简短确认放行写稿。"""
+    if not _DRAFT_CONFIRM_RE.fullmatch(str(user_text or "").strip()):
+        return False
+    recent = ui_context.get("recent_conversation")
+    if not isinstance(recent, list):
+        return False
+    for item in reversed(recent):
+        if not isinstance(item, dict) or str(item.get("role") or "") != "assistant":
+            continue
+        text = str(item.get("content") or "")
+        return bool(re.search(r"(?:逐封评估|确认.*生成.*草稿|assessed.*emails?|confirm.*generate.*draft)", text, re.IGNORECASE))
+    return False
+
+
+def _is_selected_batch_draft_request(user_text: str, ui_context: dict[str, Any]) -> bool:
+    """选中多封邮件的批量回复是显式范围，不应重新路由为全邮箱检索。"""
+    selected = ui_context.get("selected_threads")
+    count = sum(1 for item in selected if isinstance(item, dict)) if isinstance(selected, list) else 0
+    if count < 2:
+        return False
+    return bool(_SELECTED_BATCH_DRAFT_RE.search(str(user_text or ""))) or _selected_batch_draft_confirmed(user_text, ui_context)
+
+
 def _requires_thread_draft_preview(user_text: str, ui_context: dict[str, Any], arguments: dict[str, Any]) -> bool:
     if _is_draft_confirmation(user_text, ui_context):
         return False
@@ -154,7 +322,9 @@ def _requires_thread_draft_preview(user_text: str, ui_context: dict[str, Any], a
 
 
 def _requires_thread_draft_card(user_text: str, ui_context: dict[str, Any]) -> bool:
-    return _is_draft_confirmation(user_text, ui_context)
+    from mail_agent.ai_turn.router import _explicit_current_thread_request
+
+    return _is_draft_confirmation(user_text, ui_context) and _explicit_current_thread_request(user_text)
 
 
 def _tool_catalog_text() -> str:
@@ -200,7 +370,9 @@ def _planner_system_prompt() -> str:
         "For a first-time reply/draft request, after evidence is enough, action=final with an email summary, reply intent, and a confirmation question; do not output the draft body or call ai_draft_reply yet. "
         "Call ai_draft_reply only after the user confirms the draft body (yes/好的/可以/开始吧/确认/生成卡片). "
         "For ai_draft_reply, pass thread_ref or message_id/thread_id from search hits when the drawer is closed. "
-        "arguments must be a JSON object; always include mailbox/ui_context fields when available. "
+        "arguments must be a JSON object containing only the minimum fields required by the selected tool. "
+        "Never include or echo ui_context, recent_conversation, screen, or full email bodies in tool-call arguments; "
+        "the backend injects authoritative context. "
         "Never invent tool names outside the list."
     )
 
@@ -484,6 +656,11 @@ def _inject_context_args(
         "propose_inbox_actions",
     }:
         merged["user_text"] = user_text
+    if tool == "ai_compose_new":
+        template = _local_draft_template(ui_context)
+        if template:
+            # 完整模板只在真正写稿时注入。它来自当前本地对话，而非 500 字符的长期 Memory。
+            merged["user_text"] = f"{merged['user_text']}\n\n[full_local_template]\n{template}"
     # 工作流 id 列表：若查询含 is:todo 等，从 ui_context 拷贝（与 host systemPrompt 一致）
     for key in ("todo_message_ids", "done_message_ids", "snoozed_message_ids"):
         if key not in merged and isinstance(ui_context.get(key), list):
@@ -502,6 +679,20 @@ def _inject_context_args(
         if key not in merged and key in arguments:
             merged[key] = arguments[key]
     return merged
+
+
+def _strip_model_context_fields(value: Any) -> Any:
+    """删除模型回显的上下文字段，避免大段 UI 轨迹进入工具调用和后续轨迹。"""
+    forbidden = {"ui_context", "recent_conversation", "screen"}
+    if isinstance(value, dict):
+        return {
+            key: _strip_model_context_fields(item)
+            for key, item in value.items()
+            if key not in forbidden
+        }
+    if isinstance(value, list):
+        return [_strip_model_context_fields(item) for item in value]
+    return value
 
 
 def _normalize_plan(raw: dict[str, Any]) -> dict[str, Any]:
@@ -568,7 +759,9 @@ def _assemble_outcome(
             plan = data.get("query_plan") if isinstance(data.get("query_plan"), dict) else {}
             scan_query = str(data.get("scan_query") or data.get("query") or plan.get("query") or "").strip()
             scan_source = str(data.get("scan_source") or ("cache" if kind.startswith("evidence") and scan_query else "gmail" if scan_query else "")).strip()
-        if kind in {"draft", "propose", "memory", "mail_context", "clarify", "error", "evidence_template"}:
+        if kind in {"draft", "propose", "memory", "mail_context", "clarify", "error", "evidence_template", "batch_draft_preview"}:
+            # batch_draft_preview：工具已产出逐封摘要与确认证据，需原样透传给前端，
+            # 让 THREAD_REF 与结果字段（match_status/results）进入已确认引用边界。
             structured = dict(data)
             break
         if kind == "evidence":
@@ -603,11 +796,19 @@ def _assemble_outcome(
                 structured["artifact"] = data["artifact"]
             break
         # 工具 data 直接带 artifact / proposed_actions
-        if isinstance(data.get("artifact"), dict) or isinstance(data.get("artifacts"), list):
+        if (
+            isinstance(data.get("artifact"), dict)
+            or isinstance(data.get("artifacts"), list)
+            or isinstance(data.get("compose_artifacts"), list)
+        ):
             structured = {
                 "kind": "draft",
                 "assistant_text": str(data.get("assistant_text") or final_text or ""),
-                **{k: data[k] for k in ("artifact", "artifacts", "mail_context", "batch_failures") if k in data},
+                **{
+                    k: data[k]
+                    for k in ("artifact", "artifacts", "compose_artifacts", "mail_context", "batch_failures")
+                    if k in data
+                },
             }
             break
         if isinstance(data.get("proposed_actions"), dict):
@@ -694,7 +895,10 @@ async def run_local_agent_session(
     invoke_id: str = "",
 ) -> dict[str, Any]:
     """本地多步环：Sampling 选型 → 同一 ``handle_ai_agent_tool`` 执行 → 最终回答。"""
-    language = "zh" if any("\u3400" <= ch <= "\u9fff" for ch in (user_text or "")) else "en"
+    language = "zh" if (
+        str(ui_context.get("language_hint") or "").lower().startswith("zh")
+        or any("\u3400" <= ch <= "\u9fff" for ch in (user_text or ""))
+    ) else "en"
     if not user_text.strip():
         return {
             "kind": "error",
@@ -711,6 +915,109 @@ async def run_local_agent_session(
             ),
             "error": "sampling_unavailable",
         }
+
+    continuation = _continuation_batch_request(user_text, ui_context)
+    if continuation:
+        source_text, offset = continuation
+        from mail_agent.ai_turn.tools import tool_batch_compose_new
+
+        return await tool_batch_compose_new(
+            source_text,
+            ui_context,
+            arguments,
+            language=language,
+            sampling_create_message=sampling_create_message,
+            confirmed=True,
+            batch_offset=offset,
+            progress_callback=progress_callback,
+        )
+
+    if _is_multi_recipient_compose_request(user_text):
+        # 批量新邮件不依赖 inbox 勾选项；直接执行可避免 Sampling 误选 ai_batch_draft，
+        # 后者是“已选邮件回复”工具，会错误要求用户去勾选收件箱邮件。
+        from mail_agent.ai_turn.tools import tool_batch_compose_new
+
+        return await tool_batch_compose_new(
+            user_text,
+            ui_context,
+            arguments,
+            language=language,
+            sampling_create_message=sampling_create_message,
+            confirmed=True,
+            progress_callback=progress_callback,
+        )
+
+    if _is_deferred_template_capture_request(user_text):
+        # 录入模板时不调用 remember_preference：长期偏好有长度上限，不能承载完整邮件模板。
+        return {
+            "kind": "chat",
+            "assistant_text": (
+                "已将模板保留在当前对话中，暂不生成草稿。"
+                if language == "zh"
+                else "I've kept the template in this conversation and will not generate a draft yet."
+            ),
+        }
+
+    if _is_local_template_waiting_request(user_text, ui_context):
+        return {
+            "kind": "chat",
+            "assistant_text": (
+                "好的，等待你提供邀请人、仓库链接、备注和联系方式后再生成草稿卡片。"
+                if language == "zh"
+                else "Understood. I will wait for the invitee, repository, notes, and contact details before generating a draft card."
+            ),
+        }
+
+    if _is_local_template_compose_request(user_text, ui_context):
+        # 联系人资料到达后直接写稿，禁止 Planner 将“之前的模板”误路由为邮箱检索。
+        tool_args = _inject_context_args(
+            "ai_compose_new",
+            {},
+            user_text=user_text,
+            ui_context=ui_context,
+            arguments=arguments,
+        )
+        if callable(progress_callback):
+            result = await handle_ai_agent_tool(
+                "ai_compose_new",
+                tool_args,
+                invoke_id,
+                progress_callback=progress_callback,
+            )
+        else:
+            result = await handle_ai_agent_tool("ai_compose_new", tool_args, invoke_id)
+        data = result.get("data") if isinstance(result, dict) else None
+        return data if isinstance(data, dict) else {
+            "kind": "error",
+            "assistant_text": "无法生成草稿。" if language == "zh" else "Could not generate the draft.",
+            "error": "local_template_compose_failed",
+        }
+
+    batch_compose_request = _confirmed_batch_compose_request(user_text, ui_context)
+    if batch_compose_request:
+        from mail_agent.ai_turn.tools import tool_batch_compose_new
+
+        return await tool_batch_compose_new(
+            batch_compose_request,
+            ui_context,
+            arguments,
+            language=language,
+            sampling_create_message=sampling_create_message,
+            confirmed=True,
+            progress_callback=progress_callback,
+        )
+
+    if _is_selected_batch_draft_request(user_text, ui_context):
+        from mail_agent.ai_turn.tools import tool_batch_draft
+
+        return await tool_batch_draft(
+            user_text,
+            ui_context,
+            language=language,
+            sampling_create_message=sampling_create_message,
+            confirmed=_selected_batch_draft_confirmed(user_text, ui_context),
+            progress_callback=progress_callback,
+        )
 
     log(
         f"ai_sidebar path=local_agent_session tools=host_whitelist "
@@ -868,15 +1175,25 @@ and not (
 
         tool_name = plan["tool"]
         _progress(tool_name, {"step": step, "tool": tool_name})
+        # 先清除模型可能回显的上下文，再由下方 helper 注入前端权威事实。
+        model_arguments = _strip_model_context_fields(plan["arguments"])
         tool_args = _inject_context_args(
             tool_name,
-            plan["arguments"],
+            model_arguments if isinstance(model_arguments, dict) else {},
             user_text=user_text,
             ui_context=ui_context if isinstance(ui_context, dict) else {},
             arguments=arguments if isinstance(arguments, dict) else {},
         )
         try:
-            result = await handle_ai_agent_tool(tool_name, tool_args, invoke_id)
+            if callable(progress_callback):
+                result = await handle_ai_agent_tool(
+                    tool_name,
+                    tool_args,
+                    invoke_id,
+                    progress_callback=_progress,
+                )
+            else:
+                result = await handle_ai_agent_tool(tool_name, tool_args, invoke_id)
         except Exception as exc:
             _logger.warning(
                 "local_agent_session tool failed tool=%s error_type=%s",
@@ -905,7 +1222,12 @@ and not (
         data = result.get("data") if isinstance(result, dict) else None
         if isinstance(data, dict):
             kind = str(data.get("kind") or "")
-            if tool_name == "ai_draft_reply" and kind == "draft":
+            if tool_name in {"ai_draft_reply", "ai_compose_new"} and kind == "draft":
+                final_text = str(data.get("assistant_text") or "").strip()
+                break
+            if tool_name == "ai_batch_draft" and kind in {"batch_draft_preview", "batch_draft", "draft"}:
+                # 批量起草的预览/确认文案由工具模板确定性生成（含 THREAD_REF 跳转标记），
+                # 不让模型二次改写，避免丢弃线程跳转入口。
                 final_text = str(data.get("assistant_text") or "").strip()
                 break
             if kind in {"draft", "propose", "memory", "evidence_template"} and str(data.get("assistant_text") or "").strip():
@@ -973,23 +1295,9 @@ and not (
                     final_body = candidate
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
-    # 域名风险备注仅在已有实质 final 时补回；禁止用注脚单独充当答案。
+    # 域名风险提示已由证据阶段按用户问题筛选；这里不再无条件追加，
+    # 避免把与当前问题无关的安全说明附加到最终回答末尾。
     if final_body and len(final_body) >= 40:
-        for record in reversed(tool_records):
-            data = record.get("data") if isinstance(record, dict) and isinstance(record.get("data"), dict) else None
-            if not data:
-                continue
-            for key in ("domain_warning_note",):
-                note = str(data.get(key) or "").strip()
-                if not note:
-                    continue
-                # 已有等价语义则不重复追加。
-                if "域名不一致" in final_body or "sender domain" in final_body.lower():
-                    continue
-                marker = note[:12]
-                if marker and marker not in final_body:
-                    final_body = f"{final_body.rstrip()}\n\n{note}"
-            break
         final_text = final_body
 
     return _assemble_outcome(

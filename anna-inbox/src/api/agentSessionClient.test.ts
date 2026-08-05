@@ -19,7 +19,8 @@ describe("AI sidebar Host Agent contract", () => {
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never use Markdown tables");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("call query_mail_evidence exactly once");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("creates one QueryPlan");
-    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("recent_conversation is the recent visible transcript");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Agent Session's prior turns");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).not.toContain("recent_conversation");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Do not replace a clear confirmation with a generic feature menu");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("base conclusions on bodyFull evidence");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Never describe it as a 7/30/60-day search");
@@ -30,6 +31,7 @@ describe("AI sidebar Host Agent contract", () => {
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Two-step reply drafting is mandatory");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("do NOT call ai_draft_reply yet");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("Only after the user clearly confirms");
+    expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("not to generate a draft yet");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("开始吧");
     expect(AI_SIDEBAR_SYSTEM_PROMPT).toContain("开始吧");
     expect(agentClientSource).toContain("tool_end");

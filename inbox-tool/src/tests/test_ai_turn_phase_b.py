@@ -15,8 +15,9 @@ if str(SRC) not in sys.path:
 async def test_fallback_draft_with_thread():
     from mail_agent.ai_turn.router import route_ai_turn
 
+    # 明确指向当前邮件时才走 draft_reply。
     route = await route_ai_turn(
-        "帮我起草回复",
+        "为这封邮件起草回复",
         {
             "current_thread": {
                 "kind": "thread",
@@ -29,6 +30,29 @@ async def test_fallback_draft_with_thread():
     )
     assert route["steps"][0]["tool"] == "draft_reply"
     print("[PASS] test_fallback_draft_with_thread")
+
+
+async def test_fallback_generic_draft_scopes_to_mailbox_search_then_compose():
+    from mail_agent.ai_turn.router import route_ai_turn
+
+    # 未明确指向当前线程时，不得假定 current_thread 为目标；先检索再起草。
+    route = await route_ai_turn(
+        "帮我起草回复",
+        {
+            "current_thread": {
+                "kind": "thread",
+                "message_id": "m1",
+                "thread_id": "t1",
+                "mailbox": "a@b.com",
+            },
+        },
+        sampling_create_message=None,
+    )
+    tools = [step["tool"] for step in route["steps"]]
+    assert tools[0] == "search_mail"
+    assert "compose_new" in tools
+    assert "draft_reply" not in tools
+    print("[PASS] test_fallback_generic_draft_scopes_to_mailbox_search_then_compose")
 
 
 async def test_fallback_revise_with_draft():
@@ -145,7 +169,10 @@ async def test_normalize_rejects_mutation_tool():
     )
     tools = [s["tool"] for s in route["steps"]]
     assert "archive_mail" not in tools
-    assert "draft_reply" in tools
+    # 非明确当前线程时 draft_reply 会被替换为检索后再起草，避免误用已打开线程。
+    assert "draft_reply" not in tools
+    assert "search_mail" in tools
+    assert "compose_new" in tools
     print("[PASS] test_normalize_rejects_mutation_tool")
 
 
@@ -202,6 +229,7 @@ async def test_phase_a_search_still_works():
 
 def main():
     asyncio.run(test_fallback_draft_with_thread())
+    asyncio.run(test_fallback_generic_draft_scopes_to_mailbox_search_then_compose())
     asyncio.run(test_fallback_revise_with_draft())
     asyncio.run(test_draft_outputs_use_review_copy_and_rewrite_bad_model_status())
     test_draft_review_text_preserves_historical_sent_facts()

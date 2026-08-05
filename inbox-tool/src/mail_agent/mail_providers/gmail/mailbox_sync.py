@@ -29,6 +29,12 @@ PRIORITY_BATCH_PER_INVOKE = 200
 BACKFILL_BATCH_PER_TICK = 100
 # 单次 messages.list 目标上限（Gmail 分页上限由 search_gmail 处理）
 _SEARCH_PAGE_CAP = 500
+# 单封 metadata 拉取失败不应阻塞整页分页。失败项写入有限持久队列，后续同步节拍
+# 优先补齐；队列中的邮件 ID 仅保存本地同步状态，不进入诊断日志。
+PENDING_METADATA_MAX = 500
+PENDING_METADATA_BATCH_PER_TICK = 20
+_PENDING_METADATA_RETRY_BASE_SECONDS = 5
+_PENDING_METADATA_RETRY_MAX_SECONDS = 300
 
 _backfill_lock = threading.Lock()
 _backfill_running: set[str] = set()
@@ -138,6 +144,14 @@ def _sync_stage_from_state(state: dict[str, Any]) -> str:
     """根据已持久化的同步状态计算对外同步阶段，不读取缓存或外部数据。"""
     if not bool(state.get("initial_sync_complete")):
         return "priority_metadata"
+    try:
+        pending_count = int(state.get("pending_metadata_count") or 0)
+    except (TypeError, ValueError):
+        pending_count = 0
+    if _pending_metadata_entries(state) or pending_count > 0:
+        return "metadata_repair"
+    if _pending_metadata_entries(state):
+        return "metadata_repair"
     if not bool(state.get("backfill_complete")):
         return "backfill_metadata"
     if not bool(state.get("body_sync_complete")) or not bool(state.get("attachment_sync_complete")):
@@ -148,6 +162,75 @@ def _sync_stage_from_state(state: dict[str, Any]) -> str:
     if watch_status in {"", "unknown"}:
         return "watch_setup"
     return "ready"
+
+
+def _pending_metadata_entries(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """规范化持久化的 metadata 补齐队列，忽略损坏或过期的历史记录。"""
+    candidate_entries = state.get("pending_metadata")
+    raw_entries: list[Any] = candidate_entries if isinstance(candidate_entries, list) else []
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_entries:
+        if not isinstance(raw, dict):
+            continue
+        message_id = str(raw.get("id") or "").strip()
+        if not message_id or message_id in seen:
+            continue
+        seen.add(message_id)
+        try:
+            attempts = max(0, int(raw.get("attempts") or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+        try:
+            next_retry_at = max(0.0, float(raw.get("next_retry_at") or 0))
+        except (TypeError, ValueError):
+            next_retry_at = 0.0
+        entries.append({"id": message_id, "attempts": attempts, "next_retry_at": next_retry_at})
+        if len(entries) >= PENDING_METADATA_MAX:
+            break
+    return entries
+
+
+def _settle_pending_metadata(
+    mailbox: str,
+    *,
+    resolved_ids: set[str] | None = None,
+    retry_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """结算 metadata 缺口：成功或 Gmail 404 的邮件移除，暂时失败项指数退避。
+
+    只保存 message ID、尝试次数和下次重试时间。Gmail 404 表示邮件已删除或当前
+    账号不可再访问，属于已结算状态，绝不能永久卡住分页游标。
+    """
+    from .adapter import _history_sync_lock, normalize_mailbox
+
+    normalized = normalize_mailbox(mailbox)
+    resolved_source = resolved_ids if resolved_ids is not None else set()
+    retry_source = retry_ids if retry_ids is not None else set()
+    resolved = {str(item or "").strip() for item in resolved_source if str(item or "").strip()}
+    retry = {str(item or "").strip() for item in retry_source if str(item or "").strip()} - resolved
+    # 分页 worker 和后台补齐可能同时结算队列。使用同一 mailbox 锁保证不会因
+    # read-merge-write 交错而丢失另一方刚记录的失败邮件。
+    with _history_sync_lock(normalized):
+        state = read_sync_state(normalized)
+        entries = {str(item["id"]): dict(item) for item in _pending_metadata_entries(state)}
+        for message_id in resolved:
+            entries.pop(message_id, None)
+        now = time.time()
+        for message_id in retry:
+            previous = entries.get(message_id, {})
+            attempts = min(100, int(previous.get("attempts") or 0) + 1)
+            delay = min(
+                _PENDING_METADATA_RETRY_MAX_SECONDS,
+                _PENDING_METADATA_RETRY_BASE_SECONDS * (2 ** min(attempts - 1, 6)),
+            )
+            entries[message_id] = {
+                "id": message_id,
+                "attempts": attempts,
+                "next_retry_at": now + delay,
+            }
+        pending = sorted(entries.values(), key=lambda item: (float(item["next_retry_at"]), str(item["id"])))[:PENDING_METADATA_MAX]
+        return write_sync_state(normalized, {"pending_metadata": pending})
 
 
 def _compute_index_bounds(messages: list[dict[str, Any]]) -> tuple[str, str, int, int]:
@@ -237,6 +320,7 @@ def refresh_boundary_from_cache(mailbox: str, *, extra: dict[str, Any] | None = 
         "earliest_indexed_at": earliest,
         "latest_indexed_at": latest,
         "cache_total": len(messages),
+        "pending_metadata_count": len(_pending_metadata_entries(state)),
         "initial_sync_complete": bool(state.get("initial_sync_complete")),
         "backfill_complete": bool(state.get("backfill_complete")),
         "body_sync_complete": bool(state.get("body_sync_complete")),
@@ -279,6 +363,7 @@ def get_mailbox_sync_boundary(mailbox: str) -> dict[str, Any]:
         "last_history_id": str(state.get("history_id") or state.get("last_history_id") or ""),
         "configured_sync_range": state.get("configured_sync_range") or configured_sync_range(),
         "cache_total": len(messages),
+        "pending_metadata_count": len(_pending_metadata_entries(state)),
         "priority_days": INITIAL_PRIORITY_DAYS,
         "watch_status": str(state.get("watch_status") or "unknown"),
         "updated_at": str(state.get("updated_at") or _utc_now_iso()),
@@ -363,6 +448,7 @@ def _fetch_metadata_page(
     位置继续，而不是反复扫描同一批最新命中。
     """
     from .adapter import (
+        GmailApiError,
         SUMMARY_FETCH_MAX_WORKERS,
         fetch_message_summary,
         get_access_token,
@@ -403,6 +489,8 @@ def _fetch_metadata_page(
         if isinstance(item, dict) and item.get("id")
     }
     missing_ids = [message_id for message_id in message_ids if message_id not in by_id]
+    retry_ids: set[str] = set()
+    resolved_ids: set[str] = set(message_ids) - set(missing_ids)
     if missing_ids:
         worker_context = copy_context()
         with ThreadPoolExecutor(max_workers=SUMMARY_FETCH_MAX_WORKERS) as pool:
@@ -418,12 +506,122 @@ def _fetch_metadata_page(
                 for message_id in missing_ids
             }
             for future in as_completed(futures):
+                message_id = futures[future]
+                try:
+                    summary = future.result()
+                    if not summary:
+                        raise RuntimeError("Gmail message metadata request returned no data")
+                except GmailApiError as exc:
+                    # 邮件在 messages.list 和 messages.get 之间被删除时 Gmail 会返回
+                    # 404。该邮件已无法缓存，应视为结算完成而不是让分页永远停在本页。
+                    if exc.status_code == 404:
+                        resolved_ids.add(message_id)
+                    else:
+                        retry_ids.add(message_id)
+                except Exception:
+                    # 连接波动、限流或单封响应异常不影响该页其余邮件入库；失败 ID
+                    # 持久化到补齐队列，由后续同步节拍按退避时间继续处理。
+                    retry_ids.add(message_id)
+                else:
+                    resolved_ids.add(message_id)
+                    by_id[str(summary.get("id") or message_id)] = summary
+    write_index(mailbox, sorted(by_id.values(), key=lambda item: int(item.get("internal_date") or 0), reverse=True))
+    _settle_pending_metadata(mailbox, resolved_ids=resolved_ids, retry_ids=retry_ids)
+    return message_ids, next_token
+
+
+def repair_pending_metadata(
+    mailbox: str,
+    *,
+    batch_limit: int = PENDING_METADATA_BATCH_PER_TICK,
+    force: bool = False,
+) -> dict[str, Any]:
+    """增量补齐此前单封 metadata 拉取失败的邮件，不清空已有缓存。
+
+    正常后台 tick 仅处理达到 ``next_retry_at`` 的条目，手动补齐可传 ``force=True``
+    立即尝试。成功与 Gmail 404 都会从队列移除；其他异常继续指数退避。
+    """
+    from .adapter import (
+        GmailApiError,
+        SUMMARY_FETCH_MAX_WORKERS,
+        fetch_message_summary,
+        get_access_token,
+        normalize_mailbox,
+        read_cache,
+        write_index,
+    )
+
+    normalized = normalize_mailbox(mailbox)
+    try:
+        cap = max(1, min(int(batch_limit), PENDING_METADATA_MAX))
+    except (TypeError, ValueError):
+        cap = PENDING_METADATA_BATCH_PER_TICK
+    now = time.time()
+    entries = _pending_metadata_entries(read_sync_state(normalized))
+    due_entries = [
+        item for item in entries
+        if force or float(item.get("next_retry_at") or 0) <= now
+    ][:cap]
+    if not due_entries:
+        return {
+            "mailbox": normalized,
+            "attempted": 0,
+            "repaired": 0,
+            "pending": len(entries),
+            "deferred": len(entries),
+        }
+
+    cache = read_cache(normalized)
+    by_id = {
+        str(item.get("id") or ""): dict(item)
+        for item in cache.get("messages") or []
+        if isinstance(item, dict) and item.get("id")
+    }
+    access_token = get_access_token(normalized)
+    resolved_ids: set[str] = set()
+    retry_ids: set[str] = set()
+    repaired = 0
+    worker_context = copy_context()
+    with ThreadPoolExecutor(max_workers=min(SUMMARY_FETCH_MAX_WORKERS, len(due_entries))) as pool:
+        futures = {
+            pool.submit(
+                worker_context.copy().run,
+                fetch_message_summary,
+                normalized,
+                str(entry["id"]),
+                access_token=access_token,
+                strict=True,
+            ): str(entry["id"])
+            for entry in due_entries
+        }
+        for future in as_completed(futures):
+            message_id = futures[future]
+            try:
                 summary = future.result()
                 if not summary:
                     raise RuntimeError("Gmail message metadata request returned no data")
-                by_id[str(summary.get("id") or futures[future])] = summary
-    write_index(mailbox, sorted(by_id.values(), key=lambda item: int(item.get("internal_date") or 0), reverse=True))
-    return message_ids, next_token
+            except GmailApiError as exc:
+                if exc.status_code == 404:
+                    resolved_ids.add(message_id)
+                else:
+                    retry_ids.add(message_id)
+            except Exception:
+                retry_ids.add(message_id)
+            else:
+                resolved_ids.add(message_id)
+                by_id[str(summary.get("id") or message_id)] = summary
+                repaired += 1
+    if repaired:
+        write_index(normalized, sorted(by_id.values(), key=lambda item: int(item.get("internal_date") or 0), reverse=True))
+    state = _settle_pending_metadata(normalized, resolved_ids=resolved_ids, retry_ids=retry_ids)
+    pending = _pending_metadata_entries(state)
+    return {
+        "mailbox": normalized,
+        "attempted": len(due_entries),
+        "repaired": repaired,
+        "pending": len(pending),
+        "deferred": max(0, len(pending) - len(retry_ids)),
+    }
 
 
 def progress_priority_metadata_sync(
@@ -642,6 +840,14 @@ def schedule_background_backfill(mailbox: str) -> bool:
             # 多 tick，避免一次占满；进程退出则中断，下次 sync 再续。
             for tick in range(1, 6):
                 ticks = tick
+                repair = repair_pending_metadata(normalized)
+                _log_sync_phase(
+                    phase="metadata_repair",
+                    fetched=int(repair.get("repaired") or 0),
+                    complete=int(repair.get("pending") or 0) == 0,
+                    cache_total=int(get_mailbox_sync_boundary(normalized).get("cache_total") or 0),
+                    tick=tick,
+                )
                 result = progress_backfill_metadata_sync(normalized)
                 boundary = result.get("boundary") if isinstance(result.get("boundary"), dict) else {}
                 _log_sync_phase(
@@ -652,10 +858,15 @@ def schedule_background_backfill(mailbox: str) -> bool:
                     has_next_page=not bool(result.get("backfill_complete")),
                     tick=tick,
                 )
-                if result.get("backfill_complete"):
+                pending_count = int(get_mailbox_sync_boundary(normalized).get("pending_metadata_count") or 0)
+                if result.get("backfill_complete") and pending_count == 0:
                     completed = True
                     break
-                if int(result.get("new_count") or 0) == 0 and int(result.get("fetched") or 0) == 0:
+                if (
+                    int(result.get("new_count") or 0) == 0
+                    and int(result.get("fetched") or 0) == 0
+                    and int(repair.get("attempted") or 0) == 0
+                ):
                     break
                 time.sleep(0.05)
         except Exception as exc:
@@ -712,6 +923,14 @@ def schedule_background_sync(mailbox: str, *, profile_history_id: str = "") -> b
         try:
             for tick in range(1, 6):
                 ticks = tick
+                repair = repair_pending_metadata(normalized)
+                _log_sync_phase(
+                    phase="metadata_repair",
+                    fetched=int(repair.get("repaired") or 0),
+                    complete=int(repair.get("pending") or 0) == 0,
+                    cache_total=int(get_mailbox_sync_boundary(normalized).get("cache_total") or 0),
+                    tick=tick,
+                )
                 state = read_sync_state(normalized)
                 if not bool(state.get("initial_sync_complete")):
                     result = progress_priority_metadata_sync(
@@ -858,11 +1077,13 @@ def run_mailbox_sync_tick(
     run_priority: bool = True,
     run_backfill: bool = True,
     ensure_watch: bool = True,
+    force_pending_repair: bool = False,
 ) -> dict[str, Any]:
-    """单次同步节拍：优先 180d → 可选回填 tick → Watch 续订。"""
+    """单次同步节拍：先补齐缺口，再推进优先窗口、历史回填与 Watch。"""
     from .adapter import normalize_mailbox
 
     normalized = normalize_mailbox(mailbox)
+    repair = repair_pending_metadata(normalized, force=force_pending_repair)
     priority = None
     if run_priority:
         priority = progress_priority_metadata_sync(
@@ -881,6 +1102,7 @@ def run_mailbox_sync_tick(
     boundary = get_mailbox_sync_boundary(normalized)
     return {
         "mailbox": normalized,
+        "repair": repair,
         "priority": priority,
         "backfill": backfill,
         "watch": watch,
@@ -897,6 +1119,7 @@ __all__ = [
     "get_mailbox_sync_boundary",
     "progress_backfill_metadata_sync",
     "progress_priority_metadata_sync",
+    "repair_pending_metadata",
     "read_sync_state",
     "refresh_boundary_from_cache",
     "reset_mailbox_sync_state",

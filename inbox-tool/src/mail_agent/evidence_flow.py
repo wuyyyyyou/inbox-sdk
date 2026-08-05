@@ -1770,6 +1770,7 @@ def _cache_gap_allows_gmail_fallback(boundary: dict[str, Any]) -> bool:
     触发（须 boundary 显式带字段，避免空 dict 误触发）：
     - `initial_sync_complete` 显式为 False（180 天 priority 未完成）
     - 或 `cache_total` 显式为 0（缓存空）
+    - 或存在尚未补齐的 metadata 缺口
 
     不因单独的 `backfill_complete=False` 触发：无硬顶 backfill 可能长期未完成，
     否则几乎每次零命中都会打 Gmail，拖垮平均耗时。更早历史仍靠时间边界 history 托底。
@@ -1778,6 +1779,11 @@ def _cache_gap_allows_gmail_fallback(boundary: dict[str, Any]) -> bool:
         return False
     if "initial_sync_complete" in boundary and not bool(boundary.get("initial_sync_complete")):
         return True
+    try:
+        if int(boundary.get("pending_metadata_count") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        return False
     if "cache_total" in boundary:
         try:
             return int(boundary.get("cache_total") or 0) <= 0

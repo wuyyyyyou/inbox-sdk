@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import sys
+import urllib.error
+from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
 
@@ -65,6 +67,28 @@ def test_gmail_check_uses_one_total_budget() -> None:
     assert urlopen.call_args.kwargs["timeout"] <= 2.0
 
 
+def test_gmail_check_exposes_http_error_code() -> None:
+    """Gmail HTTP 错误必须返回状态码，供前端展示对应的处理提示。"""
+    from anna_inbox_executa import gmail_tools
+
+    error = urllib.error.HTTPError(
+        "https://gmail.googleapis.com",
+        400,
+        "Bad Request",
+        Message(),
+        None,
+    )
+    with (
+        patch("mail_agent.mail_providers.gmail.adapter.get_platform_account", return_value={}),
+        patch.object(gmail_tools, "refresh_platform_google_accounts", return_value=[]),
+        patch("mail_agent.mail_providers.gmail.adapter.get_access_token", return_value="short-lived-token"),
+        patch("urllib.request.urlopen", side_effect=error),
+    ):
+        result = gmail_tools._check_gmail_api_status("checked@example.com", timeout_seconds=2.0)
+
+    assert result["error_code"] == "400"
+
+
 def test_manifest_declares_both_connectivity_tools() -> None:
     """前端调用的两项检测都必须在发布 manifest 中声明。"""
     manifest_path = Path(__file__).resolve().parents[2] / "manifest.json"
@@ -76,5 +100,6 @@ def test_manifest_declares_both_connectivity_tools() -> None:
 if __name__ == "__main__":
     test_reverse_response_bypasses_request_handler()
     test_gmail_check_uses_one_total_budget()
+    test_gmail_check_exposes_http_error_code()
     test_manifest_declares_both_connectivity_tools()
     print("Connectivity status: OK")
