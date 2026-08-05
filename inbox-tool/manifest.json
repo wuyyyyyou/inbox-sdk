@@ -1,7 +1,7 @@
 {
   "slug": "mail-agent",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.3.5",
+  "version": "2.3.6",
   "description": "Anna Inbox Executa for Gmail sync, thread actions, drafts, attachments, Ask / AI sidebar, and Anna LLM sampling.",
   "author": "Panwb",
   "host_capabilities": [
@@ -2704,6 +2704,25 @@
           "type": "string",
           "description": "Optional optimistic-concurrency etag.",
           "required": false
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "create_or_update_compose_drafts",
+      "description": "Create or update multiple reviewed Anna Compose drafts in one storage operation.",
+      "parameters": [
+        {
+          "name": "mailbox",
+          "type": "string",
+          "description": "Mailbox email address.",
+          "required": true
+        },
+        {
+          "name": "drafts",
+          "type": "array",
+          "description": "Compose draft contents with stable ids when updating existing drafts.",
+          "required": true
         }
       ],
       "timeout": 120

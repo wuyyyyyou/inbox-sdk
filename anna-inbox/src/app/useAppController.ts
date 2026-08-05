@@ -354,6 +354,7 @@ function pendingBatchComposeContinuation(messages: AiChatMessage[]) {
 
 function buildAiTurnUiContext(args: {
   mailbox: string;
+  mailboxes?: MailboxInfo[];
   selectedMailboxes: string[];
   conversationId: string;
   scanPlan: ScanPlan | null | undefined;
@@ -368,6 +369,9 @@ function buildAiTurnUiContext(args: {
   inboxListContext?: AiInboxListContext;
 }) {
   const mailbox = selectedOrPrimary(args.selectedMailboxes, args.mailbox);
+  const ownerDisplayName = args.mailboxes?.find(
+    (item) => normalizedMailbox(item.email) === normalizedMailbox(mailbox),
+  )?.display_name?.trim() || "";
   const plan = normalizeScanPlan(args.scanPlan);
   const rangeDays = clampInt(args.displayRangeDays, plan.scan_window_days, 1, 90);
   const ctx = args.currentMailContext;
@@ -428,6 +432,7 @@ function buildAiTurnUiContext(args: {
   return {
     conversation_id: args.conversationId,
     mailbox,
+    owner_display_name: ownerDisplayName,
     selected_mailboxes: selectableMailboxes(args.selectedMailboxes, args.mailbox),
     display_range_days: rangeDays,
     max_messages: plan.max_messages,
@@ -557,16 +562,25 @@ function partialBatchComposeArtifacts(partial: unknown): import("../types/mail")
     if (!source || typeof source !== "object") return [];
     const draft = source as Record<string, unknown>;
     if (String(draft.type || "") !== "compose_draft" || !String(draft.body || "").trim()) return [];
+    const recipients = Array.isArray(draft.recipients) ? draft.recipients.map(String).filter(Boolean) : [];
     return [{
       type: "compose_draft" as const,
+      id: composeArtifactId(String(draft.mailbox || ""), recipients, String(draft.source_prompt || ""), String(draft.subject || "")),
       mailbox: String(draft.mailbox || ""),
       body: String(draft.body || ""),
       source_prompt: String(draft.source_prompt || ""),
       mode: draft.mode === "replace" ? "replace" : "insert",
-      recipients: Array.isArray(draft.recipients) ? draft.recipients.map(String).filter(Boolean) : [],
+      recipients,
       subject: String(draft.subject || ""),
     }];
   });
+}
+
+function composeArtifactId(mailbox: string, recipients: string[], sourcePrompt: string, subject: string): string {
+  const identity = [mailbox.trim().toLowerCase(), ...recipients.map((item) => item.trim().toLowerCase()).sort(), sourcePrompt.trim(), subject.trim()].join("|");
+  let hash = 2166136261;
+  for (let index = 0; index < identity.length; index += 1) hash = Math.imul(hash ^ identity.charCodeAt(index), 16777619);
+  return `ai-compose-${(hash >>> 0).toString(16)}`;
 }
 
 function latestDraftOutcome(outcomes: AgentToolOutcome[]): Record<string, unknown> | null {
@@ -1098,6 +1112,7 @@ export interface AppActions {
   searchComposeContacts(mailbox: string, query: string): Promise<{ contacts: ComposeContact[]; permissionRequired: boolean }>;
   listComposeDrafts(mailbox: string): Promise<ComposeDraftListPayload>;
   saveComposeDraft(mailbox: string, draft: Partial<ComposeDraft>, ifMatch?: string): Promise<ComposeDraft>;
+  saveComposeDraftBatch(mailbox: string, drafts: Array<Partial<ComposeDraft>>): Promise<ComposeDraft[]>;
   deleteComposeDraft(mailbox: string, draftId: string): Promise<void>;
   sendComposeEmails(mailbox: string, messages: ComposeDraft[]): Promise<Array<{ id: string; ok: boolean; error?: string }>>;
   prepareInboxAttachmentAccess(mailbox: string, messageId: string, attachmentId: string, mode: "preview" | "download"): Promise<AttachmentDownloadPayload>;
@@ -3728,6 +3743,9 @@ export function useAppController() {
               },
               visible_prompt: request.visiblePrompt,
               expected_artifact: requestedArtifact,
+              owner_display_name: state.mailboxes?.find(
+                (item) => normalizedMailbox(item.email) === normalizedMailbox(context.mailbox),
+              )?.display_name?.trim() || "",
               ai_provider: state.llmProvider,
               storage_provider: state.storageProvider,
               run_id: generationRun.runId,
@@ -3870,6 +3888,10 @@ export function useAppController() {
     async saveComposeDraft(mailbox, draft, ifMatch) {
       const result = await client.saveComposeDraft(normalizedMailbox(mailbox), draft, ifMatch, state.storageProvider);
       return { ...result.draft, etag: result.etag || result.draft.etag };
+    },
+    async saveComposeDraftBatch(mailbox, drafts) {
+      const result = await client.saveComposeDraftBatch(normalizedMailbox(mailbox), drafts, state.storageProvider);
+      return result.drafts || [];
     },
     async deleteComposeDraft(mailbox, draftId) {
       await client.deleteComposeDraft(normalizedMailbox(mailbox), draftId, state.storageProvider);
@@ -4804,6 +4826,7 @@ const userRequest = String(options.prompt ?? state.customScanInput).trim();
         const scanMailbox = selectedOrPrimary(state.selectedMailboxes, state.mailbox);
         const uiContext = buildAiTurnUiContext({
           mailbox: state.mailbox,
+          mailboxes: state.mailboxes,
           selectedMailboxes: state.selectedMailboxes,
           conversationId,
           scanPlan: state.scanPlan,
@@ -5170,6 +5193,7 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
               source_prompt: String(art.source_prompt || userRequest), mode: art.mode === "replace" ? "replace" as const : "insert" as const,
               recipients: Array.isArray(art.recipients) ? art.recipients.map(String).filter(Boolean) : [], subject: String(art.subject || ""),
             });
+            list[list.length - 1].id = composeArtifactId(list[list.length - 1].mailbox, list[list.length - 1].recipients || [], list[list.length - 1].source_prompt, list[list.length - 1].subject || "");
           }
           return list.length ? list : undefined;
         };

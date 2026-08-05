@@ -108,8 +108,64 @@ def _normalize_compose_payload(payload: dict[str, Any]) -> tuple[str, str, list[
             for recipient in (raw_recipients if isinstance(raw_recipients, list) else [])
             if str(recipient).strip()
         ][:50]
-        return draft_body[:_DRAFT_LIMIT], subject, recipients
+        return _normalize_generated_signature(
+            draft_body[:_DRAFT_LIMIT],
+            str(payload.get("mailbox") or ""),
+            str(payload.get("owner_display_name") or ""),
+        ), subject, recipients
     return "", "", []
+
+
+def _mailbox_sender_name(mailbox: str, owner_display_name: str = "") -> str:
+    """优先使用当前邮箱资料名的 First Name，并规范首字母大小写。"""
+    display_name = _clean_sender_name(owner_display_name)
+    if display_name:
+        return display_name
+    local_part = str(mailbox or "").strip().split("@", 1)[0]
+    return _clean_sender_name(local_part.split(".", 1)[0])
+
+
+def _clean_sender_name(value: str) -> str:
+    """取名字首项并规范首字母，过滤平台或模型误传的纯符号名称。"""
+    name = str(value or "").strip()
+    first_name = name.split()[0] if name.split() else ""
+    if not re.search(r"[^\W_]", first_name, flags=re.UNICODE):
+        return ""
+    return first_name[:1].upper() + first_name[1:80]
+
+
+def _requested_sender_name(user_text: str) -> str:
+    """提取用户明确指定的落款名；未匹配时返回空字符串。"""
+    text = str(user_text or "").strip()
+    patterns = (
+        r"(?:sender[_ ]?name|sign(?:ed)? off as|use the name)\s*[:：]?\s*[\"']?([^\"'\n,，。.!！]{1,80})",
+        r"(?:落款(?:名|姓名)?|署名)(?:是|为|用|写成)?\s*[:：]?\s*[\"']?([^\"'\n,，。.!！]{1,80})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return _clean_sender_name(match.group(1))
+    return ""
+
+
+def _normalize_generated_signature(
+    body: str,
+    mailbox: str,
+    owner_display_name: str = "",
+    requested_sender_name: str = "",
+) -> str:
+    """将生成正文末尾落款统一为用户指定名、账户资料名或邮箱本地部分。"""
+    sender_name = (
+        _clean_sender_name(requested_sender_name)[:80]
+        or _mailbox_sender_name(mailbox, owner_display_name)
+    )
+    if not sender_name:
+        return body
+    return re.sub(
+        r"(?im)^(?P<signoff>[ \t]*(?:all the best|best(?: regards)?|cheers|kind regards|many thanks|regards|respectfully|sincerely|thanks|thank you|warm regards)[,.!，。！]?[ \t]*)\n(?:[ \t]*\n)*[^\n]+\s*$",
+        lambda match: f"{match.group('signoff').rstrip()}\n{sender_name}",
+        body.strip(),
+    )
 
 
 def _uses_chinese(text: str) -> bool:
@@ -508,7 +564,12 @@ async def tool_revise_draft(
         max_attempts=1,
     )
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
-    draft_body = str(payload.get("draft_body") or draft).strip()[:_DRAFT_LIMIT]
+    draft_body = _normalize_generated_signature(
+        str(payload.get("draft_body") or draft).strip()[:_DRAFT_LIMIT],
+        mailbox,
+        str(ui_context.get("owner_display_name") or ""),
+        _requested_sender_name(user_text),
+    )
     assistant_text = str(payload.get("assistant_text") or fallback_text).strip()
     if is_compose:
         artifact = {
@@ -559,7 +620,11 @@ async def tool_compose_new(
         else "New compose draft ready to insert."
     )
     if sampling_create_message is None:
-        body = user_text[:800]
+        body = _normalize_generated_signature(
+            user_text[:800], mailbox,
+            str(ui_context.get("owner_display_name") or ""),
+            _requested_sender_name(user_text),
+        )
         return {
             "kind": "draft",
             "assistant_text": fallback_text,
@@ -594,7 +659,16 @@ async def tool_compose_new(
         max_attempts=1,
     )
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
-    draft_body, subject, recipients = _normalize_compose_payload(payload)
+    draft_body, subject, recipients = _normalize_compose_payload({
+        **payload,
+        "mailbox": mailbox,
+        "owner_display_name": str(ui_context.get("owner_display_name") or ""),
+    })
+    draft_body = _normalize_generated_signature(
+        draft_body, mailbox,
+        str(ui_context.get("owner_display_name") or ""),
+        _requested_sender_name(user_text),
+    )
     assistant_text = str(payload.get("assistant_text") or fallback_text).strip()
     if not draft_body:
         return {
@@ -978,7 +1052,12 @@ async def tool_batch_compose_new(
             # 收件人以本批已确认的目标为准，禁止模型返回的合并地址污染其它草稿。
             artifact = {
                 **artifact,
-                "body": str(artifact.get("body") or "")[:_BATCH_COMPOSE_DRAFT_BODY_LIMIT],
+                "body": _normalize_generated_signature(
+                    str(artifact.get("body") or "")[:_BATCH_COMPOSE_DRAFT_BODY_LIMIT],
+                    str(ui_context.get("mailbox") or arguments.get("mailbox") or ""),
+                    str(ui_context.get("owner_display_name") or ""),
+                    _requested_sender_name(user_text),
+                ),
                 "recipients": [recipient],
             }
             artifacts.append(artifact)

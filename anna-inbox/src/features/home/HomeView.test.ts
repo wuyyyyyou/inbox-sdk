@@ -155,6 +155,12 @@ describe("AI draft card layout", () => {
     expect(homeViewSource).toContain('t("ai.draftMessage")');
   });
 
+  it("keeps batch draft saves idempotent while streaming adds artifacts", () => {
+    expect(homeViewSource).toContain("const [savedIds, setSavedIds] = useState<Set<string>>(new Set())");
+    expect(homeViewSource).toContain("actions.saveComposeDraftBatch");
+    expect(homeViewSource).not.toContain("const saved = await Promise.all(valid.map");
+  });
+
   it("auto-expands the message editor and omits the second assistant follow-up", () => {
     expect(homeViewSource).toContain("textarea.style.height = \"auto\";");
     expect(homeViewSource).toContain("textarea.style.height = `${textarea.scrollHeight}px`;");

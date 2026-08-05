@@ -971,10 +971,50 @@ _DRAFT_STATUS_ERROR_RE = re.compile(
 )
 
 
-def _normalize_generated_draft_body(value: Any) -> str:
-    """Remove an accidental blank line between a closing and final signature line."""
+def _requested_sender_name(text: str) -> str:
+    """提取用户明确指定的落款名，未指定时返回空字符串。"""
+    value = str(text or "").strip()
+    patterns = (
+        r"(?:sender[_ ]?name|sign(?:ed)? off as|use the name)\s*[:：]?\s*[\"']?([^\"'\n,，。.!！]{1,80})",
+        r"(?:落款(?:名|姓名)?|署名)(?:是|为|用|写成)?\s*[:：]?\s*[\"']?([^\"'\n,，。.!！]{1,80})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, value, flags=re.IGNORECASE)
+        if match:
+            return _clean_sender_name(match.group(1))[:80]
+    return ""
+
+
+def _clean_sender_name(value: str) -> str:
+    """取名字首项并规范首字母，过滤平台或模型误传的纯符号名称。"""
+    name = str(value or "").strip()
+    first_name = name.split()[0] if name.split() else ""
+    if not re.search(r"[^\W_]", first_name, flags=re.UNICODE):
+        return ""
+    return first_name[:1].upper() + first_name[1:80]
+
+
+def _normalize_generated_draft_body(
+    value: Any,
+    mailbox: str = "",
+    owner_display_name: str = "",
+    requested_sender_name: str = "",
+) -> str:
+    """规范落款间距，并优先使用当前邮箱账户资料名。"""
     body = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    return _DRAFT_SIGNOFF_BLANK_LINE_RE.sub(r"\g<signoff>\n", body)
+    body = _DRAFT_SIGNOFF_BLANK_LINE_RE.sub(r"\g<signoff>\n", body)
+    sender_name = _clean_sender_name(requested_sender_name)[:80]
+    if not sender_name:
+        sender_name = _clean_sender_name(owner_display_name)[:80]
+    if not sender_name:
+        sender_name = _clean_sender_name(str(mailbox or "").strip().split("@", 1)[0].split(".", 1)[0])
+    if sender_name:
+        body = re.sub(
+            r"(?im)^(?P<signoff>[ \t]*(?:all the best|best(?: regards)?|cheers|kind regards|many thanks|regards|respectfully|sincerely|thanks|thank you|warm regards)[,.!，。！]?[ \t]*)\n(?:[ \t]*\n)*[^\n]+\s*$",
+            lambda match: f"{match.group('signoff').rstrip()}\n{sender_name}",
+            body,
+        )
+    return body
 
 
 def _normalize_draft_assistant_text(value: Any) -> str:
@@ -1711,6 +1751,7 @@ async def _generate_mail_prompt_result(
     visible_prompt: str,
     expected_artifact: str,
     user_answers: dict[str, str] | None,
+    owner_display_name: str,
     sampling_create_message: Any,
 ) -> dict[str, Any]:
     from mail_agent.llm_runtime.service import call_llm_json_safe
@@ -1824,7 +1865,9 @@ async def _generate_mail_prompt_result(
         })
 
     draft_payload = payload.get("draft_reply") if isinstance(payload.get("draft_reply"), dict) else {}
-    draft_body = _normalize_generated_draft_body(draft_payload.get("body"))
+    draft_body = _normalize_generated_draft_body(
+        draft_payload.get("body"), mailbox, owner_display_name, _requested_sender_name(visible_prompt)
+    )
     artifact = None
     if expected_artifact == "draft_reply" and draft_body and not needs_user_input:
         artifact = {
@@ -1932,6 +1975,7 @@ async def _generate_compose_mail_prompt_result(
     draft: dict[str, Any],
     visible_prompt: str,
     expected_artifact: str,
+    owner_display_name: str,
     sampling_create_message: Any,
 ) -> dict[str, Any]:
     """Run a read-only Compose-aware sidebar prompt and return an optional artifact.
@@ -1982,7 +2026,9 @@ async def _generate_compose_mail_prompt_result(
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
     gaps = _normalize_compose_gaps(payload.get("compose_gaps"))
     raw_compose_draft = payload.get("compose_draft") if isinstance(payload.get("compose_draft"), dict) else {}
-    proposed_body = _normalize_generated_draft_body(raw_compose_draft.get("body"))
+    proposed_body = _normalize_generated_draft_body(
+        raw_compose_draft.get("body"), mailbox, owner_display_name, _requested_sender_name(visible_prompt)
+    )
     suggested_subject = str(
         raw_compose_draft.get("subject") or payload.get("suggested_subject") or ""
     ).strip()[:998]
@@ -2063,6 +2109,7 @@ async def _handle_inbox_mail_prompt_background(run_id: str, arguments: dict[str,
     visible_prompt = str(arguments.get("visible_prompt", "")).strip()
     expected_artifact = str(arguments.get("expected_artifact", "")).strip()
     user_answers = arguments.get("user_answers") if isinstance(arguments.get("user_answers"), dict) else None
+    owner_display_name = str(arguments.get("owner_display_name") or "").strip()
     try:
         sampling = _build_sampling_for_run(arguments, invoke_id)
         result = await _generate_mail_prompt_result(
@@ -2073,6 +2120,7 @@ async def _handle_inbox_mail_prompt_background(run_id: str, arguments: dict[str,
             visible_prompt=visible_prompt,
             expected_artifact=expected_artifact,
             user_answers=user_answers,
+            owner_display_name=owner_display_name,
             sampling_create_message=sampling,
         )
         MAIL_AGENT_RUNS[run_id].update(status="done", result=result, updated_at=beijing_now())
@@ -2090,6 +2138,7 @@ async def _handle_compose_mail_prompt_background(run_id: str, arguments: dict[st
     draft = arguments.get("draft") if isinstance(arguments.get("draft"), dict) else {}
     visible_prompt = str(arguments.get("visible_prompt", "")).strip()
     expected_artifact = str(arguments.get("expected_artifact", "")).strip()
+    owner_display_name = str(arguments.get("owner_display_name") or "").strip()
     try:
         sampling = _build_sampling_for_run(arguments, invoke_id)
         result = await _generate_compose_mail_prompt_result(
@@ -2097,6 +2146,7 @@ async def _handle_compose_mail_prompt_background(run_id: str, arguments: dict[st
             draft=draft,
             visible_prompt=visible_prompt,
             expected_artifact=expected_artifact,
+            owner_display_name=owner_display_name,
             sampling_create_message=sampling,
         )
         MAIL_AGENT_RUNS[run_id].update(status="done", result=result, updated_at=beijing_now())
@@ -3269,9 +3319,9 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    if tool in {"get_compose_draft", "create_or_update_compose_draft", "delete_compose_draft", "list_compose_drafts"}:
+    if tool in {"get_compose_draft", "create_or_update_compose_draft", "create_or_update_compose_drafts", "delete_compose_draft", "list_compose_drafts"}:
         draft_id = str(arguments.get("draft_id", "")).strip()
-        from mail_agent.storage.ops import delete_compose_draft, get_compose_draft, list_compose_drafts, set_compose_draft
+        from mail_agent.storage.ops import delete_compose_draft, get_compose_draft, list_compose_drafts, set_compose_draft, set_compose_drafts_batch
         if tool == "get_compose_draft":
             if not mailbox or not draft_id:
                 return {"error": "mailbox and draft_id are required"}
@@ -3293,6 +3343,13 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
             if not mailbox:
                 return {"error": "mailbox is required"}
             return await list_compose_drafts(mailbox, limit=int(arguments.get("limit") or 100))
+        if tool == "create_or_update_compose_drafts":
+            if not mailbox:
+                return {"error": "mailbox is required"}
+            raw_drafts = arguments.get("drafts") if isinstance(arguments.get("drafts"), list) else []
+            if not raw_drafts:
+                return {"error": "drafts is required"}
+            return await set_compose_drafts_batch(mailbox, [item for item in raw_drafts if isinstance(item, dict)])
         if not mailbox:
             return {"error": "mailbox is required"}
         raw_draft = arguments.get("draft") if isinstance(arguments.get("draft"), dict) else {}

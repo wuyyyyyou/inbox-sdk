@@ -752,6 +752,21 @@ async def set_compose_draft(
     return {"ok": True, "etag": str(result.get("etag") or ""), "draft": payload}
 
 
+async def set_compose_drafts_batch(mailbox: str, drafts: list[dict[str, Any]]) -> dict[str, Any]:
+    """在一次工具调用内并发保存多封草稿，降低前端逐封 RPC 的往返开销。"""
+    import asyncio
+
+    results = await asyncio.gather(
+        *(set_compose_draft(mailbox, draft, if_match=str(draft.get("etag") or "") or None) for draft in drafts[:100]),
+    )
+    saved: list[dict[str, Any]] = []
+    for result in results:
+        draft = dict(result.get("draft") or {})
+        draft["etag"] = str(result.get("etag") or "")
+        saved.append(draft)
+    return {"ok": True, "mailbox": mailbox, "drafts": saved}
+
+
 async def delete_compose_draft(mailbox: str, draft_id: str) -> dict[str, Any]:
     return await get_storage().delete(_compose_draft_key(mailbox, draft_id), scope=default_scope())
 
@@ -759,7 +774,7 @@ async def delete_compose_draft(mailbox: str, draft_id: str) -> dict[str, Any]:
 async def list_compose_drafts(mailbox: str, *, limit: int = 100) -> dict[str, Any]:
     prefix = f"{_mailbox_prefix(mailbox)}/compose-drafts/"
     result = await get_storage().list(prefix=prefix, limit=max(1, min(int(limit or 100), 500)), scope=default_scope())
-    drafts: list[dict[str, Any]] = []
+    drafts_by_fingerprint: dict[str, dict[str, Any]] = {}
     for item in result.get("items") or []:
         key = item.get("key") if isinstance(item, dict) else item
         if not key:
@@ -768,7 +783,14 @@ async def list_compose_drafts(mailbox: str, *, limit: int = 100) -> dict[str, An
         value = loaded.get("value") if loaded.get("exists") and isinstance(loaded.get("value"), dict) else {}
         if not value:
             continue
-        drafts.append({**value, "etag": str(loaded.get("etag") or "")})
+        draft = {**value, "etag": str(loaded.get("etag") or "")}
+        # 旧版本可能已写入重复草稿；列表返回时保留最新一条，避免重复展示。
+        recipients = ",".join(sorted(str(item).strip().lower() for item in draft.get("recipients") or []))
+        fingerprint = "|".join((recipients, str(draft.get("subject") or "").strip(), str(draft.get("body") or "").strip()))
+        previous = drafts_by_fingerprint.get(fingerprint)
+        if previous is None or str(draft.get("updated_at") or "") >= str(previous.get("updated_at") or ""):
+            drafts_by_fingerprint[fingerprint] = draft
+    drafts = list(drafts_by_fingerprint.values())
     drafts.sort(key=lambda draft: str(draft.get("updated_at") or ""), reverse=True)
     return {"mailbox": mailbox, "count": len(drafts), "drafts": drafts}
 

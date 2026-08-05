@@ -66,6 +66,11 @@ describe("AI scan invocation", () => {
     expect(controllerSource).toMatch(/value\.batch_compose_draft \? \[value\.batch_compose_draft\]/);
   });
 
+  it("exposes one batch compose draft RPC instead of one RPC per card", () => {
+    expect(controllerSource).toContain("saveComposeDraftBatch(mailbox, drafts)");
+    expect(controllerSource).toContain("client.saveComposeDraftBatch");
+  });
+
   it("merges final compose artifacts with streamed partials and preserves cards on error", () => {
     expect(controllerSource).toContain("const finalComposeArtifacts = resolvedComposeArtifacts.length");
     expect(controllerSource).toContain("composeArtifacts: finalComposeArtifacts.length ? finalComposeArtifacts : undefined");

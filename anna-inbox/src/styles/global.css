@@ -10077,6 +10077,15 @@ textarea::placeholder {
 .compose-view .compose-body .rich-text-editor-surface {
   min-height: 165px;
 }
+
+/* 签名两行保持紧凑，正文段落仍使用默认间距。 */
+.compose-view .rich-text-editor-surface p:nth-last-child(2):has(+ p:last-child) {
+  margin-bottom: 0.2em;
+}
+
+.compose-view .rich-text-editor-surface p:last-child {
+  margin-bottom: 0;
+}
 .compose-view .compose-footer {
   display: flex;
   align-items: center;

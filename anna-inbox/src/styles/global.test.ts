@@ -116,3 +116,10 @@ describe("mail detail composer controls", () => {
     expect(styles).toContain("width: min(420px, max(260px, calc(100vw - 48px)));");
   });
 });
+
+describe("compose signature spacing", () => {
+  it("keeps only the final signature paragraphs compact", () => {
+    expect(styles).toContain(".compose-view .rich-text-editor-surface p:nth-last-child(2):has(+ p:last-child)");
+    expect(styles).toContain("margin-bottom: 0.2em;");
+  });
+});

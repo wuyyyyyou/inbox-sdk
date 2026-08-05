@@ -341,7 +341,7 @@ def _handle_invoke_bound(
         "list_inbox_thread_drafts",
         "save_inbox_thread_draft", "delete_inbox_thread_draft", "modify_message_labels", "set_message_starred",
         "update_inbox_thread_state", "search_compose_contacts", "get_compose_draft", "create_or_update_compose_draft",
-        "delete_compose_draft", "list_compose_drafts", "send_compose_emails",
+        "delete_compose_draft", "list_compose_drafts", "create_or_update_compose_drafts", "send_compose_emails",
         "begin_stage_outgoing_attachment", "complete_stage_outgoing_attachment", "delete_staged_outgoing_attachment",
         "prepare_staged_outgoing_attachment_access",
     ):

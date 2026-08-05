@@ -441,6 +441,10 @@ export class MailAgentClient {
     return this.invoke<{ ok?: boolean; etag?: string; draft: ComposeDraft }>("create_or_update_compose_draft", { mailbox, draft, if_match: ifMatch, storage_provider: storageProvider });
   }
 
+  saveComposeDraftBatch(mailbox: string, drafts: Array<Partial<ComposeDraft>>, storageProvider?: string) {
+    return this.invoke<{ ok?: boolean; drafts?: ComposeDraft[] }>("create_or_update_compose_drafts", { mailbox, drafts, storage_provider: storageProvider });
+  }
+
   deleteComposeDraft(mailbox: string, draftId: string, storageProvider?: string) {
     return this.invoke<{ ok?: boolean }>("delete_compose_draft", { mailbox, draft_id: draftId, storage_provider: storageProvider });
   }

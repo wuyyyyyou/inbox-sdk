@@ -1868,30 +1868,41 @@ function BatchComposeDraftArtifacts({
   onSave,
 }: {
   artifacts: ComposeDraftArtifact[];
-  onSave: (drafts: ComposeDraftArtifact[]) => Promise<void>;
+  onSave: (drafts: ComposeDraftArtifact[]) => Promise<ComposeDraftArtifact[]>;
 }) {
   const { t } = useI18n();
   const [drafts, setDrafts] = useState(artifacts);
   const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [savedIds, setSavedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    setDrafts(artifacts);
-    setSaved(false);
+    setDrafts((current) => artifacts.map((draft, index) => {
+      const previous = current[index];
+      return {
+        ...draft,
+        id: draft.id || previous?.id || `ai-compose-${index}`,
+        etag: draft.etag || previous?.etag,
+      };
+    }));
   }, [artifacts]);
 
   const updateDraft = (index: number, patch: Partial<ComposeDraftArtifact>) => {
     setDrafts((current) => current.map((draft, currentIndex) => (
       currentIndex === index ? { ...draft, ...patch } : draft
     )));
-    setSaved(false);
+    setSavedIds((current) => {
+      const next = new Set(current);
+      if (drafts[index]?.id) next.delete(drafts[index].id);
+      return next;
+    });
   };
 
   const saveAll = async () => {
     setSaving(true);
     try {
-      await onSave(drafts);
-      setSaved(true);
+      const savedDrafts = await onSave(drafts);
+      setDrafts(savedDrafts);
+      setSavedIds(new Set(savedDrafts.map((draft) => draft.id).filter((id): id is string => Boolean(id))));
     } finally {
       setSaving(false);
     }
@@ -1917,10 +1928,10 @@ function BatchComposeDraftArtifacts({
         </div>
       ))}
       <div className="ai-draft-artifact-actions">
-        <button className="is-primary" onClick={() => void saveAll()} disabled={saving || saved}>
+        <button className="is-primary" onClick={() => void saveAll()} disabled={saving || drafts.every((draft) => Boolean(draft.id && savedIds.has(draft.id)))}>
           {saving ? t("ai.saveDraftsSaving") : t("ai.saveDrafts")}
         </button>
-        {saved ? <span>{t("ai.saveDraftsSaved", { count: drafts.length })}</span> : null}
+        {savedIds.size ? <span>{t("ai.saveDraftsSaved", { count: savedIds.size })}</span> : null}
       </div>
     </div>
   );
@@ -1947,7 +1958,7 @@ function AiAssistantMessage({
     artifact: ComposeDraftArtifact,
     context: AiComposeContextRef | null,
   ) => void;
-  onSaveComposeArtifacts: (artifacts: ComposeDraftArtifact[]) => Promise<void>;
+  onSaveComposeArtifacts: (artifacts: ComposeDraftArtifact[]) => Promise<ComposeDraftArtifact[]>;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
   onTextComplete?: () => void;
@@ -2779,7 +2790,7 @@ function AiMessageBubble({
     artifact: ComposeDraftArtifact,
     context: AiComposeContextRef | null,
   ) => void;
-  onSaveComposeArtifacts: (artifacts: ComposeDraftArtifact[]) => Promise<void>;
+  onSaveComposeArtifacts: (artifacts: ComposeDraftArtifact[]) => Promise<ComposeDraftArtifact[]>;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
   onTextComplete?: () => void;
@@ -2835,7 +2846,7 @@ function AiSidebar({
     artifact: ComposeDraftArtifact,
     context: AiComposeContextRef | null,
   ) => void;
-  onSaveComposeArtifacts: (artifacts: ComposeDraftArtifact[]) => Promise<void>;
+  onSaveComposeArtifacts: (artifacts: ComposeDraftArtifact[]) => Promise<ComposeDraftArtifact[]>;
   onOpenMail: (target: AskMailLink) => void;
   onConfirmSendPlan: (plan: SendPlanArtifact) => void;
   onApplyScanQuery?: (query: string) => void;
@@ -6554,15 +6565,32 @@ export function HomeView() {
       if (valid.length !== artifacts.length) {
         throw new Error("请先补全每封草稿的收件人、主题和正文。");
       }
-      const saved = await Promise.all(valid.map((artifact) => actions.saveComposeDraft(
-        artifact.mailbox || mailbox,
-        { recipients: artifact.recipients || [], subject: artifact.subject || "", body: artifact.body },
-      )));
+      const saved = await actions.saveComposeDraftBatch(
+        valid[0]?.mailbox || mailbox,
+        valid.map((artifact) => ({
+          id: artifact.id || crypto.randomUUID(),
+          recipients: artifact.recipients || [],
+          subject: artifact.subject || "",
+          body: artifact.body,
+          etag: artifact.etag,
+        })),
+      );
       setComposeDrafts((current) => [
         ...saved,
         ...current.filter((draft) => !saved.some((item) => item.id === draft.id)),
       ]);
       actions.showToast(t("ai.saveDraftsSaved", { count: saved.length }));
+      return saved.map((draft) => ({
+        type: "compose_draft" as const,
+        mailbox: draft.mailbox,
+        id: draft.id,
+        etag: draft.etag,
+        body: draft.body,
+        recipients: draft.recipients,
+        subject: draft.subject,
+        source_prompt: "",
+        mode: "insert" as const,
+      }));
     },
     [actions, mailbox, t],
   );

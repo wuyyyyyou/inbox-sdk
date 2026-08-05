@@ -18,7 +18,9 @@ def main() -> None:
         MAIL_SUMMARY_SYSTEM,
         _sidebar_fallback_text,
         _sidebar_language_instruction,
+        _normalize_generated_draft_body,
     )
+    from mail_agent.ai_turn.tools import _normalize_generated_signature
     from mail_agent.ai_turn.prompts import ask_planner_system_prompt
 
     chinese_instruction = _sidebar_language_instruction("请总结这封邮件，并告诉我下一步怎么办")
@@ -31,6 +33,14 @@ def main() -> None:
     english_instruction = _sidebar_language_instruction("Summarize this thread")
     assert "same language as the visible prompt" in english_instruction
     assert _sidebar_fallback_text("Summarize this thread", "summary") == "I reviewed the thread, but could not generate a detailed summary."
+    assert _normalize_generated_signature("Hello\n\nBest,\n\nAnna", "jiao@anna.partners", "Jiao Zhang") == "Hello\n\nBest,\nJiao"
+    assert _normalize_generated_signature("Hello\n\nBest,\n\nAnna", "jiao@anna.partners", "jiao zhang") == "Hello\n\nBest,\nJiao"
+    assert _normalize_generated_signature("Hello\n\nBest,\n\nAnna", "kate@anna.partners", "") == "Hello\n\nBest,\nKate"
+    assert _normalize_generated_signature("Hello\n\nBest,\n\nAnna", "jiao@anna.partners", "]") == "Hello\n\nBest,\nJiao"
+    assert _normalize_generated_signature("Hello\n\nBest,\n\nAnna", "jiao@anna.partners") == "Hello\n\nBest,\nJiao"
+    assert _normalize_generated_signature("Hello\n\nBest,\n\nAnna", "jiao@anna.partners", "Jiao Zhang", "Jiao") == "Hello\n\nBest,\nJiao"
+    assert _normalize_generated_draft_body("Hello\n\nBest,\n\nKate", "jiao@anna.partners", "Jiao Zhang") == "Hello\n\nBest,\nJiao"
+    assert _normalize_generated_draft_body("Hello\n\nBest,\n\nKate", "jiao@anna.partners", "]") == "Hello\n\nBest,\nJiao"
 
     for prompt in (MAIL_PROMPT_SYSTEM, COMPOSE_MAIL_PROMPT_SYSTEM):
         assert "Follow the Response language instruction" in prompt

@@ -719,6 +719,8 @@ export interface SendPlanArtifact {
 
 export interface ComposeDraftArtifact {
   type: "compose_draft";
+  id?: string;
+  etag?: string;
   mailbox: string;
   body: string;
   source_prompt: string;
