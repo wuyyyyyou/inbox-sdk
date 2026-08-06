@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  getListEnterAction,
   plainTextToEditorHtml,
   sanitizeEditorStyle,
 } from "./RichTextEditor";
@@ -18,5 +19,10 @@ describe("RichTextEditor pure helpers", () => {
 
   it("normalizes supported pasted style values and drops unsafe CSS", () => {
     expect(sanitizeEditorStyle("color: rgb(37, 99, 235); position: fixed; text-align: justify; font-size: 99px")).toBe("color: #2563eb; text-align: justify");
+  });
+
+  it("keeps Enter inside empty list items", () => {
+    expect(getListEnterAction(true)).toBe("split");
+    expect(getListEnterAction(false)).toBe("split");
   });
 });

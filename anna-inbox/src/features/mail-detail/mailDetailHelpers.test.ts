@@ -256,7 +256,7 @@ describe("mailDetailHelpers", () => {
     })).toThrow("Attachment expired");
   });
 
-  it("downloads url access from the current document without opening a window", () => {
+  it("materializes url access before downloading and releases the blob url later", async () => {
     const click = vi.fn();
     const remove = vi.fn();
     const appendChild = vi.fn();
@@ -265,22 +265,56 @@ describe("mailDetailHelpers", () => {
       createElement: vi.fn(() => link),
       body: { appendChild },
     } as unknown as Document;
-    triggerAttachmentDownload({
+    const previousFetch = globalThis.fetch;
+    const createObjectURL = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:download");
+    const revokeObjectURL = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    const setTimeout = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: TimerHandler) => {
+      if (typeof callback === "function") callback();
+      return 1 as unknown as number;
+    }) as typeof window.setTimeout);
+    globalThis.fetch = vi.fn(async () => ({ ok: true, blob: async () => new Blob(["file"]) })) as unknown as typeof fetch;
+    try {
+      await triggerAttachmentDownload({
       kind: "url",
       url: "https://files.example.test/file.pdf",
       filename: "file.pdf",
       mimeType: "application/pdf",
       externalPreview: false,
-    }, undefined, ownerDocument);
-    expect(link.href).toBe("https://files.example.test/file.pdf");
-    expect(link.download).toBe("file.pdf");
-    expect(link.style.display).toBe("none");
-    expect(appendChild).toHaveBeenCalledWith(link);
-    expect(click).toHaveBeenCalledOnce();
-    expect(remove).toHaveBeenCalledOnce();
+      }, undefined, ownerDocument);
+      expect(link.href).toBe("blob:download");
+      expect(link.download).toBe("file.pdf");
+      expect(link.style.display).toBe("none");
+      expect(appendChild).toHaveBeenCalledWith(link);
+      expect(click).toHaveBeenCalledOnce();
+      expect(remove).toHaveBeenCalledOnce();
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:download");
+    } finally {
+      globalThis.fetch = previousFetch;
+      createObjectURL.mockRestore();
+      revokeObjectURL.mockRestore();
+      setTimeout.mockRestore();
+    }
   });
 
-  it("downloads blob access from the current document", () => {
+  it("throws when a url download response is not ok", async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => ({ ok: false, status: 403 })) as unknown as typeof fetch;
+    try {
+      await expect(triggerAttachmentDownload({
+        kind: "url",
+        url: "https://files.example.test/file.pdf",
+        filename: "file.pdf",
+        mimeType: "application/pdf",
+        externalPreview: false,
+      }, undefined, {
+        createElement: vi.fn(),
+      } as unknown as Document)).rejects.toThrow("Attachment fetch failed with 403");
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it("downloads blob access from the current document", async () => {
     const click = vi.fn();
     const remove = vi.fn();
     const appendChild = vi.fn();
@@ -298,7 +332,7 @@ describe("mailDetailHelpers", () => {
         };
       },
     } as unknown as Document;
-    triggerAttachmentDownload({
+    await triggerAttachmentDownload({
       kind: "blob",
       url: "blob:file",
       filename: "file.pdf",

@@ -86,14 +86,51 @@ def main() -> None:
 
     attachment_msg = _message([_part("text/plain", "Please review the attachment.")])
     attachment_msg["attachments"] = [
-        {"filename": "offer.pdf", "mimeType": "application/pdf", "size": 1234, "attachmentId": "att-1"},
         {"filename": "", "mimeType": "image/png", "size": 10, "attachmentId": "inline"},
+        {"filename": "", "mimeType": "text/plain", "size": 0, "attachmentId": "no-filename"},
+        {"filename": "offer.pdf", "mimeType": "application/pdf", "size": 1234, "attachmentId": "att-1"},
     ]
     attachments = adapter.attachment_metadata_from_message(attachment_msg)
     check("attachment metadata filters non-downloadable parts", len(attachments) == 1)
     check("attachment metadata has opaque id", attachments[0]["id"] and "att-1" not in attachments[0]["id"])
     found = adapter.find_attachment_for_token(attachment_msg, attachments[0]["id"])
     check("attachment token resolves to gmail attachment id", found["gmail_attachment_id"] == "att-1")
+
+    refreshed_attachment_msg = {
+        **attachment_msg,
+        "attachments": [
+            {"filename": "", "mimeType": "image/png", "size": 10, "attachmentId": "inline-refreshed"},
+            {"filename": "", "mimeType": "text/plain", "size": 0, "attachmentId": "no-filename-refreshed"},
+            {"filename": "offer.pdf", "mimeType": "application/pdf", "size": 1234, "attachmentId": "att-2"},
+        ],
+    }
+    refreshed = adapter.find_attachment_for_token(refreshed_attachment_msg, attachments[0]["id"])
+    check("stale attachment token resolves by stable position", refreshed["gmail_attachment_id"] == "att-2")
+    check("stale attachment token keeps current metadata", refreshed["filename"] == "offer.pdf")
+
+    invalid_index_token = adapter._attachment_token("msg-1", "missing-id", 1)
+    try:
+        adapter.find_attachment_for_token(refreshed_attachment_msg, invalid_index_token)
+    except ValueError as exc:
+        check("non-downloadable raw index is rejected", str(exc) == "Attachment not found")
+    else:
+        raise AssertionError("non-downloadable raw index must not match another attachment")
+
+    out_of_range_token = adapter._attachment_token("msg-1", "missing-id", 99)
+    try:
+        adapter.find_attachment_for_token(refreshed_attachment_msg, out_of_range_token)
+    except ValueError as exc:
+        check("out-of-range raw index is rejected", str(exc) == "Attachment not found")
+    else:
+        raise AssertionError("out-of-range raw index must not match another attachment")
+
+    wrong_message_token = adapter._attachment_token("other-message", "att-2", 2)
+    try:
+        adapter.find_attachment_for_token(refreshed_attachment_msg, wrong_message_token)
+    except ValueError as exc:
+        check("attachment token message id is enforced", str(exc) == "Attachment does not belong to this message")
+    else:
+        raise AssertionError("attachment token from another message must be rejected")
 
     inline_image = {
         "mimeType": "image/png",

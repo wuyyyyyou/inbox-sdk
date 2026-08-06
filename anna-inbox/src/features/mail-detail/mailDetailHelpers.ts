@@ -214,12 +214,12 @@ export async function materializeAttachmentAccess(access: ResolvedAttachmentAcce
   };
 }
 
-export function triggerAttachmentDownload(
+export async function triggerAttachmentDownload(
   access: ResolvedAttachmentAccess,
   filename?: string,
   ownerDocument: Document = document,
-) {
-  triggerBrowserDownload(access.url, filename || access.filename || "attachment", ownerDocument);
+): Promise<void> {
+  await triggerBrowserDownload(access.url, filename || access.filename || "attachment", ownerDocument);
 }
 
 export function deriveReplyToAddress(message: InboxThreadMessage | undefined, mailbox: string) {

@@ -4433,11 +4433,11 @@ export function useAppController() {
           throw new Error(result.error || "Attachment download is unavailable in this runtime.");
         }
         if (result.download_url) {
-          triggerBrowserDownload(result.download_url, result.filename || "attachment");
+          await triggerBrowserDownload(result.download_url, result.filename || "attachment");
         } else if (result.content_b64) {
           const blobUrl = base64ToBlobUrl(result.content_b64, result.mime_type || "application/octet-stream");
           try {
-            triggerBrowserDownload(blobUrl, result.filename || "attachment");
+            await triggerBrowserDownload(blobUrl, result.filename || "attachment");
           } finally {
             window.setTimeout(() => URL.revokeObjectURL(blobUrl), 30_000);
           }

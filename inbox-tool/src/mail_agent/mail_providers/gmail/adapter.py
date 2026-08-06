@@ -2021,10 +2021,36 @@ def find_attachment_for_token(message: dict[str, Any], token: str) -> dict[str, 
     if not payload or str(payload.get("m") or "") != message_id:
         raise ValueError("Attachment does not belong to this message")
     attachment_id = str(payload.get("a") or "")
-    for item in attachment_metadata_from_message(message):
+    attachments = attachment_metadata_from_message(message)
+    # 先按 token 中保存的 Gmail attachmentId 直接匹配，兼容当前邮件仍保留
+    # 原始 ID 的正常路径，也避免在 ID 未变化时额外依赖附件位置。
+    for item in attachments:
         decoded = _decode_attachment_token(str(item.get("id") or ""))
         if str(decoded.get("a") or "") == attachment_id:
             return {**item, "gmail_attachment_id": attachment_id}
+
+    # Gmail 刷新同一封邮件时可能重新签发 attachmentId。前端令牌同时保存了
+    # 附件在原始 attachments 列表中的位置，因此旧令牌仍可在严格校验
+    # message_id 后解析到当前附件 ID。这里必须读取原始列表，不能使用已经
+    # 过滤掉 inline/CID 或无 filename 项的 attachment metadata 列表，否则
+    # 前置被过滤项会造成索引偏移并误选另一份附件。
+    try:
+        attachment_index = int(payload.get("i"))
+    except (TypeError, ValueError):
+        attachment_index = -1
+    raw_attachments = message.get("attachments") if isinstance(message.get("attachments"), list) else []
+    if 0 <= attachment_index < len(raw_attachments):
+        raw_item = raw_attachments[attachment_index]
+        if isinstance(raw_item, dict):
+            # 只有同时具备 filename 和 attachmentId 的原始项才允许下载；
+            # 不可下载项即使位置合法，也不能借用其他附件的 metadata。
+            filename = str(raw_item.get("filename") or "").strip()
+            current_attachment_id = str(raw_item.get("attachmentId") or "").strip()
+            if filename and current_attachment_id:
+                for current in attachments:
+                    decoded = _decode_attachment_token(str(current.get("id") or ""))
+                    if int(decoded.get("i", -1)) == attachment_index:
+                        return {**current, "gmail_attachment_id": current_attachment_id}
     raise ValueError("Attachment not found")
 
 

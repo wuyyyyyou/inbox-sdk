@@ -1779,10 +1779,25 @@ export function MailDetailDrawer({
     const messageId = String(item.messageId || item.attachment.message_id || "").trim();
     const attachmentId = String(item.attachment.id || "").trim();
     if (!messageId || !attachmentId) {
-      throw new Error("This attachment is missing its message or attachment id. Refresh the thread and try again.");
+      throw new Error(t("detail.attachmentMissingId"));
     }
     const result = await prepareInboxAttachmentAccess(mailbox, messageId, attachmentId, mode);
     return resolveAttachmentAccess(result);
+  };
+
+  const attachmentErrorMessage = (reason: unknown) => {
+    const raw = reason instanceof Error ? reason.message : String(reason);
+    const message = raw.replace(/^\[tool:[^\]]+\]\s*/i, "").trim();
+    const normalized = message.toLowerCase();
+    if (normalized.includes("attachment not found") || normalized.includes("does not belong to this message")) {
+      return t("detail.attachmentNotFound");
+    }
+    if (normalized.includes("does not support preview")) return t("detail.attachmentTypeUnsupported");
+    if (normalized.includes("missing its message or attachment id")) return t("detail.attachmentMissingId");
+    if (normalized.includes("content is unavailable")) return t("detail.attachmentUnavailable");
+    const status = message.match(/(?:attachment|preview) fetch failed with (\d+)/i)?.[1];
+    if (status) return t("detail.attachmentFetchFailed", { status });
+    return t("detail.attachmentAccessFailed");
   };
 
   const attachmentDownloadKey = (item: PreviewAttachmentRef) =>
@@ -1799,9 +1814,9 @@ export function MailDetailDrawer({
     showToast(t("toast.preparingDownload"));
     try {
       access = await prepareAttachmentAccess(item, "download");
-      triggerAttachmentDownload(access, item.attachment.filename);
+      await triggerAttachmentDownload(access, item.attachment.filename);
     } catch (reason) {
-      throw new Error(reason instanceof Error ? reason.message : String(reason));
+      throw new Error(attachmentErrorMessage(reason));
     } finally {
       if (access?.kind === "blob") {
         window.setTimeout(() => access?.revoke?.(), 60_000);
@@ -1852,7 +1867,7 @@ export function MailDetailDrawer({
         if (access.kind === "url" && kind !== "text") access = await materializeAttachmentAccess(access);
         if (session !== previewSessionRef.current) {
           access.revoke?.();
-          throw new Error("Preview session ended.");
+          throw new Error(t("detail.attachmentAccessFailed"));
         }
         entry.access = access;
         if (kind === "text") {
@@ -1860,7 +1875,7 @@ export function MailDetailDrawer({
             entry.textTruncated = true;
           } else {
             const response = await fetch(access.url);
-            if (!response.ok) throw new Error(`Preview fetch failed with ${response.status}`);
+            if (!response.ok) throw new Error(t("detail.attachmentFetchFailed", { status: response.status }));
             entry.text = await response.text();
           }
         }
@@ -1870,7 +1885,7 @@ export function MailDetailDrawer({
         access?.revoke?.();
         entry.access = null;
         entry.status = "error";
-        entry.error = reason instanceof Error ? reason.message : String(reason);
+        entry.error = attachmentErrorMessage(reason);
       } finally {
         entry.promise = undefined;
         if (session === previewSessionRef.current) notifyPreviewCacheChanged();
@@ -1961,7 +1976,7 @@ export function MailDetailDrawer({
     } catch (reason) {
       if (session === previewSessionRef.current && currentPreviewKeyRef.current === key) {
         clearPreviewAccess();
-        setPreviewError(reason instanceof Error ? reason.message : String(reason));
+        setPreviewError(attachmentErrorMessage(reason));
       }
     } finally {
       if (session === previewSessionRef.current && currentPreviewKeyRef.current === key) setPreviewLoading(false);
@@ -2761,19 +2776,19 @@ export function MailDetailDrawer({
           <button className="attachment-preview-backdrop" aria-label={t("detail.closePreview")} onClick={closePreview} />
           <div className="attachment-preview-sheet">
             <header>
-              <strong>{previewIndex + 1} / {previewableAttachments.length} - {previewAttachment.attachment.filename}</strong>
+              <strong>{Math.max(1, previewIndex + 1)} / {previewableAttachments.length} - {previewAttachment.attachment.filename}</strong>
               <div>
                 <DownloadButton disabled={isAttachmentDownloading(previewAttachment)} onClick={() => void downloadAttachment(previewAttachment).catch((reason) => showToast(reason instanceof Error ? reason.message : String(reason)))} />
-                <PreviewToolbarButton label="Close" onClick={closePreview}><CloseIcon /></PreviewToolbarButton>
+                <PreviewToolbarButton label={t("detail.closePreview")} onClick={closePreview}><CloseIcon /></PreviewToolbarButton>
               </div>
             </header>
             <div ref={previewBodyRef} className={`attachment-preview-body is-${previewTransition}`}>
-              {previewLoading ? <p>Loading preview…</p> : null}
+              {previewLoading ? <p>{t("detail.loadingPreview")}</p> : null}
               {!previewLoading && previewError ? (
                 <div className="attachment-preview-error">
                   <p>{previewError}</p>
                   <div className="attachment-preview-actions">
-                    <button onClick={() => void loadPreviewItem(previewAttachment)}>Retry</button>
+                    <button onClick={() => void loadPreviewItem(previewAttachment)}>{t("detail.retry")}</button>
                     <DownloadButton disabled={isAttachmentDownloading(previewAttachment)} onClick={() => void downloadAttachment(previewAttachment).catch((reason) => showToast(reason instanceof Error ? reason.message : String(reason)))} />
                   </div>
                 </div>
@@ -2810,8 +2825,16 @@ export function MailDetailDrawer({
                 );
               })}
             </div>
-            {previewIndex > 0 ? <PreviewArrow direction="previous" disabled={previewLoading || previewSwitching} onClick={() => void stepPreview(-1)} /> : null}
-            {previewIndex >= 0 && previewIndex < previewableAttachments.length - 1 ? <PreviewArrow direction="next" disabled={previewLoading || previewSwitching} onClick={() => void stepPreview(1)} /> : null}
+            {previewableAttachments.length > 1 ? (
+              <div
+                className="attachment-preview-navigation"
+                aria-hidden="false"
+                style={{ position: "absolute", inset: 0, zIndex: 20, pointerEvents: "none" }}
+              >
+                {previewIndex > 0 ? <span style={{ pointerEvents: "auto" }}><PreviewArrow direction="previous" disabled={previewLoading || previewSwitching} onClick={() => void stepPreview(-1)} /></span> : null}
+                {previewIndex >= 0 && previewIndex < previewableAttachments.length - 1 ? <span style={{ pointerEvents: "auto" }}><PreviewArrow direction="next" disabled={previewLoading || previewSwitching} onClick={() => void stepPreview(1)} /></span> : null}
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}

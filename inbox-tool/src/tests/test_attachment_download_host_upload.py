@@ -211,6 +211,38 @@ async def main_async() -> None:
     check("APS upload completes once", len(fake_aps_files.complete_calls) == 1)
     check("content bytes stay out of JSON result", "content" not in result and "content_b64" not in result)
 
+    # Gmail 的不透明附件令牌可能超过平台对对象路径段的 128 字符限制。
+    long_attachment_token = "eyJ" + "a" * 256
+    v2_tools._aps_files = fake_aps_files
+    v2_tools.host_upload = _HostUnavailable()
+    v2_tools._put_presigned_url_sync = lambda *args, **kwargs: "etag-2"
+    try:
+        long_token_result = await v2_tools._upload_attachment_for_download(
+            "user@example.com",
+            "message-1",
+            {
+                "id": long_attachment_token,
+                "filename": "deck.pdf",
+                "mime_type": "application/pdf",
+                "message_id": "message-1",
+            },
+            b"pdf-bytes",
+        )
+    finally:
+        v2_tools._aps_files = original_aps_files
+        v2_tools.host_upload = original_host_upload
+        v2_tools._put_presigned_url_sync = original_put
+    long_token_path = str(fake_aps_files.begin_calls[-1]["path"])
+    check(
+        "long attachment token upload returns a URL",
+        long_token_result["url"].startswith("https://files.example.test/"),
+    )
+    check("APS path does not expose opaque attachment token", long_attachment_token not in long_token_path)
+    check(
+        "APS path segments stay within platform limit",
+        all(len(segment) <= 128 for segment in long_token_path.split("/")),
+    )
+
     os.environ.pop("ANNA_INBOX_ATTACHMENT_DOWNLOAD_MODE", None)
     check("default attachment download mode is direct inline", v2_tools._attachment_download_mode() == "direct_inline")
     os.environ["ANNA_INBOX_ATTACHMENT_DOWNLOAD_MODE"] = "host_preferred"

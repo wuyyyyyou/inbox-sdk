@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from html import escape as html_escape
 
@@ -184,6 +185,17 @@ def _safe_attachment_filename(filename: str) -> str:
     return name[:160] or "attachment"
 
 
+def _attachment_storage_id(attachment: dict[str, Any]) -> str:
+    """将不透明附件令牌压缩为适用于 APS Files 路径的固定长度标识。"""
+    token = str(attachment.get("id") or "attachment")
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _attachment_path_segment(value: str) -> str:
+    """将 APS Files 对象路径段限制在平台允许的长度内。"""
+    return _safe_attachment_filename(value)[:120] or "attachment"
+
+
 def _put_presigned_url_sync(url: str, headers: dict[str, Any], content: bytes, mime_type: str) -> str:
     import subprocess
     import tempfile
@@ -318,7 +330,8 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
     # 2) APS Files 回退
     path = (
         f"anna-inbox/mailbox/{sanitize_mailbox_id(mailbox)}/attachments/"
-        f"{_safe_attachment_filename(card_id)}/{_safe_attachment_filename(str(attachment.get('id') or 'attachment'))}/{filename}"
+        f"{_attachment_path_segment(card_id)}/{_attachment_storage_id(attachment)}/"
+        f"{_attachment_path_segment(filename)}"
     )
     begin = await _aps_files.upload_begin(
         path=path,
