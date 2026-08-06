@@ -29,6 +29,25 @@ describe("inbox startup settings", () => {
   });
 });
 
+describe("toast queue", () => {
+  it("keeps a bounded queue with independent expiration callbacks", () => {
+    expect(controllerSource).toContain("const MAX_VISIBLE_TOASTS = 4");
+    expect(controllerSource).toContain("const toastTimers = useRef(new Map<string, number>())");
+    expect(controllerSource).toContain("onExpire?: () => void | Promise<void>");
+    expect(controllerSource).toContain("while (toastItemsRef.current.length >= MAX_VISIBLE_TOASTS)");
+    expect(controllerSource).toContain("expireToast(toastItemsRef.current[0].id);");
+  });
+
+  it("removes an action toast before invoking its callback so undo cannot expire afterward", () => {
+    const appSource = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+    expect(appSource).toContain("<div className=\"toast-stack\"");
+    expect(appSource).toContain("toasts.map((toast)");
+    expect(appSource.indexOf("dismissToast(toast.id);")).toBeLessThan(
+      appSource.indexOf("toast.onAction?.();"),
+    );
+  });
+});
+
 describe("Manage Splits tooltip", () => {
   it("uses only the custom tooltip instead of a browser title tooltip", () => {
     const manageSplitsButton = homeViewSource.match(
@@ -236,5 +255,18 @@ describe("mailbox switching", () => {
     expect(controllerSource).toMatch(
       /inboxRequestSequence\.current \+= 1;[\s\S]*draftRequestSequence\.current \+= 1;/,
     );
+  });
+
+  it("loads only the target mailbox Ask history and clears the active conversation on switch", () => {
+    expect(controllerSource).toContain("await saveCurrentAiConversationBeforeMailboxSwitch(previousMailbox)");
+    expect(controllerSource).toContain("void loadAiAskHistory(primary)");
+    expect(controllerSource).toContain("askHistory: []");
+    expect(controllerSource).toContain("aiChatMessages: []");
+  });
+
+  it("persists Ask history through the APS-scoped client and clears only the current mailbox", () => {
+    expect(controllerSource).toContain("client.saveAiAskHistory");
+    expect(controllerSource).toContain("await saveAiAskHistory(mailbox, [])");
+    expect(controllerSource).not.toMatch(/async clearHistory\(\)[\s\S]*?client\.clearHistory\(\)/);
   });
 });

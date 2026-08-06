@@ -22,7 +22,7 @@ afterEach(() => {
 });
 
 describe("createInitialState", () => {
-  it("starts a fresh Ask chat after reload while keeping old conversations in history", () => {
+  it("discards legacy local Ask history because it has no mailbox scope", () => {
     const recentTs = new Date().toISOString();
     const savedHistory = [{
       conversationId: "chat_previous",
@@ -44,13 +44,13 @@ describe("createInitialState", () => {
     const state = createInitialState();
 
     expect(state.mailbox).toBe("owner@example.com");
-    expect(state.askHistory).toEqual(savedHistory);
+    expect(state.askHistory).toEqual([]);
+    expect(window.localStorage.getItem(AI_ASK_HISTORY_STORAGE_KEY)).toBeNull();
     expect(state.aiChatMessages).toEqual([]);
     expect(state.aiChatConversationId).toBe("");
-    expect(state.askHistory[0].pendingRun).toEqual({ runId: "at_pending123", question: "hello" });
   });
 
-  it("drops ask history older than 7 days on load", () => {
+  it("does not load any legacy local history, including recent entries", () => {
     const oldTs = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
     const recentTs = new Date().toISOString();
     installLocalStorage({
@@ -61,7 +61,7 @@ describe("createInitialState", () => {
       ]),
     });
     const state = createInitialState();
-    expect(state.askHistory.map((e) => e.conversationId)).toEqual(["new"]);
+    expect(state.askHistory).toEqual([]);
   });
 });
 

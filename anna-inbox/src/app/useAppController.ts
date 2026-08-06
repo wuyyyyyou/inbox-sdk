@@ -309,7 +309,6 @@ function upsertInboxThreadDraftPreview(
   return messages.map((message, index) => index === existingIndex ? nextMessage : message);
 }
 
-const AI_ASK_HISTORY_STORAGE_KEY = "anna-inbox:ai-ask-history:v1";
 function createId(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
 }
@@ -903,18 +902,6 @@ function pruneAskHistoryEntries(history: AskHistoryEntry[], nowMs = Date.now()):
     .slice(0, 30);
 }
 
-function persistAskHistory(history: AskHistoryEntry[]) {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(
-      AI_ASK_HISTORY_STORAGE_KEY,
-      JSON.stringify(pruneAskHistoryEntries(history)),
-    );
-  } catch {
-    // localStorage 写入失败不影响主流程，最多只是刷新后不能恢复侧栏对话。
-  }
-}
-
 function syntheticChatResult(messages: AiChatMessage[]): CustomRunResult {
   const firstUser = messages.find((message) => message.role === "user")?.content || "Chat with Anna";
   const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant" && !message.pending)?.content || "";
@@ -1025,7 +1012,12 @@ type ToastOptions = {
   onAction?: () => void;
   secondaryActionLabel?: string;
   onSecondaryAction?: () => void;
+  /** Toast 自然消失时执行；用于将可撤销的前端操作延后提交到后端。 */
+  onExpire?: () => void | Promise<void>;
 };
+
+type ToastItem = { id: string; message: string } & ToastOptions;
+const MAX_VISIBLE_TOASTS = 4;
 
 type BatchInboxActionResult = {
   ok: boolean;
@@ -1110,7 +1102,8 @@ export interface AppActions {
   ): Promise<{ ok?: boolean; etag?: string; updated?: boolean }>;
   deleteInboxThreadDraft(mailbox: string, threadId: string): Promise<{ ok?: boolean }>;
   searchComposeContacts(mailbox: string, query: string): Promise<{ contacts: ComposeContact[]; permissionRequired: boolean }>;
-  listComposeDrafts(mailbox: string): Promise<ComposeDraftListPayload>;
+  listComposeDrafts(mailbox: string, limit?: number, offset?: number): Promise<ComposeDraftListPayload>;
+  getComposeDraft(mailbox: string, draftId: string): Promise<{ draft?: ComposeDraft }>;
   saveComposeDraft(mailbox: string, draft: Partial<ComposeDraft>, ifMatch?: string): Promise<ComposeDraft>;
   saveComposeDraftBatch(mailbox: string, drafts: Array<Partial<ComposeDraft>>): Promise<ComposeDraft[]>;
   deleteComposeDraft(mailbox: string, draftId: string): Promise<void>;
@@ -1255,10 +1248,12 @@ export interface AppActions {
 export function useAppController() {
   const { locale, t } = useI18n();
   const [state, setState] = useState<AppState>(() => createInitialState());
-  const [toast, setToast] = useState<({ message: string } & ToastOptions) | null>(null);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [accountSwitchNotice, setAccountSwitchNotice] = useState<{ email: string; avatarUrl?: string } | null>(null);
   const [accountSwitchNoticeVisible, setAccountSwitchNoticeVisible] = useState(false);
-  const toastTimer = useRef<number | null>(null);
+  const toastItemsRef = useRef<ToastItem[]>([]);
+  const toastTimers = useRef(new Map<string, number>());
+  const toastSequence = useRef(0);
   const accountSwitchTimer = useRef<number | null>(null);
   const accountSwitchDismissTimer = useRef<number | null>(null);
   const runtimePromise = useRef<Promise<AppState["runtime"]> | null>(null);
@@ -1287,6 +1282,9 @@ export function useAppController() {
   const aiSidebarBackendModeRef = useRef<AiSidebarMode>("host");
   /** 每个会话首轮固定 AI 执行路径，避免追问在 Host/local 间切换。 */
   const aiSidebarModeByConversationRef = useRef(new Map<string, AiSidebarMode>());
+  const askHistoryEtagsRef = useRef(new Map<string, string>());
+  const askHistorySaveQueueRef = useRef(new Map<string, Promise<void>>());
+  const askHistoryLoadSequenceRef = useRef(0);
   const workflowMigrationRef = useRef(new Set<string>());
 
   const getRuntime = useCallback(async () => {
@@ -1370,19 +1368,58 @@ export function useAppController() {
     }
   }, [client, state.indexedSearchHasMore, state.indexedSearchLoading, state.indexedSearchNextOffset, state.indexedSearchQuery, state.inboxWorkflowState.done, state.inboxWorkflowState.snoozed, state.inboxWorkflowState.todos, state.mailbox, state.selectedMailboxes]);
 
-  const showToast = useCallback((message: string, options?: ToastOptions) => {
-    setToast({ message, ...options });
-    if (toastTimer.current) window.clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToast(null), options?.durationMs ?? 3200);
+  const removeToast = useCallback((toastId: string) => {
+    const timer = toastTimers.current.get(toastId);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      toastTimers.current.delete(toastId);
+    }
+    const item = toastItemsRef.current.find((toast) => toast.id === toastId);
+    if (!item) return null;
+    const next = toastItemsRef.current.filter((toast) => toast.id !== toastId);
+    toastItemsRef.current = next;
+    setToasts(next);
+    return item;
   }, []);
 
-  const dismissToast = useCallback(() => {
-    if (toastTimer.current) {
-      window.clearTimeout(toastTimer.current);
-      toastTimer.current = null;
+  const expireToast = useCallback((toastId: string) => {
+    const item = removeToast(toastId);
+    if (!item?.onExpire) return;
+    // 先撤掉 Toast 与计时器，再提交后台操作；Undo 不会与过期回调并发执行。
+    void Promise.resolve(item.onExpire()).catch(() => undefined);
+  }, [removeToast]);
+
+  const showToast = useCallback((message: string, options?: ToastOptions) => {
+    while (toastItemsRef.current.length >= MAX_VISIBLE_TOASTS) {
+      expireToast(toastItemsRef.current[0].id);
     }
-    setToast(null);
-  }, []);
+    toastSequence.current += 1;
+    const item: ToastItem = {
+      id: `toast-${toastSequence.current}`,
+      message,
+      ...options,
+    };
+    const next = [...toastItemsRef.current, item];
+    toastItemsRef.current = next;
+    setToasts(next);
+    toastTimers.current.set(
+      item.id,
+      window.setTimeout(() => expireToast(item.id), options?.durationMs ?? 3200),
+    );
+  }, [expireToast]);
+
+  const dismissToast = useCallback((toastId: string) => {
+    removeToast(toastId);
+  }, [removeToast]);
+
+  useEffect(
+    () => () => {
+      for (const timer of toastTimers.current.values()) window.clearTimeout(timer);
+      toastTimers.current.clear();
+      toastItemsRef.current = [];
+    },
+    [],
+  );
 
   // All mail 混排后 INBOX 占比可能偏低；刷新/预热多拉一些进缓存，投影后 Inbox 才够用
   const ALL_MAIL_CACHE_FETCH_LIMIT = 400;
@@ -1782,6 +1819,95 @@ export function useAppController() {
     void silentSyncInbox(pending.days);
   }, [silentSyncInbox, state.mailDetailOpen]);
 
+  const saveAiAskHistory = useCallback(async (mailboxInput: string, history: AskHistoryEntry[]) => {
+    const mailbox = normalizedMailbox(mailboxInput);
+    if (!mailbox) return;
+    const nextHistory = pruneAskHistoryEntries(history);
+    const previous = askHistorySaveQueueRef.current.get(mailbox) || Promise.resolve();
+    const next = previous.catch(() => undefined).then(async () => {
+      const payload = await client.saveAiAskHistory(
+        mailbox,
+        nextHistory,
+        askHistoryEtagsRef.current.get(mailbox) || undefined,
+      );
+      askHistoryEtagsRef.current.set(mailbox, payload.etag || "");
+    });
+    askHistorySaveQueueRef.current.set(mailbox, next);
+    try {
+      await next;
+    } finally {
+      if (askHistorySaveQueueRef.current.get(mailbox) === next) {
+        askHistorySaveQueueRef.current.delete(mailbox);
+      }
+    }
+  }, [client]);
+
+  const loadAiAskHistory = useCallback(async (mailboxInput?: string) => {
+    const mailbox = normalizedMailbox(mailboxInput || state.mailbox);
+    if (!mailbox) return;
+    const requestId = ++askHistoryLoadSequenceRef.current;
+    setState((s) => normalizedMailbox(s.mailbox) === mailbox
+      ? { ...s, askHistory: [], askHistoryExpanded: {} }
+      : s);
+    try {
+      const pendingSave = askHistorySaveQueueRef.current.get(mailbox);
+      if (pendingSave) await pendingSave.catch(() => undefined);
+      const payload = await client.loadAiAskHistory(mailbox);
+      const history = pruneAskHistoryEntries(Array.isArray(payload.entries) ? payload.entries : []);
+      askHistoryEtagsRef.current.set(mailbox, payload.etag || "");
+      if (askHistoryLoadSequenceRef.current !== requestId) return;
+      setState((s) => normalizedMailbox(s.mailbox) === mailbox
+        ? { ...s, askHistory: history, askHistoryExpanded: {} }
+        : s);
+    } catch (error) {
+      if (askHistoryLoadSequenceRef.current !== requestId) return;
+      setState((s) => normalizedMailbox(s.mailbox) === mailbox
+        ? { ...s, askHistory: [], askHistoryExpanded: {} }
+        : s);
+      console.warn("[ask-history] load failed:", error instanceof Error ? error.message : String(error));
+    }
+  }, [client, state.mailbox]);
+
+  const saveCurrentAiConversationBeforeMailboxSwitch = useCallback(async (mailboxInput: string) => {
+    const mailbox = normalizedMailbox(mailboxInput);
+    if (!mailbox) return;
+    let history = state.askHistory;
+    const conversationId = state.aiChatConversationId;
+    const lastUser = [...state.aiChatMessages].reverse().find((message) => message.role === "user");
+    const running = Boolean(aiGenerationRun.current || state.aiChatLoading || state.isCustomScanning);
+    if (running && conversationId && lastUser) {
+      const run = aiGenerationRun.current;
+      if (run) {
+        run.cancelled = true;
+        run.controller.abort();
+        aiGenerationRun.current = null;
+      }
+      void cancelAiAgentTurn(conversationId).catch((error) => {
+        console.warn("[agent.session] cancel failed:", error);
+      });
+      const stoppedAt = new Date().toISOString();
+      const messages = state.aiChatMessages.map((message) => message.pending
+        ? { ...message, pending: false, kind: "stopped" as const, content: "Generation stopped.", timestamp: stoppedAt }
+        : message);
+      const entry: AskHistoryEntry = {
+        conversationId,
+        kind: lastUser.kind === "scan" ? "scan" : "chat",
+        query: lastUser.content,
+        result: syntheticChatResult(messages),
+        timestamp: stoppedAt,
+        messages,
+      };
+      history = pruneAskHistoryEntries([
+        entry,
+        ...history.filter((item) => item.conversationId !== conversationId),
+      ]);
+      setState((s) => normalizedMailbox(s.mailbox) === mailbox
+        ? { ...s, askHistory: history, aiChatMessages: messages }
+        : s);
+    }
+    await saveAiAskHistory(mailbox, history);
+  }, [saveAiAskHistory, state.aiChatConversationId, state.aiChatLoading, state.aiChatMessages, state.askHistory, state.isCustomScanning]);
+
   const upsertAiConversationHistory = useCallback((
     conversationId: string,
     messages: AiChatMessage[],
@@ -1808,11 +1934,13 @@ export function useAppController() {
         entry,
         ...s.askHistory.filter((item) => item.conversationId !== conversationId),
       ]);
-      persistAskHistory(nextHistory);
+      void saveAiAskHistory(s.mailbox, nextHistory).catch((error) => {
+        console.warn("[ask-history] save failed:", error instanceof Error ? error.message : String(error));
+      });
       // Ask history 是“会话索引”；点击历史恢复 messages 后，用户可以继续在同一 conversationId 里追问。
       return { ...s, askHistory: nextHistory, aiChatMessages: messages, aiChatConversationId: conversationId };
     });
-  }, []);
+  }, [saveAiAskHistory]);
 
   const refreshStoredCardFields = useCallback((cards: FrontendCard[]) => {
     setState((s) => {
@@ -3009,6 +3137,8 @@ export function useAppController() {
           }
           inboxAvailable = await preloadMailboxSnapshot(currentMailbox, rangeDays, true);
         }
+        // AI 侧栏历史独立于 Gmail 授权状态，启动时按当前邮箱从 APS 恢复。
+        void loadAiAskHistory(currentMailbox);
         void loadMailboxes().then(async (discoveredState) => {
           const discoveredPrimary = normalizedMailbox(discoveredState.primary);
           if (!discoveredPrimary || discoveredPrimary === currentMailbox) return;
@@ -3075,7 +3205,7 @@ export function useAppController() {
       showToast(t("toast.initFailed", { detail: msg }));
       setState((s) => ({ ...s, loading: false, inboxLoading: false, inboxError: msg }));
     }
-  }, [client, discoverMailbox, getRuntime, loadCustomPlans, loadInboxSettings, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshConnectivityStatus, showToast, state.mailbox, state.selectedMailboxes, state.storageProvider, t]);
+  }, [client, discoverMailbox, getRuntime, loadAiAskHistory, loadCustomPlans, loadInboxSettings, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshConnectivityStatus, showToast, state.mailbox, state.selectedMailboxes, state.storageProvider, t]);
 
   // 初次连接失败不会再永久缓存 mock runtime；前台保持每 5 秒尝试一次完整初始化，
   // 成功后 effect 自动停止。业务 mutation 不在此处重放，仍需用户再次确认。
@@ -3245,6 +3375,13 @@ export function useAppController() {
         setState((s) => ({ ...s, selectedMailboxes: primary ? [primary] : s.selectedMailboxes, briefMailboxFilter: primary ? [primary] : s.briefMailboxFilter }));
         return;
       }
+      const previousMailbox = normalizedMailbox(state.mailbox);
+      // 切换邮箱前先把进行中的会话冻结并写回原邮箱，避免停止扫描后丢失最后一轮提问。
+      try {
+        await saveCurrentAiConversationBeforeMailboxSwitch(previousMailbox);
+      } catch (error) {
+        console.warn("[ask-history] switch save failed:", error instanceof Error ? error.message : String(error));
+      }
       // 立刻停上一邮箱扫描，释放 getToken / Gmail。
       stopActiveScans("switched mailbox");
       if (deferredInboxLoadTimer.current) {
@@ -3274,8 +3411,18 @@ export function useAppController() {
           inboxSnapshotMessages: [],
           inboxDraftMessages: [],
           inboxSnapshotComplete: false,
+          askHistory: [],
+          askHistoryExpanded: {},
+          aiChatMessages: [],
+          aiChatConversationId: "",
+          customScanInput: "",
+          aiChatLoading: false,
+          isCustomScanning: false,
+          scanStatus: "",
+          customRunProgress: null,
         };
       });
+      void loadAiAskHistory(primary);
       void setSelectedMailbox(primary);
       const rangeDays = clampInboxSettings(state.inboxSettings).display_range_days;
 
@@ -3882,8 +4029,14 @@ export function useAppController() {
       const result = await client.searchComposeContacts(normalizedMailbox(mailbox), query, 10, state.storageProvider);
       return { contacts: result.contacts || [], permissionRequired: Boolean(result.permission_required) };
     },
-    async listComposeDrafts(mailbox) {
-      return client.listComposeDrafts(normalizedMailbox(mailbox), 100, state.storageProvider);
+    async listComposeDrafts(mailbox, limit = 100, offset = 0) {
+      return client.listComposeDrafts(normalizedMailbox(mailbox), limit, offset, state.storageProvider);
+    },
+    async getComposeDraft(mailbox, draftId) {
+      const result = await client.getComposeDraft(normalizedMailbox(mailbox), draftId, state.storageProvider);
+      return {
+        draft: result.draft ? { ...result.draft, etag: result.etag || result.draft.etag } : undefined,
+      };
     },
     async saveComposeDraft(mailbox, draft, ifMatch) {
       const result = await client.saveComposeDraft(normalizedMailbox(mailbox), draft, ifMatch, state.storageProvider);
@@ -4613,7 +4766,9 @@ export function useAppController() {
           entry,
           ...s.askHistory.filter((item) => item.conversationId !== chatId),
         ]);
-        persistAskHistory(nextHistory);
+        void saveAiAskHistory(s.mailbox, nextHistory).catch((error) => {
+          console.warn("[ask-history] save failed:", error instanceof Error ? error.message : String(error));
+        });
         return {
           ...s,
           aiChatMessages: messages,
@@ -4717,7 +4872,9 @@ export function useAppController() {
       if (entry.conversationId) aiSidebarModeByConversationRef.current.delete(entry.conversationId);
       setState((s) => {
         const nextHistory = removeAskHistoryEntry(s.askHistory, index);
-        persistAskHistory(nextHistory);
+        void saveAiAskHistory(s.mailbox, nextHistory).catch((error) => {
+          console.warn("[ask-history] save failed:", error instanceof Error ? error.message : String(error));
+        });
         return {
           ...s,
           askHistory: nextHistory,
@@ -5526,7 +5683,9 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
         const result = buildCustomRunResult(runId, (completed.result || {}) as Record<string, unknown>);
         setState((s) => {
           const nextHistory = [{ query: userRequest, result, timestamp: new Date().toISOString(), kind: "scan" as const }, ...s.askHistory].slice(0, 30);
-          persistAskHistory(nextHistory);
+          void saveAiAskHistory(s.mailbox, nextHistory).catch((error) => {
+            console.warn("[ask-history] save failed:", error instanceof Error ? error.message : String(error));
+          });
           return {
             ...s,
             scanStatus: "",
@@ -5593,7 +5752,9 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
         const result = buildCustomRunResult(runId, (completed.result || {}) as Record<string, unknown>);
         setState((s) => {
           const nextHistory = [{ query: question, result, timestamp: new Date().toISOString(), kind: "scan" as const }, ...s.askHistory].slice(0, 30);
-          persistAskHistory(nextHistory);
+          void saveAiAskHistory(s.mailbox, nextHistory).catch((error) => {
+            console.warn("[ask-history] save failed:", error instanceof Error ? error.message : String(error));
+          });
           return { ...s, scanStatus: "", askHistory: nextHistory, customRunProgress: null };
         });
         showToast(t("toast.reRunComplete"));
@@ -5628,13 +5789,16 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
       }
     },
     async clearHistory() {
+      const mailbox = normalizedMailbox(state.mailbox);
+      if (!mailbox) return;
+      // 使已经发出的旧邮箱历史读取失效，避免清空后被旧响应写回界面。
+      askHistoryLoadSequenceRef.current += 1;
       try {
-        const result = await client.clearHistory();
-        if (result.ok) {
-          persistAskHistory([]);
-          setState((s) => ({ ...s, askHistory: [], aiChatMessages: [], aiChatConversationId: "" }));
-          showToast(t("toast.historyCleared"));
-        }
+        await saveAiAskHistory(mailbox, []);
+        setState((s) => normalizedMailbox(s.mailbox) === mailbox
+          ? { ...s, askHistory: [], askHistoryExpanded: {}, aiChatMessages: [], aiChatConversationId: "" }
+          : s);
+        showToast(t("toast.historyCleared"));
       } catch (error) {
         showToast(error instanceof Error ? error.message : String(error));
       }
@@ -5643,7 +5807,6 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
       try {
         const result = await client.resetAllData();
         if (result.ok) {
-          persistAskHistory([]);
           setState((s) => ({ ...s, cards: [], allCards: [], scanState: null, askHistory: [], aiChatMessages: [], aiChatConversationId: "", customPlans: [], lowerPriorityOpen: false, expandedDetails: {}, cleanupReadState: {}, markingReadIds: {}, attachmentDownloads: {}, askItemActions: {}, askEditDraft: {}, askGapAnswers: {}, askDraftsByKey: {}, gapAnswersByCard: {}, threadSummaryById: {}, draftById: {}, draftPreferencesById: {}, replyIntentById: {}, replyModeById: {}, revisionById: {}, threadContextExpanded: {} }));
           showToast(t("toast.allDataReset"));
           window.location.reload();
@@ -5952,5 +6115,5 @@ payload = normalizeAiArtifactPayload((completed.result || {}) as Record<string, 
     },
   };
 
-  return { state, setState, actions, toast, dismissToast, accountSwitchNotice, accountSwitchNoticeVisible, closeAccountSwitchNotice, initialize };
+  return { state, setState, actions, toasts, dismissToast, accountSwitchNotice, accountSwitchNoticeVisible, closeAccountSwitchNotice, initialize };
 }

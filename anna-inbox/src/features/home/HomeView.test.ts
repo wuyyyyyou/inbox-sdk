@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { PlusIcon, accountDisplayName, aiSearchStatus, aiThinkingElapsedLabel, formatInboxTabCount, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, inboxLastSyncedLabel, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isMailFeedNearBottom, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, renderAiUserMessageContent, resolveSourceMessages, restoreInboxWorkflow, senderParts, shouldShowImportantIcon, transitionInboxWorkflow } from "./HomeView";
+import { PlusIcon, accountDisplayName, aiSearchStatus, aiThinkingElapsedLabel, composeDraftOverlayMessages, formatInboxTabCount, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, inboxLastSyncedLabel, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isMailFeedNearBottom, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, renderAiUserMessageContent, resolveSourceMessages, restoreInboxWorkflow, senderParts, shouldShowImportantIcon, transitionInboxWorkflow } from "./HomeView";
 
 const homeViewSource = readFileSync(new URL("./HomeView.tsx", import.meta.url), "utf8");
 const workflowOf = (flags: { todos: string[]; snoozed: string[]; done: string[]; doneRemoved?: string[] }) => ({
@@ -62,6 +62,16 @@ describe("mail detail complete body", () => {
     expect(cacheRender).toBeLessThan(backgroundRefresh);
   });
 
+  it("renders the cached reply draft before the APS refresh and ignores late responses after editing", () => {
+    const drawerSource = readFileSync(
+      new URL("../mail-detail/MailDetailDrawer.tsx", import.meta.url),
+      "utf8",
+    );
+    expect(drawerSource).toContain("getCachedInboxThreadDraft(mailbox, threadId)");
+    expect(drawerSource).toContain("editSequence !== draftEditSequenceRef.current");
+    expect(drawerSource).toContain("setCachedInboxThreadDraft(mailbox, threadId");
+  });
+
   it("keeps the cached mailbox snapshot when the active mailbox changes", () => {
     const rangeEffect = homeViewSource.match(/const appliedDisplayRangeRef[\s\S]*?const lastSyncedLabel/)?.[0] || "";
     expect(rangeEffect).toContain("void syncInbox(configuredDays);");
@@ -114,6 +124,144 @@ describe("legacy AI draft preview", () => {
     );
     expect(promptSource).toContain("ask whether to generate a reply draft");
     expect(promptSource).toContain("Do not output the draft body");
+  });
+});
+
+describe("compose draft synchronization feedback", () => {
+  it("renders the local draft mirror before refreshing APS in the background", () => {
+    expect(homeViewSource).toContain("getCachedComposeDraftDirectory(mailbox)");
+    expect(homeViewSource).toContain("if (!cancelled) void refreshStoredDrafts();");
+    expect(homeViewSource).toContain("setCachedComposeDraftDirectory(mailbox");
+  });
+
+  it("shows an APS network retry message instead of a Gmail draft-sync error", () => {
+    expect(homeViewSource).toContain("const [draftSyncError, setDraftSyncError] = useState(false);");
+    expect(homeViewSource).toContain("setDraftSyncError(true);");
+    expect(homeViewSource).toContain("draftSyncError &&");
+    expect(homeViewSource).toContain('mailboxView === "drafts"');
+    expect(homeViewSource).toContain('t("mail.draftsApsSyncFailed")');
+    expect(homeViewSource).toContain('t("mail.draftsApsSyncHint")');
+  });
+
+  it("keeps APS compose-draft loading independent from inbox-thread draft loading", () => {
+    const refreshStart = homeViewSource.indexOf("const refreshStoredDrafts = useCallback");
+    const refreshEnd = homeViewSource.indexOf("const syncInbox = useCallback", refreshStart);
+    const refreshSource = homeViewSource.slice(refreshStart, refreshEnd);
+    expect(refreshSource).toContain("void composeDraftActionsRef.current");
+    expect(refreshSource).toContain(".listInboxThreadDrafts(mailbox, 100)");
+    expect(refreshSource).toContain("const payload = await composeDraftActionsRef.current.listComposeDrafts(mailbox)");
+    expect(refreshSource).not.toContain("Promise.allSettled([");
+  });
+
+  it("does not render the bottom refresh action beside the empty-state retry", () => {
+    expect(homeViewSource).toContain("const hasGroupedMessages = grouped.some");
+    expect(homeViewSource).toContain(
+      'mailboxView === "drafts" && !state.inboxLoading && (!draftSyncError || hasGroupedMessages)',
+    );
+  });
+
+  it("shows progress for the empty-state retry and coalesces duplicate draft refreshes", () => {
+    expect(homeViewSource).toContain("const [draftSyncing, setDraftSyncing] = useState(false)");
+    expect(homeViewSource).toContain("composeDraftRefreshInFlightRef");
+    expect(homeViewSource).toContain('draftSyncing ? t("mail.refreshingDrafts") : t("mail.tryAgain")');
+  });
+
+  it("does not repeatedly reload drafts when the controller action object rerenders", () => {
+    expect(homeViewSource).toContain("const composeDraftActionsRef = useRef({");
+    expect(homeViewSource).toContain("composeDraftActionsRef.current.listComposeDrafts(mailbox)");
+    expect(homeViewSource).toContain("}, [mailbox]);");
+  });
+
+  it("loads only the selected draft body after the lightweight directory row is clicked", () => {
+    expect(homeViewSource).toContain("getComposeDraft: actions.getComposeDraft");
+    expect(homeViewSource).toContain("await composeDraftActionsRef.current.getComposeDraft(mailbox, draftId)");
+    expect(homeViewSource).toContain("composeDraftBodyPreview(draft)");
+  });
+
+  it("mounts a Drafts directory detail in its closed state before opening the drawer", () => {
+    const openHelperStart = homeViewSource.indexOf("const openComposeDraftDrawer = useCallback");
+    const openHelperEnd = homeViewSource.indexOf("const openMessageDetail = useCallback", openHelperStart);
+    const openHelper = homeViewSource.slice(openHelperStart, openHelperEnd);
+    expect(openHelper).toContain("setComposeOpening(true);");
+    expect(openHelper).toContain("window.requestAnimationFrame");
+    expect(openHelper).toContain("setComposeOpen(true);");
+    expect(openHelper.indexOf("setComposeOpening(true);")).toBeLessThan(
+      openHelper.indexOf("setComposeOpen(true);"),
+    );
+    expect(homeViewSource).toContain("openComposeDraftDrawer(draft);");
+    expect(homeViewSource).toContain("composeOpen || composeOpening || composeClosing");
+  });
+
+  it("clears stale search terms before rendering the Drafts folder", () => {
+    const selectViewStart = homeViewSource.indexOf("const selectMailboxView = (next: MailboxView) => {");
+    const selectViewEnd = homeViewSource.indexOf("const updateFlag", selectViewStart);
+    const selectViewSource = homeViewSource.slice(selectViewStart, selectViewEnd);
+    expect(selectViewSource).toContain('if (next === "drafts")');
+    expect(selectViewSource).toContain('setSearch("");');
+    expect(selectViewSource).toContain('setActiveSearch("");');
+  });
+});
+
+describe("compose close persistence", () => {
+  it("closes the composer before its remote draft save completes", () => {
+    const composeSource = readFileSync(
+      new URL("./ComposeView.tsx", import.meta.url),
+      "utf8",
+    );
+    const closeStart = composeSource.indexOf("const close = () => {");
+    const closeEnd = composeSource.indexOf("const saveToDrafts", closeStart);
+    const closeSource = composeSource.slice(closeStart, closeEnd);
+    expect(closeSource).toContain("onCloseWithSave(draftInput, etag || undefined);");
+    expect(closeSource).not.toContain("await save()");
+    expect(closeSource.indexOf("onCloseWithSave")).toBeLessThan(
+      closeSource.indexOf("onClose();"),
+    );
+  });
+
+  it("keeps a failed background save available through an explicit restore action", () => {
+    expect(homeViewSource).toContain("const saveComposeDraftAfterClose = useCallback(");
+    expect(homeViewSource).toContain('t("compose.backgroundSaveFailed")');
+    expect(homeViewSource).toContain('t("compose.restoreDraft")');
+    expect(homeViewSource).toContain("restoreBackgroundComposeDraft(recovery)");
+  });
+
+  it("does not queue an APS save when the compose draft has not changed", () => {
+    const composeSource = readFileSync(
+      new URL("./ComposeView.tsx", import.meta.url),
+      "utf8",
+    );
+    expect(composeSource).toContain("composeDraftFingerprint");
+    expect(composeSource).toContain(
+      "composeDraftFingerprint(draftInput) !== persistedDraftFingerprintRef.current",
+    );
+  });
+});
+
+describe("compose draft deletion", () => {
+  it("optimistically hides a draft and waits for the undo toast to expire before deleting remotely", () => {
+    const deleteStart = homeViewSource.indexOf("const requestComposeDraftDelete = useCallback(");
+    const deleteEnd = homeViewSource.indexOf("const scheduleComposeBatch", deleteStart);
+    const deleteSource = homeViewSource.slice(deleteStart, deleteEnd);
+    expect(deleteSource).toContain("pendingComposeDraftDeletesRef.current.add(draft.id);");
+    expect(deleteSource).toContain("const nextDrafts = current.filter((item) => item.id !== draft.id);");
+    expect(deleteSource).toContain("return nextDrafts;");
+    expect(deleteSource).toContain('actionLabel: t("toast.undo")');
+    expect(deleteSource).toContain("onAction: restore");
+    expect(deleteSource).toContain("onExpire: async () => {");
+    expect(deleteSource.indexOf("onExpire: async () => {")).toBeLessThan(
+      deleteSource.indexOf("await actions.deleteComposeDraft(mailbox, draft.id);"),
+    );
+  });
+
+  it("uses the same deferred deletion flow from the compose discard control", () => {
+    const composeSource = readFileSync(
+      new URL("./ComposeView.tsx", import.meta.url),
+      "utf8",
+    );
+    expect(composeSource).toContain("onDiscardDraft: (draft: ComposeDraft) => void;");
+    expect(composeSource).toContain("onDiscardDraft({");
+    expect(composeSource).not.toContain("await actions.deleteComposeDraft(mailbox, draftId)");
+    expect(homeViewSource).toContain("onDiscardDraft={requestComposeDraftDelete}");
   });
 });
 
@@ -511,6 +659,34 @@ describe("resolveSourceMessages", () => {
 
     expect(resolveSourceMessages("starred", [], merged, flags).map((message) => message.id)).toEqual(["message-1"]);
     expect(resolveSourceMessages("drafts", [], merged, flags).map((message) => message.id)).toEqual(["message-1"]);
+  });
+
+  it("overlays an APS Compose draft onto its source inbox thread", () => {
+    const inboxMessage = {
+      id: "received-1",
+      thread_id: "thread-1",
+      mailbox: "owner@example.com",
+      label_ids: ["INBOX"],
+    };
+    const composeDrafts = [{
+      id: "compose-1",
+      mailbox: "owner@example.com",
+      source_thread_id: "thread-1",
+      recipients: ["julian@example.com"],
+      subject: "Re: Meeting",
+      body: "Thanks for the update.",
+      updated_at: "2026-08-06T07:48:43+00:00",
+    }];
+
+    const [merged] = mergeDraftOverlayMessages(
+      [inboxMessage],
+      composeDraftOverlayMessages(composeDrafts),
+    );
+
+    expect(merged.id).toBe("received-1");
+    expect(merged.draft_local).toBe(true);
+    expect(merged.draft_body).toBe("Thanks for the update.");
+    expect(merged.label_ids).toContain("DRAFT");
   });
 
   it("preserves the inbox message direction when applying a draft from the same thread", () => {

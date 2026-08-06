@@ -10,6 +10,9 @@ from anna_inbox_executa.sampling_tools import *
 from anna_inbox_executa.storage_tools import *
 
 INLINE_ATTACHMENT_DIRECT_MAX_BYTES = 4 * 1024 * 1024
+# 草稿目录与普通邮件目录共用保守的 RPC 帧上限。正文只能在用户打开某一封草稿后
+# 按需读取，避免多封 HTML 草稿叠加后被宿主以超大 stdio 帧终止进程。
+COMPOSE_DRAFT_DIRECTORY_RESPONSE_MAX_BYTES = 48 * 1024
 # APS / Host reverse-RPC 单次协商超时：需明显短于前端 tools.invoke 60s，
 # 以便失败时仍能返回可读错误，而不是被宿主整调用超时淹没。
 APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS = 20.0
@@ -2169,6 +2172,128 @@ def _card_context(card: Any) -> dict[str, str]:
         return {}
 
 
+
+def _compose_draft_directory_frame_size(data: dict[str, Any]) -> int:
+    """按实际 JSON-RPC 外层结构测量草稿目录帧大小，保留足够的请求 ID 余量。"""
+    frame = {
+        "jsonrpc": JSONRPC_VERSION,
+        "id": "x" * 128,
+        "result": {"success": True, "tool": "list_compose_drafts", "data": data},
+    }
+    return len(json.dumps(frame, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _compose_draft_detail_frame_size(data: dict[str, Any]) -> int:
+    """测量单封草稿详情帧，异常超大 HTML 也不能穿透 stdio。"""
+    frame = {
+        "jsonrpc": JSONRPC_VERSION,
+        "id": "x" * 128,
+        "result": {"success": True, "tool": "get_compose_draft", "data": data},
+    }
+    return len(json.dumps(frame, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _compact_compose_draft_directory_entry(draft: dict[str, Any]) -> dict[str, Any]:
+    """构造无完整正文的草稿目录行，列表只用于预览与按需打开。"""
+    body = str(draft.get("body") or "")
+    attachments = draft.get("attachments") if isinstance(draft.get("attachments"), list) else []
+    # 收件人和主题有业务展示价值，但仍须限制单一异常 MIME 头部撑大目录帧。
+    return {
+        "id": str(draft.get("id") or "")[:256],
+        "mailbox": str(draft.get("mailbox") or "")[:320],
+        "draft_mode": "forward" if str(draft.get("draft_mode") or "").lower() == "forward" else "compose",
+        "source_thread_id": str(draft.get("source_thread_id") or "")[:256],
+        "source_message_id": str(draft.get("source_message_id") or "")[:256],
+        "gmail_draft_id": str(draft.get("gmail_draft_id") or "")[:256],
+        "gmail_message_id": str(draft.get("gmail_message_id") or "")[:256],
+        "recipients": [str(item)[:320] for item in (draft.get("recipients") or [])[:50]],
+        "cc": [str(item)[:320] for item in (draft.get("cc") or [])[:50]],
+        "bcc": [str(item)[:320] for item in (draft.get("bcc") or [])[:50]],
+        "subject": str(draft.get("subject") or "")[:4096],
+        # 保留空 body 以兼容既有 ComposeDraft DTO；真实正文绝不放入目录响应。
+        "body": "",
+        "body_preview": body[:120],
+        "attachments": [
+            {
+                "id": str(item.get("id") or "")[:256],
+                "filename": str(item.get("filename") or "attachment")[:512],
+                "mime_type": str(item.get("mime_type") or "application/octet-stream")[:256],
+                "size": int(item.get("size") or 0),
+                "storage_key": str(item.get("storage_key") or "")[:1024],
+            }
+            for item in attachments[:50]
+            if isinstance(item, dict)
+        ],
+        "created_at": str(draft.get("created_at") or "")[:128],
+        "updated_at": str(draft.get("updated_at") or "")[:128],
+        "etag": str(draft.get("etag") or "")[:512],
+    }
+
+
+async def _list_aps_compose_drafts(mailbox: str, limit: int, offset: int) -> dict[str, Any]:
+    """从 APS 构造草稿目录页，不读取或合并 Gmail 草稿。"""
+    from mail_agent.storage.ops import list_compose_drafts
+
+    page_offset = max(0, int(offset or 0))
+    page_limit = max(1, min(int(limit or 100), 500))
+    persisted = await list_compose_drafts(mailbox, limit=min(500, page_offset + page_limit))
+    persisted_drafts = persisted.get("drafts") if isinstance(persisted.get("drafts"), list) else []
+    directory_entries: list[dict[str, Any]] = []
+    aps_has_more = len(persisted_drafts) > page_offset + page_limit
+    for draft in persisted_drafts[page_offset:page_offset + page_limit]:
+        if not isinstance(draft, dict):
+            continue
+        compact = _compact_compose_draft_directory_entry(draft)
+        candidate = {
+            "mailbox": mailbox,
+            "count": len(directory_entries) + 1,
+            "drafts": [*directory_entries, compact],
+            "has_more": aps_has_more,
+            "next_offset": page_offset + len(directory_entries) + 1,
+        }
+        if directory_entries and _compose_draft_directory_frame_size(candidate) > COMPOSE_DRAFT_DIRECTORY_RESPONSE_MAX_BYTES:
+            aps_has_more = True
+            break
+        directory_entries.append(compact)
+    return {
+        "mailbox": mailbox,
+        "count": len(directory_entries),
+        "drafts": directory_entries,
+        "has_more": aps_has_more,
+        "next_offset": page_offset + len(directory_entries),
+    }
+
+
+async def _get_aps_compose_draft(mailbox: str, draft_id: str) -> dict[str, Any]:
+    """读取 APS 草稿详情；超大正文使用临时 URL，避免写入 JSON-RPC 响应。"""
+    from mail_agent.storage.ops import get_compose_draft
+
+    persisted = await get_compose_draft(mailbox, draft_id)
+    persisted_draft = persisted.get("draft") if isinstance(persisted.get("draft"), dict) else {}
+    if not persisted.get("exists"):
+        return {"mailbox": mailbox, "exists": False, "etag": "", "draft": {}}
+    draft = {**persisted_draft, "etag": str(persisted.get("etag") or persisted_draft.get("etag") or "")}
+    result = {"mailbox": mailbox, "exists": True, "etag": str(draft.get("etag") or ""), "draft": draft}
+    if _compose_draft_detail_frame_size(result) <= COMPOSE_DRAFT_DIRECTORY_RESPONSE_MAX_BYTES:
+        return result
+
+    # 单封异常大草稿同样不允许走 stdout。前端会立即从短期 loopback URL 读取 HTML，
+    # 再填入 Compose 编辑器；APS 与浏览器缓存都不会持久化该临时 URL。
+    body_html = str(draft.get("body_html") or "")
+    if not body_html:
+        body_html = (
+            "<!doctype html><html><body><pre style=\"white-space:pre-wrap;word-break:break-word\">"
+            f"{html_escape(str(draft.get('body') or ''))}"
+            "</pre></body></html>"
+        )
+    draft = {
+        **draft,
+        "body": "",
+        "body_html": "",
+        "body_url": _write_loopback_email_body(body_html, {}),
+    }
+    return {"mailbox": mailbox, "exists": True, "etag": str(draft.get("etag") or ""), "draft": draft}
+
 async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) -> dict[str, Any]:
     """Handle V2 interaction tools (async, runs on the event loop)."""
     from mail_agent.storage.ops import (
@@ -3325,15 +3450,14 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if tool == "get_compose_draft":
             if not mailbox or not draft_id:
                 return {"error": "mailbox and draft_id are required"}
-            result = await get_compose_draft(mailbox, draft_id)
-            return {"mailbox": mailbox, **result}
+            return await _get_aps_compose_draft(mailbox, draft_id)
         if tool == "delete_compose_draft":
             if not mailbox or not draft_id:
                 return {"error": "mailbox and draft_id are required"}
-            # 删除草稿时同步清理已 stage 的外发附件文件。
+            existing = await get_compose_draft(mailbox, draft_id)
+            draft_value = existing.get("draft") if isinstance(existing.get("draft"), dict) else {}
+            # 草稿当前仅保存在 APS；删除不再触发 Gmail Draft API。
             try:
-                existing = await get_compose_draft(mailbox, draft_id)
-                draft_value = existing.get("draft") if isinstance(existing.get("draft"), dict) else {}
                 await _delete_outgoing_attachments(mailbox, draft_value.get("attachments") if isinstance(draft_value, dict) else [])
             except Exception:
                 pass
@@ -3342,14 +3466,19 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
         if tool == "list_compose_drafts":
             if not mailbox:
                 return {"error": "mailbox is required"}
-            return await list_compose_drafts(mailbox, limit=int(arguments.get("limit") or 100))
+            limit = int(arguments.get("limit") or 100)
+            offset = max(0, int(arguments.get("offset") or 0))
+            return await _list_aps_compose_drafts(mailbox, limit, offset)
         if tool == "create_or_update_compose_drafts":
             if not mailbox:
                 return {"error": "mailbox is required"}
             raw_drafts = arguments.get("drafts") if isinstance(arguments.get("drafts"), list) else []
             if not raw_drafts:
                 return {"error": "drafts is required"}
-            return await set_compose_drafts_batch(mailbox, [item for item in raw_drafts if isinstance(item, dict)])
+            return await set_compose_drafts_batch(
+                mailbox,
+                [item for item in raw_drafts[:100] if isinstance(item, dict)],
+            )
         if not mailbox:
             return {"error": "mailbox is required"}
         raw_draft = arguments.get("draft") if isinstance(arguments.get("draft"), dict) else {}

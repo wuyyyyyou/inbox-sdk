@@ -757,6 +757,10 @@ export interface ComposeDraft {
   /** forward 草稿回到原邮件详情时使用的路由信息。 */
   draft_mode?: "compose" | "forward";
   source_thread_id?: string;
+  /** 历史 Gmail Draft 关联字段；当前 APS-only 模式不读取或写入该字段。 */
+  gmail_draft_id?: string;
+  /** 历史 Gmail 草稿 message ID；仅为兼容已保存的数据。 */
+  gmail_message_id?: string;
   source_message_id?: string;
   recipients: string[];
   /** 抄送地址列表 */
@@ -764,9 +768,13 @@ export interface ComposeDraft {
   /** 密送地址列表 */
   bcc?: string[];
   subject: string;
+  /** 草稿目录页只返回这一小段预览；完整正文在用户打开该草稿时按需读取。 */
+  body_preview?: string;
   body: string;
   /** 可选 HTML 正文（转发保留原格式时使用 multipart/alternative） */
   body_html?: string;
+  /** 单封异常大草稿的短期 loopback 正文地址，仅在打开编辑器时读取。 */
+  body_url?: string;
   /** 外发附件元数据列表 */
   attachments?: OutgoingAttachmentMeta[];
   created_at?: string;
@@ -778,6 +786,9 @@ export interface ComposeDraftListPayload {
   mailbox: string;
   count: number;
   drafts: ComposeDraft[];
+  /** 草稿目录按与其他邮箱分类相同的偏移量方式续页。 */
+  has_more?: boolean;
+  next_offset?: number;
 }
 
 export interface ContactMemorySummary {

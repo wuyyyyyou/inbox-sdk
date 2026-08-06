@@ -29,6 +29,35 @@ describe("unwrapToolResult", () => {
     );
   });
 
+  it("routes AI Ask history reads and writes to APS with mailbox scope", async () => {
+    const invoke = vi.fn().mockResolvedValue({ success: true, data: { mailbox: "owner@example.com", entries: [], etag: "etag-1" } });
+    const client = new MailAgentClient(async () => ({
+      connected: true,
+      mode: "host",
+      client: { tools: { invoke } },
+    } as never));
+
+    await client.loadAiAskHistory("owner@example.com");
+    await client.saveAiAskHistory("owner@example.com", [], "etag-1");
+
+    expect(invoke).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        method: "get_ai_ask_history",
+        args: { mailbox: "owner@example.com", storage_provider: "aps" },
+      }),
+      expect.objectContaining({ timeoutMs: 180_000 }),
+    );
+    expect(invoke).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        method: "save_ai_ask_history",
+        args: { mailbox: "owner@example.com", storage_provider: "aps", if_match: "etag-1", entries: [] },
+      }),
+      expect.objectContaining({ timeoutMs: 180_000 }),
+    );
+  });
+
   it("retries a safe AI scan invocation after an HTML response", async () => {
     vi.useFakeTimers();
     const invoke = vi.fn()

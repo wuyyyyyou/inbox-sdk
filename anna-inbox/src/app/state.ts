@@ -1,7 +1,6 @@
 import type { AppState } from "../types/mail";
 import { DEFAULT_MODE, getSavedMailbox } from "./constants";
 
-const AI_ASK_HISTORY_STORAGE_KEY = "anna-inbox:ai-ask-history:v1";
 /** 侧栏会话历史仅保留 7 天；每条为独立 conversationId。 */
 const AI_ASK_HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const AI_ASK_HISTORY_MAX_ENTRIES = 30;
@@ -20,24 +19,15 @@ export function pruneAskHistory(
     .slice(0, AI_ASK_HISTORY_MAX_ENTRIES);
 }
 
-function loadSavedAskHistory(): AppState["askHistory"] {
+function discardLegacyAskHistory() {
   if (typeof window === "undefined") return [];
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(AI_ASK_HISTORY_STORAGE_KEY) || "[]");
-    const pruned = pruneAskHistory(Array.isArray(parsed) ? parsed : []);
-    // 启动时回写裁剪结果，避免过期会话长期占用 localStorage。
-    if (pruned.length !== (Array.isArray(parsed) ? parsed.length : 0)) {
-      try {
-        window.localStorage.setItem(AI_ASK_HISTORY_STORAGE_KEY, JSON.stringify(pruned));
-      } catch {
-        /* ignore */
-      }
-    }
-    return pruned;
+    // 旧版历史没有邮箱归属，不能迁移到当前邮箱，直接删除。
+    window.localStorage.removeItem("anna-inbox:ai-ask-history:v1");
   } catch {
-    // 历史记录只是 UI 恢复能力，损坏时直接丢弃，避免阻塞 App 启动。
-    return [];
+    // localStorage 不可用时不影响从 APS 加载当前邮箱历史。
   }
+  return [];
 }
 
 export function removeAskHistoryEntry(
@@ -50,7 +40,7 @@ export function removeAskHistoryEntry(
 
 export function createInitialState(): AppState {
   const mailbox = getSavedMailbox();
-  const savedAskHistory = loadSavedAskHistory();
+  const savedAskHistory = discardLegacyAskHistory();
   return {
     runtime: { connected: false, mode: "connecting" },
     view: "start",

@@ -61,9 +61,12 @@ import {
 } from "./aiMessageFormatting";
 import { customExecutionSteps } from "../brief/runHelpers";
 import {
+  getCachedComposeDraftDirectory,
   getCachedMessageBody,
   getContactAvatarCache,
   getMailFlags,
+  removeCachedInboxThreadDraft,
+  setCachedComposeDraftDirectory,
   setCachedMessageBody,
   setContactAvatarCache,
   setMailFlags,
@@ -780,6 +783,26 @@ export function isDraftMessage(message: InboxMessage) {
   return Boolean(message.draft_local || message.draft_body);
 }
 
+function composeDraftBodyPreview(draft: ComposeDraft) {
+  return String(draft.body_preview || draft.body || "");
+}
+
+function composeDraftHtmlToPlain(html: string) {
+  return String(html || "")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&amp;/gi, "&")
+    .replace(/\s+\n/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
 export function shouldShowImportantIcon(
   important: boolean,
   outgoing: boolean,
@@ -888,6 +911,21 @@ export function mergeDraftOverlayMessages(
     };
   });
   return [...merged, ...draftsByThread.values()];
+}
+
+/** 将带来源线程的 APS Compose 草稿投影为线程草稿，供收件箱显示“草稿”标记。 */
+export function composeDraftOverlayMessages(drafts: ComposeDraft[]): InboxMessage[] {
+  return drafts
+    .filter((draft) => Boolean(draft.source_thread_id))
+    .map((draft) => ({
+      id: `compose-overlay:${draft.id}`,
+      thread_id: draft.source_thread_id,
+      mailbox: draft.mailbox,
+      date: draft.updated_at || draft.created_at || "",
+      draft_body: composeDraftBodyPreview(draft),
+      draft_local: true,
+      label_ids: ["DRAFT"],
+    }));
 }
 
 export function isDoneMessage(
@@ -1898,6 +1936,9 @@ function BatchComposeDraftArtifacts({
   };
 
   const saveAll = async () => {
+    if (savedIds.size && !window.confirm(t("ai.reSaveDraftsConfirm", { count: savedIds.size }))) {
+      return;
+    }
     setSaving(true);
     try {
       const savedDrafts = await onSave(drafts);
@@ -1928,8 +1969,8 @@ function BatchComposeDraftArtifacts({
         </div>
       ))}
       <div className="ai-draft-artifact-actions">
-        <button className="is-primary" onClick={() => void saveAll()} disabled={saving || drafts.every((draft) => Boolean(draft.id && savedIds.has(draft.id)))}>
-          {saving ? t("ai.saveDraftsSaving") : t("ai.saveDrafts")}
+        <button className="is-primary" onClick={() => void saveAll()} disabled={saving}>
+          {saving ? t("ai.saveDraftsSaving") : savedIds.size ? t("ai.reSaveDrafts") : t("ai.saveDrafts")}
         </button>
         {savedIds.size ? <span>{t("ai.saveDraftsSaved", { count: savedIds.size })}</span> : null}
       </div>
@@ -3731,6 +3772,8 @@ export function HomeView() {
   const [folderOpen, setFolderOpen] = useState(false);
 
   const [composeOpen, setComposeOpen] = useState(false);
+  /** 草稿详情按需加载后，先挂载关闭态一帧，再切到打开态以触发抽屉入场动画。 */
+  const [composeOpening, setComposeOpening] = useState(false);
   const [composeClosing, setComposeClosing] = useState(false);
   const [composeResumeDraft, setComposeResumeDraft] =
     useState<ComposeDraft | null>(null);
@@ -3742,6 +3785,28 @@ export function HomeView() {
   } | null>(null);
   const [aiComposerFocusKey, setAiComposerFocusKey] = useState(0);
   const [composeDrafts, setComposeDrafts] = useState<ComposeDraft[]>([]);
+  const [draftSyncError, setDraftSyncError] = useState(false);
+  const [draftSyncing, setDraftSyncing] = useState(false);
+  const [composeDraftHasMore, setComposeDraftHasMore] = useState(false);
+  const [composeDraftNextOffset, setComposeDraftNextOffset] = useState(0);
+  const composeDraftRefreshSequenceRef = useRef(0);
+  const composeDraftRefreshInFlightRef = useRef<{
+    mailbox: string;
+    requestId: number;
+    promise: Promise<boolean>;
+  } | null>(null);
+  /** 撤销窗口内先在 UI 隐藏；刷新结果也不能把待删除草稿重新带回列表。 */
+  const pendingComposeDraftDeletesRef = useRef(new Set<string>());
+  const composeDraftActionsRef = useRef({
+    listInboxThreadDrafts: actions.listInboxThreadDrafts,
+    listComposeDrafts: actions.listComposeDrafts,
+    getComposeDraft: actions.getComposeDraft,
+  });
+  composeDraftActionsRef.current = {
+    listInboxThreadDrafts: actions.listInboxThreadDrafts,
+    listComposeDrafts: actions.listComposeDrafts,
+    getComposeDraft: actions.getComposeDraft,
+  };
   const [selectedComposeDraftIds, setSelectedComposeDraftIds] = useState<
     Set<string>
   >(new Set());
@@ -3768,6 +3833,7 @@ export function HomeView() {
     });
   }
   const composeCloseTimer = useRef<number | null>(null);
+  const composeOpenFrame = useRef<number | null>(null);
   const [mailboxView, setMailboxView] = useState<MailboxView>("inbox");
   const mailboxViewRef = useRef<MailboxView>("inbox");
   const [feedWindow, setFeedWindow] = useState<InboxFeedWindow>(
@@ -4017,18 +4083,29 @@ export function HomeView() {
   );
   const localCategory = isLocalMailboxView(mailboxView);
 
+  const composeDraftOverlays = useMemo(
+    () => composeDraftOverlayMessages(composeDrafts),
+    [composeDrafts],
+  );
+
   const inboxMessagesWithDrafts = useMemo(
     () =>
-      mergeDraftOverlayMessages(state.inboxMessages, state.inboxDraftMessages),
-    [state.inboxDraftMessages, state.inboxMessages],
+      mergeDraftOverlayMessages(
+        mergeDraftOverlayMessages(state.inboxMessages, state.inboxDraftMessages),
+        composeDraftOverlays,
+      ),
+    [composeDraftOverlays, state.inboxDraftMessages, state.inboxMessages],
   );
   const inboxSnapshotMessagesWithDrafts = useMemo(
     () =>
       mergeDraftOverlayMessages(
-        state.inboxSnapshotMessages,
-        state.inboxDraftMessages,
+        mergeDraftOverlayMessages(
+          state.inboxSnapshotMessages,
+          state.inboxDraftMessages,
+        ),
+        composeDraftOverlays,
       ),
-    [state.inboxDraftMessages, state.inboxSnapshotMessages],
+    [composeDraftOverlays, state.inboxDraftMessages, state.inboxSnapshotMessages],
   );
   // 与 is:unread 一致：Inbox + Todos + Snoozed（排除 Done）
   const workflowAwareInboxMessages = useMemo(
@@ -4073,9 +4150,10 @@ export function HomeView() {
       to: draft.recipients.join(", "),
       thread_id: draft.source_thread_id || undefined,
       subject: draft.subject || "(no subject)",
-      snippet: draft.body.slice(0, 120),
-      body_preview: draft.body.slice(0, 120),
-      draft_body: draft.body,
+      snippet: composeDraftBodyPreview(draft).slice(0, 120),
+      body_preview: composeDraftBodyPreview(draft).slice(0, 120),
+      // 目录页不含完整正文，但仍要标识为 Draft，供分类和批量操作投影使用。
+      draft_body: composeDraftBodyPreview(draft),
       draft_local: true,
       label_ids: ["DRAFT"],
     }));
@@ -4722,6 +4800,98 @@ export function HomeView() {
     [actions, loadGmailPage],
   );
 
+  const refreshStoredDrafts = useCallback(async () => {
+    const inFlight = composeDraftRefreshInFlightRef.current;
+    if (inFlight?.mailbox === mailbox) return inFlight.promise;
+
+    const refreshSequence = ++composeDraftRefreshSequenceRef.current;
+    setDraftSyncing(true);
+    // 线程草稿只补充当前设备的未发送回复，不应阻塞 APS Compose 草稿目录的显示。
+    void composeDraftActionsRef.current
+      .listInboxThreadDrafts(mailbox, 100)
+      .catch(() => undefined);
+
+    let refreshPromise: Promise<boolean>;
+    refreshPromise = (async () => {
+      try {
+        const payload = await composeDraftActionsRef.current.listComposeDrafts(mailbox);
+        if (refreshSequence === composeDraftRefreshSequenceRef.current) {
+          const nextDrafts = (payload.drafts || []).filter(
+            (draft) => !pendingComposeDraftDeletesRef.current.has(draft.id),
+          );
+          const nextOffset = Number(payload.next_offset || payload.drafts?.length || 0);
+          setComposeDrafts(nextDrafts);
+          setDraftSyncError(false);
+          setComposeDraftHasMore(Boolean(payload.has_more));
+          setComposeDraftNextOffset(nextOffset);
+          void setCachedComposeDraftDirectory(mailbox, {
+            ...payload,
+            drafts: nextDrafts,
+            next_offset: nextOffset,
+          });
+        }
+        return true;
+      } catch {
+        // APS 连续重试均失败时保留最后一次成功列表，并提示用户检查网络后手动重试。
+        if (refreshSequence === composeDraftRefreshSequenceRef.current) {
+          setDraftSyncError(true);
+          setComposeDraftHasMore(false);
+        }
+        return false;
+      } finally {
+        if (composeDraftRefreshInFlightRef.current?.requestId === refreshSequence) {
+          composeDraftRefreshInFlightRef.current = null;
+          if (refreshSequence === composeDraftRefreshSequenceRef.current) {
+            setDraftSyncing(false);
+          }
+        }
+      }
+    })();
+    composeDraftRefreshInFlightRef.current = {
+      mailbox,
+      requestId: refreshSequence,
+      promise: refreshPromise,
+    };
+    return refreshPromise;
+  }, [mailbox]);
+
+  const loadMoreComposeDrafts = useCallback(async () => {
+    if (!composeDraftHasMore || draftSyncing || pageLoadInFlight.current) return;
+    pageLoadInFlight.current = true;
+    setFeedAction("more");
+    try {
+      const payload = await composeDraftActionsRef.current.listComposeDrafts(
+        mailbox,
+        100,
+        composeDraftNextOffset,
+      );
+      setComposeDrafts((current) => {
+        const byId = new Map(current.map((draft) => [draft.id, draft]));
+        for (const draft of payload.drafts || []) {
+          if (!pendingComposeDraftDeletesRef.current.has(draft.id)) byId.set(draft.id, draft);
+        }
+        const nextDrafts = [...byId.values()];
+        void setCachedComposeDraftDirectory(mailbox, {
+          mailbox,
+          count: nextDrafts.length,
+          drafts: nextDrafts,
+          has_more: Boolean(payload.has_more),
+          next_offset: Number(payload.next_offset || composeDraftNextOffset),
+        });
+        return nextDrafts;
+      });
+      setComposeDraftHasMore(Boolean(payload.has_more));
+      setComposeDraftNextOffset(Number(payload.next_offset || composeDraftNextOffset));
+      setDraftSyncError(false);
+    } catch {
+      // 目录续页和首次读取使用同一 APS 自动重试策略；仍失败时提示用户手动重试。
+      setDraftSyncError(true);
+    } finally {
+      pageLoadInFlight.current = false;
+      setFeedAction((current) => (current === "more" ? null : current));
+    }
+  }, [composeDraftHasMore, composeDraftNextOffset, draftSyncing, mailbox]);
+
   const syncInbox = useCallback(
     async (targetDays = feedWindow.days, clearCache = false) => {
       requestedGmailCursors.current.clear();
@@ -4817,6 +4987,26 @@ export function HomeView() {
       mailboxView,
     ],
   );
+
+  useEffect(() => {
+    let cancelled = false;
+    const bootstrapDrafts = async () => {
+      // 先投影本机镜像，避免 APS 往返让草稿标签和编辑页短暂空白。
+      const cached = await getCachedComposeDraftDirectory(mailbox);
+      if (!cancelled && cached) {
+        setComposeDrafts(
+          cached.drafts.filter((draft) => !pendingComposeDraftDeletesRef.current.has(draft.id)),
+        );
+        setComposeDraftHasMore(Boolean(cached.has_more));
+        setComposeDraftNextOffset(Number(cached.next_offset || cached.drafts.length || 0));
+      }
+      if (!cancelled) void refreshStoredDrafts();
+    };
+    void bootstrapDrafts();
+    return () => {
+      cancelled = true;
+    };
+  }, [mailbox, refreshStoredDrafts]);
 
 
   const gmailAuthorizationRequired = isGmailAuthorizationRequired(
@@ -5054,11 +5244,16 @@ export function HomeView() {
   ]);
   // 列表触底或内容不足以填满视口时自动续页（不展示 Show more 按钮）
   const tryAutoLoadMoreEmails = useCallback(() => {
-    if (!canShowMoreEmails || pageLoadInFlight.current) return;
+    const canLoadMore = mailboxView === "drafts" ? composeDraftHasMore : canShowMoreEmails;
+    if (!canLoadMore || pageLoadInFlight.current) return;
     const scroller = mailFeedRef.current;
     if (!scroller || !isMailFeedNearBottom(scroller)) return;
+    if (mailboxView === "drafts") {
+      void loadMoreComposeDrafts();
+      return;
+    }
     void showMoreEmails();
-  }, [canShowMoreEmails, showMoreEmails]);
+  }, [canShowMoreEmails, composeDraftHasMore, loadMoreComposeDrafts, mailboxView, showMoreEmails]);
   useEffect(() => {
     tryAutoLoadMoreEmails();
   }, [
@@ -5067,29 +5262,22 @@ export function HomeView() {
     feedWindow.localLimit,
     feedWindow.hasMore,
     feedAction,
+    composeDraftHasMore,
   ]);
   const refreshDrafts = useCallback(async () => {
     if (mailboxView !== "drafts" || pageLoadInFlight.current) return;
     pageLoadInFlight.current = true;
     setFeedAction("more");
     try {
-      await Promise.all([
-        actions.listInboxThreadDrafts(mailbox, 100),
-        actions
-          .listComposeDrafts(mailbox)
-          .then((payload) => setComposeDrafts(payload.drafts || []))
-          .catch(() => setComposeDrafts([])),
-      ]);
-      actions.showToast(t("mail.draftsRefreshed"));
-    } catch (reason) {
+      const synced = await refreshStoredDrafts();
       actions.showToast(
-        reason instanceof Error ? reason.message : String(reason),
+        synced ? t("mail.draftsRefreshed") : t("mail.draftsApsSyncFailed"),
       );
     } finally {
       pageLoadInFlight.current = false;
       setFeedAction((current) => (current === "more" ? null : current));
     }
-  }, [actions, mailbox, mailboxView]);
+  }, [actions, mailboxView, refreshStoredDrafts, t]);
 
   const grouped = useMemo(() => {
     if (mailboxView !== "inbox" || filter === "search") {
@@ -5156,6 +5344,7 @@ export function HomeView() {
     state.inboxSettings,
     t,
   ]);
+  const hasGroupedMessages = grouped.some((group) => group.messages.length);
 
   const aiInboxListContext = useMemo<AiInboxListContext>(() => {
     const customCategory = filter.startsWith("category:")
@@ -5640,6 +5829,7 @@ export function HomeView() {
           }
           void actions.silentSyncInbox();
           await actions.deleteInboxThreadDraft(args.mailbox, args.threadId);
+          void removeCachedInboxThreadDraft(args.mailbox, args.threadId);
           actions.showToast(t("toast.emailSent"));
         },
         onError: (reason) =>
@@ -5761,13 +5951,20 @@ export function HomeView() {
         body_html: args.bodyHtml,
         attachments: args.attachments || [],
       }, args.ifMatch);
-      setComposeDrafts((current) => [
-        saved,
-        ...current.filter((draft) => draft.id !== saved.id),
-      ]);
+      setComposeDrafts((current) => {
+        const nextDrafts = [saved, ...current.filter((draft) => draft.id !== saved.id)];
+        void setCachedComposeDraftDirectory(args.mailbox, {
+          mailbox: args.mailbox,
+          count: nextDrafts.length,
+          drafts: nextDrafts,
+          has_more: composeDraftHasMore,
+          next_offset: composeDraftNextOffset,
+        });
+        return nextDrafts;
+      });
       return saved;
     },
-    [actions],
+    [actions, composeDraftHasMore, composeDraftNextOffset],
   );
 
   const setMailDetailOpenRef = useRef(actions.setMailDetailOpen);
@@ -5782,12 +5979,60 @@ export function HomeView() {
     return () => setMailDetailOpenRef.current(false, "");
   }, [drawerMessage?.id, drawerOpen, selectedId]);
 
+  const openComposeDraftDrawer = useCallback((draft: ComposeDraft) => {
+    if (composeCloseTimer.current) window.clearTimeout(composeCloseTimer.current);
+    if (composeOpenFrame.current !== null) {
+      window.cancelAnimationFrame(composeOpenFrame.current);
+    }
+    setComposeClosing(false);
+    setComposeResumeDraft(draft);
+    setComposeOpening(true);
+    // CSS transition 需要先让 .mail-detail-drawer 以关闭态完成一次绘制；若和
+    // 异步 get_compose_draft 的结果在同一提交内直接设为 open，浏览器不会产生位移动画。
+    composeOpenFrame.current = window.requestAnimationFrame(() => {
+      composeOpenFrame.current = window.requestAnimationFrame(() => {
+        composeOpenFrame.current = null;
+        setComposeOpen(true);
+        setComposeOpening(false);
+      });
+    });
+  }, []);
+
   const openMessageDetail = useCallback(
-    (message: InboxMessage) => {
+    async (message: InboxMessage) => {
+      const loadComposeDraft = async (prefix: "compose:" | "forward:") => {
+        const draftId = message.id.slice(prefix.length);
+        if (!composeDrafts.some((item) => item.id === draftId)) return null;
+        try {
+          const result = await composeDraftActionsRef.current.getComposeDraft(mailbox, draftId);
+          if (!result.draft) throw new Error(t("mail.draftsApsSyncFailed"));
+          let complete = result.draft;
+          const bodyUrl = String(complete.body_url || "").trim();
+          if (bodyUrl) {
+            const controller = new AbortController();
+            const timeout = window.setTimeout(() => controller.abort(), 15_000);
+            try {
+              const response = await fetch(bodyUrl, { cache: "no-store", signal: controller.signal });
+              if (!response.ok) throw new Error(`Failed to load draft body (${response.status}).`);
+              const bodyHtml = await response.text();
+              complete = {
+                ...complete,
+                body_html: bodyHtml,
+                body: composeDraftHtmlToPlain(bodyHtml),
+              };
+            } finally {
+              window.clearTimeout(timeout);
+            }
+          }
+          setComposeDrafts((current) => current.map((item) => item.id === complete.id ? complete : item));
+          return complete;
+        } catch (reason) {
+          actions.showToast(reason instanceof Error ? reason.message : String(reason));
+          return null;
+        }
+      };
       if (message.id.startsWith("forward:")) {
-        const draft = composeDrafts.find(
-          (item) => item.id === message.id.slice("forward:".length),
-        );
+        const draft = await loadComposeDraft("forward:");
         if (draft) {
           const source = [
             ...inboxMessagesWithDrafts,
@@ -5815,25 +6060,15 @@ export function HomeView() {
               composeDraftEtag: draft.etag,
             });
           } else {
-            if (composeCloseTimer.current)
-              window.clearTimeout(composeCloseTimer.current);
-            setComposeClosing(false);
-            setComposeResumeDraft(draft);
-            setComposeOpen(true);
+            openComposeDraftDrawer(draft);
           }
         }
         return;
       }
       if (message.id.startsWith("compose:")) {
-        const draft = composeDrafts.find(
-          (item) => item.id === message.id.slice("compose:".length),
-        );
+        const draft = await loadComposeDraft("compose:");
         if (draft) {
-          if (composeCloseTimer.current)
-            window.clearTimeout(composeCloseTimer.current);
-          setComposeClosing(false);
-          setComposeResumeDraft(draft);
-          setComposeOpen(true);
+          openComposeDraftDrawer(draft);
         }
         return;
       }
@@ -5875,7 +6110,7 @@ export function HomeView() {
           });
       }
     },
-    [actions, composeDrafts, inboxMessagesWithDrafts, inboxSnapshotMessagesWithDrafts, mailbox, patchSavedMessages, state.inboxMessages],
+    [actions, composeDrafts, inboxMessagesWithDrafts, inboxSnapshotMessagesWithDrafts, mailbox, openComposeDraftDrawer, patchSavedMessages, state.inboxMessages, t],
   );
 
   const openMailDetailFromAi = useCallback(
@@ -6362,6 +6597,11 @@ export function HomeView() {
     setMailboxView(next);
     setFolderOpen(false);
     setSelectedId("");
+    if (next === "drafts") {
+      // 草稿箱只展示 APS Compose 草稿，不能沿用其他视图的搜索条件。
+      setSearch("");
+      setActiveSearch("");
+    }
     setFilter("important");
     // 切分类：瞬间切换，不播入场动画
     skipEnterAnimRef.current = true;
@@ -6385,11 +6625,7 @@ export function HomeView() {
       return;
     }
     if (next === "drafts") {
-      void actions.listInboxThreadDrafts(mailbox, 100).catch(() => undefined);
-      void actions
-        .listComposeDrafts(mailbox)
-        .then((payload) => setComposeDrafts(payload.drafts || []))
-        .catch(() => setComposeDrafts([]));
+      void refreshStoredDrafts();
       return;
     }
     if (isLocalMailboxView(next)) {
@@ -6440,6 +6676,17 @@ export function HomeView() {
           const result = results[0];
           if (result?.ok) {
             await actions.deleteComposeDraft(mailbox, draft.id);
+            setComposeDrafts((current) => {
+              const nextDrafts = current.filter((item) => item.id !== draft.id);
+              void setCachedComposeDraftDirectory(mailbox, {
+                mailbox,
+                count: nextDrafts.length,
+                drafts: nextDrafts,
+                has_more: composeDraftHasMore,
+                next_offset: composeDraftNextOffset,
+              });
+              return nextDrafts;
+            });
             actions.showToast(t("toast.emailSent"));
             return;
           }
@@ -6459,10 +6706,15 @@ export function HomeView() {
       setComposeOpen(false);
       setComposeClosing(true);
     },
-    [actions, mailbox],
+    [actions, composeDraftHasMore, composeDraftNextOffset, mailbox],
   );
 
   const closeComposeDrawer = useCallback(() => {
+    if (composeOpenFrame.current !== null) {
+      window.cancelAnimationFrame(composeOpenFrame.current);
+      composeOpenFrame.current = null;
+    }
+    setComposeOpening(false);
     setComposeOpen(false);
     setComposeAiContext(null);
     setComposeInsertRequest(null);
@@ -6475,6 +6727,190 @@ export function HomeView() {
       composeCloseTimer.current = null;
     }, 360);
   }, []);
+
+  const restoreBackgroundComposeDraft = useCallback((draft: ComposeDraft) => {
+    if (composeCloseTimer.current)
+      window.clearTimeout(composeCloseTimer.current);
+    setComposeClosing(false);
+    setComposeResumeDraft(draft);
+    setComposeOpen(true);
+  }, []);
+
+  const saveComposeDraftAfterClose = useCallback(
+    (draft: Partial<ComposeDraft>, ifMatch?: string) => {
+      const recoveryDraft: ComposeDraft = {
+        id: String(draft.id || ""),
+        mailbox,
+        draft_mode: draft.draft_mode,
+        source_thread_id: draft.source_thread_id,
+        source_message_id: draft.source_message_id,
+        gmail_draft_id: draft.gmail_draft_id,
+        gmail_message_id: draft.gmail_message_id,
+        recipients: [...(draft.recipients || [])],
+        cc: [...(draft.cc || [])],
+        bcc: [...(draft.bcc || [])],
+        subject: String(draft.subject || ""),
+        body: String(draft.body || ""),
+        body_html: draft.body_html,
+        attachments: draft.attachments ? [...draft.attachments] : [],
+        etag: ifMatch,
+      };
+      const recoveryKey = crypto.randomUUID();
+      const localDraft = { ...recoveryDraft, id: recoveryDraft.id || recoveryKey };
+      const existingDraft = composeDrafts.find((item) => item.id === localDraft.id);
+      const hasChanged = JSON.stringify({
+        recipients: localDraft.recipients,
+        cc: localDraft.cc,
+        bcc: localDraft.bcc,
+        subject: localDraft.subject,
+        body: localDraft.body,
+        body_html: localDraft.body_html || "",
+        attachments: localDraft.attachments,
+      }) !== JSON.stringify({
+        recipients: existingDraft?.recipients || [],
+        cc: existingDraft?.cc || [],
+        bcc: existingDraft?.bcc || [],
+        subject: existingDraft?.subject || "",
+        body: existingDraft?.body || "",
+        body_html: existingDraft?.body_html || "",
+        attachments: existingDraft?.attachments || [],
+      });
+      if (!hasChanged) return;
+
+      // 先更新本机镜像，关闭抽屉后草稿箱和会话中的“草稿”标记无需等待 APS。
+      setComposeDrafts((current) => {
+        const nextDrafts = [localDraft, ...current.filter((item) => item.id !== localDraft.id)];
+        void setCachedComposeDraftDirectory(mailbox, {
+          mailbox,
+          count: nextDrafts.length,
+          drafts: nextDrafts,
+          has_more: composeDraftHasMore,
+          next_offset: composeDraftNextOffset,
+        });
+        return nextDrafts;
+      });
+
+      // 关闭动作不等待远端。失败时只保留这个不可变快照，用户可从 Toast 手动恢复。
+      void actions
+        .saveComposeDraft(mailbox, draft, ifMatch)
+        .then((saved) => {
+          setComposeDrafts((current) => {
+            const nextDrafts = [
+              saved,
+              ...current.filter((item) => item.id !== saved.id && item.id !== localDraft.id),
+            ];
+            void setCachedComposeDraftDirectory(mailbox, {
+              mailbox,
+              count: nextDrafts.length,
+              drafts: nextDrafts,
+              has_more: composeDraftHasMore,
+              next_offset: composeDraftNextOffset,
+            });
+            return nextDrafts;
+          });
+        })
+        .catch(() => {
+          const recovery = { ...recoveryDraft, id: recoveryKey };
+          actions.showToast(t("compose.backgroundSaveFailed"), {
+            actionLabel: t("compose.restoreDraft"),
+            onAction: () => restoreBackgroundComposeDraft(recovery),
+          });
+        });
+    },
+    [actions, composeDraftHasMore, composeDraftNextOffset, composeDrafts, mailbox, restoreBackgroundComposeDraft, t],
+  );
+
+  const applySavedComposeDraft = useCallback(
+    (saved: ComposeDraft) => {
+      setComposeDrafts((current) => {
+        const nextDrafts = [saved, ...current.filter((item) => item.id !== saved.id)];
+        void setCachedComposeDraftDirectory(mailbox, {
+          mailbox,
+          count: nextDrafts.length,
+          drafts: nextDrafts,
+          has_more: composeDraftHasMore,
+          next_offset: composeDraftNextOffset,
+        });
+        return nextDrafts;
+      });
+    },
+    [composeDraftHasMore, composeDraftNextOffset, mailbox],
+  );
+
+  const requestComposeDraftDelete = useCallback(
+    (draft: ComposeDraft) => {
+      if (!draft.id || pendingComposeDraftDeletesRef.current.has(draft.id)) return;
+      pendingComposeDraftDeletesRef.current.add(draft.id);
+      let restoreIndex = 0;
+      setComposeDrafts((current) => {
+        const index = current.findIndex((item) => item.id === draft.id);
+        restoreIndex = index < 0 ? current.length : index;
+        const nextDrafts = current.filter((item) => item.id !== draft.id);
+        void setCachedComposeDraftDirectory(mailbox, {
+          mailbox,
+          count: nextDrafts.length,
+          drafts: nextDrafts,
+          has_more: composeDraftHasMore,
+          next_offset: composeDraftNextOffset,
+        });
+        return nextDrafts;
+      });
+      setSelectedComposeDraftIds((current) => {
+        const next = new Set(current);
+        next.delete(`compose:${draft.id}`);
+        return next;
+      });
+      setSelectedListKeys((current) => {
+        const next = new Set(current);
+        next.delete(
+          inboxThreadProjectionKey({
+            id: `compose:${draft.id}`,
+            mailbox,
+          }),
+        );
+        return next;
+      });
+      setSelectedId((current) =>
+        current === `compose:${draft.id}` ? "" : current,
+      );
+
+      const restore = () => {
+        pendingComposeDraftDeletesRef.current.delete(draft.id);
+        setComposeDrafts((current) => {
+          if (current.some((item) => item.id === draft.id)) return current;
+          const index = Math.min(restoreIndex, current.length);
+          const nextDrafts = [
+            ...current.slice(0, index),
+            draft,
+            ...current.slice(index),
+          ];
+          void setCachedComposeDraftDirectory(mailbox, {
+            mailbox,
+            count: nextDrafts.length,
+            drafts: nextDrafts,
+            has_more: composeDraftHasMore,
+            next_offset: composeDraftNextOffset,
+          });
+          return nextDrafts;
+        });
+      };
+
+      actions.showToast(t("compose.deleted"), {
+        actionLabel: t("toast.undo"),
+        onAction: restore,
+        onExpire: async () => {
+          try {
+            await actions.deleteComposeDraft(mailbox, draft.id);
+            pendingComposeDraftDeletesRef.current.delete(draft.id);
+          } catch {
+            restore();
+            actions.showToast(t("compose.deleteFailed"));
+          }
+        },
+      });
+    },
+    [actions, composeDraftHasMore, composeDraftNextOffset, mailbox, t],
+  );
 
   const scheduleComposeBatch = useCallback(
     (confirmed = false) => {
@@ -6518,7 +6954,17 @@ export function HomeView() {
             succeeded.map((id) => actions.deleteComposeDraft(mailbox, id)),
           );
           setComposeDrafts((drafts) =>
-            drafts.filter((draft) => !succeeded.includes(draft.id)),
+            {
+              const nextDrafts = drafts.filter((draft) => !succeeded.includes(draft.id));
+              void setCachedComposeDraftDirectory(mailbox, {
+                mailbox,
+                count: nextDrafts.length,
+                drafts: nextDrafts,
+                has_more: composeDraftHasMore,
+                next_offset: composeDraftNextOffset,
+              });
+              return nextDrafts;
+            },
           );
           setSelectedComposeDraftIds(new Set());
           const failures = results.filter((result) => !result.ok);
@@ -6534,7 +6980,7 @@ export function HomeView() {
           ),
       });
     },
-    [actions, composeDrafts, mailbox, selectedComposeDraftIds],
+    [actions, composeDraftHasMore, composeDraftNextOffset, composeDrafts, mailbox, selectedComposeDraftIds],
   );
 
   const confirmAiSendPlan = useCallback(
@@ -6600,6 +7046,8 @@ export function HomeView() {
       pendingSendScheduler.current?.dispose();
       if (composeCloseTimer.current)
         window.clearTimeout(composeCloseTimer.current);
+      if (composeOpenFrame.current !== null)
+        window.cancelAnimationFrame(composeOpenFrame.current);
     },
     [],
   );
@@ -7231,7 +7679,20 @@ export function HomeView() {
                 {t("mail.tryAgain")}
               </button>
             </div>
-          ) : !grouped.some((group) => group.messages.length) ? (
+          ) : draftSyncError && mailboxView === "drafts" && !hasGroupedMessages ? (
+            <div className="mail-empty is-category-empty">
+              <SearchIcon />
+              <h2>{t("mail.draftsApsSyncFailed")}</h2>
+              <p>{t("mail.draftsApsSyncHint")}</p>
+              <button
+                type="button"
+                onClick={() => void refreshDrafts()}
+                disabled={draftSyncing || feedAction !== null}
+              >
+                {draftSyncing ? t("mail.refreshingDrafts") : t("mail.tryAgain")}
+              </button>
+            </div>
+          ) : !hasGroupedMessages ? (
             filter === "search" && activeSearch ? (
               <div className="mail-empty">
                 <SearchIcon />
@@ -7295,7 +7756,7 @@ export function HomeView() {
                         void handleGmailThreadAction(operation, message)
                       }
                       onSnooze={openSnoozePicker}
-                      onSelect={() => openMessageDetail(message)}
+                      onSelect={() => void openMessageDetail(message)}
                       entering={enteringIds.has(message.id)}
                       selectable={
                         (mailboxView === "drafts" && isDraftMessage(message)) ||
@@ -7326,26 +7787,11 @@ export function HomeView() {
                       onComposeDraftDelete={
                         message.id.startsWith("compose:")
                           ? () => {
-                              const id = message.id.slice("compose:".length);
-                              void actions
-                                .deleteComposeDraft(mailbox, id)
-                                .then(() => {
-                                  setComposeDrafts((drafts) =>
-                                    drafts.filter((draft) => draft.id !== id),
-                                  );
-                                  setSelectedComposeDraftIds((current) => {
-                                    const next = new Set(current);
-                                    next.delete(message.id);
-                                    return next;
-                                  });
-                                })
-                                .catch((reason) =>
-                                  actions.showToast(
-                                    reason instanceof Error
-                                      ? reason.message
-                                      : String(reason),
-                                  ),
-                                );
+                              const draft = composeDrafts.find(
+                                (item) =>
+                                  item.id === message.id.slice("compose:".length),
+                              );
+                              if (draft) requestComposeDraftDelete(draft);
                             }
                           : undefined
                       }
@@ -7367,14 +7813,18 @@ export function HomeView() {
                 : olderRangeButtonLabel(days, nextRangeDays, t)}
             </button>
           ) : null}
-          {mailboxView === "drafts" && !state.inboxLoading ? (
+          {mailboxView === "drafts" && !state.inboxLoading && (!draftSyncError || hasGroupedMessages) ? (
             <button
               className="older-mail-btn"
               type="button"
-              onClick={() => void refreshDrafts()}
+              onClick={() => void (composeDraftHasMore ? loadMoreComposeDrafts() : refreshDrafts())}
               disabled={isInboxSyncing || feedAction !== null}
             >
-              {feedAction === "more" ? t("mail.refreshingDrafts") : t("mail.refreshDrafts")}
+              {feedAction === "more"
+                ? t("mail.refreshingDrafts")
+                : composeDraftHasMore
+                  ? t("mail.loadMore")
+                  : t("mail.refreshDrafts")}
             </button>
           ) : null}
           {mailboxView === "trash" ? (
@@ -7448,12 +7898,15 @@ export function HomeView() {
           latestThreadMessageId={latestSelectedThreadMessage?.id || ""}
           autoOpenDraftComposer={mailboxView === "drafts"}
         />
-        {composeOpen || composeClosing ? (
+        {composeOpen || composeOpening || composeClosing ? (
           <ComposeView
             mailbox={mailbox}
             initialDraft={composeResumeDraft}
             open={composeOpen}
             onClose={closeComposeDrawer}
+            onCloseWithSave={saveComposeDraftAfterClose}
+            onDiscardDraft={requestComposeDraftDelete}
+            onSavedDraft={applySavedComposeDraft}
             onViewDrafts={() => {
               closeComposeDrawer();
               selectMailboxView("drafts");

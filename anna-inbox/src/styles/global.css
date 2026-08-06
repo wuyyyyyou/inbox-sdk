@@ -6173,15 +6173,27 @@ textarea {
   text-align: right;
 }
 
-.toast {
+.toast-stack {
   position: absolute;
   left: 50%;
   bottom: 92px;
   z-index: 60;
   display: flex;
+  flex-direction: column;
   align-items: center;
   gap: 8px;
-  transform: translateX(-50%) translateY(16px);
+  width: min(calc(100% - 32px), 560px);
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.toast {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  transform: translateY(10px) scale(0.96);
   opacity: 0;
   pointer-events: none;
   padding: 11px 14px;
@@ -6193,13 +6205,28 @@ textarea {
   box-shadow: 0 18px 42px rgba(0, 0, 0, 0.28);
   font-size: 14px;
   font-weight: 680;
-  transition: 0.22s ease;
+  transition: opacity 0.22s ease, transform 0.22s ease;
 }
 
 .toast.is-visible {
   opacity: 1;
-  transform: translateX(-50%) translateY(0);
+  transform: translateY(0) scale(1);
   pointer-events: auto;
+  animation: toast-bubble-in 0.24s ease-out;
+}
+
+@keyframes toast-bubble-in {
+  0% {
+    opacity: 0;
+    transform: translateY(14px) scale(0.9);
+  }
+  70% {
+    transform: translateY(-2px) scale(1.02);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }
 
 .toast-action {
@@ -13695,6 +13722,15 @@ body,
   background: transparent;
   scrollbar-width: thin;
   scrollbar-color: #d8dce8 transparent;
+}
+
+/* 与 Compose 保持一致：正文后保留一行空隙，签名两行本身紧凑。 */
+.mail-detail-composer-body .rich-text-editor-surface p:nth-last-child(2):has(+ p:last-child) {
+  margin-bottom: 0.2em;
+}
+
+.mail-detail-composer-body .rich-text-editor-surface p:last-child {
+  margin-bottom: 0;
 }
 
 .rich-text-editor {

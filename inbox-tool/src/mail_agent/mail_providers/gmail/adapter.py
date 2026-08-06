@@ -43,6 +43,8 @@ def _record_diagnostic_span(stage: str, started: float, *, outcome: str = "ok", 
 def _gmail_endpoint_kind(path: str) -> str:
     """将 Gmail 路径归并为稳定类别，避免 message/thread ID 出现在诊断中。"""
     normalized = str(path or "")
+    if "/drafts" in normalized:
+        return "drafts"
     if "/history" in normalized:
         return "history"
     if "/threads" in normalized:
@@ -997,6 +999,8 @@ SUMMARY_METADATA_REFRESH_SECONDS = 30 * 60
 ATTACHMENT_SCAN_VERSION = 1
 SUMMARY_FETCH_MAX_WORKERS = 20
 GMAIL_PAGE_SUMMARY_FETCH_MAX_WORKERS = 20
+# 草稿详情包含完整 MIME，每封都需要一次 Gmail 请求；限制并发避免大草稿箱触发过多瞬时连接。
+DRAFT_DETAIL_FETCH_MAX_WORKERS = 8
 # History 增量：单次 invoke 最多拉取变更摘要数，避免串行全量式 metadata 拖垮 60s Host 超时。
 HISTORY_CHANGE_FETCH_BATCH = 40
 # 单封变更摘要 HTTP 预算；超时后本轮不推进 cursor，下一次从同一 cursor 重试。
@@ -1112,12 +1116,6 @@ def _refresh_access_token(record: dict[str, Any], *, timeout_seconds: float | No
                 raise
             if deadline is not None and deadline - time.monotonic() <= 0:
                 raise
-            logging.getLogger("mail_agent.gmail").warning(
-                "token refresh retry %s/3 for %s after %s",
-                attempt + 2,
-                str(record.get("email") or "<local-token>"),
-                exc,
-            )
             time.sleep(0.35 * (attempt + 1))
     else:
         if last_error:
@@ -1210,7 +1208,6 @@ def get_access_token(
                         if isinstance(exc, urllib.error.HTTPError):
                             raise ValueError(f"Gmail token refresh failed for {mailbox}: HTTP {exc.code}") from exc
                         raise ValueError(f"Gmail token refresh failed for {mailbox}: {exc}") from exc
-                    logging.getLogger("mail_agent.gmail").warning("refresh failed for %s; trying current access token (%s)", mailbox, exc)
                 else:
                     should_persist = False
                     with _multi_token_lock:
@@ -1288,7 +1285,6 @@ def get_access_token(
                 if isinstance(exc, urllib.error.HTTPError):
                     raise ValueError(f"Gmail token refresh failed for {mailbox}: HTTP {exc.code}") from exc
                 raise ValueError(f"Gmail token refresh failed for {mailbox}: {exc}") from exc
-            logging.getLogger("mail_agent.gmail").warning("local refresh failed for %s; trying current access token (%s)", mailbox, exc)
     token = record.get("access_token")
     if not token:
         raise ValueError(f"Local Gmail access token is missing for {mailbox}")
@@ -1570,13 +1566,12 @@ def gmail_request(
     method: str = "GET",
     body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """向 Gmail REST API 发起请求（默认 GET；Watch 等场景可 POST JSON body）。
+    """向 Gmail REST API 发起请求（支持 Draft API 所需的 JSON 写入方法）。
 
     未显式传入 access_token 时，若收到 HTTP 401，会清空当前 ContextVar 中的短期
     token、force_refresh 换票后仅重试一次；调用方显式传入 token 时不自动换票。
-    对 RemoteDisconnected / 读超时等瞬时网络故障做有限退避重试，避免偶发断连
-    直接穿透到上层使整次 invoke 失败；gmail_request 的调用均为幂等语义
-    （GET 读取与 Watch 注册），重试不会产生重复副作用。
+    对 GET / PUT / DELETE 的瞬时网络故障做有限退避重试；POST 创建草稿在连接
+    中断时不能安全重试，避免服务端已创建而客户端未收到响应时产生重复草稿。
     短期 token 仅在 _gmail_request_token_scope 内按 mailbox 复用，禁止跨邮箱/跨 invoke 泄漏。
     """
     # 调用方可在一个受限业务请求内复用已取得的短期 token，减少平台
@@ -1586,7 +1581,7 @@ def gmail_request(
     except (TypeError, ValueError):
         request_timeout = 60.0
     http_method = str(method or "GET").upper()
-    if http_method not in {"GET", "POST"}:
+    if http_method not in {"GET", "POST", "PUT", "DELETE"}:
         raise ValueError(f"Unsupported Gmail HTTP method: {http_method}")
     retried_auth = False
     network_retries_left = _GMAIL_REQUEST_NETWORK_RETRIES
@@ -1609,7 +1604,7 @@ def gmail_request(
             url += "?" + urllib.parse.urlencode(query, doseq=True)
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         data = None
-        if http_method == "POST":
+        if http_method in {"POST", "PUT"}:
             headers["Content-Type"] = "application/json"
             data = json.dumps(body or {}, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
@@ -1630,10 +1625,6 @@ def gmail_request(
                 detail_json = {"status_code": exc.code}
             # 仅在未由调用方固定 token 时自愈；显式 access_token 由上层决定生命周期。
             if exc.code == 401 and not retried_auth and not access_token:
-                logging.getLogger("mail_agent.gmail").warning(
-                    "Gmail HTTP 401 on %s; clearing scoped token and forcing refresh once",
-                    endpoint,
-                )
                 _record_diagnostic_span(
                     "gmail.http",
                     started,
@@ -1661,18 +1652,14 @@ def gmail_request(
             )
             raise GmailApiError(exc.code, f"Gmail API request failed: {exc.code} {detail_json}") from exc
         except Exception as exc:
-            # 对 RemoteDisconnected / 读超时 / SSL 抖动这类瞬时网络故障做有限退避
-            # 重试，避免偶发断连直接穿透到上层使整次 invoke 失败。gmail_request
-            # 的调用均为幂等语义（GET 读取与 Watch 注册），重试无重复副作用；
-            # 401 换票已在上面单独处理，这里只处理非 HTTP 状态的传输层异常。
-            if network_retries_left > 0 and isinstance(exc, _GMAIL_TRANSIENT_NETWORK_ERRORS):
+            # POST 创建 Draft 在网络中断后无法确认服务端是否已成功处理，因此绝不
+            # 自动重试；Watch 注册等其他 POST 仍保持原有的有限重试能力。
+            if (
+                (http_method != "POST" or endpoint != "drafts")
+                and network_retries_left > 0
+                and isinstance(exc, _GMAIL_TRANSIENT_NETWORK_ERRORS)
+            ):
                 network_retries_left -= 1
-                logging.getLogger("mail_agent.gmail").warning(
-                    "Gmail transient network error on %s; retrying (left=%d, type=%s)",
-                    endpoint,
-                    network_retries_left,
-                    type(exc).__name__,
-                )
                 _record_diagnostic_span(
                     "gmail.http",
                     started,
@@ -2445,8 +2432,6 @@ def fetch_message_summary(
     except GmailApiError as exc:
         if strict:
             raise
-        if exc.status_code != 404:
-            logging.getLogger("mail_agent.gmail").warning("metadata fetch failed for %s: HTTP %s", message_id, exc.status_code)
         return None
     except ValueError:
         if strict:
@@ -2631,11 +2616,6 @@ def _fetch_history_message_summary(
             raise
         except (TimeoutError, OSError, urllib.error.URLError) as exc:
             last_error = exc
-            logging.getLogger("mail_agent.gmail").warning(
-                "history summary timeout/network error attempt=%s error_type=%s",
-                attempt + 1,
-                type(exc).__name__,
-            )
             continue
     if last_error is not None:
         raise last_error
@@ -2697,10 +2677,6 @@ def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
                 )
                 seeded = str(profile.get("historyId") or "")
             except (GmailApiError, TimeoutError, OSError, urllib.error.URLError, ValueError) as exc:
-                logging.getLogger("mail_agent.gmail").warning(
-                    "history cursor seed failed error_type=%s",
-                    type(exc).__name__,
-                )
                 seeded = ""
             if seeded:
                 # 锚定当前 historyId 会丢掉「cursor 丢失窗口」内的变更；仅补最近 2 天
@@ -2713,11 +2689,8 @@ def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
                         max_results=80,
                         request_timeout_seconds=HISTORY_SUMMARY_TIMEOUT_SECONDS,
                     )
-                except Exception as exc:
-                    logging.getLogger("mail_agent.gmail").warning(
-                        "history cursor seed catch-up failed error_type=%s",
-                        type(exc).__name__,
-                    )
+                except Exception:
+                    pass
                 try:
                     from .mailbox_sync import refresh_boundary_from_cache
 
@@ -2865,10 +2838,6 @@ def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
             raise
         except (TimeoutError, OSError, urllib.error.URLError) as exc:
             # 网络抖动不应炸成 internal error，也不推进 cursor。
-            logging.getLogger("mail_agent.gmail").warning(
-                "history.list network failure error_type=%s",
-                type(exc).__name__,
-            )
             return {
                 "mailbox": normalized,
                 "mode": "history_retry",
@@ -2923,11 +2892,6 @@ def sync_cached_mailbox_history(mailbox: str) -> dict[str, Any]:
                                 continue
                             summaries_by_id[str(summary.get("id") or message_id)] = summary
             except (TimeoutError, OSError, urllib.error.URLError, RuntimeError) as exc:
-                logging.getLogger("mail_agent.gmail").warning(
-                    "history summary batch failed error_type=%s changed=%s",
-                    type(exc).__name__,
-                    len(changed_ids),
-                )
                 return {
                     "mailbox": normalized,
                     "mode": "history_retry",
@@ -3525,6 +3489,245 @@ def _send_raw_mime(mailbox: str, raw_bytes: bytes, *, thread_id: str = "") -> di
         raise ValueError(f"Gmail send failed: HTTP {exc.code} {detail[:300]}") from exc
 
 
+def _gmail_draft_request(
+    mailbox: str,
+    url: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """通过统一 Gmail 请求层执行 Draft API，复用换票、诊断和安全错误语义。"""
+    parsed = urllib.parse.urlsplit(url)
+    api_base_path = urllib.parse.urlsplit(GMAIL_API_BASE).path.rstrip("/")
+    # urlsplit 后 path 只保留 /gmail/v1/...，不能再用包含 scheme/host 的
+    # GMAIL_API_BASE 去移除前缀；否则统一请求层会把 /gmail/v1 重复拼接并返回 404。
+    path = parsed.path.removeprefix(api_base_path) or "/"
+    if not path.startswith("/"):
+        path = f"/{path}"
+    query = {
+        key: values if len(values) > 1 else values[0]
+        for key, values in urllib.parse.parse_qs(parsed.query, keep_blank_values=True).items()
+    } if parsed.query else None
+    return gmail_request(mailbox, path, query, method=method, body=payload)
+
+
+def delete_gmail_draft(mailbox: str, gmail_draft_id: str) -> bool:
+    """删除用户明确丢弃的 Gmail 草稿；已不存在时视为删除完成。"""
+    normalized_draft_id = str(gmail_draft_id or "").strip()
+    if not normalized_draft_id:
+        return False
+    try:
+        _gmail_draft_request(
+            mailbox,
+            f"{GMAIL_API_BASE}/users/me/drafts/{urllib.parse.quote(normalized_draft_id, safe='')}",
+            method="DELETE",
+        )
+    except GmailApiError as exc:
+        if exc.status_code != 404:
+            raise
+    return True
+
+
+def create_or_update_gmail_draft(
+    mailbox: str,
+    recipients: list[str],
+    subject: str,
+    body: str,
+    *,
+    gmail_draft_id: str = "",
+    thread_id: str = "",
+    cc: list[str] | str | None = None,
+    bcc: list[str] | str | None = None,
+    body_html: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    """由用户显式保存动作创建或更新 Gmail 草稿，返回稳定的 Gmail Draft ID。"""
+    import base64 as b64
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from mail_agent.mail_providers.gmail.outgoing_html import sanitize_outgoing_html
+
+    normalized_recipients = _normalize_email_list(recipients)
+    normalized_cc = _normalize_email_list(cc)
+    normalized_bcc = _normalize_email_list(bcc)
+    plain_body = str(body or "")
+    html_body = sanitize_outgoing_html(body_html)
+    if not normalized_recipients or not str(subject).strip() or (not plain_body.strip() and not html_body):
+        raise ValueError("Recipient, subject and content are required")
+
+    # 草稿和发送使用相同 MIME 规则，避免用户在 Gmail 中看到与 Anna 预览不同的正文或附件。
+    if html_body:
+        text_root: Any = MIMEMultipart("alternative")
+        text_root.attach(MIMEText(plain_body or _html_to_text(html_body), "plain", "utf-8"))
+        text_root.attach(MIMEText(html_body, "html", "utf-8"))
+    else:
+        text_root = MIMEText(plain_body, "plain", "utf-8")
+    attachment_items = [item for item in (attachments or []) if isinstance(item, dict) and isinstance(item.get("content"), (bytes, bytearray))]
+    if attachment_items:
+        message: Any = MIMEMultipart("mixed")
+        message.attach(text_root)
+        _attach_file_parts(message, attachment_items)
+    else:
+        message = text_root
+    message["To"] = ", ".join(normalized_recipients)
+    if normalized_cc:
+        message["Cc"] = ", ".join(normalized_cc)
+    if normalized_bcc:
+        message["Bcc"] = ", ".join(normalized_bcc)
+    message["Subject"] = str(subject)
+
+    payload: dict[str, Any] = {"message": {"raw": b64.urlsafe_b64encode(message.as_bytes()).decode("ascii")}}
+    if thread_id:
+        payload["message"]["threadId"] = thread_id
+    normalized_draft_id = str(gmail_draft_id or "").strip()
+    if normalized_draft_id:
+        response = _gmail_draft_request(mailbox, f"{GMAIL_API_BASE}/users/me/drafts/{urllib.parse.quote(normalized_draft_id, safe='')}", method="PUT", payload=payload)
+    else:
+        response = _gmail_draft_request(mailbox, f"{GMAIL_API_BASE}/users/me/drafts", method="POST", payload=payload)
+    response_message = response.get("message") if isinstance(response.get("message"), dict) else {}
+    return {"gmail_draft_id": str(response.get("id") or ""), "gmail_message_id": str(response_message.get("id") or ""), "thread_id": str(response_message.get("threadId") or thread_id or "")}
+
+
+def _parse_gmail_draft_detail(
+    mailbox: str,
+    gmail_draft_id: str,
+    detail: dict[str, Any],
+) -> dict[str, Any] | None:
+    """解析单封 Gmail Draft 的 raw MIME，集中复用列表和按需详情读取的解析规则。
+
+    Gmail Draft 列表只返回 ID，正文必须从单封 Draft 的 raw MIME 取得。该函数不记录
+    MIME 内容，避免邮件正文进入本地诊断日志。
+    """
+    import base64 as b64
+    from email import message_from_bytes
+
+    normalized_mailbox = normalize_mailbox(mailbox)
+    message_payload = detail.get("message") if isinstance(detail.get("message"), dict) else {}
+    raw = str(message_payload.get("raw") or "")
+    if not raw:
+        return None
+    try:
+        parsed = message_from_bytes(b64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+    except Exception:
+        # 单封异常草稿不能阻断其他草稿恢复，且不记录其原始内容。
+        return None
+    plain_body = ""
+    html_body = ""
+    for part in parsed.walk() if parsed.is_multipart() else [parsed]:
+        if part.is_multipart() or str(part.get_content_disposition() or "").lower() == "attachment":
+            continue
+        try:
+            content = (part.get_payload(decode=True) or b"").decode(part.get_content_charset() or "utf-8", errors="replace")
+        except Exception:
+            content = ""
+        content_type = str(part.get_content_type() or "").lower()
+        if content_type == "text/html" and content:
+            html_body = content
+        elif content_type == "text/plain" and content:
+            plain_body = content
+    if not plain_body and html_body:
+        plain_body = _html_to_text(html_body)
+    return {
+        "id": gmail_draft_id,
+        "gmail_draft_id": gmail_draft_id,
+        "gmail_message_id": str(message_payload.get("id") or ""),
+        "mailbox": normalized_mailbox,
+        "recipients": _normalize_email_list(str(parsed.get("To") or "")),
+        "cc": _normalize_email_list(str(parsed.get("Cc") or "")),
+        "bcc": _normalize_email_list(str(parsed.get("Bcc") or "")),
+        "subject": str(parsed.get("Subject") or ""),
+        "body": plain_body,
+        "body_html": html_body,
+        "source_thread_id": str(message_payload.get("threadId") or ""),
+    }
+
+
+def get_gmail_draft(mailbox: str, gmail_draft_id: str) -> dict[str, Any] | None:
+    """按需读取一封 Gmail 草稿的完整内容，供用户点击目录项后编辑。"""
+    normalized_draft_id = str(gmail_draft_id or "").strip()
+    if not normalized_draft_id:
+        return None
+    detail = _gmail_draft_request(
+        mailbox,
+        f"{GMAIL_API_BASE}/users/me/drafts/{urllib.parse.quote(normalized_draft_id, safe='')}?format=raw",
+    )
+    return _parse_gmail_draft_detail(mailbox, normalized_draft_id, detail)
+
+
+def list_gmail_drafts_page(
+    mailbox: str,
+    *,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """分页读取 Gmail Drafts，并只并发取当前目录页的草稿详情。
+
+    offset 使用应用侧稳定的数字偏移量。Gmail 的 pageToken 不透传到前端，防止页面
+    刷新或账户切换后遗留不可复用的 API token；需要更后页时在后端重新顺序跨页读取。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    page_limit = max(1, min(int(limit or 100), 500))
+    page_offset = max(0, int(offset or 0))
+    required = page_offset + page_limit
+
+    with _gmail_request_token_scope(mailbox=mailbox):
+        draft_ids: list[str] = []
+        page_token = ""
+        has_more_remote = False
+        while len(draft_ids) < required:
+            query = f"maxResults={min(500, max(page_limit, required - len(draft_ids)))}"
+            if page_token:
+                query += f"&pageToken={urllib.parse.quote(page_token, safe='')}"
+            listing = _gmail_draft_request(mailbox, f"{GMAIL_API_BASE}/users/me/drafts?{query}")
+            draft_ids.extend(
+                str(item.get("id") or "")
+                for item in listing.get("drafts") or []
+                if isinstance(item, dict) and str(item.get("id") or "").strip()
+            )
+            page_token = str(listing.get("nextPageToken") or "")
+            if not page_token:
+                break
+
+        selected_ids = draft_ids[page_offset:required]
+        has_more_remote = bool(page_token) or len(draft_ids) > required
+        if not selected_ids:
+            return {
+                "drafts": [],
+                "has_more": False,
+                "next_offset": page_offset,
+            }
+
+        worker_context = copy_context()
+        drafts_by_id: dict[str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(
+            max_workers=min(DRAFT_DETAIL_FETCH_MAX_WORKERS, len(selected_ids)),
+        ) as pool:
+            futures = {
+                pool.submit(worker_context.copy().run, get_gmail_draft, mailbox, gmail_draft_id): gmail_draft_id
+                for gmail_draft_id in selected_ids
+            }
+            for future in as_completed(futures):
+                try:
+                    draft = future.result()
+                except Exception:
+                    # Gmail 单封详情失败只跳过该草稿；下一次刷新仍会重试恢复。
+                    continue
+                if draft:
+                    drafts_by_id[str(draft["id"])] = draft
+
+    # 并发完成顺序不可预测，按 Gmail 列表原顺序返回以保持目录稳定。
+    drafts = [drafts_by_id[draft_id] for draft_id in selected_ids if draft_id in drafts_by_id]
+    return {
+        "drafts": drafts,
+        "has_more": has_more_remote,
+        "next_offset": page_offset + len(selected_ids),
+    }
+
+
+def list_gmail_drafts(mailbox: str, *, limit: int = 100) -> list[dict[str, Any]]:
+    """兼容旧调用方：读取 Gmail Drafts 首页的完整草稿数据。"""
+    return list_gmail_drafts_page(mailbox, limit=limit, offset=0)["drafts"]
 def send_compose_email(
     mailbox: str,
     recipients: list[str],

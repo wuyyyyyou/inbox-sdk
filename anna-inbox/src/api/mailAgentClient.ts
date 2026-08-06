@@ -24,6 +24,7 @@ import type {
   MailboxListPayload,
   MailboxInfo,
   RunHistoryEntry,
+  AskHistoryEntry,
   RunStatus,
   RuntimeState,
   RuntimeDiagnostics,
@@ -217,6 +218,29 @@ export class MailAgentClient {
 
   loadRunHistory() {
     return this.invoke<{ history: RunHistoryEntry[] }>("get_run_history");
+  }
+
+  loadAiAskHistory(mailbox: string) {
+    return this.invoke<{
+      mailbox: string;
+      exists?: boolean;
+      entries?: AskHistoryEntry[];
+      etag?: string;
+    }>("get_ai_ask_history", { mailbox, storage_provider: "aps" });
+  }
+
+  saveAiAskHistory(mailbox: string, entries: AskHistoryEntry[], ifMatch?: string) {
+    return this.invoke<{
+      ok?: boolean;
+      mailbox: string;
+      entries?: AskHistoryEntry[];
+      etag?: string;
+    }>("save_ai_ask_history", {
+      mailbox,
+      entries,
+      if_match: ifMatch || undefined,
+      storage_provider: "aps",
+    });
   }
 
   loadScanPlan(mailbox: string, storageProvider: string) {
@@ -433,20 +457,32 @@ export class MailAgentClient {
     return this.invoke<{ contacts?: ComposeContact[]; permission_required?: boolean }>("search_compose_contacts", { mailbox, query, limit, storage_provider: storageProvider });
   }
 
-  listComposeDrafts(mailbox: string, limit = 100, storageProvider?: string) {
-    return this.invoke<ComposeDraftListPayload>("list_compose_drafts", { mailbox, limit, storage_provider: storageProvider });
+  listComposeDrafts(mailbox: string, limit = 100, offset = 0, storageProvider?: string) {
+    // 读取 APS 草稿目录是幂等操作；网络抖动时最多自动重试两次。
+    return this.invoke<ComposeDraftListPayload>(
+      "list_compose_drafts",
+      { mailbox, limit, offset, storage_provider: "aps" },
+      { retry: "safe" },
+    );
+  }
+
+  getComposeDraft(mailbox: string, draftId: string, storageProvider?: string) {
+    return this.invoke<{ mailbox: string; exists?: boolean; etag?: string; draft?: ComposeDraft }>(
+      "get_compose_draft",
+      { mailbox, draft_id: draftId, storage_provider: "aps" },
+    );
   }
 
   saveComposeDraft(mailbox: string, draft: Partial<ComposeDraft>, ifMatch?: string, storageProvider?: string) {
-    return this.invoke<{ ok?: boolean; etag?: string; draft: ComposeDraft }>("create_or_update_compose_draft", { mailbox, draft, if_match: ifMatch, storage_provider: storageProvider });
+    return this.invoke<{ ok?: boolean; etag?: string; draft: ComposeDraft }>("create_or_update_compose_draft", { mailbox, draft, if_match: ifMatch, storage_provider: "aps" });
   }
 
   saveComposeDraftBatch(mailbox: string, drafts: Array<Partial<ComposeDraft>>, storageProvider?: string) {
-    return this.invoke<{ ok?: boolean; drafts?: ComposeDraft[] }>("create_or_update_compose_drafts", { mailbox, drafts, storage_provider: storageProvider });
+    return this.invoke<{ ok?: boolean; drafts?: ComposeDraft[] }>("create_or_update_compose_drafts", { mailbox, drafts, storage_provider: "aps" });
   }
 
   deleteComposeDraft(mailbox: string, draftId: string, storageProvider?: string) {
-    return this.invoke<{ ok?: boolean }>("delete_compose_draft", { mailbox, draft_id: draftId, storage_provider: storageProvider });
+    return this.invoke<{ ok?: boolean }>("delete_compose_draft", { mailbox, draft_id: draftId, storage_provider: "aps" });
   }
 
   sendComposeEmails(mailbox: string, messages: ComposeDraft[], storageProvider?: string) {

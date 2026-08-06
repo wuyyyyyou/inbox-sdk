@@ -736,6 +736,9 @@ async def set_compose_draft(
         "id": draft_id,
         "mailbox": str(mailbox or "").strip().lower(),
         "draft_mode": "forward" if str(draft.get("draft_mode") or "").strip().lower() == "forward" else "compose",
+        # Gmail Draft ID 是跨设备恢复和原位更新的稳定关联，不保存大正文以外的冗余副本。
+        "gmail_draft_id": str(draft.get("gmail_draft_id") or (existing.get("value") or {}).get("gmail_draft_id") or ""),
+        "gmail_message_id": str(draft.get("gmail_message_id") or (existing.get("value") or {}).get("gmail_message_id") or ""),
         "source_thread_id": str(draft.get("source_thread_id") or "").strip(),
         "source_message_id": str(draft.get("source_message_id") or "").strip(),
         "recipients": _addr_list("recipients"),
@@ -749,7 +752,20 @@ async def set_compose_draft(
         "updated_at": _now(),
     }
     result = await get_storage().set(key, payload, scope=default_scope(), if_match=str(existing.get("etag") or "") or None)
-    return {"ok": True, "etag": str(result.get("etag") or ""), "draft": payload}
+    # compose-drafts 由 SelectiveStorageClient 路由至 APS。写后立即读回，避免 Cloud
+    # Agent 生命周期变化时把未真正持久化的草稿映射误报成“已保存”。
+    confirmed = await get_storage().get(key, scope=default_scope())
+    confirmed_value = confirmed.get("value") if confirmed.get("exists") and isinstance(confirmed.get("value"), dict) else {}
+    write_etag = str(result.get("etag") or "")
+    confirmed_etag = str(confirmed.get("etag") or "")
+    if (
+        not confirmed.get("exists")
+        or str(confirmed_value.get("id") or "") != draft_id
+        or str(confirmed_value.get("gmail_draft_id") or "") != str(payload.get("gmail_draft_id") or "")
+        or (write_etag and confirmed_etag and write_etag != confirmed_etag)
+    ):
+        raise RuntimeError("Compose draft APS persistence verification failed")
+    return {"ok": True, "etag": confirmed_etag or write_etag, "draft": payload}
 
 
 async def set_compose_drafts_batch(mailbox: str, drafts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -773,16 +789,31 @@ async def delete_compose_draft(mailbox: str, draft_id: str) -> dict[str, Any]:
 
 async def list_compose_drafts(mailbox: str, *, limit: int = 100) -> dict[str, Any]:
     prefix = f"{_mailbox_prefix(mailbox)}/compose-drafts/"
-    result = await get_storage().list(prefix=prefix, limit=max(1, min(int(limit or 100), 500)), scope=default_scope())
+    bounded_limit = max(1, min(int(limit or 100), 500))
+    result = await get_storage().list(prefix=prefix, limit=bounded_limit, scope=default_scope())
+    items = result.get("items") if isinstance(result.get("items"), list) else []
     drafts_by_fingerprint: dict[str, dict[str, Any]] = {}
-    for item in result.get("items") or []:
+    loaded_count = 0
+    missing_count = 0
+    invalid_value_count = 0
+    missing_key_count = 0
+    for item in items:
         key = item.get("key") if isinstance(item, dict) else item
         if not key:
+            missing_key_count += 1
             continue
         loaded = await get_storage().get(str(key), scope=default_scope())
-        value = loaded.get("value") if loaded.get("exists") and isinstance(loaded.get("value"), dict) else {}
-        if not value:
+        if not loaded.get("exists"):
+            missing_count += 1
             continue
+        if not isinstance(loaded.get("value"), dict):
+            invalid_value_count += 1
+            continue
+        value = loaded.get("value")
+        if not value:
+            invalid_value_count += 1
+            continue
+        loaded_count += 1
         draft = {**value, "etag": str(loaded.get("etag") or "")}
         # 旧版本可能已写入重复草稿；列表返回时保留最新一条，避免重复展示。
         recipients = ",".join(sorted(str(item).strip().lower() for item in draft.get("recipients") or []))
@@ -1410,7 +1441,8 @@ async def reset_all_data() -> dict:
         mbox = entry.email
         prefix = _mailbox_prefix(mbox)
         # Use correct key suffixes matching _cards_key, _scan_key etc
-        for sub in ("cards/active", "cards/active_index", "cards/cleanup_bundle", "cards/cleanup_index", "scan_state", "scan_plan", "processed"):
+        # AI Ask 历史按邮箱保存；全量重置时也必须一并删除，避免 APS 残留旧会话。
+        for sub in ("cards/active", "cards/active_index", "cards/cleanup_bundle", "cards/cleanup_index", "scan_state", "scan_plan", "processed", "ask_history"):
             try:
                 await storage.delete(f"{prefix}/{sub}", scope=default_scope())
             except Exception:

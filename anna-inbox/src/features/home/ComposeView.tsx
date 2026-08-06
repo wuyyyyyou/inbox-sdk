@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useApp } from "../../app/AppContext";
 import { OutgoingAttachButton, OutgoingAttachmentList } from "../../shared/OutgoingAttachmentBar";
 import {
@@ -56,11 +56,32 @@ const SaveDraftIcon = () => (
   </ToolbarIcon>
 );
 
+function composeDraftFingerprint(draft: Partial<ComposeDraft>) {
+  return JSON.stringify({
+    recipients: draft.recipients || [],
+    cc: draft.cc || [],
+    bcc: draft.bcc || [],
+    subject: draft.subject || "",
+    body: draft.body || "",
+    body_html: draft.body_html || "",
+    attachments: (draft.attachments || []).map(({ id, filename, mime_type, size, storage_key }) => ({
+      id,
+      filename,
+      mime_type,
+      size,
+      storage_key,
+    })),
+  });
+}
+
 export function ComposeView({
   mailbox,
   initialDraft,
   open,
   onClose,
+  onCloseWithSave,
+  onDiscardDraft,
+  onSavedDraft,
   onViewDrafts,
   onScheduleSend,
   insertRequest,
@@ -71,6 +92,12 @@ export function ComposeView({
   initialDraft?: ComposeDraft | null;
   open: boolean;
   onClose: () => void;
+  /** 关闭窗口时将不可为空的草稿快照交给父级后台保存，避免阻塞关闭动画。 */
+  onCloseWithSave: (draft: Partial<ComposeDraft>, ifMatch?: string) => void;
+  /** 已保存草稿交给父级乐观隐藏，并在撤销窗口结束后再执行远端删除。 */
+  onDiscardDraft: (draft: ComposeDraft) => void;
+  /** 显式保存完成后同步更新父级草稿目录与本地镜像。 */
+  onSavedDraft: (draft: ComposeDraft) => void;
   onViewDrafts: () => void;
   onScheduleSend: (draft: ComposeDraft) => void;
   insertRequest?: { nonce: string; artifact: ComposeDraftArtifact } | null;
@@ -102,6 +129,7 @@ export function ComposeView({
   const [error, setError] = useState("");
   const [exitWithoutSavingConfirmation, setExitWithoutSavingConfirmation] =
     useState(false);
+  const persistedDraftFingerprintRef = useRef("");
 
   const canSend =
     recipients.length > 0 &&
@@ -133,6 +161,7 @@ export function ComposeView({
     setSaving(false);
     setError("");
     setExitWithoutSavingConfirmation(false);
+    persistedDraftFingerprintRef.current = composeDraftFingerprint(initialDraft || {});
   }, [initialDraft, open]);
 
   // 恢复草稿图片预览 URL（local stage 或 APS Files）
@@ -298,6 +327,7 @@ export function ComposeView({
       );
       setDraftId(saved.id);
       setEtag(saved.etag || "");
+      persistedDraftFingerprintRef.current = composeDraftFingerprint(draftInput);
       return saved;
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
@@ -313,6 +343,7 @@ export function ComposeView({
             );
             setDraftId(saved.id);
             setEtag(saved.etag || "");
+            persistedDraftFingerprintRef.current = composeDraftFingerprint(draftInput);
             return saved;
           }
         } catch (retryReason) {
@@ -327,13 +358,14 @@ export function ComposeView({
     }
   };
 
-  const close = async () => {
+  const close = () => {
     if (!recipients.length && (subject.trim() || body.trim() || cc.length || bcc.length || attachments.length)) {
       setExitWithoutSavingConfirmation(true);
       return;
     }
-    if (!isEmpty) {
-      await save();
+    if (!isEmpty && composeDraftFingerprint(draftInput) !== persistedDraftFingerprintRef.current) {
+      // 关闭优先：仅将已改动的快照交给父级异步写入 APS，避免无改动关闭产生额外同步。
+      onCloseWithSave(draftInput, etag || undefined);
     }
     onClose();
   };
@@ -347,6 +379,7 @@ export function ComposeView({
     }
     const saved = await save();
     if (!saved) return;
+    onSavedDraft(saved);
     actions.showToast(t("compose.saved"), {
       actionLabel: t("compose.view"),
       onAction: onViewDrafts,
@@ -354,8 +387,16 @@ export function ComposeView({
     onClose();
   };
 
-  const discard = async () => {
-    if (draftId) await actions.deleteComposeDraft(mailbox, draftId);
+  const discard = () => {
+    if (draftId) {
+      onDiscardDraft({
+        ...initialDraft,
+        ...draftInput,
+        id: draftId,
+        mailbox,
+        etag: etag || undefined,
+      });
+    }
     onClose();
   };
 
@@ -365,7 +406,10 @@ export function ComposeView({
       return;
     }
     const saved = await save();
-    if (saved) onScheduleSend(saved);
+    if (saved) {
+      onSavedDraft(saved);
+      onScheduleSend(saved);
+    }
   };
 
   const ccBccButtons = (
@@ -418,7 +462,7 @@ export function ComposeView({
             </button>
             <button
               type="button"
-              onClick={() => void discard()}
+              onClick={discard}
               aria-label={t("compose.discard")}
               data-tooltip={t("compose.discard")}
               disabled={saving}

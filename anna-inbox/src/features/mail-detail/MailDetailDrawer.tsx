@@ -19,8 +19,11 @@ import type {
 import { RecipientChipInput } from "../../shared/RecipientChipInput";
 import { SafeEmailHtml, SafeEmailText } from "../../shared/SafeEmailHtml";
 import {
+  getCachedInboxThreadDraft,
   getCachedMessageBody,
   getCachedThreadPage,
+  removeCachedInboxThreadDraft,
+  setCachedInboxThreadDraft,
   setCachedMessageBody,
   setCachedThreadPage,
 } from "../../shared/browserStorage";
@@ -806,6 +809,29 @@ export function MailDetailDrawer({
   const closeComposerRef = useRef<() => Promise<void>>(async () => undefined);
   const aiDraftModeRef = useRef<ComposerMode>("reply");
 
+  const applyStoredReplyDraft = (stored: {
+    body: string;
+    body_html?: string;
+    etag?: string;
+    attachments?: OutgoingAttachmentMeta[];
+  }) => {
+    const storedBody = stored.body || "";
+    const fallbackBody = message?.draft_body || "";
+    const nextDraft = storedBody || fallbackBody;
+    const storedAttachments = (stored.attachments || []).map((item) => ({
+      ...item,
+      status: "ready" as const,
+    }));
+    if (!nextDraft && !storedAttachments.length) return;
+    if (autoOpenDraftComposer) setComposerOpen(true);
+    updateComposerDraft("reply", {
+      body: nextDraft,
+      bodyHtml: stored.body_html || plainTextToEditorHtml(nextDraft),
+      etag: stored.etag || "",
+      attachments: storedAttachments,
+    });
+  };
+
   const updateComposerDraft = (mode: ComposerMode, patch: ComposerDraftPatch) => {
     setComposerDrafts((current) => {
       const previous = current[mode];
@@ -884,7 +910,8 @@ export function MailDetailDrawer({
   const saveForwardDraftIfNeeded = async () => {
     const forwardDraft = composerDrafts.forward;
     const forwardNote = stripForwardedMessageBlock(forwardDraft.body).trim();
-    if ((!forwardNote && !forwardDraft.attachments.length) || !threadId || !message?.id) return;
+    // 关闭编辑区不应成为一次写入操作：只有用户实际修改过转发草稿才异步同步到 APS。
+    if (!forwardDraft.dirty || (!forwardNote && !forwardDraft.attachments.length) || !threadId || !message?.id) return;
     return onSaveForwardDraft({
       id: forwardDraft.id || undefined,
       ifMatch: forwardDraft.etag || undefined,
@@ -1411,27 +1438,27 @@ export function MailDetailDrawer({
     if (suppressDraftLoadForRef.current === draftStorageKey) return;
     const requestId = ++draftLoadSequenceRef.current;
     let cancelled = false;
-    void getInboxThreadDraftRef.current(mailbox, threadId)
-      .then((stored) => {
-        if (cancelled || requestId !== draftLoadSequenceRef.current) return;
-        const storedBody = stored.body || "";
-        const fallbackBody = message?.draft_body || "";
-        const nextDraft = storedBody || fallbackBody;
-        const storedAttachments = (stored.attachments || []).map((item) => ({
-          ...item,
-          status: "ready" as const,
-        }));
-        if (nextDraft || storedAttachments.length) {
-          if (autoOpenDraftComposer) setComposerOpen(true);
-          updateComposerDraft("reply", {
-            body: nextDraft,
-            bodyHtml: stored.body_html || plainTextToEditorHtml(nextDraft),
-            etag: stored.etag || "",
-            attachments: storedAttachments,
-          });
-        }
-      })
-      .catch(() => undefined);
+    // 先显示本机镜像，再后台读取 APS。顺序读取避免迟到的旧镜像覆盖 APS 新数据。
+    void (async () => {
+      const cached = await getCachedInboxThreadDraft(mailbox, threadId).catch(() => null);
+      if (cached && !cancelled && requestId === draftLoadSequenceRef.current) {
+        applyStoredReplyDraft(cached);
+      }
+      const editSequence = draftEditSequenceRef.current;
+      const stored = await getInboxThreadDraftRef.current(mailbox, threadId).catch(() => null);
+      // 用户开始输入后不允许 APS 的旧响应覆盖当前编辑内容。
+      if (!stored || cancelled || requestId !== draftLoadSequenceRef.current || editSequence !== draftEditSequenceRef.current) return;
+      applyStoredReplyDraft(stored);
+      if (stored.exists) {
+        void setCachedInboxThreadDraft(mailbox, threadId, {
+          ...stored,
+          mailbox,
+          thread_id: threadId,
+        });
+      } else {
+        void removeCachedInboxThreadDraft(mailbox, threadId);
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -1517,6 +1544,15 @@ export function MailDetailDrawer({
           if (editSequence !== draftEditSequenceRef.current) return;
           setDraftDirty(false);
           if (result.etag) setDraftEtag(result.etag);
+          void setCachedInboxThreadDraft(mailbox, threadId, {
+            mailbox,
+            thread_id: threadId,
+            exists: true,
+            body: draft,
+            body_html: draftHtml || undefined,
+            etag: result.etag || draftEtag || undefined,
+            attachments: toPersistedOutgoingAttachments(composerAttachments),
+          });
         } catch {
           // The next edit can retry the save; keep the editor usable meanwhile.
         }
@@ -1527,6 +1563,20 @@ export function MailDetailDrawer({
     }, 500);
     return () => window.clearTimeout(timer);
   }, [composerAttachments, composerMode, composerOpen, draft, draftDirty, draftEtag, draftHtml, latestMessage, mailbox, message, threadId]);
+
+  useEffect(() => {
+    if (!composerOpen || composerMode !== "reply" || !threadId || !mailbox || !draftDirty) return;
+    // 本地镜像先落盘，APS 防抖保存稍后执行；刷新或重新打开时不会等网络才看到刚编辑的草稿。
+    void setCachedInboxThreadDraft(mailbox, threadId, {
+      mailbox,
+      thread_id: threadId,
+      exists: true,
+      body: draft,
+      body_html: draftHtml || undefined,
+      etag: draftEtag || undefined,
+      attachments: toPersistedOutgoingAttachments(composerAttachments),
+    });
+  }, [composerAttachments, composerMode, composerOpen, draft, draftDirty, draftEtag, draftHtml, mailbox, threadId]);
 
   useEffect(() => {
     if (!composerOpen) return;
@@ -2248,14 +2298,17 @@ export function MailDetailDrawer({
     await closeComposer();
     setComposerExpanded(false);
     await Promise.allSettled([...pendingDraftSavesRef.current]);
-    if (discardMode === "reply" && threadId) await deleteInboxThreadDraft(mailbox, threadId);
+    if (discardMode === "reply" && threadId) {
+      await deleteInboxThreadDraft(mailbox, threadId);
+      void removeCachedInboxThreadDraft(mailbox, threadId);
+    }
   };
 
   const closeThread = async () => {
     onRequestClose();
     const forwardDraft = composerDrafts.forward;
     const forwardNote = stripForwardedMessageBlock(forwardDraft.body).trim();
-    if (forwardNote) {
+    if (forwardDraft.dirty && forwardNote) {
       try {
         await onSaveForwardDraft({
           id: forwardDraft.id || undefined,
@@ -2274,7 +2327,7 @@ export function MailDetailDrawer({
         showToast(reason instanceof Error ? reason.message : String(reason));
         return;
       }
-    } else {
+    } else if (!forwardNote) {
       clearEmptyForwardDraft();
     }
     if (composerMode === "reply" && draftDirty && draft.trim()) showToast(t("detail.draftSaved"));

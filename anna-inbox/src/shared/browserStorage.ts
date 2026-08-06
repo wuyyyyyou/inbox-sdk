@@ -1,5 +1,8 @@
 import type {
+  ComposeDraft,
+  ComposeDraftListPayload,
   InboxMessage,
+  InboxThreadDraftPayload,
   InboxThreadPagePayload,
   MailAttachmentMeta,
   MailboxInfo,
@@ -13,6 +16,7 @@ const META_SELECTED_MAILBOX = "selected_mailbox";
 const META_LAST_USED_MAILBOXES = "last_used_mailboxes";
 const MAIL_FLAGS_KEY = "current";
 const CONTACT_AVATARS_KEY = "current";
+const COMPOSE_DRAFT_DIRECTORY_KEY = "compose_directory";
 
 export type BrowserMailUiFlags = {
   todos: string[];
@@ -57,6 +61,12 @@ export type CachedThreadPage = {
   updated_at: number;
   expires_at: number;
   page: InboxThreadPagePayload;
+};
+
+type CachedDraftMirror<T> = {
+  key: string;
+  value: T;
+  updated_at: number;
 };
 
 function hasIndexedDb() {
@@ -132,6 +142,27 @@ function messageBodyKey(messageId: string, internalDate?: string | null) {
 
 function threadPageKey(threadId: string, latestMessageId?: string | null) {
   return `${threadId}::${latestMessageId || ""}`;
+}
+
+function inboxThreadDraftKey(threadId: string) {
+  return `inbox_thread:${threadId}`;
+}
+
+function cloneComposeDraft(draft: ComposeDraft): ComposeDraft {
+  return {
+    ...draft,
+    recipients: [...(draft.recipients || [])],
+    cc: [...(draft.cc || [])],
+    bcc: [...(draft.bcc || [])],
+    attachments: (draft.attachments || []).map(({ preview_url, status, progress, error, ...item }) => item),
+  };
+}
+
+function cloneInboxThreadDraft(draft: InboxThreadDraftPayload): InboxThreadDraftPayload {
+  return {
+    ...draft,
+    attachments: (draft.attachments || []).map(({ preview_url, status, progress, error, ...item }) => item),
+  };
 }
 
 function openDeviceDb() {
@@ -355,6 +386,76 @@ export async function setCachedThreadPage(mailbox: string, page: InboxThreadPage
     updated_at: now,
     expires_at: now + MESSAGE_BODY_TTL_MS,
   } satisfies CachedThreadPage));
+}
+
+/**
+ * Compose 草稿目录使用本机 IndexedDB 镜像：页面先读镜像，随后再由 APS 结果覆盖。
+ * 附件临时预览 URL 不能持久化，避免刷新后保存失效的 blob/短期访问地址。
+ */
+export async function getCachedComposeDraftDirectory(mailbox: string): Promise<ComposeDraftListPayload | null> {
+  const cached = await withMailboxStore<CachedDraftMirror<ComposeDraftListPayload>>(
+    mailbox,
+    "draft_mirror",
+    "readonly",
+    (store) => store.get(COMPOSE_DRAFT_DIRECTORY_KEY),
+  );
+  if (!cached?.value || !Array.isArray(cached.value.drafts)) return null;
+  return {
+    ...cached.value,
+    drafts: cached.value.drafts.map(cloneComposeDraft),
+  };
+}
+
+export async function setCachedComposeDraftDirectory(
+  mailbox: string,
+  payload: ComposeDraftListPayload,
+): Promise<void> {
+  const normalized = mailbox.trim().toLowerCase();
+  if (!normalized) return;
+  await withMailboxStore(normalized, "draft_mirror", "readwrite", (store) => store.put({
+    key: COMPOSE_DRAFT_DIRECTORY_KEY,
+    value: {
+      mailbox: normalized,
+      count: Number(payload.count || payload.drafts.length),
+      drafts: (payload.drafts || []).map(cloneComposeDraft),
+      has_more: Boolean(payload.has_more),
+      next_offset: Number(payload.next_offset || 0),
+    },
+    updated_at: Date.now(),
+  } satisfies CachedDraftMirror<ComposeDraftListPayload>));
+}
+
+export async function getCachedInboxThreadDraft(
+  mailbox: string,
+  threadId: string,
+): Promise<InboxThreadDraftPayload | null> {
+  if (!threadId) return null;
+  const cached = await withMailboxStore<CachedDraftMirror<InboxThreadDraftPayload>>(
+    mailbox,
+    "draft_mirror",
+    "readonly",
+    (store) => store.get(inboxThreadDraftKey(threadId)),
+  );
+  return cached?.value ? cloneInboxThreadDraft(cached.value) : null;
+}
+
+export async function setCachedInboxThreadDraft(
+  mailbox: string,
+  threadId: string,
+  draft: InboxThreadDraftPayload,
+): Promise<void> {
+  const normalized = mailbox.trim().toLowerCase();
+  if (!normalized || !threadId) return;
+  await withMailboxStore(normalized, "draft_mirror", "readwrite", (store) => store.put({
+    key: inboxThreadDraftKey(threadId),
+    value: cloneInboxThreadDraft({ ...draft, mailbox: normalized, thread_id: threadId }),
+    updated_at: Date.now(),
+  } satisfies CachedDraftMirror<InboxThreadDraftPayload>));
+}
+
+export async function removeCachedInboxThreadDraft(mailbox: string, threadId: string): Promise<void> {
+  if (!threadId) return;
+  await withMailboxStore(mailbox, "draft_mirror", "readwrite", (store) => store.delete(inboxThreadDraftKey(threadId)));
 }
 
 export async function clearMailboxDatabase(mailbox: string): Promise<void> {

@@ -8,7 +8,7 @@ import { useAppController } from "./useAppController";
 function AppShell() {
   const controller = useAppController();
   const { t } = useI18n();
-  const { state, actions, toast, dismissToast, accountSwitchNotice, accountSwitchNoticeVisible, closeAccountSwitchNotice, initialize } = controller;
+  const { state, actions, toasts, dismissToast, accountSwitchNotice, accountSwitchNoticeVisible, closeAccountSwitchNotice, initialize } = controller;
   useEffect(() => {
     void initialize();
     // Initial boot should run once; subsequent state changes are driven by actions.
@@ -32,28 +32,28 @@ function AppShell() {
               </button>
             </div>
           ) : null}
-          <div className={`toast ${toast ? "is-visible" : ""}`}>
-            {toast ? (
-              <>
+          <div className="toast-stack" aria-live="polite" aria-atomic="false">
+            {toasts.map((toast) => (
+              <div className="toast is-visible" key={toast.id} role="status">
                 <span>{toast.message}</span>
                 {toast.actionLabel && toast.onAction ? (
                   <button type="button" className="toast-action" onClick={() => {
+                    dismissToast(toast.id);
                     toast.onAction?.();
-                    dismissToast();
                   }}>
                     {toast.actionLabel}
                   </button>
                 ) : null}
                 {toast.secondaryActionLabel && toast.onSecondaryAction ? (
                   <button type="button" className="toast-action is-secondary" onClick={() => {
+                    dismissToast(toast.id);
                     toast.onSecondaryAction?.();
-                    dismissToast();
                   }}>
                     {toast.secondaryActionLabel}
                   </button>
                 ) : null}
-              </>
-            ) : null}
+              </div>
+            ))}
           </div>
         </main>
       </div>

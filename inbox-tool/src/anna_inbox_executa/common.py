@@ -561,6 +561,7 @@ DEFAULT_MANIFEST = {
             "description": "Get mailbox-scoped AI Ask conversation history.",
             "parameters": [
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
+                {"name": "storage_provider", "type": "string", "description": "Storage backend: aps.", "required": False},
             ],
         },
         {
@@ -570,6 +571,7 @@ DEFAULT_MANIFEST = {
                 {"name": "mailbox", "type": "string", "description": "Mailbox email address.", "required": True},
                 {"name": "entries", "type": "array", "description": "Pruned AI Ask conversation entries.", "required": True},
                 {"name": "if_match", "type": "string", "description": "Current Ask-history etag.", "required": False},
+                {"name": "storage_provider", "type": "string", "description": "Storage backend: aps.", "required": False},
             ],
         },
         {
