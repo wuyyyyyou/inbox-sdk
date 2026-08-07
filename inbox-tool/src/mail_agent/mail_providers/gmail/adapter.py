@@ -3234,7 +3234,11 @@ def live_search_and_cache(
 # ── MessageLite / MessageDetail / ThreadContext ────────────────────
 
 def _to_message_lite(msg: dict[str, Any]) -> MessageLite:
-    """Convert cached message summary to MessageLite."""
+    """将缓存摘要转换为 MessageLite，并兼容历史附件字段。"""
+    # 附件缓存存在三种表达：完整 attachments 列表、has_attachment 标记，
+    # 以及 attachment_count 数量。统一使用附件数量 helper，避免旧缓存在
+    # 转换为 MessageLite 后丢失 has:attachment 的检索能力。
+    has_attachment = _message_attachment_count(msg) > 0
     return MessageLite(
         message_id=str(msg.get("id") or ""),
         thread_id=str(msg.get("thread_id") or ""),
@@ -3248,7 +3252,7 @@ def _to_message_lite(msg: dict[str, Any]) -> MessageLite:
         unread="UNREAD" in str(msg.get("label_ids") or "").upper(),
         starred="STARRED" in str(msg.get("label_ids") or "").upper(),
         important="IMPORTANT" in str(msg.get("label_ids") or "").upper(),
-        has_attachment=bool(msg.get("attachments") and len(msg.get("attachments") or []) > 0),
+        has_attachment=has_attachment,
         attachments=attachment_metadata_from_message(msg),
         headers={
             "list_unsubscribe": str(msg.get("raw_headers", {}).get("list-unsubscribe", "")),

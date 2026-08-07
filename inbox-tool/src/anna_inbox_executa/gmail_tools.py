@@ -1001,10 +1001,28 @@ def search_indexed_emails(
         ]
         matched_rows.sort(key=_inbox_message_sort_key)
         result["total"] = len(matched_rows)
-        page = matched_rows[offset:offset + limit]
-        result["next_offset"] = offset + len(page)
+        # 先按稳定排序和调用方 offset 取候选窗口，再按压缩后的实际响应逐条试装。
+        # 这样 limit=200 时仍不会把大字段索引一次性塞进超出 Host 实际承受范围的
+        # JSON-RPC 帧；offset 只按真正返回的消息推进，下一页不会跳过未返回的命中。
+        page_rows = matched_rows[offset:offset + limit]
+        messages: list[dict[str, Any]] = []
+        for message in page_rows:
+            compact_message = _compact_inbox_message(message, mailbox)
+            candidate_messages = [*messages, compact_message]
+            candidate_result = {
+                **result,
+                "messages": candidate_messages,
+                "next_offset": offset + len(candidate_messages),
+                "has_more": offset + len(candidate_messages) < result["total"],
+            }
+            # 至少保留一个完整邮件；正常压缩字段均远小于预算，且该分支可避免
+            # 单个异常记录让最终响应失去明确的预算边界。
+            if _cached_rpc_frame_size("search_indexed_emails", candidate_result) > CACHED_FEED_RESPONSE_MAX_BYTES:
+                break
+            messages = candidate_messages
+        result["messages"] = messages
+        result["next_offset"] = offset + len(messages)
         result["has_more"] = result["next_offset"] < result["total"]
-        result["messages"] = [_compact_inbox_message(message, mailbox) for message in page]
         return result
     except Exception as exc:
         # 统一返回业务错误，协议层仍能稳定拿到约定字段。

@@ -1924,9 +1924,13 @@ body.is-resizing-ai-sidebar {
   outline: 0;
   color: transparent;
   caret-color: #303447;
-  font: inherit;
+  font-family: inherit;
   font-size: 14px;
-  line-height: normal;
+  line-height: 20px;
+  letter-spacing: inherit;
+  font-weight: inherit;
+  text-transform: inherit;
+  box-sizing: border-box;
   background: transparent;
 }
 .mail-search-highlight {
@@ -1937,7 +1941,13 @@ body.is-resizing-ai-sidebar {
   overflow: hidden;
   white-space: pre;
   color: #303447;
+  font-family: inherit;
   font-size: 14px;
+  line-height: 20px;
+  letter-spacing: inherit;
+  font-weight: inherit;
+  text-transform: inherit;
+  box-sizing: border-box;
   pointer-events: none;
 }
 .mail-search-highlight .is-field {
@@ -1955,6 +1965,13 @@ body.is-resizing-ai-sidebar {
 .mail-search-highlight .is-editing {
   color: #d97816;
   background: #fff0dd;
+}
+.mail-search-highlight .is-operator.is-editing {
+  color: #303447;
+  background: transparent;
+}
+.splits-query-editor .mail-search-highlight {
+  left: 47px;
 }
 .mail-search input::placeholder {
   color: #a1a6b5;

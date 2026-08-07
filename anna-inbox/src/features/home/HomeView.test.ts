@@ -18,6 +18,56 @@ describe("display range switching", () => {
   });
 });
 
+describe("search suggestion submission", () => {
+  it("submits a complete query directly and rechecks active search after sync", () => {
+    expect(homeViewSource).toContain("if (parsedSearch.expression && !parsedSearch.error) {");
+    expect(homeViewSource).toContain("applySearch(search);");
+    expect(homeViewSource).toContain("const refreshActiveSearch = () => {");
+    expect(homeViewSource).toContain("void searchIndexedEmailsRef.current(value).catch(() => undefined);");
+  });
+
+  it("keeps typing and incomplete suggestions in edit mode without executing search", () => {
+    expect(homeViewSource).not.toContain("setFilter(\"search\");\n      void searchIndexedEmailsRef.current(value).catch(() => undefined);");
+    expect(homeViewSource).toContain("(suggestion: string, executeComplete = false)");
+    expect(homeViewSource).toContain("if (executeComplete && parsed.expression && !parsed.error)");
+    expect(homeViewSource).toContain("onClick={() => applySuggestion(suggestion, true)}");
+  });
+
+  it("prioritizes explicit Enter submission over an open completion menu", () => {
+    const enterHandler = homeViewSource.match(/else if \(event\.key === "Enter"\) \{[\s\S]*?\n                  \}\n                \}/)?.[0] || "";
+    expect(enterHandler).toContain("if (parsedSearch.expression && !parsedSearch.error)");
+    expect(enterHandler).toContain("if (hasIncompleteSuggestion)");
+    expect(enterHandler).toContain("applySearch(search);");
+    expect(enterHandler).toContain("applySuggestion(searchSuggestions[searchSuggestionIndex]);");
+  });
+
+  it("retains an incomplete field completion and closes the menu for direct value entry", () => {
+    expect(homeViewSource).toContain("const hasIncompleteSuggestion = searchSuggestions.some");
+    expect(homeViewSource).toContain("applySuggestion(searchSuggestions[searchSuggestionIndex]);");
+    expect(homeViewSource).toContain("setSearchFocused(false);");
+    expect(homeViewSource).toContain("window.requestAnimationFrame");
+    expect(homeViewSource).toContain("const next = applyInboxQuerySuggestion(search, suggestion);");
+    expect(homeViewSource).toContain("if (executeComplete && parsed.expression && !parsed.error)");
+  });
+
+  it("restores the pre-search filter without changing mailbox state when cleared", () => {
+    const clearStart = homeViewSource.indexOf('setSearch("");', homeViewSource.indexOf("mail-search-clear"));
+    const clearHandler = homeViewSource.slice(clearStart, clearStart + 180);
+    expect(clearHandler).toContain("setFilter(filterBeforeSearch);");
+    expect(clearHandler).not.toContain('setMailboxView("inbox")');
+    expect(clearHandler).not.toContain("searchIndexedEmailsRef");
+  });
+
+  it("restores the pre-search filter when the input is manually deleted", () => {
+    const changeHandler = homeViewSource.match(/onChange=\{\(event\) => \{[\s\S]*?setSearchSuggestionIndex\(0\);\n\s*\}\}/)?.[0] || "";
+    expect(changeHandler).toContain('if (!next.trim() && (activeSearch || filter === "search"))');
+    expect(changeHandler).toContain("setActiveSearch(\"\");");
+    expect(changeHandler).toContain("setFilter(filterBeforeSearch);");
+    expect(changeHandler).toContain("setSearchFocused(true);");
+    expect(changeHandler).not.toContain("searchIndexedEmailsRef");
+  });
+});
+
 describe("AI thread reference", () => {
   it("opens a detail placeholder before resolving the referenced thread page", () => {
     const handler = homeViewSource.match(/const openMailDetailFromAi = useCallback\([\s\S]*?const handleGmailThreadAction = useCallback/)?.[0] || "";

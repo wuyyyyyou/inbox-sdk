@@ -40,10 +40,33 @@ const SUGGESTION_PLACEHOLDERS: Record<string, Parameters<TranslateFn>[0]> = {
   "from:": "search.suggestion.from",
   "to:": "search.suggestion.to",
   "is:": "search.suggestion.is",
+  "is:sent": "search.suggestion.isSent",
+  "is:unread": "search.suggestion.isUnread",
+  "is:done": "search.suggestion.isDone",
+  "is:todo": "search.suggestion.isTodo",
+  "is:inbox": "search.suggestion.isInbox",
+  "is:snoozed": "search.suggestion.isSnoozed",
+  "is:starred": "search.suggestion.isStarred",
+  "is:important": "search.suggestion.isImportant",
+  "is:draft": "search.suggestion.isDraft",
+  "is:trash": "search.suggestion.isTrash",
+  "is:spam": "search.suggestion.isSpam",
+  "is:all": "search.suggestion.isAll",
   "has:": "search.suggestion.has",
+  "has:attachment": "search.suggestion.hasAttachment",
   "before:": "search.suggestion.before",
   "after:": "search.suggestion.after",
 };
+const QUERY_ERROR_KEYS = {
+  unclosedQuote: "search.error.unclosedQuote",
+  invalidExpression: "search.error.invalidExpression",
+  missingSearchTerm: "search.error.missingSearchTerm",
+  unknownField: "search.error.unknownField",
+  fieldNeedsKeyword: "search.error.fieldNeedsKeyword",
+  invalidStatus: "search.error.invalidStatus",
+  attachmentOnly: "search.error.attachmentOnly",
+  invalidDate: "search.error.invalidDate",
+} as const satisfies Record<string, Parameters<TranslateFn>[0]>;
 type InboxQueryTokenKind = "field" | "value" | "operator" | "plain";
 type InboxQueryToken = { text: string; kind: InboxQueryTokenKind };
 
@@ -168,6 +191,24 @@ export function parseInboxQuery(input: string): ParsedInboxQuery {
   return { expression, error: "" };
 }
 
+/** 将 parser 保持兼容的英文错误转换为当前界面的本地化文案。 */
+export function localizeInboxQueryError(error: string, t: TranslateFn = tFallback): string {
+  if (!error) return "";
+  if (error === "Quoted search phrases must be closed.") return t(QUERY_ERROR_KEYS.unclosedQuote);
+  if (error === "Invalid parentheses or operator placement.") return t(QUERY_ERROR_KEYS.invalidExpression);
+  if (error === "The - operator needs a search term after it.") return t(QUERY_ERROR_KEYS.missingSearchTerm);
+  const unknownField = /^Unknown search field: (.+)\.$/u.exec(error);
+  if (unknownField) return t(QUERY_ERROR_KEYS.unknownField, { field: unknownField[1] });
+  const fieldNeedsKeyword = /^The (.+): field needs a keyword\.$/u.exec(error);
+  if (fieldNeedsKeyword) return t(QUERY_ERROR_KEYS.fieldNeedsKeyword, { field: fieldNeedsKeyword[1] });
+  const invalidStatus = /^is: must use (.+)\.$/u.exec(error);
+  if (invalidStatus) return t(QUERY_ERROR_KEYS.invalidStatus, { values: invalidStatus[1] });
+  if (error === "has: currently supports attachment only.") return t(QUERY_ERROR_KEYS.attachmentOnly);
+  const invalidDate = /^(before|after): must use YYYY-MM-DD\.$/u.exec(error);
+  if (invalidDate) return t(QUERY_ERROR_KEYS.invalidDate, { field: invalidDate[1] });
+  return error;
+}
+
 function hasMatch(value: string | null | undefined, term: string): boolean {
   return String(value || "").toLowerCase().includes(term);
 }
@@ -252,13 +293,26 @@ export function getInboxQuerySuggestions(input: string): string[] {
   const raw = String(input || "");
   // 首次聚焦时展示可用字段；已完成的单个条件则不弹出菜单。
   if (!raw.trim()) return FIELDS.map((field) => `${field}:`);
-  if (/\s$/u.test(raw) && raw.trim()) return [];
+  if (/\s$/u.test(raw) && raw.trim()) {
+    const previous = parseInboxQuery(raw.trim());
+    return previous.expression && !previous.error ? ["AND", "OR"] : [];
+  }
   const current = raw.trim().split(/\s+/u).at(-1)?.toLowerCase() || "";
   const bare = current.startsWith("-") ? current.slice(1) : current;
+  const previousInput = raw.trim().slice(0, -current.length).trimEnd();
+  if ((bare === "an" || bare === "and" || bare === "o" || bare === "or") && previousInput) {
+    const previous = parseInboxQuery(previousInput);
+    if (previous.expression && !previous.error) {
+      return bare.startsWith("a") ? ["AND"] : ["OR"];
+    }
+  }
   if (!bare.includes(":")) {
     const fields = FIELDS.filter((field) => field.startsWith(bare)).map((field) => `${field}:`);
     if (fields.length) return fields;
   }
+  // 任意字段已有非空值时，不再回退到字段候选；is/has 下面仍可提供值候选。
+  const fieldValue = /^-?(subject|body|from|to|is|has|before|after):(.+)$/u.exec(bare);
+  if (fieldValue && fieldValue[2] && fieldValue[1] !== "is" && fieldValue[1] !== "has") return [];
   const complete = parseInboxQuery(raw);
   if (complete.expression && !complete.error) return [];
   if (bare.startsWith("is:")) {
@@ -269,7 +323,7 @@ export function getInboxQuerySuggestions(input: string): string[] {
   return [];
 }
 
-/** 返回建议的简短占位说明，状态值建议无需额外说明。 */
+/** 返回建议的简短占位说明。 */
 export function getInboxQuerySuggestionPlaceholder(suggestion: string, t?: TranslateFn): string {
   const key = SUGGESTION_PLACEHOLDERS[suggestion];
   return key ? (t ? t(key) : tFallback(key)) : "";
@@ -277,10 +331,10 @@ export function getInboxQuerySuggestionPlaceholder(suggestion: string, t?: Trans
 
 /** 将当前未完成的 token 替换为补全项，供主页搜索与 Split 查询编辑器复用。 */
 export function applyInboxQuerySuggestion(input: string, suggestion: string): string {
-  const firstToken = !/\s/u.test(input.trim());
+  const suffix = suggestion.endsWith(":") ? "" : " ";
   return /\s$/u.test(input)
-    ? `${input}${suggestion} `
-    : input.replace(/\S*$/u, `${suggestion}${firstToken ? "" : " "}`);
+    ? `${input}${suggestion}${suffix}`
+    : input.replace(/\S*$/u, `${suggestion}${suffix}`);
 }
 
 function appendQueryHighlightTerm(tokens: InboxQueryToken[], text: string): void {
@@ -309,6 +363,23 @@ function appendQueryHighlightTerm(tokens: InboxQueryToken[], text: string): void
 export function splitInboxQueryTokens(input: string): InboxQueryToken[] {
   const raw = String(input || "");
   const tokens: InboxQueryToken[] = [];
+  const trimmed = raw.trim();
+  const current = trimmed.split(/\s+/u).at(-1)?.toLowerCase() || "";
+  const previousInput = trimmed.slice(0, -current.length).trimEnd();
+  if ((current === "a" || current === "an" || current === "and" || current === "o" || current === "or") && previousInput) {
+    const previous = parseInboxQuery(previousInput);
+    if (previous.expression && !previous.error) {
+      appendQueryHighlightTerm(tokens, raw.slice(0, raw.length - current.length));
+      const trailing = tokens.at(-1);
+      const value = tokens.at(-2);
+      if (trailing?.kind === "plain" && /^\s+$/u.test(trailing.text) && value?.kind === "value") {
+        value.text += trailing.text;
+        tokens.pop();
+      }
+      tokens.push({ text: raw.slice(raw.length - current.length), kind: "operator" });
+      return tokens;
+    }
+  }
   let termStart = 0;
   for (const operator of findQueryOperators(raw)) {
     appendQueryHighlightTerm(tokens, raw.slice(termStart, operator.index));

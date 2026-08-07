@@ -63,6 +63,16 @@ def test_workflow_status_ids_override_gmail_labels() -> None:
     print("[PASS] test_workflow_status_ids_override_gmail_labels")
 
 
+def test_has_attachment_matches_dict_attachment_variants() -> None:
+    """has:attachment 应兼容本地索引中的三种附件字段表达。"""
+    parsed = parse_local_query("has:attachment")
+    assert match_local_query({"attachments": [{"filename": "invoice.pdf"}]}, parsed)
+    assert match_local_query({"has_attachment": True}, parsed)
+    assert match_local_query({"attachment_count": 2}, parsed)
+    assert not match_local_query({"attachments": [], "attachment_count": 0}, parsed)
+    print("[PASS] test_has_attachment_matches_dict_attachment_variants")
+
+
 def test_normalize_gmail_fragments() -> None:
     assert "is:inbox" in normalize_to_local_query("in:inbox newer_than:7d is:unread")
     assert not parse_local_query(normalize_to_local_query("in:inbox is:unread")).error
@@ -138,6 +148,7 @@ def test_build_local_query_from_plan() -> None:
 if __name__ == "__main__":
     test_parse_and_exclude_and_todo()
     test_workflow_status_ids_override_gmail_labels()
+    test_has_attachment_matches_dict_attachment_variants()
     test_normalize_gmail_fragments()
     test_filter_cached_messages()
     test_multiword_subject_matches_in_ai_local_query()

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { InboxCustomCategory, InboxSettings } from "../../types/mail";
-import { applyInboxQuerySuggestion, getInboxQuerySuggestionPlaceholder, getInboxQuerySuggestions, parseInboxQuery, splitInboxQueryTokens } from "../search/inboxQuery";
+import { applyInboxQuerySuggestion, getInboxQuerySuggestionPlaceholder as getSuggestionPlaceholder, getInboxQuerySuggestions, localizeInboxQueryError, parseInboxQuery, splitInboxQueryTokens } from "../search/inboxQuery";
 import { useApp } from "../../app/AppContext";
 import { useI18n } from "../../i18n";
 
@@ -43,9 +43,14 @@ export function SplitsManager({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const queryInputRef = useRef<HTMLInputElement>(null);
+  const queryCaretPositionRef = useRef<number | null>(null);
   const categories = Array.isArray(settings.custom_categories) ? settings.custom_categories : [];
-  const parsed = useMemo(() => parseInboxQuery(draft.query), [draft.query]);
+  const parsed = useMemo(() => {
+    const result = parseInboxQuery(draft.query);
+    return result.error ? { ...result, error: localizeInboxQueryError(result.error, t) } : result;
+  }, [draft.query, t]);
   const querySuggestions = useMemo(() => getInboxQuerySuggestions(draft.query), [draft.query]);
+  const getInboxQuerySuggestionPlaceholder = (suggestion: string) => getSuggestionPlaceholder(suggestion, t);
 
   useEffect(() => {
     if (open) return;
@@ -69,6 +74,13 @@ export function SplitsManager({
     setQueryFocused(true);
     window.requestAnimationFrame(() => queryInputRef.current?.setSelectionRange(next.length, next.length));
   };
+  useEffect(() => {
+    const position = queryCaretPositionRef.current;
+    const input = queryInputRef.current;
+    if (position === null || !input || document.activeElement !== input) return;
+    input.setSelectionRange(position, position);
+    queryCaretPositionRef.current = null;
+  }, [draft.query]);
   const startEdit = (split: InboxCustomCategory) => {
     setDraft(split);
     setScreen("form");
@@ -135,7 +147,7 @@ export function SplitsManager({
           <label className="mail-search splits-query-editor">
             <span className="splits-query-search-icon" aria-hidden="true">⌕</span>
             <span className="mail-search-highlight" aria-hidden="true">{splitInboxQueryTokens(draft.query).map((token, index, tokens) => <span className={`is-${token.kind}${parsed.error && index === tokens.length - 1 && !/\s$/u.test(draft.query) ? " is-editing" : ""}`} key={`${token.text}-${index}`}>{token.text}</span>)}</span>
-            <input ref={queryInputRef} autoFocus value={draft.query} onChange={(event) => { setDraft((current) => ({ ...current, query: event.target.value })); setQueryFocused(true); setQuerySuggestionIndex(0); }} onFocus={() => setQueryFocused(true)} onBlur={() => window.setTimeout(() => setQueryFocused(false), 120)} onKeyDown={(event) => { if (event.key === "ArrowDown" && querySuggestions.length) { event.preventDefault(); setQuerySuggestionIndex((index) => (index + 1) % querySuggestions.length); } else if (event.key === "ArrowUp" && querySuggestions.length) { event.preventDefault(); setQuerySuggestionIndex((index) => (index - 1 + querySuggestions.length) % querySuggestions.length); } else if (event.key === "Enter") { event.preventDefault(); if (querySuggestions.length) applyQuerySuggestion(querySuggestions[querySuggestionIndex]); else if (parsed.expression && !parsed.error && !/\s$/u.test(draft.query)) { const next = `${draft.query} `; setDraft((current) => ({ ...current, query: next })); window.requestAnimationFrame(() => queryInputRef.current?.setSelectionRange(next.length, next.length)); } } }} placeholder={t("splits.queryPlaceholder")} />
+            <input ref={queryInputRef} autoFocus value={draft.query} onChange={(event) => { const next = event.target.value; queryCaretPositionRef.current = event.target.selectionStart ?? next.length; setDraft((current) => ({ ...current, query: next })); setQueryFocused(true); setQuerySuggestionIndex(0); }} onFocus={() => setQueryFocused(true)} onBlur={() => window.setTimeout(() => setQueryFocused(false), 120)} onKeyDown={(event) => { if (event.key === "ArrowDown" && querySuggestions.length) { event.preventDefault(); setQuerySuggestionIndex((index) => (index + 1) % querySuggestions.length); } else if (event.key === "ArrowUp" && querySuggestions.length) { event.preventDefault(); setQuerySuggestionIndex((index) => (index - 1 + querySuggestions.length) % querySuggestions.length); } else if (event.key === "Enter") { event.preventDefault(); if (querySuggestions.length) applyQuerySuggestion(querySuggestions[querySuggestionIndex]); else if (parsed.expression && !parsed.error && !/\s$/u.test(draft.query)) { const next = `${draft.query} `; setDraft((current) => ({ ...current, query: next })); window.requestAnimationFrame(() => queryInputRef.current?.setSelectionRange(next.length, next.length)); } } }} placeholder={t("splits.queryPlaceholder")} />
           </label>
           {queryFocused && (querySuggestions.length > 0 || Boolean(parsed.error)) ? <div className="mail-search-suggestions splits-query-suggestions" role="listbox">{querySuggestions.length ? querySuggestions.map((suggestion, index) => <button type="button" role="option" aria-selected={index === querySuggestionIndex} className={index === querySuggestionIndex ? "is-selected" : ""} key={suggestion} onMouseDown={(event) => event.preventDefault()} onMouseMove={() => setQuerySuggestionIndex(index)} onClick={() => applyQuerySuggestion(suggestion)}><strong>{suggestion}</strong>{getInboxQuerySuggestionPlaceholder(suggestion) ? <span>{getInboxQuerySuggestionPlaceholder(suggestion)}</span> : null}{index === querySuggestionIndex ? <kbd>Enter</kbd> : null}</button>) : parsed.error ? <p role="alert">{parsed.error}</p> : null}</div> : null}
         </div>

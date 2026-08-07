@@ -138,8 +138,8 @@ App 与 Tool **版本解耦**（当前基线）：
 
 | 端 | 版本 | 权威文件 |
 | --- | --- | --- |
-| App | `2.2.8` | `anna-inbox/app.json` |
-| Tool | `2.3.8` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
+| App | `2.2.9` | `anna-inbox/app.json` |
+| Tool | `2.3.9` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
 
 Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Tool 版本后运行：
 
@@ -154,6 +154,6 @@ python scripts/sync/sync_executa_identity.py --check
 
 当前文档索引见 [`anna-inbox/docs/README.md`](anna-inbox/docs/README.md)。
 
-- [2.3.8 架构与发布基线](anna-inbox/docs/2.3.8架构与发布基线.md)
+- [2.3.9 架构与发布基线](anna-inbox/docs/2.3.9架构与发布基线.md)
 - [邮箱同步 P0：缓存优先](anna-inbox/docs/邮箱同步P0缓存优先方案.md)
 - [平台超时诊断与反馈流程](anna-inbox/docs/平台超时诊断与反馈流程.md)

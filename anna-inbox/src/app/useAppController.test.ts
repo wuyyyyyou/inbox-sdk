@@ -270,3 +270,26 @@ describe("mailbox switching", () => {
     expect(controllerSource).not.toMatch(/async clearHistory\(\)[\s\S]*?client\.clearHistory\(\)/);
   });
 });
+
+describe("indexed search request races", () => {
+  it("guards first-page responses and errors by request sequence, mailbox, and query", () => {
+    expect(controllerSource).toContain("const indexedSearchRequestSequence = useRef(0);");
+    expect(controllerSource).toContain("const requestId = ++indexedSearchRequestSequence.current;");
+    expect(controllerSource).toMatch(
+      /requestId === indexedSearchRequestSequence\.current[\s\S]*?normalizedMailbox\(current\.selectedMailboxes\[0\] \|\| current\.mailbox\) === normalizedMailbox\(mailbox\)/,
+    );
+    expect(controllerSource).toMatch(
+      /setState\(\(current\) => isCurrentSearch\(current, true\)[\s\S]*?indexedSearchMessages: payload\.messages \|\| \[\]/,
+    );
+    expect(controllerSource).toMatch(
+      /catch \(error\)[\s\S]*?setState\(\(current\) => isCurrentSearch\(current, true\)[\s\S]*?indexedSearchMessages: \[\]/,
+    );
+  });
+
+  it("invalidates indexed searches on unmount and mailbox switch without changing load-more guards", () => {
+    expect(controllerSource).toContain("indexedSearchRequestSequence.current += 1;");
+    expect(controllerSource).toMatch(
+      /if \(current\.indexedSearchQuery !== query\) return \{ \.\.\.current, indexedSearchLoading: false \};/,
+    );
+  });
+});

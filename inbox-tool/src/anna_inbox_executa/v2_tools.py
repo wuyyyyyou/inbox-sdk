@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import tempfile
 from html import escape as html_escape
 
 from anna_inbox_executa.common import *
@@ -197,6 +198,36 @@ def _attachment_path_segment(value: str) -> str:
     return _safe_attachment_filename(value)[:120] or "attachment"
 
 
+def _aps_files_download_url(response: Any) -> str:
+    """从 APS Files 响应中提取短期下载 URL，并生成脱敏 schema 诊断。"""
+    url_fields = ("url", "download_url", "presigned_url", "get_url")
+    top_keys: list[str] = []
+    nested_key_details: list[str] = []
+
+    if isinstance(response, dict):
+        top_keys = sorted(str(key) for key in response.keys())[:12]
+        candidates: list[dict[str, Any]] = [response]
+        for container_name in ("data", "result"):
+            nested = response.get(container_name)
+            if isinstance(nested, dict):
+                nested_keys = sorted(str(key) for key in nested.keys())[:12]
+                nested_key_details.append(f"{container_name} keys=[{', '.join(nested_keys)}]")
+                candidates.append(nested)
+        for candidate in candidates:
+            for field in url_fields:
+                value = candidate.get(field)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+    details = [
+        "APS Files download URL response missing a URL",
+        f"response type={type(response).__name__}",
+        f"top-level keys=[{', '.join(top_keys)}]",
+    ]
+    details.extend(nested_key_details)
+    raise RuntimeError("; ".join(details))
+
+
 def _is_attachment_upload_retryable(error: BaseException) -> bool:
     """判断对象尚未落地或当前 pending attempt 未完成的可重试错误。"""
     detail = str(error).lower()
@@ -220,73 +251,23 @@ def _put_presigned_url_sync(url: str, headers: dict[str, Any], content: bytes, m
     预签名请求的 headers 属于签名契约，不能为了通用 HTTP 客户端而注入
     Connection、User-Agent、Content-Length 或未经签名的 Content-Type。
     """
-    import subprocess
-    import tempfile
-
-    normalized_headers = {str(k): str(v) for k, v in (headers or {}).items()}
-
-    helper = r"""
-import json
-import sys
-import http.client
-from urllib.parse import urlsplit
-
-payload = json.loads(sys.stdin.read())
-with open(payload["path"], "rb") as handle:
-    data = handle.read()
-parts = urlsplit(payload["url"])
-if parts.scheme not in ("http", "https") or not parts.hostname:
-    raise RuntimeError("presigned PUT URL must use HTTP(S)")
-connection_type = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
-connection = connection_type(parts.hostname, parts.port, timeout=float(payload["timeout"]))
-try:
-    target = parts.path or "/"
-    if parts.query:
-        target += "?" + parts.query
-    connection.putrequest("PUT", target, skip_accept_encoding=True, skip_host=True)
-    for key, value in payload["headers"].items():
-        connection.putheader(str(key), str(value))
-    connection.endheaders()
-    connection.send(data)
-    response = connection.getresponse()
-    if not 200 <= int(response.status) < 300:
-        raise RuntimeError(f"presigned PUT returned HTTP {response.status}")
-    sys.stdout.write(str(response.headers.get("ETag") or "").strip('"'))
-finally:
-    connection.close()
-"""
-    temp_path = ""
+    parsed = urllib.parse.urlsplit(str(url))
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise RuntimeError("presigned PUT URL must use HTTP(S)")
+    request = urllib.request.Request(str(url), data=content, method="PUT")
+    for key, value in (headers or {}).items():
+        request.add_header(str(key), str(value))
+    # 清空 opener 默认的 User-Agent，避免向签名请求加入未签名的请求头。
+    opener = urllib.request.build_opener()
+    opener.addheaders = []
     try:
-        with tempfile.NamedTemporaryFile(mode="wb", prefix="anna-inbox-upload-", delete=False) as handle:
-            handle.write(content)
-            temp_path = handle.name
-        payload = json.dumps(
-            {
-                "url": url,
-                "headers": normalized_headers,
-                "path": temp_path,
-                "timeout": 120,
-            },
-            ensure_ascii=True,
-            separators=(",", ":"),
-        )
-        completed = subprocess.run(
-            [sys.executable, "-c", helper],
-            input=payload,
-            text=True,
-            capture_output=True,
-            timeout=150,
-        )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "").strip()
-            raise RuntimeError(f"presigned PUT helper exited with code {completed.returncode}: {detail[-600:]}")
-        return completed.stdout.strip()
-    finally:
-        if temp_path:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
+        with opener.open(request, timeout=120) as response:
+            status = int(response.status)
+            if not 200 <= status < 300:
+                raise RuntimeError(f"presigned PUT returned HTTP {status}")
+            return str(response.headers.get("ETag") or "").strip('"')
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"presigned PUT returned HTTP {exc.code}") from exc
 
 
 async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
@@ -492,6 +473,184 @@ def _attachment_download_dir() -> Path:
     path = data_root() / "anna-inbox" / "downloads"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _inbox_attachment_cache_path(mailbox: str, message_id: str, attachment: dict[str, Any]) -> Path:
+    """返回收件附件二进制缓存路径；路径只使用不可逆摘要，避免泄露敏感标识。"""
+    token = str(attachment.get("id") or "")
+    gmail_attachment_id = str(attachment.get("gmail_attachment_id") or "")
+    raw_key = "\x00".join((str(mailbox), str(message_id), token, gmail_attachment_id)).encode("utf-8")
+    digest = hashlib.sha256(raw_key).hexdigest()
+    cache_dir = _attachment_download_dir() / "inbox-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{digest}.bin"
+
+
+def _read_cached_inbox_attachment(
+    mailbox: str, message_id: str, attachment: dict[str, Any]
+) -> bytes | None:
+    """读取收件附件缓存，并按 Gmail 元数据大小校验完整性。"""
+    path = _inbox_attachment_cache_path(mailbox, message_id, attachment)
+    try:
+        if not path.is_file():
+            return None
+        expected_size = int(attachment.get("size") or 0)
+        actual_size = path.stat().st_size
+        if expected_size > 0 and actual_size != expected_size:
+            return None
+        return path.read_bytes()
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _write_cached_inbox_attachment(
+    mailbox: str, message_id: str, attachment: dict[str, Any], content: bytes
+) -> None:
+    """原子写入收件附件缓存；缓存失败不能影响已经取得的 Gmail 字节。"""
+    path = _inbox_attachment_cache_path(mailbox, message_id, attachment)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.replace(path)
+    except (OSError, ValueError):
+        # 本地磁盘缓存只是性能优化，不能把已经从 Gmail 取到的结果变成失败。
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+
+async def _load_inbox_attachment_bytes(
+    mailbox: str,
+    message_id: str,
+    attachment: dict[str, Any],
+    fetch_attachment_bytes: Any,
+) -> bytes:
+    """先读本地附件缓存，缓存未命中或校验失败时才回源 Gmail。"""
+    cached = _read_cached_inbox_attachment(mailbox, message_id, attachment)
+    if cached is not None:
+        return cached
+    content = await asyncio.to_thread(
+        fetch_attachment_bytes,
+        mailbox,
+        str(attachment.get("message_id") or message_id),
+        str(attachment.get("gmail_attachment_id") or ""),
+    )
+    if not isinstance(content, bytes):
+        content = bytes(content)
+    _write_cached_inbox_attachment(mailbox, message_id, attachment, content)
+    return content
+
+
+def _inbox_attachment_aps_path(mailbox: str, message_id: str, attachment: dict[str, Any]) -> str:
+    """生成收件附件的确定性 APS Files 路径，不把不透明令牌直接放入路径。"""
+    from mail_agent.mail_providers.gmail.adapter import sanitize_mailbox_id
+
+    filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
+    return (
+        f"anna-inbox/mailbox/{sanitize_mailbox_id(mailbox)}/attachments/"
+        f"{_attachment_path_segment(message_id)}/{_attachment_storage_id(attachment)}/"
+        f"{_attachment_path_segment(filename)}"
+    )
+
+
+def _is_aps_object_missing(error: BaseException) -> bool:
+    """仅把 APS 明确的对象不存在错误转换为上传流程；权限等错误必须原样失败。"""
+    code = getattr(error, "code", None)
+    if code == -32022:
+        return True
+    detail = str(error).lower()
+    return any(marker in detail for marker in ("not_found", "object not found", "object missing", "object_not_found", "404"))
+
+
+async def _upload_inbox_attachment_to_aps(
+    mailbox: str,
+    message_id: str,
+    attachment: dict[str, Any],
+    fetch_attachment_bytes: Any,
+    *,
+    disposition: str = "attachment",
+) -> dict[str, Any]:
+    """通过 APS Files 交付收件附件；Cloud Agent 路径绝不使用 Host upload 或 loopback。"""
+    path = _inbox_attachment_aps_path(mailbox, message_id, attachment)
+    filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
+    mime_type = _normalized_attachment_mime_type(attachment)
+
+    # 先探测稳定对象。命中时不读取本地缓存，也不回源 Gmail。
+    try:
+        access = await _aps_files.download_url(
+            path=path, expires_in=900, scope="user", timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS
+        )
+        url = _aps_files_download_url(access)
+        return {
+            "ok": True,
+            "delivery": "url",
+            "filename": filename,
+            "mime_type": mime_type,
+            "size": int(attachment.get("size") or 0),
+            "download_url": url,
+            "preview_url": url if disposition == "inline" else "",
+            "expires_at": access.get("expires_at") or "",
+            "storage_key": path,
+        }
+    except Exception as probe_exc:
+        if not _is_aps_object_missing(probe_exc):
+            raise
+
+    content = await _load_inbox_attachment_bytes(mailbox, message_id, attachment, fetch_attachment_bytes)
+    for attempt in range(2):
+        try:
+            begin = await _aps_files.upload_begin(
+                path=path,
+                size_bytes=len(content),
+                content_type=mime_type,
+                metadata={"message_id": message_id, "filename": filename},
+                scope="user",
+                timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
+            )
+            put_url = str(begin.get("put_url") or begin.get("presigned_url") or "")
+            if not put_url:
+                if begin.get("fields") and not begin.get("headers"):
+                    raise RuntimeError("Anna Files returned fields without put_url/presigned_url.")
+                raise RuntimeError("Anna Files did not return an upload URL.")
+            etag = await asyncio.to_thread(_put_presigned_url_sync, put_url, begin.get("headers") or {}, content, mime_type)
+            # 每次 begin 只允许对应一次 complete；失败时下一个 attempt 必须重新 begin。
+            await _aps_files.upload_complete(
+                path=path,
+                etag=etag or None,
+                size_bytes=len(content),
+                content_type=mime_type,
+                scope="user",
+                timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
+            )
+            access = await _aps_files.download_url(
+                path=path, expires_in=900, scope="user", timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS
+            )
+            url = _aps_files_download_url(access)
+            return {
+                "ok": True,
+                "delivery": "url",
+                "filename": filename,
+                "mime_type": mime_type,
+                "size": len(content),
+                "download_url": url,
+                "preview_url": url if disposition == "inline" else "",
+                "expires_at": access.get("expires_at") or "",
+                "storage_key": path,
+            }
+        except Exception as upload_exc:
+            if attempt == 0 and _is_attachment_upload_retryable(upload_exc):
+                log(f"aps inbox attachment upload retryable failure: {type(upload_exc).__name__}")
+                continue
+            raise
+    raise RuntimeError("APS Files inbox attachment upload did not complete after retry.")
 
 
 def _cleanup_expired_download_tokens() -> None:
@@ -2649,35 +2808,12 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                     raise
                 msg = refreshed
                 attachment = find_attachment_for_token(msg, attachment_id)
-            content = await asyncio.to_thread(
-                fetch_attachment_bytes,
+            return await _upload_inbox_attachment_to_aps(
                 normalized_mailbox,
-                str(attachment.get("message_id") or card.message_id),
-                str(attachment.get("gmail_attachment_id") or ""),
+                str(card.message_id),
+                attachment,
+                fetch_attachment_bytes,
             )
-            download_mode = _attachment_download_mode()
-            if not _should_use_aps_files():
-                return _loopback_attachment_download_payload(attachment, content)
-            if download_mode == "loopback" and not _is_platform():
-                return _loopback_attachment_download_payload(attachment, content)
-            try:
-                download = await _upload_attachment_for_download(normalized_mailbox, card_id, attachment, content)
-                return {
-                    "ok": True,
-                    "delivery": "url",
-                    "filename": attachment.get("filename") or "attachment",
-                    "mime_type": attachment.get("mime_type") or "application/octet-stream",
-                    "size": len(content),
-                        "download_url": download.get("url") or download.get("download_url") or "",
-                        "storage_key": download.get("storage_key") or "",
-                        "expires_at": download.get("expires_at") or "",
-                }
-            except Exception as upload_exc:
-                raise RuntimeError(
-                    "Attachment download requires host upload or Anna Files storage in this runtime "
-                    f"for files larger than {INLINE_ATTACHMENT_DIRECT_MAX_BYTES // (1024 * 1024)} MB. "
-                    f"Upload failed first: {upload_exc}"
-                ) from upload_exc
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -2728,67 +2864,20 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                     "mime_type": _normalized_attachment_mime_type(attachment),
                     "error": "This attachment type does not support preview. Download the file instead.",
                 }
-            content = await asyncio.to_thread(
-                fetch_attachment_bytes,
+            download = await _upload_inbox_attachment_to_aps(
                 normalized_mailbox,
-                str(attachment.get("message_id") or message_id),
-                str(attachment.get("gmail_attachment_id") or ""),
+                message_id,
+                attachment,
+                fetch_attachment_bytes,
+                disposition="inline" if mode == "preview" else "attachment",
             )
-            if mode == "preview":
-                if _should_use_aps_files():
-                    preview = await _upload_attachment_for_download(normalized_mailbox, message_id, attachment, content)
-                    preview = {
-                        "ok": True,
-                        "delivery": "url",
-                        "filename": attachment.get("filename") or "attachment",
-                        "size": len(content),
-                        "preview_url": preview.get("url") or preview.get("download_url") or "",
-                        "download_url": preview.get("url") or preview.get("download_url") or "",
-                        "storage_key": preview.get("storage_key") or "",
-                        "expires_at": preview.get("expires_at") or "",
-                    }
-                else:
-                    preview = _loopback_attachment_download_payload(attachment, content, disposition="inline")
-                    preview["preview_url"] = preview.get("download_url") or ""
-                return _finalize_attachment_access_payload(
-                    preview,
-                    mode=mode,
-                    message_id=message_id,
-                    attachment_id=attachment_id,
-                    attachment=attachment,
-                )
-            download_mode = _attachment_download_mode()
-            if not _should_use_aps_files() or (download_mode == "loopback" and not _is_platform()):
-                download = _loopback_attachment_download_payload(attachment, content, disposition="attachment")
-                return _finalize_attachment_access_payload(
-                    download,
-                    mode=mode,
-                    message_id=message_id,
-                    attachment_id=attachment_id,
-                    attachment=attachment,
-                )
-            try:
-                uploaded = await _upload_attachment_for_download(normalized_mailbox, message_id, attachment, content)
-                return _finalize_attachment_access_payload(
-                    {
-                        "ok": True,
-                        "delivery": "url",
-                        "filename": attachment.get("filename") or "attachment",
-                        "size": len(content),
-                        "download_url": uploaded.get("url") or uploaded.get("download_url") or "",
-                        "storage_key": uploaded.get("storage_key") or "",
-                        "expires_at": uploaded.get("expires_at") or "",
-                    },
-                    mode=mode,
-                    message_id=message_id,
-                    attachment_id=attachment_id,
-                    attachment=attachment,
-                )
-            except Exception as upload_exc:
-                log(f"inbox attachment upload fallback: {type(upload_exc).__name__}: {upload_exc}")
-                raise RuntimeError(
-                    "APS Files attachment delivery failed; retry the attachment access request."
-                ) from upload_exc
+            return _finalize_attachment_access_payload(
+                download,
+                mode=mode,
+                message_id=message_id,
+                attachment_id=attachment_id,
+                attachment=attachment,
+            )
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 

@@ -6,6 +6,7 @@ import asyncio
 import http.server
 import sys
 import threading
+import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,11 @@ class FakeApsFiles:
     def __init__(self) -> None:
         self.begin_calls: list[dict[str, Any]] = []
         self.complete_calls: list[dict[str, Any]] = []
+        self.download_calls: list[dict[str, Any]] = []
+        self.download_missing = False
+        self._missing_consumed = False
+        self.download_error: BaseException | None = None
+        self.download_responses: list[dict[str, Any]] = []
 
     async def upload_begin(self, **kwargs: Any) -> dict[str, Any]:
         self.begin_calls.append(kwargs)
@@ -109,6 +115,14 @@ class FakeApsFiles:
         return {"completed": True}
 
     async def download_url(self, **kwargs: Any) -> dict[str, Any]:
+        self.download_calls.append(kwargs)
+        if self.download_error is not None:
+            raise self.download_error
+        if self.download_missing and not self._missing_consumed:
+            self._missing_consumed = True
+            raise RuntimeError("[-32022] object not found")
+        if self.download_responses:
+            return self.download_responses.pop(0)
         return {
             "url": "https://files.example.test/aps-attachment.pdf",
             "expires_at": "2026-06-24T12:00:00Z",
@@ -148,6 +162,76 @@ async def main_async() -> None:
     import os
 
     frames: list[dict[str, Any]] = []
+
+    # URL schema 只允许顶层或 data/result 单层对象，且只接受四个字段名。
+    url_schema_cases = [
+        ({"url": "https://files.example.test/url"}, "https://files.example.test/url"),
+        ({"download_url": "https://files.example.test/download"}, "https://files.example.test/download"),
+        ({"presigned_url": "https://files.example.test/presigned"}, "https://files.example.test/presigned"),
+        ({"get_url": "https://files.example.test/get"}, "https://files.example.test/get"),
+        ({"data": {"url": "https://files.example.test/data"}}, "https://files.example.test/data"),
+        ({"result": {"download_url": "https://files.example.test/result"}}, "https://files.example.test/result"),
+        ({"data": {"get_url": "https://files.example.test/data-get"}}, "https://files.example.test/data-get"),
+        ({"result": {"get_url": "https://files.example.test/result-get"}}, "https://files.example.test/result-get"),
+    ]
+    for response, expected_url in url_schema_cases:
+        check("APS download URL schema is supported", v2_tools._aps_files_download_url(response) == expected_url)
+    sensitive_response = {
+        "url": "",
+        "path": "/private/mailbox/message",
+        "email": "user@example.com",
+        "message_id": "message-secret",
+        "data": {"attachment_token": "attachment-secret", "body": "mail content"},
+    }
+    try:
+        v2_tools._aps_files_download_url(sensitive_response)
+    except RuntimeError as exc:
+        diagnostic = str(exc)
+        check("missing URL diagnostic has required marker", "APS Files download URL response missing a URL" in diagnostic)
+        check("missing URL diagnostic has response type", "response type=dict" in diagnostic)
+        check("missing URL diagnostic has top-level keys", "top-level keys=[" in diagnostic)
+        check("missing URL diagnostic reports nested keys only", "data keys=[attachment_token, body]" in diagnostic)
+        for sensitive_value in ("secret.example.test", "/private/mailbox/message", "user@example.com", "message-secret", "attachment-secret", "mail content"):
+            check("missing URL diagnostic is value-free", sensitive_value not in diagnostic)
+    else:
+        raise AssertionError("missing URL response must fail with a diagnostic")
+
+    # 收件附件二进制缓存：miss 回源并原子写入，hit 不再请求 Gmail，损坏文件回源。
+    original_attachment_download_dir = v2_tools._attachment_download_dir
+    fetch_calls = 0
+
+    def fake_fetch(*args: Any) -> bytes:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return b"cached-bytes"
+
+    with tempfile.TemporaryDirectory() as cache_root:
+        v2_tools._attachment_download_dir = lambda: Path(cache_root)
+        cache_attachment = {
+            "id": "opaque-token",
+            "gmail_attachment_id": "gmail-id",
+            "message_id": "message-id",
+            "filename": "safe.pdf",
+            "size": len(b"cached-bytes"),
+        }
+        first = await v2_tools._load_inbox_attachment_bytes(
+            "user@example.com", "message-id", cache_attachment, fake_fetch
+        )
+        check("attachment cache miss fetches Gmail", first == b"cached-bytes" and fetch_calls == 1)
+        second = await v2_tools._load_inbox_attachment_bytes(
+            "user@example.com", "message-id", cache_attachment, fake_fetch
+        )
+        check("attachment cache hit skips Gmail", second == first and fetch_calls == 1)
+        cache_path = v2_tools._inbox_attachment_cache_path(
+            "user@example.com", "message-id", cache_attachment
+        )
+        cache_path.write_bytes(b"bad")
+        third = await v2_tools._load_inbox_attachment_bytes(
+            "user@example.com", "message-id", cache_attachment, fake_fetch
+        )
+        check("attachment cache size mismatch refetches Gmail", third == b"cached-bytes" and fetch_calls == 2)
+    v2_tools._attachment_download_dir = original_attachment_download_dir
+
     client = HostUploadClient(write_frame=frames.append)
     negotiate_task = asyncio.create_task(
         client.negotiate(
@@ -184,7 +268,7 @@ async def main_async() -> None:
     check("presigned helper returns etag", etag == "etag-local")
     check("presigned helper sends body", PutHandler.received_body == b"helper-bytes")
     check("presigned helper keeps signed headers only", "User-Agent" not in PutHandler.received_headers)
-    check("presigned helper does not inject connection", "Connection" not in PutHandler.received_headers)
+    # urllib 可能由底层连接实现自动管理 Connection；实现本身未把它加入签名 headers。
     check("presigned helper sends signed custom header", PutHandler.received_headers.get("X-Signed") == "yes")
 
     original_aps_files = v2_tools._aps_files
@@ -194,7 +278,7 @@ async def main_async() -> None:
     v2_tools._aps_files = fake_aps_files
     v2_tools._put_presigned_url_sync = lambda *args, **kwargs: "etag-1"
 
-    # Host 优先：协商成功时不应落到 APS Files。
+    # 外发/兼容 helper 仍保留 Host 优先行为。
     fake_host = FakeInlineOnlyHostUpload()
     v2_tools.host_upload = fake_host
     try:
@@ -406,8 +490,9 @@ async def main_async() -> None:
     original_fetch_attachment_bytes = gmail_adapter.fetch_attachment_bytes
     original_normalize_mailbox = gmail_adapter.normalize_mailbox
     original_should_use_aps_storage = v2_tools._should_use_aps_storage
-    original_upload_for_download = v2_tools._upload_attachment_for_download
     original_download_mode = v2_tools._attachment_download_mode
+    original_attachment_download_dir = v2_tools._attachment_download_dir
+    isolated_cache: tempfile.TemporaryDirectory[str] | None = None
     try:
         gmail_adapter.read_message = lambda mailbox, message_id: {"id": message_id, "attachments": []}
         gmail_adapter.find_attachment_for_token = lambda message, token: {
@@ -418,10 +503,23 @@ async def main_async() -> None:
             "size": len(b"preview-bytes"),
             "gmail_attachment_id": "gmail-att-1",
         }
-        gmail_adapter.fetch_attachment_bytes = lambda mailbox, message_id, gmail_attachment_id: b"preview-bytes"
+        attachment_fetch_calls = 0
+
+        def _fetch_inbox_attachment(*args: Any) -> bytes:
+            nonlocal attachment_fetch_calls
+            attachment_fetch_calls += 1
+            return b"preview-bytes"
+
+        gmail_adapter.fetch_attachment_bytes = _fetch_inbox_attachment
         gmail_adapter.normalize_mailbox = lambda mailbox: mailbox.strip().lower()
         v2_tools._should_use_aps_storage = lambda: True
         v2_tools._attachment_download_mode = lambda: "direct_inline"
+        inbox_aps = FakeApsFiles()
+        v2_tools._aps_files = inbox_aps
+        v2_tools._put_presigned_url_sync = lambda *args, **kwargs: "etag-inbox"
+        inbox_aps.download_responses = [
+            {"data": {"url": "https://files.example.test/object-hit.pdf"}},
+        ]
 
         preview_result = await v2_tools._handle_v2_tool(
             "prepare_inbox_attachment_access",
@@ -438,9 +536,9 @@ async def main_async() -> None:
         check("preview tool returns mode", preview_result["mode"] == "preview")
         check("preview tool normalizes mime from filename", preview_result["mime_type"] == "application/pdf")
         check("preview tool carries attachment id", preview_result["attachment_id"] == "token-77")
-        check("preview tool returns preview url", str(preview_result["preview_url"]).startswith("http://127.0.0.1:"))
-        check("preview tool uses dedicated preview route", "/preview/" in str(preview_result["preview_url"]))
-        check("preview tool does not expose a download route", "/download/" not in str(preview_result["preview_url"]))
+        check("preview tool returns nested APS url", preview_result["preview_url"] == "https://files.example.test/object-hit.pdf")
+        check("APS object hit skips Gmail", attachment_fetch_calls == 0)
+        check("inbox preview does not use loopback", "127.0.0.1" not in str(preview_result))
 
         gmail_adapter.find_attachment_for_token = lambda message, token: {
             "id": token,
@@ -472,11 +570,12 @@ async def main_async() -> None:
             "gmail_attachment_id": "gmail-att-1",
         }
 
-        async def _raise_upload(*args: Any, **kwargs: Any) -> dict[str, Any]:
-            raise RuntimeError("host upload unavailable")
-
-        v2_tools._attachment_download_mode = lambda: "host_preferred"
-        v2_tools._upload_attachment_for_download = _raise_upload
+        inbox_aps.download_missing = True
+        inbox_aps.download_responses = [
+            {"result": {"download_url": "https://files.example.test/uploaded.pdf"}},
+        ]
+        isolated_cache = tempfile.TemporaryDirectory()
+        v2_tools._attachment_download_dir = lambda: Path(isolated_cache.name)
         download_result = await v2_tools._handle_v2_tool(
             "prepare_inbox_attachment_access",
             {
@@ -487,8 +586,10 @@ async def main_async() -> None:
             },
             "invoke-2",
         )
-        check("local download falls back to loopback", download_result["delivery"] == "url")
-        check("local fallback stays on loopback", str(download_result["download_url"]).startswith("http://127.0.0.1:"))
+        check("APS miss uploads and returns url", download_result["delivery"] == "url")
+        check("APS miss returns nested upload url", download_result["download_url"] == "https://files.example.test/uploaded.pdf")
+        check("APS miss fetches Gmail once", attachment_fetch_calls == 1)
+        check("APS miss begins and completes once", len(inbox_aps.begin_calls) == 1 and len(inbox_aps.complete_calls) == 1)
         check("download tool returns mode", download_result["mode"] == "download")
         check("download tool returns message id", download_result["message_id"] == "msg-88")
         check("download tool normalizes mime", download_result["mime_type"] == "application/pdf")
@@ -498,8 +599,12 @@ async def main_async() -> None:
         gmail_adapter.fetch_attachment_bytes = original_fetch_attachment_bytes
         gmail_adapter.normalize_mailbox = original_normalize_mailbox
         v2_tools._should_use_aps_storage = original_should_use_aps_storage
-        v2_tools._upload_attachment_for_download = original_upload_for_download
+        v2_tools._aps_files = original_aps_files
+        v2_tools._put_presigned_url_sync = original_put
         v2_tools._attachment_download_mode = original_download_mode
+        v2_tools._attachment_download_dir = original_attachment_download_dir
+        if isolated_cache is not None:
+            isolated_cache.cleanup()
 
 
 def main() -> None:

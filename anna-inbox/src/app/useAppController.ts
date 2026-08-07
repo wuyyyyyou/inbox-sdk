@@ -1262,6 +1262,7 @@ export function useAppController() {
   const inboxFeedCache = useRef(new Map<string, { payload: InboxFeedPayload; loadedAt: number }>());
   const inboxRequestSequence = useRef(0);
   const draftRequestSequence = useRef(0);
+  const indexedSearchRequestSequence = useRef(0);
   const snapshotRequestMailbox = useRef("");
   const snapshotPromise = useRef<Promise<boolean> | null>(null);
   const runtimeReconnectPromise = useRef<Promise<AppState["runtime"]> | null>(null);
@@ -1321,23 +1322,36 @@ export function useAppController() {
 
   const searchIndexedEmails = useCallback(async (query: string): Promise<IndexedEmailSearchPayload> => {
     const mailbox = state.selectedMailboxes[0] || state.mailbox;
+    const requestId = ++indexedSearchRequestSequence.current;
+    const isCurrentSearch = (current: AppState, requireQuery = false) =>
+      requestId === indexedSearchRequestSequence.current
+      && normalizedMailbox(current.selectedMailboxes[0] || current.mailbox) === normalizedMailbox(mailbox)
+      && (!requireQuery || current.indexedSearchQuery === query);
     if (!mailbox) {
       const empty = { messages: [], query, error: "No mailbox selected.", total: 0, has_more: false, offset: 0, next_offset: 0 };
-      setState((current) => ({ ...current, indexedSearchMessages: [], indexedSearchQuery: query, indexedSearchLoading: false, indexedSearchError: empty.error, indexedSearchHasMore: false, indexedSearchNextOffset: 0 }));
+      setState((current) => isCurrentSearch(current)
+        ? { ...current, indexedSearchMessages: [], indexedSearchQuery: query, indexedSearchLoading: false, indexedSearchError: empty.error, indexedSearchHasMore: false, indexedSearchNextOffset: 0 }
+        : current);
       return empty;
     }
-    setState((current) => ({ ...current, indexedSearchLoading: true, indexedSearchError: "", indexedSearchQuery: query, indexedSearchHasMore: false, indexedSearchNextOffset: 0 }));
+    setState((current) => isCurrentSearch(current)
+      ? { ...current, indexedSearchLoading: true, indexedSearchError: "", indexedSearchQuery: query, indexedSearchHasMore: false, indexedSearchNextOffset: 0 }
+      : current);
     try {
       const payload = await client.searchIndexedEmails(mailbox, query, {
         todo_message_ids: state.inboxWorkflowState.todos,
         done_message_ids: state.inboxWorkflowState.done,
         snoozed_message_ids: state.inboxWorkflowState.snoozed,
       });
-      setState((current) => ({ ...current, indexedSearchMessages: payload.messages || [], indexedSearchQuery: query, indexedSearchLoading: false, indexedSearchError: payload.error || "", indexedSearchHasMore: Boolean(payload.has_more), indexedSearchNextOffset: payload.next_offset ?? (payload.messages || []).length }));
+      setState((current) => isCurrentSearch(current, true)
+        ? { ...current, indexedSearchMessages: payload.messages || [], indexedSearchQuery: query, indexedSearchLoading: false, indexedSearchError: payload.error || "", indexedSearchHasMore: Boolean(payload.has_more), indexedSearchNextOffset: payload.next_offset ?? (payload.messages || []).length }
+        : current);
       return payload;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setState((current) => ({ ...current, indexedSearchMessages: [], indexedSearchLoading: false, indexedSearchError: message, indexedSearchHasMore: false, indexedSearchNextOffset: 0 }));
+      setState((current) => isCurrentSearch(current, true)
+        ? { ...current, indexedSearchMessages: [], indexedSearchLoading: false, indexedSearchError: message, indexedSearchHasMore: false, indexedSearchNextOffset: 0 }
+        : current);
       throw error;
     }
   }, [client, state.inboxWorkflowState.done, state.inboxWorkflowState.snoozed, state.inboxWorkflowState.todos, state.mailbox, state.selectedMailboxes]);
@@ -1414,6 +1428,7 @@ export function useAppController() {
 
   useEffect(
     () => () => {
+      indexedSearchRequestSequence.current += 1;
       for (const timer of toastTimers.current.values()) window.clearTimeout(timer);
       toastTimers.current.clear();
       toastItemsRef.current = [];
@@ -3375,6 +3390,7 @@ export function useAppController() {
         setState((s) => ({ ...s, selectedMailboxes: primary ? [primary] : s.selectedMailboxes, briefMailboxFilter: primary ? [primary] : s.briefMailboxFilter }));
         return;
       }
+      indexedSearchRequestSequence.current += 1;
       const previousMailbox = normalizedMailbox(state.mailbox);
       // 切换邮箱前先把进行中的会话冻结并写回原邮箱，避免停止扫描后丢失最后一轮提问。
       try {

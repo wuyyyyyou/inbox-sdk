@@ -265,10 +265,17 @@ def _match_term(
         hit = _has_match(_field(message, "to"), term.value)
     elif term.field == "has":
         if isinstance(message, MessageLite):
-            hit = term.value == "attachment" and bool(message.has_attachment)
+            # 缓存历史上可能只保留附件列表或独立的 has_attachment 标记；
+            # 三种表达只要任一表示有附件，就应命中 has:attachment。
+            hit = term.value == "attachment" and (
+                bool(message.attachments) or bool(message.has_attachment)
+            )
         else:
-            hit = term.value == "attachment" and bool(
-                message.get("has_attachment") or message.get("attachment_count")
+            attachments = message.get("attachments")
+            hit = term.value == "attachment" and (
+                (isinstance(attachments, list) and bool(attachments))
+                or bool(message.get("has_attachment"))
+                or bool(message.get("attachment_count"))
             )
     elif term.field == "is":
         labels = _label_set(message)

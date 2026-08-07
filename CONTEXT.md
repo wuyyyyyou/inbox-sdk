@@ -2,7 +2,7 @@
 
 Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；AI 侧栏是唯一智能入口。Brief 产品面已下线，不再代表 2.0 主路径。
 
-当前发布基线：App `2.2.8` / Tool `2.3.8`。本版本：附件下载路径与 Gmail 附件令牌兼容性修复、富文本列表输入和颜色状态改进。继承：Gmail Draft 同步暂时下线、Compose 草稿改由 Anna APS 单端持久化并按需读取正文（避免大草稿穿透 stdio 帧上限），AI Ask 历史改为邮箱作用域的 APS 存储（含切换邮箱保存/恢复与清理），Toast 升级为带过期回调的有界队列以支持「撤销后删除」等异步操作、Host Agent Session 流式会话与取消/恢复、AI 侧栏本地兼容路由、邮箱检索与同步稳定性增强、线程详情和 Compose 草稿交互完善、中英文界面切换、线程摘要按 locale 隔离缓存、Reply All、富文本对齐/引用/安全粘贴、附件文件名与大小校验、响应式邮件 HTML 表格和受控 CID 图片渲染、reverse RPC 全链路 `params.context.invoke_id` 注入与跨线程 re-bind、Evidence Gmail 托底、回复草稿两步确认流、列表固定首屏 100 + 触底加载、180 天 priority + 无硬顶 backfill、`query_mail_evidence` cache-only 主路径、P0 本地评测。
+当前发布基线：App `2.2.9` / Tool `2.3.9`。本版本：搜索补全与错误本地化、搜索并发结果防串写、刷新后搜索结果同步、收件附件本地缓存与 APS Files 稳定交付、历史附件字段兼容、搜索响应按帧大小分页保护。继承：附件下载路径与 Gmail 附件令牌兼容性修复、富文本列表输入和颜色状态改进、Gmail Draft 同步暂时下线、Compose 草稿改由 Anna APS 单端持久化并按需读取正文（避免大草稿穿透 stdio 帧上限），AI Ask 历史改为邮箱作用域的 APS 存储（含切换邮箱保存/恢复与清理），Toast 升级为带过期回调的有界队列以支持「撤销后删除」等异步操作、Host Agent Session 流式会话与取消/恢复、AI 侧栏本地兼容路由、邮箱检索与同步稳定性增强、线程详情和 Compose 草稿交互完善、中英文界面切换、线程摘要按 locale 隔离缓存、Reply All、富文本对齐/引用/安全粘贴、附件文件名与大小校验、响应式邮件 HTML 表格和受控 CID 图片渲染、reverse RPC 全链路 `params.context.invoke_id` 注入与跨线程 re-bind、Evidence Gmail 托底、回复草稿两步确认流、列表固定首屏 100 + 触底加载、180 天 priority + 无硬顶 backfill、`query_mail_evidence` cache-only 主路径、P0 本地评测。
 
 ## Language
 

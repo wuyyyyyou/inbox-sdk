@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyInboxQuerySuggestion, getInboxQueryHighlightTerms, getInboxQuerySuggestions, matchInboxQuery, parseInboxQuery, splitInboxQueryTokens } from "./inboxQuery";
+import { applyInboxQuerySuggestion, getInboxQueryHighlightTerms, getInboxQuerySuggestionPlaceholder, getInboxQuerySuggestions, localizeInboxQueryError, matchInboxQuery, parseInboxQuery, splitInboxQueryTokens } from "./inboxQuery";
 
 describe("Inbox query language", () => {
   it("parses AND before OR", () => {
@@ -71,6 +71,13 @@ describe("Inbox query language", () => {
     expect(parseInboxQuery("foo AND OR bar").error).toContain("operator");
     expect(parseInboxQuery("label:inbox").error).toContain("Unknown");
     expect(getInboxQuerySuggestions("su")).toEqual(["subject:"]);
+    expect(getInboxQuerySuggestions("subject:su")).toEqual([]);
+    expect(getInboxQuerySuggestions("subject:s")).toEqual([]);
+    expect(getInboxQuerySuggestions("body:bo")).toEqual([]);
+    expect(getInboxQuerySuggestions("from:alice")).toEqual([]);
+    expect(getInboxQuerySuggestions("to:me")).toEqual([]);
+    expect(getInboxQuerySuggestions("is:un")).toEqual(["is:unread"]);
+    expect(getInboxQuerySuggestions("has:at")).toEqual(["has:attachment"]);
     expect(getInboxQueryHighlightTerms(parseInboxQuery("subject:invoice AND body:paid"))).toEqual(["invoice", "paid"]);
   });
 
@@ -102,7 +109,76 @@ describe("Inbox query language", () => {
 
   it("inserts a selected completion with the same token behavior as inbox search", () => {
     expect(applyInboxQuerySuggestion("su", "subject:")).toBe("subject:");
-    expect(applyInboxQuerySuggestion("from:alice ", "is:")).toBe("from:alice is: ");
-    expect(applyInboxQuerySuggestion("from:ali", "from:alice")).toBe("from:alice");
+    expect(applyInboxQuerySuggestion("has", "has:")).toBe("has:");
+    expect(applyInboxQuerySuggestion("from:alice ", "is:")).toBe("from:alice is:");
+    expect(applyInboxQuerySuggestion("is:un", "is:unread")).toBe("is:unread ");
+    expect(applyInboxQuerySuggestion("has:at", "has:attachment")).toBe("has:attachment ");
+    expect(applyInboxQuerySuggestion("from:ali", "from:alice")).toBe("from:alice ");
+    expect(applyInboxQuerySuggestion("to:cicala an", "AND")).toBe("to:cicala AND ");
+  });
+
+  it("suggests logical operators only after a valid condition", () => {
+    expect(getInboxQuerySuggestions("to:cicala ")).toEqual(["AND", "OR"]);
+    expect(getInboxQuerySuggestions("subject:")).toEqual([]);
+    expect(getInboxQuerySuggestions("to:cicala an")).toEqual(["AND"]);
+    expect(getInboxQuerySuggestions("to:cicala and")).toEqual(["AND"]);
+    expect(getInboxQuerySuggestions("to:cicala or")).toEqual(["OR"]);
+    expect(getInboxQuerySuggestions("is:important AND is:")).toContain("is:important");
+    expect(getInboxQuerySuggestions("is:important AND is:")).not.toContain("AND");
+    expect(getInboxQuerySuggestionPlaceholder("AND", (key) => key === "search.suggestion.and" ? "Combine two search queries" : key))
+      .toBe("Combine two search queries");
+    expect(getInboxQuerySuggestionPlaceholder("OR", (key) => key === "search.suggestion.or" ? "搜索符合任一条件的邮件" : key))
+      .toBe("搜索符合任一条件的邮件");
+    expect(splitInboxQueryTokens("to:cicala an")).toEqual([
+      { text: "to:", kind: "field" },
+      { text: "cicala ", kind: "value" },
+      { text: "an", kind: "operator" },
+    ]);
+    expect(splitInboxQueryTokens("is:important AND is:").map((token) => token.kind)).toEqual([
+      "field", "value", "plain", "operator", "plain", "field", "value",
+    ]);
+    expect(splitInboxQueryTokens("is:sent AND")).toEqual([
+      { text: "is:", kind: "field" },
+      { text: "sent ", kind: "value" },
+      { text: "AND", kind: "operator" },
+    ]);
+  });
+
+  it("maps status suggestions to concise localized descriptions", () => {
+    const translations: Record<string, string> = {
+      "search.suggestion.isUnread": "Unread messages",
+    };
+    const t = (key: string) => translations[key] || `missing:${key}`;
+    expect(getInboxQuerySuggestionPlaceholder("is:unread", t)).toBe("Unread messages");
+    expect(getInboxQuerySuggestionPlaceholder("is:unread", (key) => key === "search.suggestion.isUnread" ? "未读邮件" : key)).toBe("未读邮件");
+  });
+
+  it("maps the complete attachment suggestion in both locales", () => {
+    expect(getInboxQuerySuggestionPlaceholder("has:attachment", (key) => key === "search.suggestion.hasAttachment" ? "Messages with attachments" : key))
+      .toBe("Messages with attachments");
+    expect(getInboxQuerySuggestionPlaceholder("has:attachment", (key) => key === "search.suggestion.hasAttachment" ? "包含附件的邮件" : key))
+      .toBe("包含附件的邮件");
+  });
+
+  it("localizes query errors while preserving the English wording", () => {
+    const zh = (key: string, params?: Record<string, string | number>) => {
+      const messages: Record<string, string> = {
+        "search.error.fieldNeedsKeyword": `${params?.field}: 字段需要关键词。`,
+        "search.error.invalidDate": `${params?.field}: 必须使用 YYYY-MM-DD 格式。`,
+      };
+      return messages[key] || key;
+    };
+    const en = (key: string, params?: Record<string, string | number>) => {
+      const messages: Record<string, string> = {
+        "search.error.fieldNeedsKeyword": `The ${params?.field}: field needs a keyword.`,
+        "search.error.invalidDate": `${params?.field}: must use YYYY-MM-DD.`,
+      };
+      return messages[key] || key;
+    };
+
+    expect(localizeInboxQueryError(parseInboxQuery("after:").error, zh)).toBe("after: 字段需要关键词。");
+    expect(localizeInboxQueryError(parseInboxQuery("after:").error, en)).toBe("The after: field needs a keyword.");
+    expect(localizeInboxQueryError(parseInboxQuery("before:July").error, zh)).toBe("before: 必须使用 YYYY-MM-DD 格式。");
+    expect(localizeInboxQueryError(parseInboxQuery("before:July").error, en)).toBe("before: must use YYYY-MM-DD.");
   });
 });

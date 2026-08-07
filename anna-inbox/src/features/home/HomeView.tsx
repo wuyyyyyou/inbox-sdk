@@ -45,6 +45,7 @@ import {
   applyInboxQuerySuggestion,
   getInboxQuerySuggestionPlaceholder,
   getInboxQuerySuggestions,
+  localizeInboxQueryError,
   matchInboxQuery,
   parseInboxQuery,
   splitInboxQueryTokens,
@@ -3646,20 +3647,6 @@ export function HomeView() {
     () => parseInboxQuery(activeSearch),
     [activeSearch],
   );
-  // 输入稳定后由控制器查询完整本地索引，组件不直接调用工具。
-  useEffect(() => {
-    const value = search.trim();
-    if (!value || parsedSearch.error) {
-      setActiveSearch("");
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      setActiveSearch(value);
-      setFilter("search");
-      void searchIndexedEmailsRef.current(value).catch(() => undefined);
-    }, 300);
-    return () => window.clearTimeout(timer);
-  }, [parsedSearch.error, search]);
   useLayoutEffect(() => {
     const position = searchCaretPositionRef.current;
     const input = searchInputRef.current;
@@ -3676,6 +3663,9 @@ export function HomeView() {
           : "";
       setSearch(value);
       setSearchFocused(false);
+      if (value.trim() && !parsed.error && (!directStatus || directStatus === "unread")) {
+        void searchIndexedEmailsRef.current(value.trim()).catch(() => undefined);
+      }
       if (directStatus) {
         setActiveSearch("");
         if (directStatus === "important") {
@@ -3730,16 +3720,22 @@ export function HomeView() {
     [filter, filterBeforeSearch],
   );
   const applySuggestion = useCallback(
-    (suggestion: string) => {
+    (suggestion: string, executeComplete = false) => {
       const next = applyInboxQuerySuggestion(search, suggestion);
       setSearch(next);
-      setSearchFocused(true);
+      const parsed = parseInboxQuery(next);
+      if (executeComplete && parsed.expression && !parsed.error) {
+        applySearch(next);
+      } else {
+        // A prefix completion keeps the input focused, but closes the menu so the user can type its value.
+        setSearchFocused(false);
+      }
       // 选择补全后 React 会保留旧光标偏移；显式移到新增 token 的末尾。
       window.requestAnimationFrame(() =>
         searchInputRef.current?.setSelectionRange(next.length, next.length),
       );
     },
-    [search],
+    [applySearch, search],
   );
   const [selectedId, setSelectedId] = useState("");
   const [snoozeTarget, setSnoozeTarget] = useState<InboxMessage | null>(null);
@@ -4169,6 +4165,8 @@ export function HomeView() {
     workflowAwareInboxMessages,
     compatibleWorkflow,
     state.indexedSearchMessages,
+    state.indexedSearchQuery,
+    activeSearch,
   ]);
   const inboxSplitMessages = useMemo(() => {
     // Important/Other 仍排除 todos/snoozed（由置顶区展示）；自定义 Split 与 is:unread 同数据源
@@ -4896,14 +4894,23 @@ export function HomeView() {
     async (targetDays = feedWindow.days, clearCache = false) => {
       requestedGmailCursors.current.clear();
       setFeedAction("refresh");
+      const refreshActiveSearch = () => {
+        const value = activeSearch.trim();
+        if (value && !parseInboxQuery(value).error) {
+          void searchIndexedEmailsRef.current(value).catch(() => undefined);
+        }
+      };
       try {
         // 静默同步：与自动刷新同一路径，合并快照、不整表清空
         if (!clearCache) {
           if (localCategory && mailboxView === "drafts") {
             await actions.listInboxThreadDrafts(mailbox, 100);
+            refreshActiveSearch();
             return true;
           }
-          return actions.silentSyncInbox(targetDays);
+          const synced = await actions.silentSyncInbox(targetDays);
+          if (synced) refreshActiveSearch();
+          return synced;
         }
         // 硬刷新：仅显式刷新、换邮箱等操作才清缓存后整表重载。
         if (localCategory) {
@@ -4913,6 +4920,7 @@ export function HomeView() {
               ...current,
               localLimit: INBOX_FEED_PAGE_SIZE,
             }));
+            refreshActiveSearch();
             return true;
           }
           const result = await actions.refreshInboxEmails("all", 7, true);
@@ -4922,6 +4930,7 @@ export function HomeView() {
               localLimit: INBOX_FEED_PAGE_SIZE,
             }));
           }
+          if (result.ok) refreshActiveSearch();
           return result.ok;
         }
         if (mailboxView === "inbox" && targetDays === INBOX_ALL_TIME_DAYS) {
@@ -4946,7 +4955,10 @@ export function HomeView() {
             gmailPageToken: "",
             gmailPageOffset: 0,
           });
-          if (!result.hasMore) return true;
+          if (!result.hasMore) {
+            refreshActiveSearch();
+            return true;
+          }
           const loadedAll = await loadRemainingAllTimeInbox(
             source,
             result.nextOffset,
@@ -4955,6 +4967,7 @@ export function HomeView() {
             excludeMessageIds,
           );
           if (loadedAll) actions.showToast(t("toast.loadedAllEmails"));
+          if (loadedAll) refreshActiveSearch();
           return loadedAll;
         }
         const result = await actions.refreshInboxEmails(
@@ -4973,6 +4986,7 @@ export function HomeView() {
             gmailPageOffset: 0,
           });
         }
+        if (result.ok) refreshActiveSearch();
         return result.ok;
       } finally {
         setFeedAction((current) => (current === "refresh" ? null : current));
@@ -4985,6 +4999,7 @@ export function HomeView() {
       localCategory,
       mailbox,
       mailboxView,
+      activeSearch,
     ],
   );
 
@@ -7185,7 +7200,12 @@ export function HomeView() {
                   // 高亮层重渲染后仍保留浏览器计算的输入位置，避免光标跳到开头。
                   searchCaretPositionRef.current = event.target.selectionStart ?? next.length;
                   setSearch(next);
-                  setActiveSearch("");
+                  if (!next.trim() && (activeSearch || filter === "search")) {
+                     setActiveSearch("");
+                     setFilter(filterBeforeSearch);
+                   } else {
+                     setActiveSearch("");
+                   }
                   setSearchFocused(true);
                   setSearchSuggestionIndex(0);
                 }}
@@ -7211,22 +7231,22 @@ export function HomeView() {
                     );
                   } else if (event.key === "Enter") {
                     event.preventDefault();
-                    if (searchSuggestions.length)
+                    if (parsedSearch.expression && !parsedSearch.error) {
+                      const hasIncompleteSuggestion = searchSuggestions.some((suggestion) => {
+                        const next = applyInboxQuerySuggestion(search, suggestion);
+                        const parsed = parseInboxQuery(next);
+                        return !parsed.expression || Boolean(parsed.error);
+                      });
+                      if (hasIncompleteSuggestion) {
+                        applySuggestion(searchSuggestions[searchSuggestionIndex]);
+                      } else {
+                        applySearch(search);
+                      }
+                    } else if (searchSuggestions.length) {
                       applySuggestion(searchSuggestions[searchSuggestionIndex]);
-                    else if (
-                      parsedSearch.expression &&
-                      !parsedSearch.error &&
-                      !/\s$/u.test(search)
-                    ) {
-                      const next = `${search} `;
-                      setSearch(next);
-                      window.requestAnimationFrame(() =>
-                        searchInputRef.current?.setSelectionRange(
-                          next.length,
-                          next.length,
-                        ),
-                      );
-                    } else applySearch(search);
+                    } else {
+                      setSearchFocused(false);
+                    }
                   }
                 }}
                 placeholder={t("mail.searchPlaceholder")}
@@ -7240,8 +7260,7 @@ export function HomeView() {
                   onClick={() => {
                     setSearch("");
                     setActiveSearch("");
-                    setMailboxView("inbox");
-                    setFilter("important");
+                    setFilter(filterBeforeSearch);
                   }}
                 >
                   ×
@@ -7262,7 +7281,7 @@ export function HomeView() {
                       key={suggestion}
                       onMouseDown={(event) => event.preventDefault()}
                       onMouseMove={() => setSearchSuggestionIndex(index)}
-                      onClick={() => applySuggestion(suggestion)}
+                      onClick={() => applySuggestion(suggestion, true)}
                     >
                       <strong>{suggestion}</strong>
                       {getInboxQuerySuggestionPlaceholder(suggestion, t) ? (
@@ -7276,7 +7295,7 @@ export function HomeView() {
                     </button>
                   ))
                 ) : parsedSearch.error ? (
-                  <p role="alert">{parsedSearch.error}</p>
+                  <p role="alert">{localizeInboxQueryError(parsedSearch.error, t)}</p>
                 ) : null}
               </div>
             ) : null}
