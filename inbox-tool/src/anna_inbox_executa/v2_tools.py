@@ -19,6 +19,9 @@ COMPOSE_DRAFT_DIRECTORY_RESPONSE_MAX_BYTES = 48 * 1024
 # APS / Host reverse-RPC 单次协商超时：需明显短于前端 tools.invoke 60s，
 # 以便失败时仍能返回可读错误，而不是被宿主整调用超时淹没。
 APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS = 20.0
+# 对稳定对象的首次命中探测只是缓存优化，不能阻塞真正的附件上传链路。
+# 上传 begin/complete 与最终 URL 仍使用上面的必需操作超时。
+APS_ATTACHMENT_CACHE_PROBE_TIMEOUT_SECONDS = 3.0
 HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS = 20.0
 _DOWNLOAD_SERVER_LOCK = threading.Lock()
 _DOWNLOAD_SERVER: Any | None = None
@@ -534,15 +537,28 @@ async def _load_inbox_attachment_bytes(
     fetch_attachment_bytes: Any,
 ) -> bytes:
     """先读本地附件缓存，缓存未命中或校验失败时才回源 Gmail。"""
+    cache_started = time.monotonic()
     cached = _read_cached_inbox_attachment(mailbox, message_id, attachment)
+    record_span(
+        "attachment.cache_load",
+        cache_started,
+        source="cache",
+        cached=cached is not None,
+    )
     if cached is not None:
         return cached
-    content = await asyncio.to_thread(
-        fetch_attachment_bytes,
-        mailbox,
-        str(attachment.get("message_id") or message_id),
-        str(attachment.get("gmail_attachment_id") or ""),
-    )
+    gmail_started = time.monotonic()
+    try:
+        content = await asyncio.to_thread(
+            fetch_attachment_bytes,
+            mailbox,
+            str(attachment.get("message_id") or message_id),
+            str(attachment.get("gmail_attachment_id") or ""),
+        )
+    except Exception as exc:
+        record_span("attachment.gmail_bytes", gmail_started, outcome="error", error_type=type(exc).__name__)
+        raise
+    record_span("attachment.gmail_bytes", gmail_started, source="gmail")
     if not isinstance(content, bytes):
         content = bytes(content)
     _write_cached_inbox_attachment(mailbox, message_id, attachment, content)
@@ -570,6 +586,14 @@ def _is_aps_object_missing(error: BaseException) -> bool:
     return any(marker in detail for marker in ("not_found", "object not found", "object missing", "object_not_found", "404"))
 
 
+def _is_optional_aps_probe_miss(error: BaseException) -> bool:
+    """判断稳定对象探测是否可以安全降级为上传；权限等真实错误不能吞掉。"""
+    if _is_aps_object_missing(error) or isinstance(error, (TimeoutError, asyncio.TimeoutError, ConnectionError)):
+        return True
+    detail = str(error).lower()
+    return any(marker in detail for marker in ("unavailable", "timed out", "timeout", "connection reset", "connection refused"))
+
+
 async def _upload_inbox_attachment_to_aps(
     mailbox: str,
     message_id: str,
@@ -584,11 +608,13 @@ async def _upload_inbox_attachment_to_aps(
     mime_type = _normalized_attachment_mime_type(attachment)
 
     # 先探测稳定对象。命中时不读取本地缓存，也不回源 Gmail。
+    probe_started = time.monotonic()
     try:
         access = await _aps_files.download_url(
-            path=path, expires_in=900, scope="user", timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS
+            path=path, expires_in=900, scope="user", timeout=APS_ATTACHMENT_CACHE_PROBE_TIMEOUT_SECONDS
         )
         url = _aps_files_download_url(access)
+        record_span("attachment.aps_object_probe", probe_started, source="aps", cached=True)
         return {
             "ok": True,
             "delivery": "url",
@@ -601,11 +627,21 @@ async def _upload_inbox_attachment_to_aps(
             "storage_key": path,
         }
     except Exception as probe_exc:
-        if not _is_aps_object_missing(probe_exc):
+        if not _is_optional_aps_probe_miss(probe_exc):
+            record_span("attachment.aps_object_probe", probe_started, outcome="error", error_type=type(probe_exc).__name__)
             raise
+        record_span(
+            "attachment.aps_object_probe",
+            probe_started,
+            outcome="error",
+            source="aps",
+            cached=False,
+            error_type=type(probe_exc).__name__,
+        )
 
     content = await _load_inbox_attachment_bytes(mailbox, message_id, attachment, fetch_attachment_bytes)
     for attempt in range(2):
+        begin_started = time.monotonic()
         try:
             begin = await _aps_files.upload_begin(
                 path=path,
@@ -615,25 +651,53 @@ async def _upload_inbox_attachment_to_aps(
                 scope="user",
                 timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
             )
+        except Exception as begin_exc:
+            record_span(
+                "attachment.aps_upload_begin",
+                begin_started,
+                outcome="error",
+                error_type=type(begin_exc).__name__,
+            )
+            raise
+        record_span("attachment.aps_upload_begin", begin_started, source="aps")
+        try:
             put_url = str(begin.get("put_url") or begin.get("presigned_url") or "")
             if not put_url:
                 if begin.get("fields") and not begin.get("headers"):
                     raise RuntimeError("Anna Files returned fields without put_url/presigned_url.")
                 raise RuntimeError("Anna Files did not return an upload URL.")
-            etag = await asyncio.to_thread(_put_presigned_url_sync, put_url, begin.get("headers") or {}, content, mime_type)
+            put_started = time.monotonic()
+            try:
+                etag = await asyncio.to_thread(_put_presigned_url_sync, put_url, begin.get("headers") or {}, content, mime_type)
+            except Exception as put_exc:
+                record_span("attachment.presigned_put", put_started, outcome="error", error_type=type(put_exc).__name__)
+                raise
+            record_span("attachment.presigned_put", put_started, source="aps")
             # 每次 begin 只允许对应一次 complete；失败时下一个 attempt 必须重新 begin。
-            await _aps_files.upload_complete(
-                path=path,
-                etag=etag or None,
-                size_bytes=len(content),
-                content_type=mime_type,
-                scope="user",
-                timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
-            )
-            access = await _aps_files.download_url(
-                path=path, expires_in=900, scope="user", timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS
-            )
-            url = _aps_files_download_url(access)
+            complete_started = time.monotonic()
+            try:
+                await _aps_files.upload_complete(
+                    path=path,
+                    etag=etag or None,
+                    size_bytes=len(content),
+                    content_type=mime_type,
+                    scope="user",
+                    timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
+                )
+            except Exception as complete_exc:
+                record_span("attachment.aps_upload_complete", complete_started, outcome="error", error_type=type(complete_exc).__name__)
+                raise
+            record_span("attachment.aps_upload_complete", complete_started, source="aps")
+            final_url_started = time.monotonic()
+            try:
+                access = await _aps_files.download_url(
+                    path=path, expires_in=900, scope="user", timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS
+                )
+                url = _aps_files_download_url(access)
+            except Exception as final_url_exc:
+                record_span("attachment.aps_final_download_url", final_url_started, outcome="error", error_type=type(final_url_exc).__name__)
+                raise
+            record_span("attachment.aps_final_download_url", final_url_started, source="aps")
             return {
                 "ok": True,
                 "delivery": "url",

@@ -39,7 +39,7 @@
 
 ### 1. 当前版本与权威文件位置
 - **App (前端)**：`2.2.9` — 权威定义文件：`anna-inbox/app.json`
-- **Tool (Executa/后端)**：`2.3.9` — 权威定义文件：`inbox-tool/manifest.json`
+- **Tool (Executa/后端)**：`2.3.10` — 权威定义文件：`inbox-tool/manifest.json`
 
 ### 2. 前端项目基线 (App)
 - **UI 架构与唯一入口**：系统唯一智能入口为 **Inbox Workspace + AI 侧栏**。Brief 产品面已彻底下线，AI 侧栏只读主路径中不再暴露或使用旧的 `search_email` 或 `read_email` 工具直接拉取 Gmail，一律改由 `query_mail_evidence` 托管。

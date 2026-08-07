@@ -567,7 +567,7 @@ def list_messages(mailbox: str) -> list[dict[str, Any]]:
         if not isinstance(payload, dict):
             return []
         messages = payload.get("messages")
-        return messages if isinstance(messages, list) else []
+        return [item for item in messages if isinstance(item, dict)] if isinstance(messages, list) else []
 
     path = _index_path(mailbox)
     if path.exists():
@@ -575,8 +575,14 @@ def list_messages(mailbox: str) -> list[dict[str, Any]]:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             payload = {}
-        if isinstance(payload, dict) and payload.get("messages"):
-            return payload["messages"]
+        raw_indexed = payload.get("messages") if isinstance(payload, dict) else None
+        indexed = [item for item in raw_indexed if isinstance(item, dict)] if isinstance(raw_indexed, list) else []
+        if indexed:
+            # index.json 是轻量派生索引；进程被中断或历史同步分批写入时，
+            # 单封邮件文件可能已经落盘，但索引尚未包含它。查询必须先补齐
+            # 这类缺口，否则 Gmail 兜底会把本地索引错误地当成完整缓存。
+            reconciled = _reconcile_local_message_files(mailbox, indexed)
+            return reconciled
 
     # Fallback: rebuild from individual message files when index is missing
     msg_dir = _mailbox_cache_dir(mailbox)
@@ -593,6 +599,48 @@ def list_messages(mailbox: str) -> list[dict[str, Any]]:
         except (json.JSONDecodeError, OSError):
             pass
     return sorted(messages, key=lambda m: int(m.get("internal_date") or 0), reverse=True)
+
+
+def _reconcile_local_message_files(
+    mailbox: str,
+    indexed_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """将本地单封邮件文件中缺失的摘要增量合并回 index.json。
+
+    该修复仅适用于文件缓存模式。APS 模式的索引和邮件都由 APS 管理，不能
+    读取本机目录并混入另一套存储。单封文件是已落盘的邮件事实，index.json
+    只保存其轻量摘要，因此新增邮件使用 ``message_summary`` 后再写回索引。
+    """
+    indexed_by_id = {
+        str(item.get("id") or ""): item
+        for item in indexed_messages
+        if isinstance(item, dict) and str(item.get("id") or "")
+    }
+    if not indexed_by_id:
+        return indexed_messages
+
+    mailbox_path = _mailbox_cache_dir(mailbox)
+    missing_summaries: list[dict[str, Any]] = []
+    for message_path in mailbox_path.glob("*.json"):
+        if message_path.name in {"index.json", "sync_state.json"}:
+            continue
+        try:
+            message = json.loads(message_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(message, dict):
+            continue
+        message_id = str(message.get("id") or "")
+        if not message_id or message_id in indexed_by_id:
+            continue
+        missing_summaries.append(message_summary(message))
+
+    if not missing_summaries:
+        return indexed_messages
+
+    merged = [*indexed_messages, *missing_summaries]
+    write_index(mailbox, merged)
+    return sorted(merged, key=_internal_date_sort_key, reverse=True)
 
 
 def read_cache(mailbox: str) -> dict[str, Any]:

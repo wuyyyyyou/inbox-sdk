@@ -102,6 +102,7 @@ class FakeApsFiles:
         self._missing_consumed = False
         self.download_error: BaseException | None = None
         self.download_responses: list[dict[str, Any]] = []
+        self.download_timeout_once = False
 
     async def upload_begin(self, **kwargs: Any) -> dict[str, Any]:
         self.begin_calls.append(kwargs)
@@ -116,6 +117,9 @@ class FakeApsFiles:
 
     async def download_url(self, **kwargs: Any) -> dict[str, Any]:
         self.download_calls.append(kwargs)
+        if self.download_timeout_once:
+            self.download_timeout_once = False
+            raise TimeoutError("APS probe timed out")
         if self.download_error is not None:
             raise self.download_error
         if self.download_missing and not self._missing_consumed:
@@ -157,6 +161,7 @@ class FakeFieldsOnlyApsFiles(FakeApsFiles):
 
 async def main_async() -> None:
     from anna_inbox_executa import v2_tools
+    from anna_inbox_executa.diagnostics import activate_trace, create_trace, deactivate_trace, snapshot
     from executa_sdk.host_upload import HostUploadClient
     from mail_agent.mail_providers.gmail import adapter as gmail_adapter
     import os
@@ -570,22 +575,28 @@ async def main_async() -> None:
             "gmail_attachment_id": "gmail-att-1",
         }
 
-        inbox_aps.download_missing = True
+        inbox_aps.download_timeout_once = True
         inbox_aps.download_responses = [
             {"result": {"download_url": "https://files.example.test/uploaded.pdf"}},
         ]
         isolated_cache = tempfile.TemporaryDirectory()
         v2_tools._attachment_download_dir = lambda: Path(isolated_cache.name)
-        download_result = await v2_tools._handle_v2_tool(
-            "prepare_inbox_attachment_access",
-            {
-                "mailbox": "user@example.com",
-                "message_id": "msg-88",
-                "attachment_id": "token-88",
-                "mode": "download",
-            },
-            "invoke-2",
-        )
+        trace = create_trace(operation="attachment-test")
+        trace_token = activate_trace(trace)
+        try:
+            download_result = await v2_tools._handle_v2_tool(
+                "prepare_inbox_attachment_access",
+                {
+                    "mailbox": "user@example.com",
+                    "message_id": "msg-88",
+                    "attachment_id": "token-88",
+                    "mode": "download",
+                },
+                "invoke-2",
+            )
+            diagnostic = snapshot(trace) or {}
+        finally:
+            deactivate_trace(trace_token)
         check("APS miss uploads and returns url", download_result["delivery"] == "url")
         check("APS miss returns nested upload url", download_result["download_url"] == "https://files.example.test/uploaded.pdf")
         check("APS miss fetches Gmail once", attachment_fetch_calls == 1)
@@ -593,6 +604,26 @@ async def main_async() -> None:
         check("download tool returns mode", download_result["mode"] == "download")
         check("download tool returns message id", download_result["message_id"] == "msg-88")
         check("download tool normalizes mime", download_result["mime_type"] == "application/pdf")
+        check(
+            "APS cache probe uses a short distinct timeout",
+            inbox_aps.download_calls[-1]["timeout"] == v2_tools.APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS
+            and inbox_aps.download_calls[-2]["timeout"] == v2_tools.APS_ATTACHMENT_CACHE_PROBE_TIMEOUT_SECONDS
+            and inbox_aps.download_calls[-2]["timeout"] < inbox_aps.download_calls[-1]["timeout"],
+        )
+        stages = [str(span.get("stage")) for span in diagnostic.get("spans", [])]
+        for expected_stage in (
+            "attachment.aps_object_probe",
+            "attachment.cache_load",
+            "attachment.gmail_bytes",
+            "attachment.aps_upload_begin",
+            "attachment.presigned_put",
+            "attachment.aps_upload_complete",
+            "attachment.aps_final_download_url",
+        ):
+            check(f"diagnostics include {expected_stage}", expected_stage in stages)
+        rendered_diagnostics = str(diagnostic)
+        for sensitive_value in ("user@example.com", "msg-88", "token-88", "uploaded.pdf", "https://files.example.test"):
+            check("attachment diagnostics omit sensitive values", sensitive_value not in rendered_diagnostics)
     finally:
         gmail_adapter.read_message = original_read_message
         gmail_adapter.find_attachment_for_token = original_find_attachment_for_token

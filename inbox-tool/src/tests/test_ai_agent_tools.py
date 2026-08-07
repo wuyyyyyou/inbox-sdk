@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import json
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from anna_inbox_executa.ai_agent_tools_flow import (
@@ -248,6 +251,48 @@ def test_plain_search_only_fetches_requested_candidates() -> None:
     print("[PASS] test_plain_search_only_fetches_requested_candidates")
 
 
+def test_list_messages_reconciles_message_files_missing_from_index() -> None:
+    """索引落后于单封缓存文件时，查询应先补齐索引而不是误触发零命中。"""
+    from mail_agent.mail_providers.gmail import adapter
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cache_root = Path(temp_dir) / "mailboxes"
+        mailbox_dir = cache_root / "user_example.com"
+        mailbox_dir.mkdir(parents=True)
+        old = {
+            "id": "old",
+            "thread_id": "thread-old",
+            "internal_date": "1000",
+            "subject": "Old",
+            "from": "old@example.com",
+            "snippet": "old",
+        }
+        new = {
+            "id": "new",
+            "thread_id": "thread-new",
+            "internal_date": "2000",
+            "subject": "Eleven Labs receipt",
+            "from": "billing@example.com",
+            "snippet": "receipt",
+            "body_text": "Amount paid $11.00",
+        }
+        (mailbox_dir / "index.json").write_text(
+            json.dumps({"mailbox": "user@example.com", "messages": [old]}),
+            encoding="utf-8",
+        )
+        (mailbox_dir / "new.json").write_text(json.dumps(new), encoding="utf-8")
+
+        with patch.object(adapter, "cache_dir", return_value=cache_root), patch.object(
+            adapter, "_storage_cache_enabled", return_value=False
+        ):
+            messages = adapter.list_messages("user@example.com")
+
+        assert [item["id"] for item in messages] == ["new", "old"]
+        indexed = json.loads((mailbox_dir / "index.json").read_text(encoding="utf-8"))
+        assert {item["id"] for item in indexed["messages"]} == {"old", "new"}
+    print("[PASS] test_list_messages_reconciles_message_files_missing_from_index")
+
+
 def test_search_email_includes_attachment_filenames() -> None:
     """search_email 应暴露附件文件名，供发票/附件类问答。"""
     messages = [{
@@ -410,6 +455,7 @@ if __name__ == "__main__":
     test_search_query_keeps_gmail_syntax_and_separates_workflow_filters()
     test_search_email_uses_full_cache_and_workflow_ids()
     test_plain_search_only_fetches_requested_candidates()
+    test_list_messages_reconciles_message_files_missing_from_index()
     test_search_email_includes_attachment_filenames()
     test_search_email_falls_back_to_cached_full_body_for_body_clause()
     test_search_email_order_oldest_uses_full_cached_range()

@@ -1098,9 +1098,18 @@ def _payment_due_template(evidence: dict[str, Any], user_text: str, language: st
             continue
         hay = " ".join(str(row.get(k) or "") for k in ("subject", "bodySnippet", "from", "bodyFull")).lower()
         ref = str(row.get("thread_ref") or "").strip()
-        subject = str(row.get("subject") or "")[:80]
+        raw_subject = str(row.get("subject") or "")
+        subject = (raw_subject[:80] + "…") if len(raw_subject) > 80 else raw_subject
         bit = f"{subject}" + (f" [{ref}]" if ref else "")
-        if any(tok in hay for tok in ("receipt", "已付", "paid", "payment successful", "payment received", "amount paid")):
+        # 付款失败 / 余额不足 / 订阅降级等是「需要用户处理」的通知，绝不能混进
+        # 已付 receipt，否则会把待处理事项错报为「已付款，无需操作」。
+        if any(tok in hay for tok in (
+            "unsuccessful", "payment failed", "payments failed", "payment failure",
+            "could not be processed", "declined", "失败", "扣款失败", "付款失败", "余额不足",
+            "low account balance", "action required", "downgraded", "已降级",
+        )):
+            invoices.append(bit)
+        elif any(tok in hay for tok in ("receipt", "已付", "paid", "payment successful", "payment received", "amount paid")):
             receipts.append(bit)
         elif any(tok in hay for tok in ("invoice", "due", "amount due", "payment required", "待付", "应付")):
             invoices.append(bit)
@@ -1113,7 +1122,7 @@ def _payment_due_template(evidence: dict[str, Any], user_text: str, language: st
             lines.append("在当前缓存中未找到明确的 PayPal/Stripe 待付账单。")
             return "\n".join(lines)
         if invoices:
-            lines.append(f"可能待付（invoice/应付）共 {len(invoices)} 封，请打开核对后再付款：")
+            lines.append(f"可能待付或需处理（invoice / 付款失败 / 余额不足）共 {len(invoices)} 封，请打开核对：")
             lines.extend(f"- {item}" for item in invoices[:6])
         else:
             lines.append("未发现明确的待付 invoice；检索到的多为 **receipt（已支付确认）** 或账单通知。")
@@ -1122,14 +1131,14 @@ def _payment_due_template(evidence: dict[str, Any], user_text: str, language: st
             lines.append(f"已付/收据类（receipt）共 {len(receipts)} 封，**不需要再付款**：")
             lines.extend(f"- {item}" for item in receipts[:6])
         lines.append("")
-        lines.append("请区分 receipt（已付确认）与 invoice（可能待付），不要把已付收据当成待付款账单。")
+        lines.append("请区分 receipt（已付确认）与 invoice/待处理（可能待付），不要把已付收据当成待付款账单。")
         return "\n".join(lines)
     lines = ["## Payment status", ""]
     if not rows:
         lines.append("No clear PayPal/Stripe bills requiring payment were found in the current cache.")
         return "\n".join(lines)
     if invoices:
-        lines.append(f"Possibly due (invoice) — {len(invoices)} item(s); verify before paying:")
+        lines.append(f"May need payment/action (invoice / failed payment / low balance) — {len(invoices)} item(s); verify before paying:")
         lines.extend(f"- {item}" for item in invoices[:6])
     else:
         lines.append("No clear outstanding invoice found; matches look like **receipts** (already paid) or statements.")
@@ -1138,7 +1147,7 @@ def _payment_due_template(evidence: dict[str, Any], user_text: str, language: st
         lines.append(f"Receipts / already-paid — {len(receipts)} item(s); no further payment needed:")
         lines.extend(f"- {item}" for item in receipts[:6])
     lines.append("")
-    lines.append("Distinguish receipt (paid) from invoice (may be due); do not treat paid receipts as bills to pay.")
+    lines.append("Distinguish receipt (paid) from invoice/needs-action (may be due); do not treat paid receipts as bills to pay.")
     return "\n".join(lines)
 
 
