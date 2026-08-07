@@ -33,17 +33,27 @@ describe("search suggestion submission", () => {
     expect(homeViewSource).toContain("onClick={() => applySuggestion(suggestion, true)}");
   });
 
-  it("prioritizes explicit Enter submission over an open completion menu", () => {
+  it("executes search when the selected completion completes a valid query", () => {
     const enterHandler = homeViewSource.match(/else if \(event\.key === "Enter"\) \{[\s\S]*?\n                  \}\n                \}/)?.[0] || "";
-    expect(enterHandler).toContain("if (parsedSearch.expression && !parsedSearch.error)");
-    expect(enterHandler).toContain("if (hasIncompleteSuggestion)");
-    expect(enterHandler).toContain("applySearch(search);");
-    expect(enterHandler).toContain("applySuggestion(searchSuggestions[searchSuggestionIndex]);");
+    // 依据当前选中的补全判定，而不是“存在任一不完整补全”的全局测试
+    expect(enterHandler).toContain("const suggestion = searchSuggestions[searchSuggestionIndex];");
+    expect(enterHandler).toContain("const next = applyInboxQuerySuggestion(search, suggestion);");
+    expect(enterHandler).toContain("if (parsed.expression && !parsed.error) {");
+    expect(enterHandler).toContain("applySuggestion(suggestion, true);");
+    expect(enterHandler).not.toContain("hasIncompleteSuggestion");
+    expect(enterHandler).not.toContain("searchSuggestions.some");
   });
 
-  it("retains an incomplete field completion and closes the menu for direct value entry", () => {
-    expect(homeViewSource).toContain("const hasIncompleteSuggestion = searchSuggestions.some");
-    expect(homeViewSource).toContain("applySuggestion(searchSuggestions[searchSuggestionIndex]);");
+  it("keeps an incomplete completion edit-only without executing search", () => {
+    const enterHandler = homeViewSource.match(/else if \(event\.key === "Enter"\) \{[\s\S]*?\n                  \}\n                \}/)?.[0] || "";
+    expect(enterHandler).toContain("applySuggestion(suggestion);");
+    expect(enterHandler).toContain("applySearch(search);");
+    expect(enterHandler).toContain("setSearchFocused(false);");
+    expect(enterHandler).not.toContain("void searchIndexedEmailsRef.current");
+  });
+
+  it("applies a suggestion edit-only and closes the menu for direct value entry", () => {
+    expect(homeViewSource).toContain("const applySuggestion = useCallback(");
     expect(homeViewSource).toContain("setSearchFocused(false);");
     expect(homeViewSource).toContain("window.requestAnimationFrame");
     expect(homeViewSource).toContain("const next = applyInboxQuerySuggestion(search, suggestion);");
@@ -65,6 +75,65 @@ describe("search suggestion submission", () => {
     expect(changeHandler).toContain("setFilter(filterBeforeSearch);");
     expect(changeHandler).toContain("setSearchFocused(true);");
     expect(changeHandler).not.toContain("searchIndexedEmailsRef");
+  });
+
+  it("canonicalizes the query so activeSearch, RPC, and indexedSearchQuery stay identical", () => {
+    const applyStart = homeViewSource.indexOf("const applySearch = useCallback(");
+    const applyEnd = homeViewSource.indexOf(
+      "  );",
+      homeViewSource.indexOf("[filter, filterBeforeSearch]", applyStart),
+    );
+    const applySearchSource = homeViewSource.slice(applyStart, applyEnd);
+    expect(applySearchSource).toContain("const canonical = value.trim();");
+    // RPC 与 activeSearch 都只使用规范化查询，绝不存仅含空白差异的输入
+    expect(applySearchSource).toContain(
+      "void searchIndexedEmailsRef.current(canonical).catch(() => undefined);",
+    );
+    expect(applySearchSource).toContain("setActiveSearch(canonical);");
+    expect(applySearchSource).not.toContain("setActiveSearch(value");
+    // 输入框仍保留用户原始输入，但解析与执行基于规范化后的查询
+    expect(applySearchSource).toContain("setSearch(value);");
+  });
+
+  it("runs a complete valid query before AND/OR suggestions from trailing whitespace", () => {
+    const enterHandler = homeViewSource.match(/else if \(event\.key === "Enter"\) \{[\s\S]*?\n                  \}\n                \}/)?.[0] || "";
+    const validQueryIndex = enterHandler.indexOf(
+      "if (parsedSearch.expression && !parsedSearch.error) {",
+    );
+    const suggestionsIndex = enterHandler.indexOf("if (searchSuggestions.length) {");
+    expect(validQueryIndex).toBeGreaterThan(-1);
+    expect(suggestionsIndex).toBeGreaterThan(-1);
+    expect(validQueryIndex).toBeLessThan(suggestionsIndex);
+    expect(enterHandler).toContain("applySearch(search);");
+  });
+
+  it("localizes search-specific result, loading, failure, and empty-state strings", () => {
+    expect(homeViewSource).toContain('aria-label={t("search.loadingIndex")}');
+    expect(homeViewSource).toContain('t("search.failedHeading")');
+    expect(homeViewSource).toContain('t("search.failedDescription")');
+    expect(homeViewSource).toContain('t("search.emptyDescription")');
+    // 不再残留精确硬编码的搜索 UI 文案
+    expect(homeViewSource).not.toContain("Showing the first 200 matches from the local mail index.");
+    expect(homeViewSource).not.toContain('aria-label="Searching the local mail index"');
+    expect(homeViewSource).not.toContain("<h2>Search could not be completed</h2>");
+    expect(homeViewSource).not.toContain("do not fetch Gmail while you type");
+    // 搜索失败视图只展示本地化描述，不再渲染后端返回的原始错误文本
+    const searchErrorView =
+      homeViewSource.match(
+        /state\.indexedSearchError \? \([\s\S]*?\) : !localCategory && state\.inboxLoading/,
+      )?.[0] || "";
+    const searchErrorBody = searchErrorView.replace(/^[\s\S]*?state\.indexedSearchError \? \(/, "");
+    expect(searchErrorBody).toContain('t("search.failedHeading")');
+    expect(searchErrorBody).toContain('t("search.failedDescription")');
+    expect(searchErrorBody).not.toContain("state.indexedSearchError");
+  });
+
+  it("keeps loaded search results mounted while fetching the next page", () => {
+    const loadingView = homeViewSource.match(
+      /filter === "search" &&[\s\S]*?aria-label=\{t\("search\.loadingIndex"\)\}/,
+    )?.[0] || "";
+    expect(loadingView).toContain("state.indexedSearchLoading");
+    expect(loadingView).toContain("!sourceMessages.length");
   });
 });
 
@@ -401,6 +470,8 @@ describe("list pagination", () => {
     expect(homeViewSource).toContain("feedWindow.localLimit + INBOX_FEED_PAGE_SIZE");
     expect(homeViewSource).toContain("tryAutoLoadMoreEmails");
     expect(homeViewSource).toContain("onScroll={() => tryAutoLoadMoreEmails()}");
+    expect(homeViewSource).toContain("state.indexedSearchHasMore");
+    expect(homeViewSource).toContain("await actions.loadMoreIndexedEmails()");
     expect(homeViewSource).toContain("formatInboxTabCount(count)");
     expect(homeViewSource).not.toContain("initial_list_size");
     expect(homeViewSource).not.toContain("moreInPeriodButtonLabel");

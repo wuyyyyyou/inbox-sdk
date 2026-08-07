@@ -3656,15 +3656,24 @@ export function HomeView() {
   }, [search]);
   const applySearch = useCallback(
     (value: string) => {
-      const parsed = parseInboxQuery(value);
+      // 统一规范化：执行查询前先 trim，保证 activeSearch、RPC 查询与控制器
+      // indexedSearchQuery 完全一致，否则 sourceMessages 的精确相等判断失败，
+      // 已返回的搜索结果将无法渲染。
+      const canonical = value.trim();
+      const parsed = parseInboxQuery(canonical);
       const directStatus =
         parsed.expression?.kind === "term" && parsed.expression.field === "is"
           ? parsed.expression.value
           : "";
+      // 输入框保留用户原始输入（含尾随空格），执行与状态仅使用规范化查询。
       setSearch(value);
       setSearchFocused(false);
-      if (value.trim() && !parsed.error && (!directStatus || directStatus === "unread")) {
-        void searchIndexedEmailsRef.current(value.trim()).catch(() => undefined);
+      if (
+        canonical &&
+        !parsed.error &&
+        (!directStatus || directStatus === "unread")
+      ) {
+        void searchIndexedEmailsRef.current(canonical).catch(() => undefined);
       }
       if (directStatus) {
         setActiveSearch("");
@@ -3680,7 +3689,7 @@ export function HomeView() {
         if (directStatus === "unread") {
           setMailboxView("inbox");
           setFilterBeforeSearch("important");
-          setActiveSearch(value);
+          setActiveSearch(canonical);
           setFilter("search");
           return;
         }
@@ -3709,11 +3718,11 @@ export function HomeView() {
           return;
         }
       }
-      if (value.trim() && !parsed.error) {
+      if (canonical && !parsed.error) {
         setFilterBeforeSearch(
           filter === "search" ? filterBeforeSearch : filter,
         );
-        setActiveSearch(value);
+        setActiveSearch(canonical);
         setFilter("search");
       }
     },
@@ -5179,12 +5188,15 @@ export function HomeView() {
   // 触底自动加载：所有分类（含 Inbox 下 Important/Other/自定义 Split、本地 Todos 等）统一 localLimit 分页
   const canShowMoreEmails =
     mailboxView !== "drafts" &&
-    filter !== "search" &&
-    (feedWindow.localLimit < visible.length ||
-      (isExpandableMailboxView(mailboxView) && feedWindow.hasMore)) &&
-    !state.inboxError &&
-    !state.inboxLoading &&
-    !isInboxSyncing &&
+    (filter === "search"
+      ? (feedWindow.localLimit < visible.length || state.indexedSearchHasMore) &&
+        !state.indexedSearchLoading &&
+        !state.indexedSearchError
+      : (feedWindow.localLimit < visible.length ||
+          (isExpandableMailboxView(mailboxView) && feedWindow.hasMore)) &&
+        !state.inboxError &&
+        !state.inboxLoading &&
+        !isInboxSyncing) &&
     feedAction === null;
   const showMoreEmails = useCallback(async () => {
     if (pageLoadInFlight.current) return;
@@ -5194,6 +5206,20 @@ export function HomeView() {
       ...current,
       localLimit: nextLimit,
     }));
+    if (filter === "search") {
+      if (feedWindow.localLimit < visible.length) {
+        pageLoadInFlight.current = false;
+        return;
+      }
+      setFeedAction("more");
+      try {
+        await actions.loadMoreIndexedEmails();
+      } finally {
+        pageLoadInFlight.current = false;
+        setFeedAction((current) => (current === "more" ? null : current));
+      }
+      return;
+    }
     // 快照已够展示则只抬上限；否则续读缓存并写入快照（本地分类仅抬 localLimit）
     const snapshotCount =
       state.inboxSnapshotMessages.length || state.inboxMessages.length;
@@ -5253,9 +5279,11 @@ export function HomeView() {
     feedWindow.gmailPageToken,
     feedWindow.localLimit,
     feedWindow.nextOffset,
+    filter,
     mailboxView,
     state.inboxMessages,
     state.inboxSnapshotMessages,
+    visible.length,
   ]);
   // 列表触底或内容不足以填满视口时自动续页（不展示 Show more 按钮）
   const tryAutoLoadMoreEmails = useCallback(() => {
@@ -7232,18 +7260,20 @@ export function HomeView() {
                   } else if (event.key === "Enter") {
                     event.preventDefault();
                     if (parsedSearch.expression && !parsedSearch.error) {
-                      const hasIncompleteSuggestion = searchSuggestions.some((suggestion) => {
-                        const next = applyInboxQuerySuggestion(search, suggestion);
-                        const parsed = parseInboxQuery(next);
-                        return !parsed.expression || Boolean(parsed.error);
-                      });
-                      if (hasIncompleteSuggestion) {
-                        applySuggestion(searchSuggestions[searchSuggestionIndex]);
-                      } else {
-                        applySearch(search);
-                      }
+                      // 已完整的合法查询（如 is:unread 带尾随空格）优先执行；
+                      // 否则仅因尾随空格出现的 AND/OR 补全会吞掉再次搜索。
+                      applySearch(search);
                     } else if (searchSuggestions.length) {
-                      applySuggestion(searchSuggestions[searchSuggestionIndex]);
+                      // 仅依据当前选中的补全判定：能补成完整合法查询时在同一动作内执行搜索，
+                      // 不完整前缀补全（如 AND/OR 末尾）仍保持编辑态。
+                      const suggestion = searchSuggestions[searchSuggestionIndex];
+                      const next = applyInboxQuerySuggestion(search, suggestion);
+                      const parsed = parseInboxQuery(next);
+                      if (parsed.expression && !parsed.error) {
+                        applySuggestion(suggestion, true);
+                      } else {
+                        applySuggestion(suggestion);
+                      }
                     } else {
                       setSearchFocused(false);
                     }
@@ -7614,11 +7644,6 @@ export function HomeView() {
               </div>
             </div>
           ) : null}
-          {filter === "search" && activeSearch && state.indexedSearchHasMore ? (
-            <div className="mail-sync-banner" role="status">
-              <span>Showing the first 200 matches from the local mail index. Refine your search to narrow the results.</span>
-            </div>
-          ) : null}
           {gmailAuthorizationRequired ? (
             <div
               className="mail-empty mail-auth-guide"
@@ -7665,8 +7690,11 @@ export function HomeView() {
                 {gmailAuthorizationError(state.gmailAuthStatus.source)}
               </p>
             </div>
-          ) : filter === "search" && activeSearch && state.indexedSearchLoading ? (
-            <div className="mail-loading" aria-label="Searching the local mail index">
+          ) : filter === "search" &&
+            activeSearch &&
+            state.indexedSearchLoading &&
+            !sourceMessages.length ? (
+            <div className="mail-loading" aria-label={t("search.loadingIndex")}>
               {[1, 2, 3].map((item) => (
                 <span key={item} />
               ))}
@@ -7674,8 +7702,8 @@ export function HomeView() {
           ) : filter === "search" && activeSearch && state.indexedSearchError ? (
             <div className="mail-empty">
               <SearchIcon />
-              <h2>Search could not be completed</h2>
-              <p>{state.indexedSearchError}</p>
+              <h2>{t("search.failedHeading")}</h2>
+              <p>{t("search.failedDescription")}</p>
               <button onClick={() => void searchIndexedEmailsRef.current(activeSearch).catch(() => undefined)}>
                 {t("mail.tryAgain")}
               </button>
@@ -7716,7 +7744,7 @@ export function HomeView() {
               <div className="mail-empty">
                 <SearchIcon />
                 <h2>{t("mail.noResults")}</h2>
-                <p>Searches cover the local indexed mailbox and do not fetch Gmail while you type.</p>
+                <p>{t("search.emptyDescription")}</p>
               </div>
             ) :
             mailboxView !== "inbox" && mailboxView !== "all" ? (

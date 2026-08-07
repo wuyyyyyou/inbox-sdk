@@ -17,8 +17,10 @@ _CURRENT_TRACE: ContextVar[dict[str, Any] | None] = ContextVar("anna_runtime_tra
 _MAX_SPANS = 40
 _SAFE_FIELD_NAMES = {
     "api_calls",
+    "budget_seconds",
     "cached",
     "code",
+    "detail",
     "endpoint",
     "error_type",
     "http_status",
@@ -26,6 +28,7 @@ _SAFE_FIELD_NAMES = {
     "index_reused",
     "fts_query_ms",
     "path",
+    "remaining_seconds",
     "result_count",
     "rows_indexed",
     "rows_scanned",

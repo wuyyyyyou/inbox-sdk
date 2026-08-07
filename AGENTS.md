@@ -38,8 +38,8 @@
 ## 二、 项目基线
 
 ### 1. 当前版本与权威文件位置
-- **App (前端)**：`2.2.9` — 权威定义文件：`anna-inbox/app.json`
-- **Tool (Executa/后端)**：`2.3.10` — 权威定义文件：`inbox-tool/manifest.json`
+- **App (前端)**：`2.3.1` — 权威定义文件：`anna-inbox/app.json`
+- **Tool (Executa/后端)**：`2.4.1` — 权威定义文件：`inbox-tool/manifest.json`
 
 ### 2. 前端项目基线 (App)
 - **UI 架构与唯一入口**：系统唯一智能入口为 **Inbox Workspace + AI 侧栏**。Brief 产品面已彻底下线，AI 侧栏只读主路径中不再暴露或使用旧的 `search_email` 或 `read_email` 工具直接拉取 Gmail，一律改由 `query_mail_evidence` 托管。
@@ -47,7 +47,7 @@
 - **分页控制**：前端列表分页固定首屏为 100 条（`INBOX_FEED_PAGE_SIZE=100`），触底自动续页（无 Show more 按钮）。Inbox 标签角标上限展示为 `99+`。
 - **引言与引用**：仅将本轮用户确认（Confirmed Evidence）的内容打上 `THREAD_REF` 进行引用。前端自动过滤未确认的引用或直接 Gmail 链接；引用按钮支持打开详情抽屉。
 - **草稿两步确认流**：AI 生成回复草稿必须分两步：第一步输出回复摘要并提请确认，第二步用户确认后，前端才展示 `draft_reply` 编辑卡片。「仅正文」请求不展示任何卡片。
-- **本次发布变更**：搜索支持状态值/附件值补全、AND/OR 补全和本地化错误提示，并防止邮箱切换或快速输入造成旧结果串写；收件附件增加本地缓存与 APS Files 稳定交付；本地搜索响应按帧大小分页，兼容历史附件字段。
+- **本次发布变更**：搜索规范化统一 trim，保证 activeSearch、RPC 查询与控制器 indexedSearchQuery 完全一致；搜索态触底自动续页走 `loadMoreIndexedEmails`，Enter 键对已完整合法查询优先执行、不完整 AND/OR 前缀保持编辑态；搜索 loading/error/empty 文案本地化；收件附件访问共用 90 秒总预算（覆盖回源消息、Gmail 字节与 APS 上传，避免各阶段超时叠加超过前端 120s 工具预算），附件下载增加 30s 超时、有界重试与 AbortSignal 取消；诊断安全字段扩展 `budget_seconds` / `detail` / `remaining_seconds`；release workflow 支持 OIDC 可信发布将二进制上传 Anna CDN（`executa.json` 声明 `distribution.binary_artifacts`）。
 
 ### 3. 后端项目基线 (Tool/Executa)
 - **通信与 RPC**：

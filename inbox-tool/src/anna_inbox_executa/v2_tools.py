@@ -23,12 +23,58 @@ APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS = 20.0
 # 上传 begin/complete 与最终 URL 仍使用上面的必需操作超时。
 APS_ATTACHMENT_CACHE_PROBE_TIMEOUT_SECONDS = 3.0
 HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS = 20.0
+# 收件附件一次访问必须在前端 120s 工具预算内结束；为 dispatcher 和响应路由
+# 保留余量，所有 Gmail、APS 和预签名 PUT 共用这个更小的单调时钟预算。
+ATTACHMENT_OPERATION_BUDGET_SECONDS = 90.0
 _DOWNLOAD_SERVER_LOCK = threading.Lock()
 _DOWNLOAD_SERVER: Any | None = None
 _DOWNLOAD_SERVER_THREAD: threading.Thread | None = None
 _DOWNLOAD_TOKENS: dict[str, dict[str, Any]] = {}
 _DOWNLOAD_TOKEN_TTL_SECONDS = 15 * 60
 _CID_IMAGE_RE = re.compile(r'''src\s*=\s*["']cid:([^"'\s]+)["']''', re.IGNORECASE)
+
+
+class _AttachmentOperationTimeout(TimeoutError):
+    """收件附件超时的内部分类，错误文本不包含邮箱、令牌或 URL。"""
+
+
+class _AttachmentDeadline:
+    """为一次附件访问提供共享截止时间，并将诊断限制为安全数值。"""
+
+    def __init__(self, budget_seconds: float = ATTACHMENT_OPERATION_BUDGET_SECONDS) -> None:
+        self.budget_seconds = max(1.0, float(budget_seconds))
+        self.started = time.monotonic()
+        self.deadline = self.started + self.budget_seconds
+
+    def remaining(self, stage: str, limit: float | None = None) -> float:
+        value = self.deadline - time.monotonic()
+        if value <= 0:
+            # stage 是 record_span 的首个位置参数，不能同时作为关键字传入；
+            # 这里把超时原因收敛为非敏感 detail 字段，避免重复参数报错。
+            record_span(
+                "attachment.budget",
+                self.started,
+                outcome="timeout",
+                detail=stage,
+                budget_seconds=self.budget_seconds,
+                remaining_seconds=0.0,
+            )
+            raise _AttachmentOperationTimeout("Attachment operation timed out.")
+        if limit is not None:
+            value = min(value, max(0.1, float(limit)))
+        return value
+
+    def timeout(self, stage: str, limit: float | None = None) -> float:
+        return self.remaining(stage, limit)
+
+
+async def _wait_for_attachment_stage(awaitable: Any, deadline: _AttachmentDeadline, stage: str) -> Any:
+    """等待异步或线程任务；超时后不泄露底层异常内容。"""
+    try:
+        return await asyncio.wait_for(awaitable, timeout=deadline.remaining(stage))
+    except asyncio.TimeoutError as exc:
+        deadline.remaining(stage)
+        raise _AttachmentOperationTimeout("Attachment operation timed out.") from exc
 
 
 def _strip_quoted_reply_html(html: str) -> str:
@@ -248,7 +294,14 @@ def _is_attachment_upload_retryable(error: BaseException) -> bool:
     )
 
 
-def _put_presigned_url_sync(url: str, headers: dict[str, Any], content: bytes, mime_type: str) -> str:
+def _put_presigned_url_sync(
+    url: str,
+    headers: dict[str, Any],
+    content: bytes,
+    mime_type: str,
+    *,
+    timeout: float = HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS,
+) -> str:
     """使用签名方提供的请求头上传，并返回可选的 ETag。
 
     预签名请求的 headers 属于签名契约，不能为了通用 HTTP 客户端而注入
@@ -264,7 +317,7 @@ def _put_presigned_url_sync(url: str, headers: dict[str, Any], content: bytes, m
     opener = urllib.request.build_opener()
     opener.addheaders = []
     try:
-        with opener.open(request, timeout=120) as response:
+        with opener.open(request, timeout=max(0.1, float(timeout))) as response:
             status = int(response.status)
             if not 200 <= status < 300:
                 raise RuntimeError(f"presigned PUT returned HTTP {status}")
@@ -273,7 +326,14 @@ def _put_presigned_url_sync(url: str, headers: dict[str, Any], content: bytes, m
         raise RuntimeError(f"presigned PUT returned HTTP {exc.code}") from exc
 
 
-async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment: dict[str, Any], content: bytes) -> dict[str, Any]:
+async def _upload_attachment_for_download(
+    mailbox: str,
+    card_id: str,
+    attachment: dict[str, Any],
+    content: bytes,
+    *,
+    deadline: _AttachmentDeadline | None = None,
+) -> dict[str, Any]:
     """将收件附件上传到可访问的短期 URL。
 
     优先 Host transient upload（与 KV 后端选择无关，响应始终可路由）；
@@ -281,6 +341,8 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
     Cloud Agent 不可使用 loopback：浏览器与 Executa 不在同一台机器。
     """
     from mail_agent.mail_providers.gmail.adapter import sanitize_mailbox_id
+
+    deadline = deadline or _AttachmentDeadline()
 
     filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
     mime_type = _normalized_attachment_mime_type(attachment)
@@ -298,23 +360,28 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
     for host_attempt in range(2):
         try:
             # 每次 attempt 都重新协商，避免确认失败后复用已失效的 r2_key。
-            negotiated = await host_upload.negotiate(
+            negotiated = await _wait_for_attachment_stage(host_upload.negotiate(
                 filename=filename,
                 mime_type=mime_type,
                 size_bytes=len(content),
                 purpose="user_artifact",
                 metadata=meta,
-                timeout=HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS,
-            )
+                timeout=deadline.timeout("host_negotiate", HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS),
+            ), deadline, "host_negotiate")
             host_presign_started = True
             put_url = str(negotiated.get("put_url") or "")
             r2_key = str(negotiated.get("r2_key") or "")
             if not put_url or not r2_key:
                 raise RuntimeError("Host upload did not return a presigned upload target.")
-            await asyncio.to_thread(
-                _put_presigned_url_sync, put_url, negotiated.get("headers") or {}, content, mime_type
+            await _wait_for_attachment_stage(asyncio.to_thread(
+                _put_presigned_url_sync, put_url, negotiated.get("headers") or {}, content, mime_type,
+                timeout=deadline.timeout("host_presigned_put"),
+            ), deadline, "host_presigned_put")
+            result = await _wait_for_attachment_stage(
+                host_upload.confirm(r2_key=r2_key, timeout=deadline.timeout("host_confirm", HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS)),
+                deadline,
+                "host_confirm",
             )
-            result = await host_upload.confirm(r2_key=r2_key, timeout=HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS)
             result["storage_key"] = r2_key
             return result
         except Exception as host_exc:
@@ -347,7 +414,7 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
     for aps_attempt in range(2):
         try:
             # 每次循环都是新的 begin；失败后不能再次 complete 同一个 pending attempt。
-            begin = await _aps_files.upload_begin(
+            begin = await _wait_for_attachment_stage(_aps_files.upload_begin(
                 path=path,
                 size_bytes=len(content),
                 content_type=mime_type,
@@ -358,36 +425,37 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
                     "filename": filename,
                 },
                 scope="user",
-                timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
-            )
+                timeout=deadline.timeout("aps_upload_begin", APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS),
+            ), deadline, "aps_upload_begin")
             put_url = str(begin.get("put_url") or begin.get("presigned_url") or "")
             if not put_url:
                 detail = f" Host upload failed first: {host_unavailable_error}" if host_unavailable_error else ""
                 if begin.get("fields") and not begin.get("headers"):
                     raise RuntimeError(f"Anna Files returned fields without put_url/presigned_url.{detail}")
                 raise RuntimeError(f"Anna Files did not return an upload URL.{detail}")
-            etag = await asyncio.to_thread(
-                _put_presigned_url_sync, put_url, begin.get("headers") or {}, content, mime_type
-            )
-            await _aps_files.upload_complete(
+            etag = await _wait_for_attachment_stage(asyncio.to_thread(
+                _put_presigned_url_sync, put_url, begin.get("headers") or {}, content, mime_type,
+                timeout=deadline.timeout("aps_presigned_put"),
+            ), deadline, "aps_presigned_put")
+            await _wait_for_attachment_stage(_aps_files.upload_complete(
                 path=path,
                 etag=etag or None,
                 size_bytes=len(content),
                 content_type=mime_type,
                 scope="user",
-                timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
-            )
+                timeout=deadline.timeout("aps_upload_complete", APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS),
+            ), deadline, "aps_upload_complete")
         except Exception as complete_exc:
             if aps_attempt == 0 and _is_attachment_upload_retryable(complete_exc):
                 log(f"aps attachment completion retryable failure: {type(complete_exc).__name__}")
                 continue
             raise
-        result = await _aps_files.download_url(
+        result = await _wait_for_attachment_stage(_aps_files.download_url(
             path=path,
             expires_in=900,
             scope="user",
-            timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
-        )
+            timeout=deadline.timeout("aps_download_url", APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS),
+        ), deadline, "aps_download_url")
         result["storage_key"] = path
         return result
 
@@ -535,6 +603,8 @@ async def _load_inbox_attachment_bytes(
     message_id: str,
     attachment: dict[str, Any],
     fetch_attachment_bytes: Any,
+    *,
+    deadline: _AttachmentDeadline | None = None,
 ) -> bytes:
     """先读本地附件缓存，缓存未命中或校验失败时才回源 Gmail。"""
     cache_started = time.monotonic()
@@ -547,13 +617,19 @@ async def _load_inbox_attachment_bytes(
     )
     if cached is not None:
         return cached
+    # 缓存未命中时回源 Gmail 也必须纳入本次附件访问的 90s 总预算。
+    deadline = deadline or _AttachmentDeadline()
     gmail_started = time.monotonic()
     try:
-        content = await asyncio.to_thread(
-            fetch_attachment_bytes,
-            mailbox,
-            str(attachment.get("message_id") or message_id),
-            str(attachment.get("gmail_attachment_id") or ""),
+        content = await _wait_for_attachment_stage(
+            asyncio.to_thread(
+                fetch_attachment_bytes,
+                mailbox,
+                str(attachment.get("message_id") or message_id),
+                str(attachment.get("gmail_attachment_id") or ""),
+            ),
+            deadline,
+            "gmail_bytes",
         )
     except Exception as exc:
         record_span("attachment.gmail_bytes", gmail_started, outcome="error", error_type=type(exc).__name__)
@@ -601,8 +677,14 @@ async def _upload_inbox_attachment_to_aps(
     fetch_attachment_bytes: Any,
     *,
     disposition: str = "attachment",
+    deadline: _AttachmentDeadline | None = None,
 ) -> dict[str, Any]:
-    """通过 APS Files 交付收件附件；Cloud Agent 路径绝不使用 Host upload 或 loopback。"""
+    """通过 APS Files 交付收件附件；Cloud Agent 路径绝不使用 Host upload 或 loopback。
+
+    整个流程（探测、Gmail 回源、上传 begin/complete、最终 URL）共用同一个
+    90s 总预算，避免各阶段 timeout 单独累加后超过前端 120s 工具预算。
+    """
+    deadline = deadline or _AttachmentDeadline()
     path = _inbox_attachment_aps_path(mailbox, message_id, attachment)
     filename = _safe_attachment_filename(str(attachment.get("filename") or "attachment"))
     mime_type = _normalized_attachment_mime_type(attachment)
@@ -610,8 +692,15 @@ async def _upload_inbox_attachment_to_aps(
     # 先探测稳定对象。命中时不读取本地缓存，也不回源 Gmail。
     probe_started = time.monotonic()
     try:
-        access = await _aps_files.download_url(
-            path=path, expires_in=900, scope="user", timeout=APS_ATTACHMENT_CACHE_PROBE_TIMEOUT_SECONDS
+        access = await _wait_for_attachment_stage(
+            _aps_files.download_url(
+                path=path,
+                expires_in=900,
+                scope="user",
+                timeout=deadline.timeout("aps_probe", APS_ATTACHMENT_CACHE_PROBE_TIMEOUT_SECONDS),
+            ),
+            deadline,
+            "aps_probe",
         )
         url = _aps_files_download_url(access)
         record_span("attachment.aps_object_probe", probe_started, source="aps", cached=True)
@@ -639,17 +728,23 @@ async def _upload_inbox_attachment_to_aps(
             error_type=type(probe_exc).__name__,
         )
 
-    content = await _load_inbox_attachment_bytes(mailbox, message_id, attachment, fetch_attachment_bytes)
+    content = await _load_inbox_attachment_bytes(
+        mailbox, message_id, attachment, fetch_attachment_bytes, deadline=deadline
+    )
     for attempt in range(2):
         begin_started = time.monotonic()
         try:
-            begin = await _aps_files.upload_begin(
-                path=path,
-                size_bytes=len(content),
-                content_type=mime_type,
-                metadata={"message_id": message_id, "filename": filename},
-                scope="user",
-                timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
+            begin = await _wait_for_attachment_stage(
+                _aps_files.upload_begin(
+                    path=path,
+                    size_bytes=len(content),
+                    content_type=mime_type,
+                    metadata={"message_id": message_id, "filename": filename},
+                    scope="user",
+                    timeout=deadline.timeout("aps_upload_begin", APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS),
+                ),
+                deadline,
+                "aps_upload_begin",
             )
         except Exception as begin_exc:
             record_span(
@@ -668,7 +763,18 @@ async def _upload_inbox_attachment_to_aps(
                 raise RuntimeError("Anna Files did not return an upload URL.")
             put_started = time.monotonic()
             try:
-                etag = await asyncio.to_thread(_put_presigned_url_sync, put_url, begin.get("headers") or {}, content, mime_type)
+                etag = await _wait_for_attachment_stage(
+                    asyncio.to_thread(
+                        _put_presigned_url_sync,
+                        put_url,
+                        begin.get("headers") or {},
+                        content,
+                        mime_type,
+                        timeout=deadline.timeout("aps_presigned_put"),
+                    ),
+                    deadline,
+                    "aps_presigned_put",
+                )
             except Exception as put_exc:
                 record_span("attachment.presigned_put", put_started, outcome="error", error_type=type(put_exc).__name__)
                 raise
@@ -676,13 +782,17 @@ async def _upload_inbox_attachment_to_aps(
             # 每次 begin 只允许对应一次 complete；失败时下一个 attempt 必须重新 begin。
             complete_started = time.monotonic()
             try:
-                await _aps_files.upload_complete(
-                    path=path,
-                    etag=etag or None,
-                    size_bytes=len(content),
-                    content_type=mime_type,
-                    scope="user",
-                    timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
+                await _wait_for_attachment_stage(
+                    _aps_files.upload_complete(
+                        path=path,
+                        etag=etag or None,
+                        size_bytes=len(content),
+                        content_type=mime_type,
+                        scope="user",
+                        timeout=deadline.timeout("aps_upload_complete", APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS),
+                    ),
+                    deadline,
+                    "aps_upload_complete",
                 )
             except Exception as complete_exc:
                 record_span("attachment.aps_upload_complete", complete_started, outcome="error", error_type=type(complete_exc).__name__)
@@ -690,8 +800,15 @@ async def _upload_inbox_attachment_to_aps(
             record_span("attachment.aps_upload_complete", complete_started, source="aps")
             final_url_started = time.monotonic()
             try:
-                access = await _aps_files.download_url(
-                    path=path, expires_in=900, scope="user", timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS
+                access = await _wait_for_attachment_stage(
+                    _aps_files.download_url(
+                        path=path,
+                        expires_in=900,
+                        scope="user",
+                        timeout=deadline.timeout("aps_final_download_url", APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS),
+                    ),
+                    deadline,
+                    "aps_final_download_url",
                 )
                 url = _aps_files_download_url(access)
             except Exception as final_url_exc:
@@ -2854,20 +2971,31 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 normalize_mailbox,
                 read_message,
             )
+            # 一次附件访问共用同一个 90s 总预算：回源消息、Gmail 字节与 APS 上传
+            # 全部计入，避免各阶段单独超时叠加后超过前端 120s 工具预算。
+            deadline = _AttachmentDeadline()
             normalized_mailbox = normalize_mailbox(mailbox)
             # 缓存 miss 或 token 对不上时回源 full 消息，避免缓存后附件不可用。
             try:
-                msg = read_message(normalized_mailbox, card.message_id)
+                msg = await asyncio.to_thread(read_message, normalized_mailbox, card.message_id)
             except Exception:
                 msg = None
             if not isinstance(msg, dict):
-                msg = await asyncio.to_thread(fetch_and_cache_message, normalized_mailbox, card.message_id)
+                msg = await _wait_for_attachment_stage(
+                    asyncio.to_thread(fetch_and_cache_message, normalized_mailbox, card.message_id),
+                    deadline,
+                    "gmail_message_fetch",
+                )
             if not isinstance(msg, dict):
                 return {"ok": False, "error": f"Message {card.message_id} not found"}
             try:
                 attachment = find_attachment_for_token(msg, attachment_id)
             except Exception:
-                refreshed = await asyncio.to_thread(fetch_and_cache_message, normalized_mailbox, card.message_id)
+                refreshed = await _wait_for_attachment_stage(
+                    asyncio.to_thread(fetch_and_cache_message, normalized_mailbox, card.message_id),
+                    deadline,
+                    "gmail_message_refetch",
+                )
                 if not isinstance(refreshed, dict):
                     raise
                 msg = refreshed
@@ -2877,6 +3005,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 str(card.message_id),
                 attachment,
                 fetch_attachment_bytes,
+                deadline=deadline,
             )
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -2899,20 +3028,31 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 normalize_mailbox,
                 read_message,
             )
+            # 收件附件交付共用同一个 90s 总预算：回源消息、Gmail 字节与 APS 上传
+            # 全部计入，避免各阶段单独超时叠加后超过前端 120s 工具预算。
+            deadline = _AttachmentDeadline()
             normalized_mailbox = normalize_mailbox(mailbox)
             # 列表/History 可能只有摘要缓存；访问附件时必须能回源 full 消息。
             try:
-                message = read_message(normalized_mailbox, message_id)
+                message = await asyncio.to_thread(read_message, normalized_mailbox, message_id)
             except Exception:
                 message = None
             if not isinstance(message, dict):
-                message = await asyncio.to_thread(fetch_and_cache_message, normalized_mailbox, message_id)
+                message = await _wait_for_attachment_stage(
+                    asyncio.to_thread(fetch_and_cache_message, normalized_mailbox, message_id),
+                    deadline,
+                    "gmail_message_fetch",
+                )
             if not isinstance(message, dict):
                 return {"ok": False, "error": f"Message {message_id} not found"}
             try:
                 attachment = find_attachment_for_token(message, attachment_id)
             except Exception:
-                refreshed = await asyncio.to_thread(fetch_and_cache_message, normalized_mailbox, message_id)
+                refreshed = await _wait_for_attachment_stage(
+                    asyncio.to_thread(fetch_and_cache_message, normalized_mailbox, message_id),
+                    deadline,
+                    "gmail_message_refetch",
+                )
                 if not isinstance(refreshed, dict):
                     raise
                 message = refreshed
@@ -2934,6 +3074,7 @@ async def _handle_v2_tool(tool: str, arguments: dict[str, Any], invoke_id: str) 
                 attachment,
                 fetch_attachment_bytes,
                 disposition="inline" if mode == "preview" else "attachment",
+                deadline=deadline,
             )
             return _finalize_attachment_access_payload(
                 download,

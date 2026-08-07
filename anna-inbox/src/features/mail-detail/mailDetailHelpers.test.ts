@@ -249,6 +249,95 @@ describe("mailDetailHelpers", () => {
     }
   });
 
+  it("retries transient attachment responses once before succeeding", async () => {
+    const previousFetch = globalThis.fetch;
+    const createObjectURL = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:retry");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 503 })
+      .mockResolvedValueOnce({ ok: true, blob: async () => new Blob(["pdf"], { type: "application/pdf" }) });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      const access = await materializeAttachmentAccess({
+        kind: "url",
+        url: "https://files.example.test/retry.pdf",
+        filename: "retry.pdf",
+        mimeType: "application/pdf",
+        externalPreview: false,
+      });
+      expect(access.url).toBe("blob:retry");
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      globalThis.fetch = previousFetch;
+      createObjectURL.mockRestore();
+    }
+  });
+
+  it("retries once on an ERR_CONNECTION_CLOSED network failure", async () => {
+    const previousFetch = globalThis.fetch;
+    const createObjectURL = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:conn-retry");
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error("net::ERR_CONNECTION_CLOSED"))
+      .mockResolvedValueOnce({ ok: true, blob: async () => new Blob(["pdf"], { type: "application/pdf" }) });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      const access = await materializeAttachmentAccess({
+        kind: "url",
+        url: "https://files.example.test/conn.pdf",
+        filename: "conn.pdf",
+        mimeType: "application/pdf",
+        externalPreview: false,
+      });
+      expect(access.url).toBe("blob:conn-retry");
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      globalThis.fetch = previousFetch;
+      createObjectURL.mockRestore();
+    }
+  });
+
+  it("gives up after two failed transient attempts", async () => {
+    const previousFetch = globalThis.fetch;
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 502 })
+      .mockResolvedValueOnce({ ok: false, status: 502 });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      await expect(materializeAttachmentAccess({
+        kind: "url",
+        url: "https://files.example.test/always-fails.pdf",
+        filename: "always-fails.pdf",
+        mimeType: "application/pdf",
+        externalPreview: false,
+      })).rejects.toThrow("Attachment fetch failed with 502");
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it("preserves caller cancellation instead of retrying", async () => {
+    const previousFetch = globalThis.fetch;
+    const controller = new AbortController();
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      controller.abort("cancelled by caller");
+      (init?.signal as AbortSignal).throwIfAborted();
+      return { ok: true, blob: async () => new Blob(["never"]) };
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      await expect(materializeAttachmentAccess({
+        kind: "url",
+        url: "https://files.example.test/cancel.pdf",
+        filename: "cancel.pdf",
+        mimeType: "application/pdf",
+        externalPreview: false,
+      }, controller.signal)).rejects.toBe("cancelled by caller");
+      expect(fetchMock).toHaveBeenCalledOnce();
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   it("throws when attachment access explicitly fails", () => {
     expect(() => resolveAttachmentAccess({
       ok: false,
@@ -298,7 +387,8 @@ describe("mailDetailHelpers", () => {
 
   it("throws when a url download response is not ok", async () => {
     const previousFetch = globalThis.fetch;
-    globalThis.fetch = vi.fn(async () => ({ ok: false, status: 403 })) as unknown as typeof fetch;
+    const fetchMock = vi.fn(async () => ({ ok: false, status: 403 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
     try {
       await expect(triggerAttachmentDownload({
         kind: "url",
@@ -309,6 +399,7 @@ describe("mailDetailHelpers", () => {
       }, undefined, {
         createElement: vi.fn(),
       } as unknown as Document)).rejects.toThrow("Attachment fetch failed with 403");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       globalThis.fetch = previousFetch;
     }

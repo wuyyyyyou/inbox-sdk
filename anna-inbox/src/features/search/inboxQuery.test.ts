@@ -132,7 +132,7 @@ describe("Inbox query language", () => {
     expect(splitInboxQueryTokens("to:cicala an")).toEqual([
       { text: "to:", kind: "field" },
       { text: "cicala ", kind: "value" },
-      { text: "an", kind: "operator" },
+      { text: "an", kind: "plain" },
     ]);
     expect(splitInboxQueryTokens("is:important AND is:").map((token) => token.kind)).toEqual([
       "field", "value", "plain", "operator", "plain", "field", "value",
@@ -142,6 +142,25 @@ describe("Inbox query language", () => {
       { text: "sent ", kind: "value" },
       { text: "AND", kind: "operator" },
     ]);
+  });
+
+  it("keeps incomplete logical operator prefixes as plain editing content", () => {
+    // 未完成的 a/an/o 只能按普通可编辑内容高亮（配合 is-editing 显示橙色），
+    // 只有完整确认的 AND/OR 才作为逻辑操作符高亮。
+    for (const prefix of ["a", "an", "o"]) {
+      expect(splitInboxQueryTokens(`to:cicala ${prefix}`)).toEqual([
+        { text: "to:", kind: "field" },
+        { text: "cicala ", kind: "value" },
+        { text: prefix, kind: "plain" },
+      ]);
+    }
+    for (const operator of ["and", "or"]) {
+      expect(splitInboxQueryTokens(`to:cicala ${operator}`)).toEqual([
+        { text: "to:", kind: "field" },
+        { text: "cicala ", kind: "value" },
+        { text: operator, kind: "operator" },
+      ]);
+    }
   });
 
   it("maps status suggestions to concise localized descriptions", () => {

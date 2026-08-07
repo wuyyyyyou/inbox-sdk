@@ -376,7 +376,10 @@ export function splitInboxQueryTokens(input: string): InboxQueryToken[] {
         value.text += trailing.text;
         tokens.pop();
       }
-      tokens.push({ text: raw.slice(raw.length - current.length), kind: "operator" });
+      // 仅完整确认的 AND/OR 作为逻辑操作符高亮；a/an/o 等不完整前缀按普通可编辑内容处理，
+      // 以便 HomeView 的 is-editing 样式将其标记为正在编辑（橙色）。
+      const isConfirmedOperator = current === "and" || current === "or";
+      tokens.push({ text: raw.slice(raw.length - current.length), kind: isConfirmedOperator ? "operator" : "plain" });
       return tokens;
     }
   }

@@ -5,7 +5,7 @@ import type {
   MailAttachmentMeta,
   QuickReplySuggestion,
 } from "../../types/mail";
-import { triggerBrowserDownload } from "../../shared/browserDownload";
+import { fetchAttachmentBlob, triggerBrowserDownload } from "../../shared/browserDownload";
 import {
   senderParts,
   splitAddresses,
@@ -192,13 +192,9 @@ export function resolveAttachmentAccess(payload: AttachmentDownloadPayload): Res
   throw new Error(String(payload.error || "Attachment content is unavailable."));
 }
 
-export async function materializeAttachmentAccess(access: ResolvedAttachmentAccess): Promise<ResolvedAttachmentAccess> {
+export async function materializeAttachmentAccess(access: ResolvedAttachmentAccess, signal?: AbortSignal): Promise<ResolvedAttachmentAccess> {
   if (access.kind === "blob") return access;
-  const response = await fetch(access.url);
-  if (!response.ok) {
-    throw new Error(`Attachment fetch failed with ${response.status}`);
-  }
-  const responseBlob = await response.blob();
+  const responseBlob = await fetchAttachmentBlob(access.url, signal);
   const blob = responseBlob.type || !access.mimeType
     ? responseBlob
     : new Blob([await responseBlob.arrayBuffer()], { type: access.mimeType });
@@ -218,8 +214,9 @@ export async function triggerAttachmentDownload(
   access: ResolvedAttachmentAccess,
   filename?: string,
   ownerDocument: Document = document,
+  signal?: AbortSignal,
 ): Promise<void> {
-  await triggerBrowserDownload(access.url, filename || access.filename || "attachment", ownerDocument);
+  await triggerBrowserDownload(access.url, filename || access.filename || "attachment", ownerDocument, signal);
 }
 
 export function deriveReplyToAddress(message: InboxThreadMessage | undefined, mailbox: string) {
