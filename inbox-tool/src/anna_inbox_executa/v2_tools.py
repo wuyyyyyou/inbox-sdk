@@ -5,6 +5,7 @@ import re
 from html import escape as html_escape
 
 from anna_inbox_executa.common import *
+from anna_inbox_executa.common import _aps_files, _should_use_aps_files
 from anna_inbox_executa.card_tools import _handle_generate_draft_background, _handle_summarize_background, _serialize_card_for_frontend
 from anna_inbox_executa.gmail_tools import _dedup_body, _resolve_cid_images, _sanitize_email_html
 from anna_inbox_executa.sampling_tools import *
@@ -196,36 +197,63 @@ def _attachment_path_segment(value: str) -> str:
     return _safe_attachment_filename(value)[:120] or "attachment"
 
 
+def _is_attachment_upload_retryable(error: BaseException) -> bool:
+    """判断对象尚未落地或当前 pending attempt 未完成的可重试错误。"""
+    detail = str(error).lower()
+    return any(
+        marker in detail
+        for marker in (
+            "upload_not_found",
+            "upload not found",
+            "pending_upload",
+            "upload incomplete",
+            "upstream_error",
+            "head_object",
+            "404",
+        )
+    )
+
+
 def _put_presigned_url_sync(url: str, headers: dict[str, Any], content: bytes, mime_type: str) -> str:
+    """使用签名方提供的请求头上传，并返回可选的 ETag。
+
+    预签名请求的 headers 属于签名契约，不能为了通用 HTTP 客户端而注入
+    Connection、User-Agent、Content-Length 或未经签名的 Content-Type。
+    """
     import subprocess
     import tempfile
 
     normalized_headers = {str(k): str(v) for k, v in (headers or {}).items()}
-    if not any(key.lower() == "content-type" for key in normalized_headers):
-        normalized_headers["Content-Type"] = mime_type or "application/octet-stream"
-    if not any(key.lower() == "content-length" for key in normalized_headers):
-        normalized_headers["Content-Length"] = str(len(content))
-    if not any(key.lower() == "user-agent" for key in normalized_headers):
-        normalized_headers["User-Agent"] = "anna-inbox-attachment-upload/1.0"
-    if not any(key.lower() == "connection" for key in normalized_headers):
-        normalized_headers["Connection"] = "close"
 
     helper = r"""
 import json
 import sys
-import urllib.request
+import http.client
+from urllib.parse import urlsplit
 
 payload = json.loads(sys.stdin.read())
 with open(payload["path"], "rb") as handle:
     data = handle.read()
-request = urllib.request.Request(
-    payload["url"],
-    data=data,
-    headers=payload["headers"],
-    method="PUT",
-)
-with urllib.request.urlopen(request, timeout=float(payload["timeout"])) as response:
+parts = urlsplit(payload["url"])
+if parts.scheme not in ("http", "https") or not parts.hostname:
+    raise RuntimeError("presigned PUT URL must use HTTP(S)")
+connection_type = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+connection = connection_type(parts.hostname, parts.port, timeout=float(payload["timeout"]))
+try:
+    target = parts.path or "/"
+    if parts.query:
+        target += "?" + parts.query
+    connection.putrequest("PUT", target, skip_accept_encoding=True, skip_host=True)
+    for key, value in payload["headers"].items():
+        connection.putheader(str(key), str(value))
+    connection.endheaders()
+    connection.send(data)
+    response = connection.getresponse()
+    if not 200 <= int(response.status) < 300:
+        raise RuntimeError(f"presigned PUT returned HTTP {response.status}")
     sys.stdout.write(str(response.headers.get("ETag") or "").strip('"'))
+finally:
+    connection.close()
 """
     temp_path = ""
     try:
@@ -283,49 +311,48 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
     # 1) Host transient upload（历史可用路径；不依赖 storage_provider）
     host_presign_started = False
     host_unavailable_error = ""
-    try:
-        negotiated = await host_upload.negotiate(
-            filename=filename,
-            mime_type=mime_type,
-            size_bytes=len(content),
-            purpose="user_artifact",
-            metadata=meta,
-            timeout=HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS,
-        )
-        host_presign_started = True
-        put_url = str(negotiated.get("put_url") or "")
-        r2_key = str(negotiated.get("r2_key") or "")
-        if not put_url or not r2_key:
-            raise RuntimeError("Host upload did not return a presigned upload target.")
-        put_error: Exception | None = None
+    for host_attempt in range(2):
         try:
-            await asyncio.to_thread(
-                _put_presigned_url_sync,
-                put_url,
-                negotiated.get("headers") or {},
-                content,
-                mime_type,
+            # 每次 attempt 都重新协商，避免确认失败后复用已失效的 r2_key。
+            negotiated = await host_upload.negotiate(
+                filename=filename,
+                mime_type=mime_type,
+                size_bytes=len(content),
+                purpose="user_artifact",
+                metadata=meta,
+                timeout=HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS,
             )
-        except Exception as exc:
-            put_error = exc
-            log(f"host attachment presigned PUT returned error before confirm: {type(exc).__name__}: {exc}")
-        if put_error is None:
+            host_presign_started = True
+            put_url = str(negotiated.get("put_url") or "")
+            r2_key = str(negotiated.get("r2_key") or "")
+            if not put_url or not r2_key:
+                raise RuntimeError("Host upload did not return a presigned upload target.")
+            await asyncio.to_thread(
+                _put_presigned_url_sync, put_url, negotiated.get("headers") or {}, content, mime_type
+            )
             result = await host_upload.confirm(r2_key=r2_key, timeout=HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS)
-        else:
+            result["storage_key"] = r2_key
+            return result
+        except Exception as host_exc:
+            # 404/UPLOAD_NOT_FOUND 等表示对象尚未落地，必须从 negotiate 开始重做。
+            if host_attempt == 0 and _is_attachment_upload_retryable(host_exc):
+                log(f"host attachment upload retryable failure: {type(host_exc).__name__}")
+                continue
+            if host_presign_started and not _is_attachment_upload_retryable(host_exc):
+                raise
             try:
-                result = await host_upload.confirm(r2_key=r2_key, timeout=HOST_UPLOAD_REVERSE_RPC_TIMEOUT_SECONDS)
-            except Exception as confirm_exc:
-                raise RuntimeError(
-                    f"Temporary attachment upload failed after presigned PUT error: {put_error}"
-                ) from confirm_exc
-        result["storage_key"] = r2_key
-        return result
-    except Exception as host_exc:
-        # 已开始 PUT 的失败不再吞掉；仅「协商阶段不可用」时继续 APS 回退。
-        if host_presign_started:
-            raise
-        host_unavailable_error = f"{type(host_exc).__name__}: {host_exc}"
-        log(f"host attachment upload unavailable: {host_unavailable_error}")
+                host_unavailable_error = f"{type(host_exc).__name__}"
+                log(f"host attachment upload unavailable: {host_unavailable_error}")
+            except Exception:
+                pass
+            if not host_presign_started:
+                break
+            if host_attempt == 1 and host_presign_started and _is_attachment_upload_retryable(host_exc):
+                break
+            if host_presign_started:
+                raise
+
+    # Host 不可用或对象落地失败时，继续使用 APS Files；权限、配额等非重试错误已在上面直接抛出。
 
     # 2) APS Files 回退
     path = (
@@ -333,52 +360,54 @@ async def _upload_attachment_for_download(mailbox: str, card_id: str, attachment
         f"{_attachment_path_segment(card_id)}/{_attachment_storage_id(attachment)}/"
         f"{_attachment_path_segment(filename)}"
     )
-    begin = await _aps_files.upload_begin(
-        path=path,
-        size_bytes=len(content),
-        content_type=mime_type,
-        metadata={
-            "mailbox": mailbox,
-            "card_id": card_id,
-            "message_id": str(attachment.get("message_id") or ""),
-            "filename": filename,
-        },
-        scope="user",
-        timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
-    )
-    put_url = str(begin.get("put_url") or begin.get("presigned_url") or "")
-    if not put_url:
-        detail = f" Host upload failed first: {host_unavailable_error}" if host_unavailable_error else ""
-        raise RuntimeError(f"Anna Files did not return an upload URL.{detail}")
-    upload_headers = begin.get("headers") or begin.get("fields") or {}
-    put_error = None
-    etag = ""
-    try:
-        etag = await asyncio.to_thread(_put_presigned_url_sync, put_url, upload_headers, content, mime_type)
-    except Exception as exc:
-        put_error = exc
-        log(f"aps files presigned PUT returned error before complete: {type(exc).__name__}: {exc}")
-    try:
-        await _aps_files.upload_complete(
+    for aps_attempt in range(2):
+        try:
+            # 每次循环都是新的 begin；失败后不能再次 complete 同一个 pending attempt。
+            begin = await _aps_files.upload_begin(
+                path=path,
+                size_bytes=len(content),
+                content_type=mime_type,
+                metadata={
+                    "mailbox": mailbox,
+                    "card_id": card_id,
+                    "message_id": str(attachment.get("message_id") or ""),
+                    "filename": filename,
+                },
+                scope="user",
+                timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
+            )
+            put_url = str(begin.get("put_url") or begin.get("presigned_url") or "")
+            if not put_url:
+                detail = f" Host upload failed first: {host_unavailable_error}" if host_unavailable_error else ""
+                if begin.get("fields") and not begin.get("headers"):
+                    raise RuntimeError(f"Anna Files returned fields without put_url/presigned_url.{detail}")
+                raise RuntimeError(f"Anna Files did not return an upload URL.{detail}")
+            etag = await asyncio.to_thread(
+                _put_presigned_url_sync, put_url, begin.get("headers") or {}, content, mime_type
+            )
+            await _aps_files.upload_complete(
+                path=path,
+                etag=etag or None,
+                size_bytes=len(content),
+                content_type=mime_type,
+                scope="user",
+                timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
+            )
+        except Exception as complete_exc:
+            if aps_attempt == 0 and _is_attachment_upload_retryable(complete_exc):
+                log(f"aps attachment completion retryable failure: {type(complete_exc).__name__}")
+                continue
+            raise
+        result = await _aps_files.download_url(
             path=path,
-            etag=etag or None,
-            size_bytes=len(content),
-            content_type=mime_type,
+            expires_in=900,
             scope="user",
             timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
         )
-    except Exception as complete_exc:
-        if put_error is not None:
-            raise RuntimeError(f"Attachment file upload failed after presigned PUT error: {put_error}") from complete_exc
-        raise
-    result = await _aps_files.download_url(
-        path=path,
-        expires_in=900,
-        scope="user",
-        timeout=APS_FILES_REVERSE_RPC_TIMEOUT_SECONDS,
-    )
-    result["storage_key"] = path
-    return result
+        result["storage_key"] = path
+        return result
+
+    raise RuntimeError("Anna Files upload did not complete after retry.")
 
 
 def _download_presigned_url_sync(url: str) -> bytes:

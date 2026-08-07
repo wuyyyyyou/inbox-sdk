@@ -23,9 +23,11 @@ def check(label: str, condition: bool) -> None:
 
 class PutHandler(http.server.BaseHTTPRequestHandler):
     received_body = b""
+    received_headers: dict[str, str] = {}
 
     def do_PUT(self) -> None:
         length = int(self.headers.get("Content-Length") or "0")
+        PutHandler.received_headers = {str(key): str(value) for key, value in self.headers.items()}
         PutHandler.received_body = self.rfile.read(length)
         self.send_response(200)
         self.send_header("ETag", '"etag-local"')
@@ -113,6 +115,32 @@ class FakeApsFiles:
         }
 
 
+class FakeRetryHostUpload(FakeInlineOnlyHostUpload):
+    def __init__(self) -> None:
+        super().__init__()
+        self.confirm_calls = 0
+
+    async def confirm(self, **kwargs: Any) -> dict[str, Any]:
+        self.confirm_calls += 1
+        if self.confirm_calls == 1:
+            raise RuntimeError("UPLOAD_NOT_FOUND: head_object returned 404")
+        return await super().confirm(**kwargs)
+
+
+class FakeRetryApsFiles(FakeApsFiles):
+    async def upload_complete(self, **kwargs: Any) -> dict[str, Any]:
+        self.complete_calls.append(kwargs)
+        if len(self.complete_calls) == 1:
+            raise RuntimeError("-32029 pending_upload: R2 head_object failed (upload incomplete?)")
+        return {"completed": True}
+
+
+class FakeFieldsOnlyApsFiles(FakeApsFiles):
+    async def upload_begin(self, **kwargs: Any) -> dict[str, Any]:
+        self.begin_calls.append(kwargs)
+        return {"fields": {"Content-Type": kwargs["content_type"]}}
+
+
 async def main_async() -> None:
     from anna_inbox_executa import v2_tools
     from executa_sdk.host_upload import HostUploadClient
@@ -139,13 +167,14 @@ async def main_async() -> None:
     await negotiate_task
 
     PutHandler.received_body = b""
+    PutHandler.received_headers = {}
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), PutHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         etag = v2_tools._put_presigned_url_sync(
             f"http://127.0.0.1:{server.server_port}/upload",
-            {},
+            {"Content-Length": str(len(b"helper-bytes")), "X-Signed": "yes"},
             b"helper-bytes",
             "application/octet-stream",
         )
@@ -154,6 +183,9 @@ async def main_async() -> None:
         server.server_close()
     check("presigned helper returns etag", etag == "etag-local")
     check("presigned helper sends body", PutHandler.received_body == b"helper-bytes")
+    check("presigned helper keeps signed headers only", "User-Agent" not in PutHandler.received_headers)
+    check("presigned helper does not inject connection", "Connection" not in PutHandler.received_headers)
+    check("presigned helper sends signed custom header", PutHandler.received_headers.get("X-Signed") == "yes")
 
     original_aps_files = v2_tools._aps_files
     original_host_upload = v2_tools.host_upload
@@ -183,6 +215,19 @@ async def main_async() -> None:
     check("host preferred confirms once", fake_host.confirmed is True)
     check("host preferred skips APS begin", len(fake_aps_files.begin_calls) == 0)
 
+    # Host confirm 404 必须重新 negotiate，不能复用第一次的 r2_key。
+    retry_host = FakeRetryHostUpload()
+    v2_tools.host_upload = retry_host
+    try:
+        retry_host_result = await v2_tools._upload_attachment_for_download(
+            "user@example.com", "card-retry-host", {"filename": "invoice.pdf", "mime_type": "application/pdf"}, b"pdf-bytes"
+        )
+    finally:
+        v2_tools.host_upload = original_host_upload
+    check("host confirm 404 retries with a second negotiate", len(retry_host.negotiate_calls) == 2)
+    check("host retry confirms only the fresh attempt", retry_host.confirm_calls == 2)
+    check("host retry still returns download url", retry_host_result["download_url"].startswith("https://files.example.test/"))
+
     # Host 协商不可用时回退 APS Files。
     class _HostUnavailable:
         async def negotiate(self, **kwargs: Any) -> dict[str, Any]:
@@ -210,6 +255,41 @@ async def main_async() -> None:
     check("APS upload carries declared bytes", fake_aps_files.begin_calls[0]["size_bytes"] == len(b"pdf-bytes"))
     check("APS upload completes once", len(fake_aps_files.complete_calls) == 1)
     check("content bytes stay out of JSON result", "content" not in result and "content_b64" not in result)
+
+    # APS complete 的 pending/404 必须重新 begin，不能重复 complete 原 pending attempt。
+    retry_aps = FakeRetryApsFiles()
+    v2_tools._aps_files = retry_aps
+    v2_tools.host_upload = _HostUnavailable()
+    v2_tools._put_presigned_url_sync = lambda *args, **kwargs: "etag-retry"
+    try:
+        retry_aps_result = await v2_tools._upload_attachment_for_download(
+            "user@example.com", "card-retry-aps", {"filename": "invoice.pdf", "mime_type": "application/pdf"}, b"pdf-bytes"
+        )
+    finally:
+        v2_tools._aps_files = original_aps_files
+        v2_tools.host_upload = original_host_upload
+        v2_tools._put_presigned_url_sync = original_put
+    check("APS pending complete retries with a second begin", len(retry_aps.begin_calls) == 2)
+    check("APS retries complete each fresh attempt once", len(retry_aps.complete_calls) == 2)
+    check("APS retry returns download url after complete", retry_aps_result["url"].startswith("https://files.example.test/"))
+
+    fields_only_aps = FakeFieldsOnlyApsFiles()
+    v2_tools._aps_files = fields_only_aps
+    v2_tools.host_upload = _HostUnavailable()
+    v2_tools._put_presigned_url_sync = lambda *args, **kwargs: "etag-fields"
+    try:
+        try:
+            await v2_tools._upload_attachment_for_download(
+                "user@example.com", "card-fields-only", {"filename": "invoice.pdf", "mime_type": "application/pdf"}, b"pdf-bytes"
+            )
+        except RuntimeError as exc:
+            check("fields-only APS response is a protocol error", "fields without put_url" in str(exc))
+        else:
+            raise AssertionError("fields-only APS response must fail")
+    finally:
+        v2_tools._aps_files = original_aps_files
+        v2_tools.host_upload = original_host_upload
+        v2_tools._put_presigned_url_sync = original_put
 
     # Gmail 的不透明附件令牌可能超过平台对对象路径段的 128 字符限制。
     long_attachment_token = "eyJ" + "a" * 256
