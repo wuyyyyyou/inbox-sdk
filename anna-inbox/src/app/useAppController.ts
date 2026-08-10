@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ensureConfirmedThreadReference } from "./aiThreadReferences";
+import { ensureConfirmedThreadReference, stripInternalThreadReferences } from "./aiThreadReferences";
 import {
   cancelAiAgentTurn,
   clearAiAgentSession,
@@ -1271,6 +1271,8 @@ export function useAppController() {
   const inboxSyncInProgress = useRef(false);
   const inboxAutoSyncInFlight = useRef(false);
   const inboxAutoSyncPending = useRef<{ mailbox: string; days: number } | null>(null);
+  /** 记录最近一次快照是否来自本地缓存，供启动后决定是否立即增量补齐。 */
+  const lastSnapshotSourceRef = useRef<"cache" | "gmail" | "deferred" | "">("");
   /** 扫描/Ask 进行中切邮箱时，延后 live Gmail 拉取，避免与扫描抢 Host getToken。 */
   const gmailBusyRef = useRef(false);
   const deferredInboxLoadTimer = useRef<number | null>(null);
@@ -1279,8 +1281,8 @@ export function useAppController() {
   const briefScanRunIdRef = useRef("");
   /** Ask/自定义扫描的 run_id，切换邮箱时一并取消。 */
   const activeBackgroundRunIdRef = useRef("");
-  /** 后端 env 默认侧栏路径（host/local）；localStorage 可覆盖。 */
-  const aiSidebarBackendModeRef = useRef<AiSidebarMode>("host");
+  /** 后端仅报告兼容状态；默认侧栏路径固定为 local，host 只能由 localStorage 显式覆盖。 */
+  const aiSidebarBackendModeRef = useRef<AiSidebarMode>("local");
   /** 每个会话首轮固定 AI 执行路径，避免追问在 Host/local 间切换。 */
   const aiSidebarModeByConversationRef = useRef(new Map<string, AiSidebarMode>());
   const askHistoryEtagsRef = useRef(new Map<string, string>());
@@ -1667,6 +1669,7 @@ export function useAppController() {
         const result = await loadMailboxSnapshotFromCache(mailbox, days, mailbox, { soft, skipLiveGmail });
         if (snapshotRequestMailbox.current !== mailbox) return false;
         if (!result.ok) return false;
+        lastSnapshotSourceRef.current = result.source || "";
         await preloadContactAvatars(mailbox, result.messages || []);
         console.info(`[inbox-startup] mailbox=${mailbox} days=${days} source=${result.source || "cache"} messages=${result.count} soft=${soft} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
         return result.count > 0;
@@ -2996,6 +2999,27 @@ export function useAppController() {
       const mailboxes = Array.isArray(payload.mailboxes) ? payload.mailboxes : [];
       const credentialsMessage = connectedAccountsStatusMessage(payload.credentials_status);
       if (credentialsMessage) showToast(credentialsMessage);
+      // 只有平台已确认拿到最新账号快照时，缺失邮箱才代表用户已在平台侧删除。
+      // 临时 discovery 失败不能触发本地缓存清理，否则网络抖动会误删用户数据。
+      if (payload.credentials_status?.code === "ok") {
+        const knownMailboxes = new Set([
+          ...state.mailboxes.map((item) => normalizedMailbox(item.email)),
+          normalizedMailbox(state.mailbox),
+        ].filter(Boolean));
+        const activeMailboxes = new Set(
+          mailboxes
+            .filter((item) => item.authorized !== false)
+            .map((item) => normalizedMailbox(item.email))
+            .filter(Boolean),
+        );
+        for (const staleMailbox of knownMailboxes) {
+          if (activeMailboxes.has(staleMailbox)) continue;
+          for (const key of inboxFeedCache.current.keys()) {
+            if (key.startsWith(`${staleMailbox}|`)) inboxFeedCache.current.delete(key);
+          }
+          void clearMailboxDatabase(staleMailbox);
+        }
+      }
       const selection = resolveMailboxSelection({
         mailboxes,
         selected: (Array.isArray(payload.selected) && payload.selected.length
@@ -3130,38 +3154,36 @@ export function useAppController() {
             briefMailboxFilter: [restoredMailbox],
           }));
         }
-        // 先读 display_range，再按该天数预热，避免先 30 天闪一下再清空加载 7 天
-        let rangeDays = clampInboxSettings(state.inboxSettings).display_range_days;
-        if (bootMailbox) {
-          const bootSettings = await loadInboxSettings(bootMailbox);
-          if (bootSettings?.display_range_days) rangeDays = bootSettings.display_range_days;
-        }
-        let inboxAvailable = bootMailbox
-          ? await preloadMailboxSnapshot(bootMailbox, rangeDays)
-          : false;
-        const mailboxState = await loadMailboxRegistry();
+        // 先刷新平台账号快照，再决定加载哪个邮箱。否则平台删除 A、切换到 B
+        // 时会先访问已失效的 A，既拖慢首页，也可能短暂展示 A 的缓存。
+        const mailboxState = await loadMailboxes();
         let currentMailbox = mailboxState.primary || bootMailbox;
         if (!currentMailbox) {
           const mailbox = await discoverMailbox();
           currentMailbox = mailbox || state.mailbox;
         }
-        if (currentMailbox && currentMailbox !== bootMailbox) {
-          const switchedSettings = await loadInboxSettings(currentMailbox);
-          if (switchedSettings?.display_range_days) {
-            rangeDays = switchedSettings.display_range_days;
+        if (bootMailbox && currentMailbox && bootMailbox !== currentMailbox
+          && !mailboxState.mailboxes.some((item) => normalizedMailbox(item.email) === bootMailbox && item.authorized !== false)) {
+          for (const key of inboxFeedCache.current.keys()) {
+            if (key.startsWith(`${bootMailbox}|`)) inboxFeedCache.current.delete(key);
           }
-          inboxAvailable = await preloadMailboxSnapshot(currentMailbox, rangeDays, true);
+          void clearMailboxDatabase(bootMailbox);
+        }
+        // 先读 display_range，再按该天数预热，避免先 30 天闪一下再清空加载 7 天。
+        let rangeDays = clampInboxSettings(state.inboxSettings).display_range_days;
+        let inboxAvailable = false;
+        if (currentMailbox) {
+          const currentSettings = await loadInboxSettings(currentMailbox);
+          if (currentSettings?.display_range_days) rangeDays = currentSettings.display_range_days;
+          inboxAvailable = await preloadMailboxSnapshot(currentMailbox, rangeDays);
         }
         // AI 侧栏历史独立于 Gmail 授权状态，启动时按当前邮箱从 APS 恢复。
         void loadAiAskHistory(currentMailbox);
-        void loadMailboxes().then(async (discoveredState) => {
-          const discoveredPrimary = normalizedMailbox(discoveredState.primary);
-          if (!discoveredPrimary || discoveredPrimary === currentMailbox) return;
-          const discoveredSettings = await loadInboxSettings(discoveredPrimary);
-          const discoveredDays = discoveredSettings?.display_range_days || rangeDays;
-          void preloadMailboxSnapshot(discoveredPrimary, discoveredDays, true);
-          void loadScanPlan(discoveredPrimary);
-        }).catch(() => undefined);
+        // 缓存首屏先展示；若确实命中缓存，立即推进 History/metadata 补齐，
+        // 不等 15 秒自动同步周期。冷启动无缓存时 list_inbox_emails 已完成该工作。
+        if (inboxAvailable && lastSnapshotSourceRef.current === "cache") {
+          void silentSyncInbox(rangeDays, currentMailbox);
+        }
         const authResult = await client.checkAnyGmailAuth();
         const systemAuthorized = Boolean(authResult?.authorized);
         const authWarning = (authResult as Record<string, unknown> | null | undefined)?.warning as string | undefined;
@@ -3220,7 +3242,7 @@ export function useAppController() {
       showToast(t("toast.initFailed", { detail: msg }));
       setState((s) => ({ ...s, loading: false, inboxLoading: false, inboxError: msg }));
     }
-  }, [client, discoverMailbox, getRuntime, loadAiAskHistory, loadCustomPlans, loadInboxSettings, loadMailboxRegistry, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshConnectivityStatus, showToast, state.mailbox, state.selectedMailboxes, state.storageProvider, t]);
+  }, [client, discoverMailbox, getRuntime, loadAiAskHistory, loadCustomPlans, loadInboxSettings, loadMailboxes, loadRunHistory, loadScanPlan, preloadMailboxSnapshot, refreshConnectivityStatus, showToast, silentSyncInbox, state.mailbox, state.selectedMailboxes, state.storageProvider, t]);
 
   // 初次连接失败不会再永久缓存 mock runtime；前台保持每 5 秒尝试一次完整初始化，
   // 成功后 effect 自动停止。业务 mutation 不在此处重放，仍需用户再次确认。
@@ -3393,11 +3415,10 @@ export function useAppController() {
       indexedSearchRequestSequence.current += 1;
       const previousMailbox = normalizedMailbox(state.mailbox);
       // 切换邮箱前先把进行中的会话冻结并写回原邮箱，避免停止扫描后丢失最后一轮提问。
-      try {
-        await saveCurrentAiConversationBeforeMailboxSwitch(previousMailbox);
-      } catch (error) {
+      // 会话保存只影响旧邮箱的历史，不应阻塞新邮箱首屏；保存失败也不能阻止切换。
+      void saveCurrentAiConversationBeforeMailboxSwitch(previousMailbox).catch((error) => {
         console.warn("[ask-history] switch save failed:", error instanceof Error ? error.message : String(error));
-      }
+      });
       // 立刻停上一邮箱扫描，释放 getToken / Gmail。
       stopActiveScans("switched mailbox");
       if (deferredInboxLoadTimer.current) {
@@ -4947,7 +4968,7 @@ const userRequest = String(options.prompt ?? state.customScanInput).trim();
       const conversationId = state.aiChatConversationId || createId("chat");
       const baseMessages = options.baseMessages
         ?? (state.aiChatConversationId === conversationId ? state.aiChatMessages : []);
-      // 侧栏选型交由 Host Agent；本地 start_ai_turn Router 不再参与该路径。
+      // 默认使用本地 start_ai_turn Router；host 仅保留为隐藏开发兼容路径。
       const generationRun = {
         runId: createId("generation"),
         cancelled: false,
@@ -5016,7 +5037,7 @@ const userRequest = String(options.prompt ?? state.customScanInput).trim();
         });
         // local 兼容环也不能收到列表展示时间窗；复合 Evidence 始终扫描全量索引缓存。
         const { display_range_days: _displayRangeDays, ...sidebarUiContext } = uiContext;
-        // local：本地 Router + Sampling；host：Host Agent Session。localStorage 覆盖后端默认。
+        // local：本地 Router + Sampling；host：Host Agent Session。仅 localStorage 可启用 host。
         let sidebarMode = aiSidebarModeByConversationRef.current.get(conversationId)
           ?? resolveAiSidebarMode(aiSidebarBackendModeRef.current);
         if (isBatchComposeMessage(userRequest, messagesWithUser) || pendingBatchComposeContinuation(messagesWithUser)) sidebarMode = "local";
@@ -5111,7 +5132,7 @@ const userRequest = String(options.prompt ?? state.customScanInput).trim();
               onText: (piece) => {
                 if (!isCurrentGeneration()) return;
                 streamed += piece;
-                const snapshot = stripTerminalDoneMarker(streamed);
+                const snapshot = stripInternalThreadReferences(stripTerminalDoneMarker(streamed));
                 setState((s) => ({
                   ...s,
                   aiChatMessages: s.aiChatMessages.map((message) => message.id === pendingMessage.id

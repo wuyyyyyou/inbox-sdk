@@ -58,25 +58,47 @@ describe("unwrapToolResult", () => {
     );
   });
 
-  it("retries a safe AI scan invocation after an HTML response", async () => {
-    vi.useFakeTimers();
-    const invoke = vi.fn()
-      .mockRejectedValueOnce(new Error("Unexpected token '<', '<!DOCTYPE' is not valid JSON"))
-      .mockResolvedValue({ success: true, data: { run_id: "scan-1", status: "queued" } });
+  it("does not retry a background scan start after a transport error", async () => {
+    const invoke = vi.fn().mockRejectedValue(new Error("fetch failed"));
     const client = new MailAgentClient(async () => ({
       connected: true,
       mode: "host",
       client: { tools: { invoke } },
     } as never));
-    const resultPromise = client.startCustomScan({ run_id: "scan-1" });
-    await vi.runAllTimersAsync();
-    await expect(resultPromise).resolves.toMatchObject({ run_id: "scan-1", status: "queued" });
-    expect(invoke).toHaveBeenCalledTimes(2);
-    expect(invoke).toHaveBeenLastCalledWith(
-      expect.objectContaining({ timeoutMs: 120_000 }),
+    await expect(client.startCustomScan({ run_id: "scan-1" })).rejects.toThrow("fetch failed");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith(
+      expect.objectContaining({ method: "start_custom_scan", timeoutMs: 120_000 }),
       expect.objectContaining({ timeoutMs: 120_000 }),
     );
-    vi.useRealTimers();
+  });
+
+  it("does not retry an inbox thread assist start after a transport error", async () => {
+    const invoke = vi.fn().mockRejectedValue(new Error("fetch failed"));
+    const client = new MailAgentClient(async () => ({
+      connected: true,
+      mode: "host",
+      client: { tools: { invoke } },
+    } as never));
+
+    await expect(client.startInboxThreadAssist({ thread_id: "thread-1" })).rejects.toThrow("fetch failed");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith(
+      expect.objectContaining({ method: "start_inbox_thread_assist" }),
+      expect.objectContaining({ timeoutMs: 180_000 }),
+    );
+  });
+
+  it("does not retry an AI turn start after a transport error", async () => {
+    const invoke = vi.fn().mockRejectedValue(new Error("fetch failed"));
+    const client = new MailAgentClient(async () => ({
+      connected: true,
+      mode: "host",
+      client: { tools: { invoke } },
+    } as never));
+
+    await expect(client.startAiTurn({ user_text: "hi" })).rejects.toThrow("fetch failed");
+    expect(invoke).toHaveBeenCalledTimes(1);
   });
 
   it("reconnects and retries a safe read on the replacement runtime", async () => {

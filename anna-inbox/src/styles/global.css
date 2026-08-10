@@ -1122,7 +1122,7 @@ body.is-resizing-ai-sidebar {
   min-width: 0;
   height: 100%;
   display: grid;
-  grid-template-rows: 72px 53px minmax(0, 1fr);
+  grid-template-rows: 72px 54px minmax(0, 1fr);
   overflow: hidden;
   background: #fff;
 }
@@ -2018,48 +2018,57 @@ body.is-resizing-ai-sidebar {
 }
 
 .mail-tabs {
+  min-width: 0;
+  min-height: 54px;
   display: flex;
-  align-items: stretch;
-  gap: 4px;
-  padding: 0 30px;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 30px;
   border-bottom: 1px solid var(--home-line);
   background: #fff;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.mail-tabs::-webkit-scrollbar {
+  display: none;
 }
 .mail-tabs button {
   position: relative;
+  flex: 0 0 auto;
+  min-height: 34px;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 18px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 9px;
   color: #747a8d;
-  font-size: 21px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 650;
   background: transparent;
 }
 .mail-tabs button::after {
-  content: "";
-  position: absolute;
-  left: 10px;
-  right: 10px;
-  bottom: -1px;
-  height: 2px;
-  border-radius: 2px;
-  background: transparent;
+  display: none;
 }
 .mail-tabs button.is-active {
   color: #334aba;
-}
-.mail-tabs button.is-active::after {
-  background: #5a72ee;
+  border-color: #dbe3ff;
+  background: #edf2ff;
 }
 .mail-tabs button span {
-  min-width: 21px;
-  padding: 2px 6px;
+  min-width: 20px;
+  padding: 2px 5px;
   border-radius: 999px;
   color: #9297a8;
-  font-size: 11px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
   text-align: center;
   background: #f0f1f5;
+}
+.mail-tabs button span.is-empty {
+  color: #b5bac7;
+  background: #f7f8fa;
 }
 .mail-tabs .mail-tabs-manage {
   position: relative;
@@ -2105,6 +2114,8 @@ body.is-resizing-ai-sidebar {
   transform: translateX(-50%) translateY(0);
 }
 .mail-tabs-meta {
+  min-width: max-content;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 20px;
@@ -2790,6 +2801,9 @@ body.is-resizing-ai-sidebar {
   .mail-topbar,
   .mail-tabs {
     padding-inline: 18px;
+  }
+  .mail-tabs {
+    gap: 4px;
   }
   .mailbox-title {
     min-width: 110px;

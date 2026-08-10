@@ -4,13 +4,12 @@ Anna Inbox 是运行在 Anna App 中的 Gmail 工作台。2.0 以完整收件箱
 
 ## 当前能力
 
-- Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 和 All mail 视图；Trash 邮件仅在 Trash 中展示且排除草稿，恢复时仅移除 Gmail 的 `TRASH` 标签。
-- Important / Other 分类、本地缓存、增量加载和 Gmail 刷新。
-- 星标、重要、Todo、Snooze、已读、完成和移至垃圾箱操作。
+- Inbox、Done、Sent、Spam 和 Trash 五个顶层箱组；Inbox 使用 All / Starred / Todos / Snoozed 紧凑子标签，Sent 使用 Sent / Drafts 子标签；Trash 邮件仅在 Trash 中展示且排除草稿，恢复时仅移除 Gmail 的 `TRASH` 标签。
+- 归档、星标、重要、Todo、Snooze、已读、完成和移至垃圾箱操作；Sent 与 Done 相互独立。
 - 线程详情、清洗后的文本或安全 HTML、AI overview、回复/转发/Compose 富文本草稿（`body_html`）、Cc·Bcc 与发送（10 秒可撤销）。
 - 收件附件预览/下载（优先 Host transient upload，回退 APS Files；本地 dev 保留 loopback）；回复与 Compose 外发附件（合计 ≤25MB）。
 - 多邮箱切换：立刻取消上一邮箱扫描，首屏读本地缓存，后台 180 天 priority + History 静默同步；缓存刷新后预热联系人头像。
-- 可折叠、可调宽的 Anna AI 侧栏：默认 Host Agent Session，只读检索经 `query_mail_evidence` 一次取证；host/local 仅由既有侧栏模式开关控制；支持当前邮件上下文、确认 Evidence 线程引用、可审阅草稿插入、停止/恢复与会话清理；本地可用 env/localStorage 走 `sidebar_local` 兼容路径。
+- 可折叠、可调宽的 Anna AI 侧栏：产品默认走本地 Sampling（`start_ai_turn`），只读检索经 `query_mail_evidence` 一次取证；host 仅保留为隐藏的 localStorage 调试开关；支持当前邮件上下文、确认 Evidence 线程引用、可审阅草稿插入、停止/恢复与会话清理。
 - Agent 工具仅执行只读检索、阅读、总结、草稿和整理建议；发送、删除、标签变更等状态修改仍须用户明确确认。
 - AI 检索默认扫描**本地已索引缓存**（非列表 7/30/60 窗）；`search_email`/`read_email` cache-only；Evidence 每轮最多一次 Gmail 托底：超最早边界 **或** 同步缺口（priority 未完成 / 空缓存）且严格零命中；完整索引普通零命中不回源；`sync_boundary` 标明覆盖范围。
 - 回复草稿两步流：先摘要意图并确认，用户确认后再出可审阅草稿卡片；「仅输出正文」类请求不展示卡片。Compose 支持批量保存草稿、按内容去重，并按当前邮箱资料名规范化 AI 落款。
@@ -138,8 +137,8 @@ App 与 Tool **主版本/次版本解耦，Patch 同步**（当前基线）：
 
 | 端 | 版本 | 权威文件 |
 | --- | --- | --- |
-| App | `2.3.4` | `anna-inbox/app.json` |
-| Tool | `2.4.4` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
+| App | `2.3.5` | `anna-inbox/app.json` |
+| Tool | `2.4.5` | `inbox-tool/manifest.json`（同步 `pyproject.toml`、`executa.json`、`min_version`） |
 
 Executa 身份以 `inbox-tool/manifest.json` 为单一来源。修改 `tool_id` 或 Tool 版本后运行：
 
@@ -154,6 +153,6 @@ python scripts/sync/sync_executa_identity.py --check
 
 当前文档索引见 [`anna-inbox/docs/README.md`](anna-inbox/docs/README.md)。
 
-- [2.4.4 架构与发布基线](anna-inbox/docs/2.4.4架构与发布基线.md)
+- [2.4.5 架构与发布基线](anna-inbox/docs/2.4.5架构与发布基线.md)
 - [邮箱同步 P0：缓存优先](anna-inbox/docs/邮箱同步P0缓存优先方案.md)
 - [平台超时诊断与反馈流程](anna-inbox/docs/平台超时诊断与反馈流程.md)

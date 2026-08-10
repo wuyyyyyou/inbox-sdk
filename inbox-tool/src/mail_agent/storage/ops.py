@@ -1352,17 +1352,42 @@ async def delete_mailbox_data(mailbox: str) -> dict:
     prefix = _mailbox_prefix(mbox)
     counts: dict[str, int] = {"keys": 0, "cache_keys": 0, "history_entries": 0}
 
-    # 1. Nuke all per-mailbox keys (covers cards, processed, scan state, scan plan, run records, contacts)
-    try:
-        result = await storage.list(f"{prefix}/", scope=default_scope())
-        for item in result.get("items", []):
+    async def delete_prefix(prefix_key: str, count_key: str) -> None:
+        """反复删除前缀下的第一批键，直到 APS/local 都确认没有残留。
+
+        不依赖单次 list 的默认返回上限，也不使用删除过程中可能失效的 cursor；
+        每轮重新读取前缀可以覆盖大邮箱缓存，避免只清理第一页后旧邮件仍可见。
+        """
+        while True:
             try:
-                await storage.delete(item.get("key", ""), scope=default_scope())
-                counts["keys"] += 1
+                result = await storage.list(
+                    prefix=prefix_key,
+                    limit=200,
+                    scope=default_scope(),
+                )
+            except TypeError:
+                # 兼容旧 StorageClient 的位置参数签名。
+                result = await storage.list(prefix_key, scope=default_scope())
             except Exception:
-                pass
-    except Exception:
-        pass
+                return
+            items = result.get("items") or []
+            keys = [
+                str(item.get("key") or "")
+                for item in items
+                if isinstance(item, dict) and str(item.get("key") or "")
+            ]
+            if not keys:
+                return
+            for key in keys:
+                try:
+                    await storage.delete(key, scope=default_scope())
+                    counts[count_key] += 1
+                except Exception:
+                    # 单键删除失败不应阻止同一邮箱其余数据继续清理。
+                    continue
+
+    # 1. Nuke all per-mailbox keys (covers cards, processed, scan state, scan plan, run records, contacts)
+    await delete_prefix(f"{prefix}/", "keys")
 
     # 2. Also delete the mailbox prefix key itself (some storages keep it as a directory marker)
     try:
@@ -1373,14 +1398,8 @@ async def delete_mailbox_data(mailbox: str) -> dict:
     # 3. Nuke Gmail cache — APS keys
     from ..mail_providers.gmail.adapter import _storage_cache_prefix
     cache_prefix = _storage_cache_prefix(mbox)
+    await delete_prefix(f"{cache_prefix}/", "cache_keys")
     try:
-        cache_result = await storage.list(f"{cache_prefix}/", scope=default_scope())
-        for item in cache_result.get("items", []):
-            try:
-                await storage.delete(item.get("key", ""), scope=default_scope())
-                counts["cache_keys"] += 1
-            except Exception:
-                pass
         await storage.delete(cache_prefix, scope=default_scope())
     except Exception:
         pass

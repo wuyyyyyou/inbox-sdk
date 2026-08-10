@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { ensureConfirmedThreadReference } from "./aiThreadReferences";
+import { ensureConfirmedThreadReference, stripInternalThreadReferences } from "./aiThreadReferences";
 
 const controllerSource = readFileSync(
   new URL("./useAppController.ts", import.meta.url),
@@ -18,14 +18,22 @@ const threadReferencesSource = readFileSync(
 describe("inbox startup settings", () => {
   it("loads inbox settings before snapshot preload so display range is respected", () => {
     expect(controllerSource).toMatch(
-      /const bootSettings = await loadInboxSettings\(bootMailbox\)/,
+      /const currentSettings = await loadInboxSettings\(currentMailbox\)/,
     );
     expect(controllerSource).toMatch(
-      /preloadMailboxSnapshot\(bootMailbox, rangeDays\)/,
+      /preloadMailboxSnapshot\(currentMailbox, rangeDays\)/,
     );
     expect(controllerSource).toMatch(
       /await Promise\.all\(\[[\s\S]*?loadInboxSettings\(currentMailbox\),/,
     );
+  });
+
+  it("discovers the current platform mailbox before loading its snapshot", () => {
+    expect(controllerSource.indexOf("const mailboxState = await loadMailboxes();")).toBeLessThan(
+      controllerSource.indexOf("inboxAvailable = await preloadMailboxSnapshot(currentMailbox, rangeDays);"),
+    );
+    expect(controllerSource).toContain('lastSnapshotSourceRef.current === "cache"');
+    expect(controllerSource).toContain("void silentSyncInbox(rangeDays, currentMailbox);");
   });
 });
 
@@ -49,13 +57,8 @@ describe("toast queue", () => {
 });
 
 describe("Manage Splits tooltip", () => {
-  it("uses only the custom tooltip instead of a browser title tooltip", () => {
-    const manageSplitsButton = homeViewSource.match(
-      /<button[\s\S]*?aria-label=\{t\("mail\.manageSplits"\)\}[\s\S]*?<\/button>/,
-    )?.[0];
-
-    expect(manageSplitsButton).toContain('data-tooltip={t("mail.manageSplits")}');
-    expect(manageSplitsButton).not.toContain('title="Manage Splits"');
+  it("does not render the retired Manage Splits control", () => {
+    expect(homeViewSource).not.toContain('aria-label={t("mail.manageSplits")}');
   });
 });
 
@@ -127,14 +130,15 @@ describe("AI scan invocation", () => {
     expect(controllerSource).toMatch(/scan_window_days: clampInt\(settings\.display_range_days, plan\.scan_window_days, 1, 90\)/);
   });
 
-  it("wires Host Agent session with optional local start_ai_turn sidebar path", () => {
+  it("defaults to local Sampling while keeping storage host as the Session override", () => {
     expect(controllerSource).toMatch(/runAiAgentTurn\(/);
     expect(controllerSource).toMatch(/buildAiAgentContent\(/);
     expect(controllerSource).toMatch(/buildAiTurnUiContext\(/);
     expect(controllerSource).toMatch(/resolveAiSidebarMode\(/);
+    expect(controllerSource).toContain('const aiSidebarBackendModeRef = useRef<AiSidebarMode>("local")');
     expect(controllerSource).toMatch(/selected_threads:/);
     const sidebarHandler = controllerSource.match(/async sendAiChatMessage\(options = \{\}\)[\s\S]*?retryAiMessage\(messageId\)/)?.[0] || "";
-    // 默认 host 走 session；local 开关下走 start_ai_turn 本地 Router。
+    // 默认 local 走 start_ai_turn；storage host 开关下走 Session。
     expect(sidebarHandler).toContain("runAiAgentTurn(");
     expect(sidebarHandler).toContain("client.startAiTurn(");
     expect(sidebarHandler).toContain('sidebarMode === "local"');
@@ -180,6 +184,20 @@ describe("AI scan invocation", () => {
     expect(controllerSource).toContain('subject || "Open email"');
   });
 
+  it("adds other confirmed references when their subjects are present", () => {
+    const result = ensureConfirmedThreadReference(
+      "已找到两封邮件：\n- Your receipt from Eleven Labs Inc. [THREAD_REF_eleven]\n- HK$54.00 payment to X was unsuccessful again",
+      new Set(["eleven", "x-payment"]),
+      {
+        eleven: "Your receipt from Eleven Labs Inc.",
+        "x-payment": "HK$54.00 payment to X was unsuccessful again",
+      },
+    );
+
+    expect(result).toContain("[THREAD_REF_eleven]");
+    expect(result).toContain("[THREAD_REF_x-payment]");
+  });
+
   it("does not append an unrelated confirmed candidate after an inline evidence reference", () => {
     const result = ensureConfirmedThreadReference(
       "该收据的实付金额为 **$11.00**。 [THREAD_REF_eleven]",
@@ -192,6 +210,11 @@ describe("AI scan invocation", () => {
 
     expect(result).toContain("[THREAD_REF_eleven]");
     expect(result).not.toContain("THREAD_REF_x-payment");
+  });
+
+  it("hides internal references while the answer is still streaming", () => {
+    expect(stripInternalThreadReferences("结论 [THREADREF_19e5d3b43916cdc6]"))
+      .toBe("结论");
   });
 
   it("renders evidence references as compact subject links", () => {
@@ -258,7 +281,7 @@ describe("mailbox switching", () => {
   });
 
   it("loads only the target mailbox Ask history and clears the active conversation on switch", () => {
-    expect(controllerSource).toContain("await saveCurrentAiConversationBeforeMailboxSwitch(previousMailbox)");
+    expect(controllerSource).toContain("void saveCurrentAiConversationBeforeMailboxSwitch(previousMailbox)");
     expect(controllerSource).toContain("void loadAiAskHistory(primary)");
     expect(controllerSource).toContain("askHistory: []");
     expect(controllerSource).toContain("aiChatMessages: []");

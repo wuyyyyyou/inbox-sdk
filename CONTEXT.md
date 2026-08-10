@@ -2,7 +2,7 @@
 
 Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Workspace、Mail Detail 和 Anna AI Sidebar 组成；AI 侧栏是唯一智能入口。Brief 产品面已下线，不再代表 2.0 主路径。
 
-当前发布基线：App `2.3.4` / Tool `2.4.4`。本版本：移除 Executa stub 中已废弃的 `distribution.binary_urls` 二进制分发声明，并同步 App 与 Tool 的 Patch 版本约束。继承：搜索查询统一 trim 规范化，保证 activeSearch、RPC 查询与控制器 indexedSearchQuery 完全一致；搜索态触底自动续页走 `loadMoreIndexedEmails`，Enter 键对已完整合法查询优先执行、不完整 AND/OR 前缀保持编辑态；搜索 loading/error/empty 文案本地化；收件附件访问共用 90 秒总预算（覆盖回源消息、Gmail 字节与 APS 上传，避免各阶段超时叠加超过前端 120s 工具预算）；附件下载增加 30s 超时、有界重试与 AbortSignal 取消；诊断安全字段扩展 `budget_seconds` / `detail` / `remaining_seconds`；继承：搜索补全与错误本地化、搜索并发结果防串写、刷新后搜索结果同步、收件附件本地缓存与 APS Files 稳定交付、历史附件字段兼容、搜索响应按帧大小分页保护、附件下载路径与 Gmail 附件令牌兼容性修复、富文本列表输入和颜色状态改进、Gmail Draft 同步暂时下线、Compose 草稿改由 Anna APS 单端持久化并按需读取正文（避免大草稿穿透 stdio 帧上限），AI Ask 历史改为邮箱作用域的 APS 存储（含切换邮箱保存/恢复与清理），Toast 升级为带过期回调的有界队列以支持「撤销后删除」等异步操作、Host Agent Session 流式会话与取消/恢复、AI 侧栏本地兼容路由、邮箱检索与同步稳定性增强、线程详情和 Compose 草稿交互完善、中英文界面切换、线程摘要按 locale 隔离缓存、Reply All、富文本对齐/引用/安全粘贴、附件文件名与大小校验、响应式邮件 HTML 表格和受控 CID 图片渲染、reverse RPC 全链路 `params.context.invoke_id` 注入与跨线程 re-bind、Evidence Gmail 托底、回复草稿两步确认流、列表固定首屏 100 + 触底加载、180 天 priority + 无硬顶 backfill、`query_mail_evidence` cache-only 主路径、P0 本地评测。
+当前发布基线：App `2.3.5` / Tool `2.4.5`。本版本：Inbox Workspace 收敛为 5 个顶层箱组（Inbox / Done / Sent / Spam / Trash），Inbox 与 Sent 使用紧凑子标签（All / Starred / Todos / Snoozed；Sent / Drafts），下线旧 Important/Other/自定义 Split 导航与 Manage Splits；Sent 邮件不再隐含 Done，Done 为独立 workflow 状态；新增归档操作；AI 侧栏产品默认走本地 Sampling（host 仅保留隐藏 localStorage 调试开关）；邮箱发现以平台快照为准，平台删除的邮箱自动清理本地数据；`上周/last week` 检索按完整自然周解析。继承：Executa stub 移除 `distribution.binary_urls`、搜索查询统一 trim 规范化、搜索态触底自动续页、收件附件访问共用 90 秒总预算、附件下载 30s 超时/有界重试/AbortSignal 取消、诊断安全字段扩展 `budget_seconds` / `detail` / `remaining_seconds`；继承：搜索补全与错误本地化、搜索并发结果防串写、刷新后搜索结果同步、收件附件本地缓存与 APS Files 稳定交付、历史附件字段兼容、搜索响应按帧大小分页保护、附件下载路径与 Gmail 附件令牌兼容性修复、富文本列表输入和颜色状态改进、Gmail Draft 同步暂时下线、Compose 草稿改由 Anna APS 单端持久化并按需读取正文（避免大草稿穿透 stdio 帧上限），AI Ask 历史改为邮箱作用域的 APS 存储（含切换邮箱保存/恢复与清理），Toast 升级为带过期回调的有界队列以支持「撤销后删除」等异步操作、Host Agent Session 流式会话与取消/恢复、AI 侧栏本地兼容路由、邮箱检索与同步稳定性增强、线程详情和 Compose 草稿交互完善、中英文界面切换、线程摘要按 locale 隔离缓存、Reply All、富文本对齐/引用/安全粘贴、附件文件名与大小校验、响应式邮件 HTML 表格和受控 CID 图片渲染、reverse RPC 全链路 `params.context.invoke_id` 注入与跨线程 re-bind、Evidence Gmail 托底、回复草稿两步确认流、列表固定首屏 100 + 触底加载、180 天 priority + 无硬顶 backfill、`query_mail_evidence` cache-only 主路径、P0 本地评测。
 
 ## Language
 
@@ -16,7 +16,7 @@ Anna Inbox 2.0 是 Anna App 中的 Gmail 工作台。产品主界面由 Inbox Wo
 
 **Mailbox View**
 
-Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 或 All mail 中的一个视图。
+Inbox、Done、Sent、Spam 或 Trash 中的一个顶层箱组。Inbox 通过 All / Starred / Todos / Snoozed 子标签展示，Sent 通过 Sent / Drafts 子标签展示；旧 Important/Other/自定义 Split 与独立 Todos/Starred/Snoozed/Drafts/All 顶层导航已下线。
 
 **Mail Detail**
 
@@ -24,7 +24,7 @@ Inbox、Todos、Starred、Snoozed、Done、Drafts、Sent、Trash、Spam 或 All 
 
 **Anna AI Sidebar**
 
-主界面左侧的对话入口。默认创建 Host Agent Session，由 Host 在显式白名单中选型并调用 `query_mail_evidence`、写/改稿、整理建议和记忆工具；前端透传只读屏上上下文（不含把展示时间窗当检索边界）并消费流式文本与工具结果。host/local 路径仅由既有侧栏模式开关控制，不再提供独立 B 路径评测开关。本地可用 `ANNA_INBOX_AI_SIDEBAR_MODE=local` 或 localStorage 覆盖，走 `start_ai_turn(source=sidebar_local)`；其 route Sampling 选择 `query_mail_evidence` 时会同步生成 QueryPlan，避免重复 Sampling。侧栏支持取消当前 run、复用会话继续对话和清理会话；整理类仅产出确认卡片，须用户确认后 mutation。
+主界面左侧的对话入口。产品默认走本地 Sampling（`start_ai_turn(source=sidebar_local)`）多步 JSON 环，由本地 route 在白名单工具中选型并调用 `query_mail_evidence`、写/改稿、整理建议和记忆工具；host（Host Agent Session）仅保留为隐藏的 localStorage 调试开关，不再作为产品默认路径。前端透传只读屏上上下文（不含把展示时间窗当检索边界）并消费流式文本与工具结果。其 route Sampling 选择 `query_mail_evidence` 时会同步生成 QueryPlan，避免重复 Sampling。侧栏支持取消当前 run、复用会话继续对话和清理会话；整理类仅产出确认卡片，须用户确认后 mutation。
 
 **sync_boundary**
 

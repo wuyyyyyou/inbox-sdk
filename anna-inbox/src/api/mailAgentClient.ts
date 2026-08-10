@@ -352,11 +352,11 @@ export class MailAgentClient {
   }
 
   startInboxMailPrompt(args: Record<string, unknown>) {
-    return this.invoke<RunStatus>("start_inbox_mail_prompt", args, { retry: "safe" });
+    return this.invoke<RunStatus>("start_inbox_mail_prompt", args);
   }
 
   startComposeMailPrompt(args: Record<string, unknown>) {
-    return this.invoke<RunStatus>("start_compose_mail_prompt", args, { retry: "safe" });
+    return this.invoke<RunStatus>("start_compose_mail_prompt", args);
   }
 
   getInboxThreadDraft(mailbox: string, threadId: string) {
@@ -595,7 +595,7 @@ export class MailAgentClient {
   }
 
   startCustomScan(args: Record<string, unknown>) {
-    return this.invoke<RunStatus>("start_custom_scan", args, { timeoutMs: CUSTOM_SCAN_INVOKE_TIMEOUT_MS, retry: "safe" });
+    return this.invoke<RunStatus>("start_custom_scan", args, { timeoutMs: CUSTOM_SCAN_INVOKE_TIMEOUT_MS });
   }
 
   reRunCustomScan(args: Record<string, unknown>) {
@@ -604,7 +604,7 @@ export class MailAgentClient {
 
   /** 统一 AI 侧栏 turn：后端本地 Router + 白名单工具，可轮询 run。 */
   startAiTurn(args: Record<string, unknown>) {
-    return this.invoke<RunStatus>("start_ai_turn", args, { timeoutMs: CUSTOM_SCAN_INVOKE_TIMEOUT_MS, retry: "safe" });
+    return this.invoke<RunStatus>("start_ai_turn", args, { timeoutMs: CUSTOM_SCAN_INVOKE_TIMEOUT_MS });
   }
 
   searchIndexedEmails(mailbox: string, query: string, context: {

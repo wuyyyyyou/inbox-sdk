@@ -984,7 +984,7 @@ export function MailDetailDrawer({
     message.label_ids?.some((label) => label.toUpperCase() === "SENT")
     || isOutboundMessageForMailbox(message.from || undefined, mailbox)
   ));
-  const isDone = Boolean(message && (flags.done.includes(message.id) || isSent));
+  const isDone = Boolean(message && flags.done.includes(message.id));
   const previewableAttachments = useMemo(
     () => visibleThreadMessages.flatMap((item) => item.attachments
       .filter(isPreviewableAttachment)
@@ -2392,9 +2392,9 @@ export function MailDetailDrawer({
                 <button aria-label={t("detail.moveToTrash")} data-tooltip={t("detail.moveToTrash")} disabled={toolbarPending} onClick={() => void runThreadAction("trash")}><TrashIcon /></button>
                 <button
                   className={isDone ? "is-active is-done" : ""}
-                  aria-label={isSent ? t("detail.done.sent") : isDone ? t("detail.done.moveToInbox") : t("detail.done")}
-                  data-tooltip={isSent ? t("detail.done.sent") : isDone ? t("detail.done.moveToInbox") : t("detail.done")}
-                  disabled={toolbarPending || isSent}
+                  aria-label={isDone ? t("detail.done.moveToInbox") : isSent ? t("detail.done.sentOnly") : t("detail.done")}
+                  data-tooltip={isDone ? t("detail.done.moveToInbox") : isSent ? t("detail.done.sentOnly") : t("detail.done")}
+                  disabled={toolbarPending || (isSent && !isDone)}
                   onClick={() => onDoneMessage(message)}
                 ><DoneIcon /></button>
               </>

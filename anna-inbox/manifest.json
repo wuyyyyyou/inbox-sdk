@@ -16,7 +16,7 @@
   "required_executas": [
     {
       "tool_id": "bundled:inbox-executa",
-      "min_version": "2.4.4",
+      "min_version": "2.4.5",
       "version": "latest"
     }
   ],

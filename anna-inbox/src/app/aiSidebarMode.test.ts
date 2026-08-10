@@ -41,11 +41,17 @@ describe("aiSidebarMode", () => {
     expect(resolveAiSidebarMode("local")).toBe("host");
   });
 
-  it("falls back to backend then host", () => {
+  it("defaults to local regardless of the backend-reported mode", () => {
     installLocalStorage();
     expect(resolveAiSidebarMode("local")).toBe("local");
+    expect(resolveAiSidebarMode("host")).toBe("local");
+    expect(resolveAiSidebarMode("weird")).toBe("local");
+    expect(resolveAiSidebarMode(undefined)).toBe("local");
+  });
+
+  it("keeps host available only through the hidden storage override", () => {
+    installLocalStorage({ [AI_SIDEBAR_MODE_STORAGE_KEY]: "host" });
+    expect(resolveAiSidebarMode("local")).toBe("host");
     expect(resolveAiSidebarMode("host")).toBe("host");
-    expect(resolveAiSidebarMode("weird")).toBe("host");
-    expect(resolveAiSidebarMode(undefined)).toBe("host");
   });
 });

@@ -78,7 +78,7 @@ import {
   splitAddresses as splitMailAddresses,
 } from "../../shared/mailIdentity";
 
-type FeedFilter = "important" | "other" | "search" | `category:${string}`;
+type FeedFilter = "all" | "starred" | "todos" | "snoozed" | "sent" | "drafts" | "search" | `category:${string}`;
 type MailboxView =
   | "inbox"
   | "todos"
@@ -174,11 +174,9 @@ export function nextFeedRangeDays(currentDays: number): number | null {
 function isExpandableMailboxView(view: MailboxView): boolean {
   return (
     view === "inbox" ||
-    view === "starred" ||
     view === "sent" ||
     view === "trash" ||
-    view === "spam" ||
-    view === "all"
+    view === "spam"
   );
 }
 const AI_CONVERSATION_BOTTOM_THRESHOLD = 24;
@@ -207,15 +205,10 @@ export function isAiConversationNearBottom(
 
 const MAILBOX_VIEW_IDS: MailboxView[] = [
   "inbox",
-  "todos",
-  "starred",
-  "snoozed",
   "done",
-  "drafts",
   "sent",
-  "trash",
   "spam",
-  "all",
+  "trash",
 ];
 
 const MAILBOX_VIEW_LABEL_KEYS: Record<MailboxView, MessageKey> = {
@@ -225,9 +218,9 @@ const MAILBOX_VIEW_LABEL_KEYS: Record<MailboxView, MessageKey> = {
   snoozed: "mail.folder.snoozed",
   done: "mail.folder.done",
   drafts: "mail.folder.drafts",
-  sent: "mail.folder.sent",
-  trash: "mail.folder.trash",
-  spam: "mail.folder.spam",
+  sent: "mail.folder.outbox",
+  trash: "mail.folder.bin",
+  spam: "mail.folder.trash",
   all: "mail.folder.all",
 };
 
@@ -759,6 +752,30 @@ export function isTrashMessage(message: InboxMessage) {
   return hasMessageLabel(message, "TRASH");
 }
 
+export function isSpamMessage(message: InboxMessage) {
+  return hasMessageLabel(message, "SPAM");
+}
+
+export function isSnoozeActive(
+  message: InboxMessage,
+  workflow: Pick<InboxWorkflowState, "snoozed"> & { snoozedUntil?: Record<string, string> },
+  now = Date.now(),
+) {
+  if (!workflow.snoozed.includes(message.id)) return false;
+  const until = new Date(workflow.snoozedUntil?.[message.id] || "").getTime();
+  return Number.isFinite(until) && until > now;
+}
+
+export function nextActiveSnoozeDeadline(
+  workflow: Pick<InboxWorkflowState, "snoozed"> & { snoozedUntil?: Record<string, string> },
+  now = Date.now(),
+) {
+  const deadlines = workflow.snoozed
+    .map((id) => new Date(workflow.snoozedUntil?.[id] || "").getTime())
+    .filter((value) => Number.isFinite(value) && value > now);
+  return deadlines.length ? Math.min(...deadlines) : null;
+}
+
 export function gmailTrashUrl(mailbox: string) {
   return `https://mail.google.com/mail/?authuser=${encodeURIComponent(mailbox.trim())}#trash`;
 }
@@ -934,7 +951,28 @@ export function isDoneMessage(
   workflow: Pick<InboxWorkflowState, "done"> & { doneRemoved?: string[] },
 ) {
   if ((workflow.doneRemoved || []).includes(message.id)) return false;
-  return workflow.done.includes(message.id) || isSentMessage(message);
+  return workflow.done.includes(message.id);
+}
+
+export function sentMessageBadgeLabel(t: TranslateFn = tFallback) {
+  return t("mail.badge.sent");
+}
+
+export function filterInboxSubtabMessages(
+  messages: InboxMessage[],
+  filter: "all" | "starred" | "todos" | "snoozed" | string,
+  workflow: Pick<InboxWorkflowState, "todos" | "snoozed"> & {
+    snoozedUntil?: Record<string, string>;
+  },
+) {
+  return messages.filter((message) => {
+    const activeSnooze = isSnoozeActive(message, workflow);
+    if (filter === "snoozed") return activeSnooze;
+    if (activeSnooze) return false;
+    if (filter === "starred") return isStarredMessage(message);
+    if (filter === "todos") return workflow.todos.includes(message.id);
+    return true;
+  });
 }
 
 /** Apply one workflow mutation without relying on a React state updater. */
@@ -1023,7 +1061,11 @@ export function resolveSourceMessages(
         .map((id) => currentMessages.get(id))
         .filter(
           (message): message is InboxMessage =>
-            message !== undefined && !isTrashMessage(message),
+            message !== undefined &&
+            hasMessageLabel(message, "INBOX") &&
+            !isTrashMessage(message) &&
+            !isSpamMessage(message) &&
+            (mailboxView !== "snoozed" || isSnoozeActive(message, workflow)),
         ),
     );
   }
@@ -1042,10 +1084,19 @@ export function resolveSourceMessages(
     );
   }
   if (mailboxView === "inbox") {
+    const inboxSourceById = new Map(
+      inboxMessages.map((message) => [message.id, message]),
+    );
+    for (const id of workflow.snoozed) {
+      const message = currentMessages.get(id);
+      if (message) inboxSourceById.set(id, message);
+    }
     return uniqueLatestInboxThreads(
-      inboxMessages.filter(
+      [...inboxSourceById.values()].filter(
         (message) =>
-          hasMessageLabel(message, "INBOX") && !isTrashMessage(message),
+          hasMessageLabel(message, "INBOX") &&
+          !isTrashMessage(message) &&
+          !isSpamMessage(message),
       ),
     );
   }
@@ -1053,7 +1104,10 @@ export function resolveSourceMessages(
     return uniqueLatestInboxThreads(
       source.filter(
         (message) =>
-          hasMessageLabel(message, "STARRED") && !isTrashMessage(message),
+          hasMessageLabel(message, "INBOX") &&
+          hasMessageLabel(message, "STARRED") &&
+          !isTrashMessage(message) &&
+          !isSpamMessage(message),
       ),
     );
   if (mailboxView === "drafts")
@@ -1082,16 +1136,18 @@ export function resolveSourceMessages(
     return uniqueLatestInboxThreads(
       source.filter(
         (message) =>
-          hasMessageLabel(message, "SPAM") && !isTrashMessage(message),
+          hasMessageLabel(message, "SPAM") &&
+          !hasMessageLabel(message, "TRASH"),
       ),
     );
   if (mailboxView === "all")
     return uniqueLatestInboxThreads(
       source.filter(
         (message) =>
-          !["TRASH", "SPAM", "CHAT"].some((label) =>
-            hasMessageLabel(message, label),
-          ),
+          hasMessageLabel(message, "INBOX") &&
+          !isTrashMessage(message) &&
+          !isSpamMessage(message) &&
+          !isSnoozeActive(message, workflow),
       ),
     );
   return uniqueLatestInboxThreads(source);
@@ -1144,6 +1200,7 @@ function InboxRow({
   onFlag,
   onThreadAction,
   onSnooze,
+  onArchive,
   onPrefetch,
   avatarUrl,
   selectable = false,
@@ -1165,6 +1222,7 @@ function InboxRow({
     message: InboxMessage,
   ) => void;
   onSnooze: (message: InboxMessage) => void;
+  onArchive: (message: InboxMessage) => void;
   onPrefetch: () => void;
   avatarUrl?: string;
   selectable?: boolean;
@@ -1270,13 +1328,11 @@ function InboxRow({
               <DraftIcon />
             </span>
           ) : !trashed && sentMessage ? (
-            <span className="mail-sent-badge" title={t("mail.badge.sentDone")}>
+            <span className="mail-sent-badge" title={sentMessageBadgeLabel(t)}>
               <SentIcon />
-              <span className="mail-sent-check">
-                <CheckIcon />
-              </span>
             </span>
-          ) : !trashed && isDone ? (
+          ) : null}
+          {!trashed && isDone ? (
             <span className="mail-sent-check" title={t("mail.badge.done")}>
               <CheckIcon />
             </span>
@@ -1384,22 +1440,20 @@ function InboxRow({
               <TrashIcon />
             </button>
             <button
+              aria-label={t("mail.action.archive")}
+              data-tooltip={t("mail.action.archive")}
+              onClick={() => onArchive(message)}
+            >
+              <InboxIcon />
+            </button>
+            <button
               className={isDone ? "is-active is-done" : ""}
               aria-label={
-                sentMessage
-                  ? "Sent and done"
-                  : isDone
-                    ? "Move to inbox"
-                    : "Done"
+                isDone ? t("mail.action.moveToInbox") : t("mail.action.done")
               }
               data-tooltip={
-                sentMessage
-                  ? "Sent and done"
-                  : isDone
-                    ? "Move to inbox"
-                    : "Done"
+                isDone ? t("mail.action.moveToInbox") : t("mail.action.done")
               }
-              disabled={sentMessage}
               onClick={() => onFlag("done", message)}
             >
               <CheckIcon />
@@ -3629,7 +3683,7 @@ function AccountRail() {
 export function HomeView() {
   const { state, actions } = useApp();
   const { t, locale } = useI18n();
-  const [filter, setFilter] = useState<FeedFilter>("important");
+  const [filter, setFilter] = useState<FeedFilter>("all");
   const [search, setSearch] = useState("");
   const [searchFocused, setSearchFocused] = useState(false);
   const [searchSuggestionIndex, setSearchSuggestionIndex] = useState(0);
@@ -3637,7 +3691,7 @@ export function HomeView() {
   const searchCaretPositionRef = useRef<number | null>(null);
   const [activeSearch, setActiveSearch] = useState("");
   const [filterBeforeSearch, setFilterBeforeSearch] =
-    useState<FeedFilter>("important");
+    useState<FeedFilter>("all");
   const parsedSearch = useMemo(() => parseInboxQuery(search), [search]);
   const searchSuggestions = useMemo(
     () => getInboxQuerySuggestions(search),
@@ -3677,26 +3731,22 @@ export function HomeView() {
       }
       if (directStatus) {
         setActiveSearch("");
-        if (directStatus === "important") {
-          setMailboxView("inbox");
-          setFilter("important");
-          return;
-        }
         if (directStatus === "all") {
-          setMailboxView("all");
+          setMailboxView("inbox");
+          setFilter("all");
           return;
         }
         if (directStatus === "unread") {
           setMailboxView("inbox");
-          setFilterBeforeSearch("important");
+          setFilterBeforeSearch("all");
           setActiveSearch(canonical);
           setFilter("search");
           return;
         }
-        // is:todo → Todos 视图；其余 is: 状态与侧栏视图同名
+        // Inbox 子标签与顶层箱组分离；重要/其他/自定义 Split 不再作为导航入口。
         const view =
           directStatus === "todo"
-            ? "todos"
+            ? "inbox"
             : directStatus === "is"
               ? "inbox"
               : directStatus;
@@ -3714,7 +3764,7 @@ export function HomeView() {
           ].includes(view)
         ) {
           setMailboxView(view as MailboxView);
-          if (view === "inbox") setFilter("other");
+          if (view === "inbox") setFilter(directStatus as FeedFilter);
           return;
         }
       }
@@ -3880,6 +3930,16 @@ export function HomeView() {
     () => ({ ...workflow, doneRemoved: flags.doneRemoved }),
     [flags.doneRemoved, workflow],
   );
+  const [snoozeClock, setSnoozeClock] = useState(0);
+  useEffect(() => {
+    const deadline = nextActiveSnoozeDeadline(compatibleWorkflow);
+    if (deadline === null) return;
+    const timer = window.setTimeout(
+      () => setSnoozeClock((value) => value + 1),
+      Math.max(0, deadline - Date.now()) + 1,
+    );
+    return () => window.clearTimeout(timer);
+  }, [compatibleWorkflow]);
   const workflowRef = useRef(workflow);
   workflowRef.current = workflow;
   const workflowMutationQueue = useRef(Promise.resolve());
@@ -4024,7 +4084,7 @@ export function HomeView() {
     requestedGmailCursors.current.clear();
     mailboxViewRef.current = "inbox";
     setMailboxView("inbox");
-    setFilter("important");
+    setFilter("all");
     setFeedWindow(DEFAULT_INBOX_FEED_WINDOW);
     return () => {
       cancelled = true;
@@ -4146,6 +4206,27 @@ export function HomeView() {
           flags,
           compatibleWorkflow,
         );
+    if (mailboxView === "sent" && filter === "drafts") {
+      const draftMessages = uniqueLatestInboxThreads(
+        [...inboxMessagesWithDrafts, ...inboxSnapshotMessagesWithDrafts].filter(
+          (message) => isDraftMessage(message) && !isTrashMessage(message),
+        ),
+      );
+      return [...draftMessages, ...composeDrafts.map((draft): InboxMessage => ({
+        id: draft.draft_mode === "forward" ? `forward:${draft.id}` : `compose:${draft.id}`,
+        mailbox,
+        date: draft.updated_at || draft.created_at || "",
+        from: mailbox,
+        to: draft.recipients.join(", "),
+        thread_id: draft.source_thread_id || undefined,
+        subject: draft.subject || "(no subject)",
+        snippet: composeDraftBodyPreview(draft).slice(0, 120),
+        body_preview: composeDraftBodyPreview(draft).slice(0, 120),
+        draft_body: composeDraftBodyPreview(draft),
+        draft_local: true,
+        label_ids: ["DRAFT"],
+      }))];
+    }
     if (mailboxView !== "drafts") return resolved;
     const composeMessages: InboxMessage[] = composeDrafts.map((draft) => ({
       id: draft.draft_mode === "forward" ? `forward:${draft.id}` : `compose:${draft.id}`,
@@ -4177,6 +4258,47 @@ export function HomeView() {
     state.indexedSearchQuery,
     activeSearch,
   ]);
+  const inboxTabMessages = useMemo(
+    () =>
+      resolveSourceMessages(
+        "inbox",
+        inboxMessagesWithDrafts,
+        inboxSnapshotMessagesWithDrafts,
+        flags,
+        compatibleWorkflow,
+      ),
+    [
+      compatibleWorkflow,
+      flags,
+      inboxMessagesWithDrafts,
+      inboxSnapshotMessagesWithDrafts,
+    ],
+  );
+  const sentTabMessages = useMemo(
+    () =>
+      resolveSourceMessages(
+        "sent",
+        inboxMessagesWithDrafts,
+        inboxSnapshotMessagesWithDrafts,
+        flags,
+        compatibleWorkflow,
+      ),
+    [
+      compatibleWorkflow,
+      flags,
+      inboxMessagesWithDrafts,
+      inboxSnapshotMessagesWithDrafts,
+    ],
+  );
+  const draftTabCount = useMemo(
+    () =>
+      uniqueLatestInboxThreads(
+        [...inboxMessagesWithDrafts, ...inboxSnapshotMessagesWithDrafts].filter(
+          (message) => isDraftMessage(message) && !isTrashMessage(message),
+        ),
+      ).length + composeDrafts.filter((draft) => !draft.source_thread_id).length,
+    [composeDrafts, inboxMessagesWithDrafts, inboxSnapshotMessagesWithDrafts],
+  );
   const inboxSplitMessages = useMemo(() => {
     // Important/Other 仍排除 todos/snoozed（由置顶区展示）；自定义 Split 与 is:unread 同数据源
     const plainInbox = workflowAwareInboxMessages.filter(
@@ -4419,20 +4541,10 @@ export function HomeView() {
     const categoryId = filter.startsWith("category:")
       ? filter.slice("category:".length)
       : "";
-    const splitMessages =
-      filter === "important"
-        ? inboxSplitMessages.important
-        : filter === "other"
-          ? inboxSplitMessages.other
-          : categoryId
-            ? inboxSplitMessages.custom[categoryId] || []
-            : null;
-    const splitMessageIds = splitMessages
-      ? new Set(splitMessages.map((message) => message.id))
-      : null;
+    const splitMessages = null;
+    const splitMessageIds = null;
     // 搜索 / 自定义 Split 与 is:unread 对齐：保留 todos/snoozed
-    const includeWorkflowInInbox =
-      filter === "search" || filter.startsWith("category:");
+    const includeWorkflowInInbox = filter === "search";
     return sourceMessages.filter((message) => {
       // 索引搜索已经在后端对全部本地缓存完成过滤；不能再按当前文件夹
       // 的 Todo/Done 投影二次排除，否则 is:done 等查询会丢失合法结果。
@@ -4442,9 +4554,7 @@ export function HomeView() {
         mailboxView === "inbox"
           ? includeWorkflowInInbox
             ? !isDoneMessage(message, compatibleWorkflow)
-            : !workflow.todos.includes(message.id) &&
-              !isDoneMessage(message, compatibleWorkflow) &&
-              !workflow.snoozed.includes(message.id)
+            : true
           : mailboxView === "todos"
             ? workflow.todos.includes(message.id)
             : mailboxView === "snoozed"
@@ -4455,13 +4565,9 @@ export function HomeView() {
                   ? isStarredMessage(message)
                   : true;
       const matchesFilter =
-        mailboxView !== "inbox"
+        mailboxView !== "inbox" || filter === "search"
           ? true
-          : filter === "important"
-            ? Boolean(splitMessageIds?.has(message.id))
-            : filter === "search"
-              ? true
-              : Boolean(splitMessageIds?.has(message.id));
+          : filterInboxSubtabMessages([message], filter, compatibleWorkflow).length > 0;
       if (!matchesView) return false;
       if (!matchesFilter) return false;
       if (filter === "search") return true;
@@ -4479,6 +4585,7 @@ export function HomeView() {
     parsedActiveSearch,
     sourceMessages,
     state.indexedSearchMessages,
+    snoozeClock,
   ]);
 
   useEffect(() => {
@@ -4486,7 +4593,7 @@ export function HomeView() {
     const id = filter.slice("category:".length);
     const categories = state.inboxSettings.custom_categories || [];
     if (!categories.some((split) => split.id === id))
-      setFilter("important");
+      setFilter("all");
   }, [filter, state.inboxSettings.custom_categories]);
 
   // 首屏阈值 + Show more：所有列表视图统一按 localLimit 截断展示
@@ -5340,32 +5447,7 @@ export function HomeView() {
         locale,
       );
     }
-    const normalImportant = displayedVisible.filter(
-      (message) =>
-        !isStarredMessage(message) && !workflow.todos.includes(message.id),
-    );
-    // pinned（星标/Todo）与列表最新条可能是同 thread 不同 message_id，合并后先按 thread 折叠
-    const source =
-      filter === "important"
-        ? splitImportantMessages(
-            uniqueLatestInboxThreads([
-              ...pinnedImportantMessages,
-              ...normalImportant,
-            ]),
-            state.inboxSettings,
-            new Set(workflow.todos),
-          ).flatMap((group) =>
-            group.kind === "important"
-              ? group.messages
-              : group.messages.map(
-                  (message) =>
-                    ({
-                      ...message,
-                      __groupLabel: group.kind.toUpperCase(),
-                    }) as InboxMessage & { __groupLabel?: string },
-                ),
-          )
-        : displayedVisible;
+    const source = displayedVisible;
     const groups: Array<{ label: string; messages: InboxMessage[] }> = [];
     for (const message of source) {
       const label =
@@ -5681,16 +5763,12 @@ export function HomeView() {
           });
         };
         if (action === "mark_done") {
-          // Gmail mark_read / 移出 INBOX 成功后再写本地 Done 样式
+          // Done 是独立 workflow 状态：只标记已读，不移除 INBOX。
           const previous = workflow;
-          const result = await actions.batchInboxActions(ids, "mark_done");
-          if (!result.ok) {
-            actions.showToast(t("toast.failedMarkDone"));
-            return;
-          }
+          await syncDoneMessagesRead(expandedMessages);
           setWorkflowFlag("done", expandedMessages, true);
           clearListSelection();
-          showUndoToast(result, previous);
+          showUndoToast({ count: ids.length, undo: async () => true }, previous);
           return;
         }
         const result = await actions.batchInboxActions(ids, action);
@@ -5739,6 +5817,20 @@ export function HomeView() {
       selectedInboxMessages,
       setWorkflowFlag,
     ],
+  );
+
+  const archiveInboxMessage = useCallback(
+    async (message: InboxMessage) => {
+      const expanded = expandInboxThreadMessages([message], messagesInThread);
+      const result = await actions.batchInboxActions(
+        expanded.map((item) => item.id),
+        "archive",
+      );
+      if (result.ok) {
+        actions.showToast(t("toast.archivedEmails", { count: result.count }));
+      }
+    },
+    [actions, messagesInThread, t],
   );
 
   const batchSnoozeSelected = useCallback(() => {
@@ -6451,7 +6543,7 @@ export function HomeView() {
         secondaryActionLabel: t("toast.view"),
         onSecondaryAction: () => {
           setMailboxView(wasDone ? "inbox" : "done");
-          setFilter(isImportantMessage(message) ? "important" : "other");
+          setFilter("all");
           setFolderOpen(false);
           setSelectedId("");
         },
@@ -6640,12 +6732,12 @@ export function HomeView() {
     setMailboxView(next);
     setFolderOpen(false);
     setSelectedId("");
-    if (next === "drafts") {
-      // 草稿箱只展示 APS Compose 草稿，不能沿用其他视图的搜索条件。
+    if (next === "sent") {
+      // 发件箱默认打开已发送，草稿子标签继续合并 Gmail 与 APS 草稿。
       setSearch("");
       setActiveSearch("");
     }
-    setFilter("important");
+    setFilter(next === "sent" ? "sent" : "all");
     // 切分类：瞬间切换，不播入场动画
     skipEnterAnimRef.current = true;
     setEnteringIds(new Set());
@@ -6667,7 +6759,7 @@ export function HomeView() {
       }
       return;
     }
-    if (next === "drafts") {
+    if (next === "sent") {
       void refreshStoredDrafts();
       return;
     }
@@ -7152,7 +7244,7 @@ export function HomeView() {
         onKeyDown={adjustSidebarWithKeyboard}
       />
       <main
-        className={`mail-workspace ${mailboxView === "inbox" && filter !== "search" ? "" : "is-folder-view"}`}
+        className={`mail-workspace ${(mailboxView === "inbox" || mailboxView === "sent") && filter !== "search" ? "" : "is-folder-view"}`}
       >
         <header className="mail-topbar">
           <div className="mailbox-picker">
@@ -7397,25 +7489,21 @@ export function HomeView() {
           </div>
         ) : null}
 
-        {mailboxView === "inbox" && filter !== "search" ? (
-          <nav className="mail-tabs" aria-label={t("mail.filters")}>
-            {(
-              [
-                ["important", t("mail.important"), inboxSplitMessages.important.length],
-                ["other", t("mail.other"), inboxSplitMessages.other.length],
-                ...(state.inboxSettings.custom_categories || [])
-                  .filter(
-                    (split) =>
-                      !split.hide_when_empty ||
-                      (inboxSplitMessages.custom[split.id] || []).length > 0,
-                  )
-                  .map((split) => [
-                    `category:${split.id}` as FeedFilter,
-                    split.name,
-                    (inboxSplitMessages.custom[split.id] || []).length,
-                  ]),
-              ] as Array<[FeedFilter, string, number]>
-            ).map(([key, label, count]) => (
+        {(mailboxView === "inbox" || mailboxView === "sent") && filter !== "search" ? (
+          <nav
+            className="mail-tabs"
+            aria-label={t("mail.filters")}
+            data-mailbox-subnav={mailboxView}
+          >
+            {((mailboxView === "inbox" ? [
+              ["all", t("mail.folder.all"), filterInboxSubtabMessages(inboxTabMessages, "all", compatibleWorkflow).length],
+              ["starred", t("mail.folder.starred"), filterInboxSubtabMessages(inboxTabMessages, "starred", compatibleWorkflow).length],
+              ["todos", t("mail.folder.todos"), filterInboxSubtabMessages(inboxTabMessages, "todos", compatibleWorkflow).length],
+              ["snoozed", t("mail.folder.snoozed"), filterInboxSubtabMessages(inboxTabMessages, "snoozed", compatibleWorkflow).length],
+            ] : [
+              ["sent", t("mail.folder.sent"), sentTabMessages.length],
+              ["drafts", t("mail.folder.drafts"), draftTabCount],
+            ]) as Array<[FeedFilter, string, number]>).map(([key, label, count]) => (
               <button
                 key={key}
                 className={filter === key ? "is-active" : ""}
@@ -7432,38 +7520,24 @@ export function HomeView() {
                 }}
               >
                 {label}
-                <span>{formatInboxTabCount(count)}</span>
+                <span className={count === 0 ? "is-empty" : ""}>
+                  {formatInboxTabCount(count)}
+                </span>
               </button>
             ))}
-            <button
-              className="icon-btn mail-tabs-manage"
-              type="button"
-              aria-label={t("mail.manageSplits")}
-              data-tooltip={t("mail.manageSplits")}
-              onClick={() => setSplitsOpen(true)}
-            >
-              <PlusIcon />
-            </button>
             <div className="mail-tabs-meta">
               {lastSyncedLabel ? <span>{lastSyncedLabel}</span> : null}
               <p>{inboxRangeLabel(days, t)}</p>
             </div>
           </nav>
         ) : null}
-        <SplitsManager
-          open={splitsOpen}
-          settings={state.inboxSettings}
-          onChange={actions.saveInboxSettings}
-          onClose={() => setSplitsOpen(false)}
-        />
-
         <section
           className={`mail-feed ${mailboxView === "trash" ? "is-trash-view" : ""}`}
           aria-live="polite"
           ref={mailFeedRef}
           onScroll={() => tryAutoLoadMoreEmails()}
         >
-          {(mailboxView === "inbox" || mailboxView === "drafts") &&
+          {(mailboxView === "inbox" || (mailboxView === "sent" && filter === "drafts")) &&
           selectedListKeys.size > 0 ? (
             <div className="inbox-selection-bar" role="toolbar" aria-label={t("mail.bulkActions")}>
               <button
@@ -7477,12 +7551,12 @@ export function HomeView() {
                 <CloseSmallIcon />
               </button>
               <span className="inbox-selection-count">
-                {mailboxView === "drafts"
+                {mailboxView === "sent" && filter === "drafts"
                   ? t("mail.draftCount", { count: selectedListKeys.size })
                   : t("mail.emailCount", { count: selectedListKeys.size })}
               </span>
               <div className="inbox-selection-actions">
-                {mailboxView === "drafts" ? (
+                {mailboxView === "sent" && filter === "drafts" ? (
                   <button
                     type="button"
                     className="inbox-selection-icon-btn is-primary"
@@ -7726,7 +7800,7 @@ export function HomeView() {
                 {t("mail.tryAgain")}
               </button>
             </div>
-          ) : draftSyncError && mailboxView === "drafts" && !hasGroupedMessages ? (
+          ) : draftSyncError && mailboxView === "sent" && filter === "drafts" && !hasGroupedMessages ? (
             <div className="mail-empty is-category-empty">
               <SearchIcon />
               <h2>{t("mail.draftsApsSyncFailed")}</h2>
@@ -7747,7 +7821,9 @@ export function HomeView() {
                 <p>{t("search.emptyDescription")}</p>
               </div>
             ) :
-            mailboxView !== "inbox" && mailboxView !== "all" ? (
+            (mailboxView !== "inbox" && mailboxView !== "all") ||
+            filter === "todos" ||
+            filter === "snoozed" ? (
               <div className="mail-empty is-category-empty">
                 <SearchIcon />
                 <h2>{t("mail.noResults")}</h2>
@@ -7803,10 +7879,11 @@ export function HomeView() {
                         void handleGmailThreadAction(operation, message)
                       }
                       onSnooze={openSnoozePicker}
+                      onArchive={(item) => void archiveInboxMessage(item)}
                       onSelect={() => void openMessageDetail(message)}
                       entering={enteringIds.has(message.id)}
                       selectable={
-                        (mailboxView === "drafts" && isDraftMessage(message)) ||
+                        ((mailboxView === "sent" && filter === "drafts") && isDraftMessage(message)) ||
                         mailboxView === "inbox"
                       }
                       selectedForBatch={selectedListKeys.has(
@@ -7821,7 +7898,7 @@ export function HomeView() {
                           return next;
                         });
                         // drafts 发送路径仍依赖 compose id 集合
-                        if (mailboxView === "drafts") {
+                        if (mailboxView === "sent" && filter === "drafts") {
                           setSelectedComposeDraftIds((current) => {
                             const next = new Set(current);
                             const id = message.id;
@@ -7849,7 +7926,12 @@ export function HomeView() {
             ))
           )}
           {/* 当前时间窗内更多由触底自动加载；底部仅保留扩时间窗 / Drafts */}
-          {canExpandFeedRange ? (
+          {canExpandFeedRange &&
+          !(
+            (mailboxView === "sent" && filter === "drafts") ||
+            filter === "todos" ||
+            filter === "snoozed"
+          ) ? (
             <button
               className="older-mail-btn"
               onClick={() => void expandFeedRange()}
@@ -7860,7 +7942,7 @@ export function HomeView() {
                 : olderRangeButtonLabel(days, nextRangeDays, t)}
             </button>
           ) : null}
-          {mailboxView === "drafts" && !state.inboxLoading && (!draftSyncError || hasGroupedMessages) ? (
+          {mailboxView === "sent" && filter === "drafts" && !state.inboxLoading && (!draftSyncError || hasGroupedMessages) ? (
             <button
               className="older-mail-btn"
               type="button"
@@ -7943,7 +8025,7 @@ export function HomeView() {
           loadContactAvatars={actions.loadContactAvatars}
           searchComposeContacts={actions.searchComposeContacts}
           latestThreadMessageId={latestSelectedThreadMessage?.id || ""}
-          autoOpenDraftComposer={mailboxView === "drafts"}
+          autoOpenDraftComposer={mailboxView === "sent" && filter === "drafts"}
         />
         {composeOpen || composeOpening || composeClosing ? (
           <ComposeView

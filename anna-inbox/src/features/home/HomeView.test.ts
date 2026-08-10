@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { PlusIcon, accountDisplayName, aiSearchStatus, aiThinkingElapsedLabel, composeDraftOverlayMessages, formatInboxTabCount, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, inboxLastSyncedLabel, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isMailFeedNearBottom, isSentMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextFeedRangeDays, renderAiUserMessageContent, resolveSourceMessages, restoreInboxWorkflow, senderParts, shouldShowImportantIcon, transitionInboxWorkflow } from "./HomeView";
+import { PlusIcon, accountDisplayName, aiSearchStatus, aiThinkingElapsedLabel, composeDraftOverlayMessages, filterInboxSubtabMessages, formatInboxTabCount, gmailAuthorizationError, gmailTrashUrl, hasMailboxScanError, inboxLastSyncedLabel, isAiConversationNearBottom, isDoneMessage, isDraftMessage, isGmailAuthorizationRequired, isImportantMessage, isMailFeedNearBottom, isSentMessage, isSnoozeActive, isSpamMessage, isStarredMessage, isTrashMessage, isUnreadMessage, mergeDraftOverlayMessages, mergeInboxSearchSourceMessages, messageParticipant, nextActiveSnoozeDeadline, nextFeedRangeDays, renderAiUserMessageContent, resolveSourceMessages, restoreInboxWorkflow, senderParts, sentMessageBadgeLabel, shouldShowImportantIcon, transitionInboxWorkflow } from "./HomeView";
 
 const homeViewSource = readFileSync(new URL("./HomeView.tsx", import.meta.url), "utf8");
 const workflowOf = (flags: { todos: string[]; snoozed: string[]; done: string[]; doneRemoved?: string[] }) => ({
@@ -15,6 +15,24 @@ describe("display range switching", () => {
   it("reprojects the cached inbox instead of triggering a Gmail rescan", () => {
     expect(homeViewSource).toContain('actions.loadCachedInboxEmails("all", configuredDays, 0, false)');
     expect(homeViewSource).not.toContain("// 用户在设置里改 display range\n      void syncInbox(configuredDays, true);");
+  });
+});
+
+describe("confirmed mailbox navigation", () => {
+  it("exposes five mailbox groups and removes legacy Inbox split entries", () => {
+    expect(homeViewSource).toContain('const MAILBOX_VIEW_IDS: MailboxView[] = [\n  "inbox",\n  "done",\n  "sent",\n  "spam",\n  "trash",\n];');
+    expect(homeViewSource).not.toContain('["important", t("mail.important")');
+    expect(homeViewSource).not.toContain('["other", t("mail.other")');
+    expect(homeViewSource).toContain('["all", t("mail.folder.all")');
+    expect(homeViewSource).toContain('["todos", t("mail.folder.todos")');
+  });
+
+  it("uses the same compact sub-navigation for Inbox and Sent", () => {
+    expect(homeViewSource).toContain('data-mailbox-subnav={mailboxView}');
+    expect(homeViewSource).toContain('setFilter(next === "sent" ? "sent" : "all");');
+    expect(homeViewSource).toContain('className={count === 0 ? "is-empty" : ""}');
+    expect(homeViewSource).toContain('["sent", t("mail.folder.sent")');
+    expect(homeViewSource).toContain('["drafts", t("mail.folder.drafts")');
   });
 });
 
@@ -275,7 +293,7 @@ describe("compose draft synchronization feedback", () => {
   it("does not render the bottom refresh action beside the empty-state retry", () => {
     expect(homeViewSource).toContain("const hasGroupedMessages = grouped.some");
     expect(homeViewSource).toContain(
-      'mailboxView === "drafts" && !state.inboxLoading && (!draftSyncError || hasGroupedMessages)',
+      'mailboxView === "sent" && filter === "drafts" && !state.inboxLoading && (!draftSyncError || hasGroupedMessages)',
     );
   });
 
@@ -315,7 +333,7 @@ describe("compose draft synchronization feedback", () => {
     const selectViewStart = homeViewSource.indexOf("const selectMailboxView = (next: MailboxView) => {");
     const selectViewEnd = homeViewSource.indexOf("const updateFlag", selectViewStart);
     const selectViewSource = homeViewSource.slice(selectViewStart, selectViewEnd);
-    expect(selectViewSource).toContain('if (next === "drafts")');
+    expect(selectViewSource).toContain('if (next === "sent")');
     expect(selectViewSource).toContain('setSearch("");');
     expect(selectViewSource).toContain('setActiveSearch("");');
   });
@@ -652,6 +670,41 @@ describe("messageParticipant", () => {
   });
 });
 
+describe("sent row state copy", () => {
+  it("uses Sent copy without implying Done", () => {
+    expect(sentMessageBadgeLabel()).toBe("Sent");
+    expect(homeViewSource).toContain('title={sentMessageBadgeLabel(t)}');
+    expect(homeViewSource).not.toContain('title={t("mail.badge.sentDone")}');
+    expect(homeViewSource).not.toContain('"Sent and done"');
+    expect(homeViewSource).not.toContain('? "Done"');
+  });
+});
+
+describe("snooze deadline timer boundary", () => {
+  it("schedules only the nearest future deadline and ignores missing/expired values", () => {
+    const now = Date.parse("2026-01-01T00:00:00Z");
+    expect(nextActiveSnoozeDeadline({ snoozed: ["expired", "missing", "next", "later"], snoozedUntil: {
+      expired: "2025-12-31T23:59:00Z",
+      next: "2026-01-01T00:00:05Z",
+      later: "2026-01-01T01:00:00Z",
+    } }, now)).toBe(now + 5000);
+    expect(nextActiveSnoozeDeadline({ snoozed: ["missing"], snoozedUntil: {} }, now)).toBeNull();
+    expect(homeViewSource).toContain("window.setTimeout");
+    expect(homeViewSource).toContain("window.clearTimeout(timer)");
+  });
+});
+
+describe("mail detail Sent state", () => {
+  it("does not treat an ordinary Sent message as Done", async () => {
+    const drawerSource = await import("../mail-detail/MailDetailDrawer").then(() =>
+      readFileSync(new URL("../mail-detail/MailDetailDrawer.tsx", import.meta.url), "utf8"),
+    );
+    expect(drawerSource).toContain('t("detail.done.sentOnly")');
+    expect(drawerSource).toContain('flags.done.includes(message.id)');
+    expect(drawerSource).not.toContain('flags.done.includes(message.id) || isSent');
+  });
+});
+
 describe("cached message label fallbacks", () => {
   it("recognizes important and starred labels without DTO booleans", () => {
     const cachedMessage = { id: "cached", label_ids: ["INBOX", "IMPORTANT", "STARRED"] };
@@ -733,6 +786,53 @@ describe("mergeInboxSearchSourceMessages", () => {
 });
 
 describe("resolveSourceMessages", () => {
+  it("shows active snooze only in the Snoozed Inbox subtab", () => {
+    const message = { id: "active-snooze", label_ids: ["INBOX"] };
+    const workflow = {
+      todos: [],
+      snoozed: [message.id],
+      done: [],
+      snoozedUntil: { [message.id]: "2099-01-01T00:00:00Z" },
+    };
+    expect(filterInboxSubtabMessages([message], "all", workflow)).toEqual([]);
+    expect(filterInboxSubtabMessages([message], "snoozed", workflow)).toEqual([message]);
+  });
+
+  it("returns an expired snooze to All and removes it from Snoozed", () => {
+    const message = { id: "expired-snooze", label_ids: ["INBOX"] };
+    const workflow = {
+      todos: [],
+      snoozed: [message.id],
+      done: [],
+      snoozedUntil: { [message.id]: "2020-01-01T00:00:00Z" },
+    };
+    expect(filterInboxSubtabMessages([message], "all", workflow)).toEqual([message]);
+    expect(filterInboxSubtabMessages([message], "snoozed", workflow)).toEqual([]);
+  });
+  it("keeps Inbox all as INBOX minus active snooze, without hiding todo or done labels", () => {
+    const messages = [
+      { id: "todo", label_ids: ["INBOX"], internal_date: "300" },
+      { id: "done", label_ids: ["INBOX"], internal_date: "200" },
+      { id: "snoozed", label_ids: ["INBOX"], internal_date: "100" },
+    ];
+    const flags = { todos: ["todo"], snoozed: ["snoozed"], done: ["done"], doneRemoved: [], drafts: [], saved: {} };
+    const workflow = { ...workflowOf(flags), snoozedUntil: { snoozed: "2099-01-01T00:00:00Z" } };
+    expect(resolveSourceMessages("inbox", messages, messages, flags, workflow).map((item) => item.id)).toEqual(["todo", "done", "snoozed"]);
+  });
+
+  it("returns snoozed mail after its deadline and maps Gmail SPAM/TRASH separately", () => {
+    const snoozed = { id: "snoozed", label_ids: ["INBOX"] };
+    const spam = { id: "spam", label_ids: ["SPAM"] };
+    const trash = { id: "trash", label_ids: ["TRASH"] };
+    const flags = { todos: [], snoozed: ["snoozed"], done: [], doneRemoved: [], drafts: [], saved: {} };
+    const workflow = { ...workflowOf(flags), snoozedUntil: { snoozed: "2020-01-01T00:00:00Z" } };
+    expect(isSnoozeActive(snoozed, workflow, Date.parse("2026-01-01T00:00:00Z"))).toBe(false);
+    expect(resolveSourceMessages("inbox", [snoozed], [snoozed], flags, workflow)).toEqual([snoozed]);
+    expect(resolveSourceMessages("spam", [], [spam, trash], flags, workflow)).toEqual([spam]);
+    expect(resolveSourceMessages("trash", [], [spam, trash], flags, workflow)).toEqual([trash]);
+    expect(isSpamMessage(spam)).toBe(true);
+    expect(isTrashMessage(trash)).toBe(true);
+  });
   it("projects trashed mail only into Trash while preserving its Gmail labels", () => {
     const trashed = {
       id: "trashed-1",
@@ -944,16 +1044,16 @@ describe("resolveSourceMessages", () => {
     expect(projected[1].has_attachment).toBeFalsy();
   });
 
-  it("treats sent mail as done by default", () => {
+  it("keeps sent mail separate from workflow done", () => {
     const snapshot = [
       { id: "sent-1", label_ids: ["SENT"], internal_date: "300" },
       { id: "done-1", label_ids: ["INBOX"], internal_date: "200" },
     ];
     const flags = { todos: [], snoozed: [], done: ["done-1"], doneRemoved: [], drafts: [], saved: {} };
 
-    expect(resolveSourceMessages("done", [], snapshot, flags, workflowOf(flags)).map((message) => message.id)).toEqual(["sent-1", "done-1"]);
+    expect(resolveSourceMessages("done", [], snapshot, flags, workflowOf(flags)).map((message) => message.id)).toEqual(["done-1"]);
     expect(isSentMessage(snapshot[0])).toBe(true);
-    expect(isDoneMessage(snapshot[0], workflowOf(flags))).toBe(true);
+    expect(isDoneMessage(snapshot[0], workflowOf(flags))).toBe(false);
   });
 
   it("treats mailbox-authored mail as sent even without an explicit SENT label", () => {
@@ -967,7 +1067,7 @@ describe("resolveSourceMessages", () => {
     const flags = { todos: [], snoozed: [], done: [], doneRemoved: [], drafts: [], saved: {} };
 
     expect(isSentMessage(sentMessage)).toBe(true);
-    expect(isDoneMessage(sentMessage, workflowOf(flags))).toBe(true);
+    expect(isDoneMessage(sentMessage, workflowOf(flags))).toBe(false);
   });
 
   it("lets sent mail be moved back out of done", () => {
@@ -975,7 +1075,7 @@ describe("resolveSourceMessages", () => {
     const flags = { todos: [], snoozed: [], done: [], doneRemoved: ["sent-1"], drafts: [], saved: {} };
 
     expect(resolveSourceMessages("done", [], [sentMessage], flags, workflowOf(flags))).toEqual([]);
-    expect(resolveSourceMessages("all", [], [sentMessage], flags, workflowOf(flags))).toEqual([sentMessage]);
+    expect(resolveSourceMessages("all", [], [sentMessage], flags, workflowOf(flags))).toEqual([]);
     expect(isDoneMessage(sentMessage, workflowOf(flags))).toBe(false);
   });
 });

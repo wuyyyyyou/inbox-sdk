@@ -70,7 +70,8 @@ def _discover_mailboxes() -> list[dict[str, Any]]:
     # 1. Anna Credentials API is the platform multi-account source of truth.
     # It returns metadata only; Gmail tokens are fetched per account on demand.
     refresh_platform_google_accounts()
-    for account in get_platform_accounts():
+    platform_accounts = get_platform_accounts()
+    for account in platform_accounts:
         email = str(account.get("email") or "").strip().lower()
         if not email or email in seen:
             continue
@@ -111,41 +112,69 @@ def _discover_mailboxes() -> list[dict[str, Any]]:
             })
 
     # 3. Legacy injected multi-token data, retained only for local migration.
-    multi_token_map = get_multi_token_map()
-    for multi_email in get_multi_token_emails():
-        if multi_email not in seen:
-            seen.add(multi_email)
-            results.append({
-                "email": multi_email, "provider": "gmail",
-                "auth_source": "platform_multi", "authorized": True,
-                "display_name": str(multi_token_map.get(multi_email, {}).get("display_name") or multi_token_map.get(multi_email, {}).get("name") or get_account_display_name(multi_email) or ""),
-                "avatar_url": str(multi_token_map.get(multi_email, {}).get("avatar_url") or multi_token_map.get(multi_email, {}).get("picture") or ""),
-                "last_auth_checked_at": beijing_now(),
-            })
+    # 3. Legacy injected multi-token data is only a local migration fallback.
+    # 一旦平台已返回 Connected accounts，平台快照就是唯一来源；否则旧 token
+    # 会把平台刚删除的邮箱重新发现出来，导致其缓存永远无法自动清理。
+    if not platform_accounts:
+        multi_token_map = get_multi_token_map()
+        for multi_email in get_multi_token_emails():
+            if multi_email not in seen:
+                seen.add(multi_email)
+                results.append({
+                    "email": multi_email, "provider": "gmail",
+                    "auth_source": "platform_multi", "authorized": True,
+                    "display_name": str(multi_token_map.get(multi_email, {}).get("display_name") or multi_token_map.get(multi_email, {}).get("name") or get_account_display_name(multi_email) or ""),
+                    "avatar_url": str(multi_token_map.get(multi_email, {}).get("avatar_url") or multi_token_map.get(multi_email, {}).get("picture") or ""),
+                    "last_auth_checked_at": beijing_now(),
+                })
 
-    # 4. 本地 dev token 文件兜底
-    for local in list_available_mailboxes_from_tokens():
-        local_email = str(local.get("email", "")).strip().lower()
-        if local_email and local_email not in seen:
-            seen.add(local_email)
-            local["avatar_url"] = str(local.get("avatar_url") or get_account_avatar_url(local_email) or "")
-            results.append(local)
+    # 4. 本地 dev token 文件兜底。平台已有账号快照时不能混入本地旧 token，
+    # 否则被平台删除的邮箱仍会被发现并阻止其数据清理。
+    if not platform_accounts:
+        for local in list_available_mailboxes_from_tokens():
+            local_email = str(local.get("email", "")).strip().lower()
+            if local_email and local_email not in seen:
+                seen.add(local_email)
+                local["avatar_url"] = str(local.get("avatar_url") or get_account_avatar_url(local_email) or "")
+                results.append(local)
 
     return results
 
 
 def _sync_list_mailboxes() -> dict[str, Any]:
-    from mail_agent.storage.ops import merge_discovered_mailboxes
+    from mail_agent.storage.ops import delete_mailbox_data, merge_discovered_mailboxes
 
     discovered = _discover_mailboxes()
     registry = _run_storage_query(merge_discovered_mailboxes(discovered))
+    credentials_status = get_platform_credentials_status()
+    if credentials_status.get("code") == "ok":
+        # 只有 Credentials API 明确返回成功时，才能把“本次未发现”解释为
+        # 平台已删除邮箱。临时网络故障会返回 unavailable，必须保留旧数据，
+        # 避免一次 discovery 抖动造成不可逆的数据删除。
+        discovered_emails = {
+            str(item.get("email") or "").strip().lower()
+            for item in discovered
+            if str(item.get("email") or "").strip()
+        }
+        stale_mailboxes = [
+            entry.email
+            for entry in registry.mailboxes
+            if entry.email not in discovered_emails and not entry.authorized
+        ]
+        for mailbox in stale_mailboxes:
+            # delete_mailbox_data 同时清理 APS、本地 Gmail 缓存、工作流、草稿、
+            # 联系人记忆和注册表，避免旧邮箱在更换账号后继续出现在首页。
+            _run_storage_query(delete_mailbox_data(mailbox))
+        if stale_mailboxes:
+            from mail_agent.storage.ops import get_mailbox_registry
+            registry = _run_storage_query(get_mailbox_registry())
     mailboxes = _registry_to_frontend(registry)
     return {
         "mailboxes": mailboxes,
         "selected": [item["email"] for item in mailboxes if item.get("selected")],
         "discovered": discovered,
         # 仅透传可安全展示的授权分类和下一步动作，绝不含 token。
-        "credentials_status": get_platform_credentials_status(),
+        "credentials_status": credentials_status,
     }
 
 

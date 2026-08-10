@@ -29,6 +29,15 @@ function removeDirectMailLinks(text: string): string {
     .trim();
 }
 
+export function stripInternalThreadReferences(text: string): string {
+  // 流式回答尚未拿到本轮 Evidence 的允许列表，内部标记不能先渲染给用户。
+  return String(text || "")
+    .replace(/\[THREAD_?REF_?[A-Za-z0-9_-]+\]/gi, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 export function ensureConfirmedThreadReference(
   text: string,
   allowedThreadIds: Set<string>,
@@ -41,9 +50,6 @@ export function ensureConfirmedThreadReference(
   const existingIds = new Set(
     Array.from(cleaned.matchAll(/\[THREAD_REF_([^\]\s]+)\]/g), (match) => match[1]),
   );
-  // 模板/模型已把证据嵌入结论时，其余确认命中仍只是候选，不能再自动追加。
-  // 这样链接与对应事实保持相邻，也不会把宽查询中的无关邮件伪装成同一结论的证据。
-  if (existingIds.size) return cleaned;
   // 优先把入口贴到包含邮件主题的发现项末尾，保持“结论 → 证据”的扫描阅读顺序。
   const lines = cleaned.split("\n");
   const fallbackLineIndex = lines.findIndex((line) => {
@@ -60,7 +66,9 @@ export function ensureConfirmedThreadReference(
     lines[lineIndex] = `${lines[lineIndex].trimEnd()} [THREAD_REF_${threadId}]`;
     existingIds.add(threadId);
   }
-  if (fallbackLineIndex >= 0) {
+  // 已有至少一个内嵌引用时，不把无法按主题定位的候选强行贴到别的事实行。
+  // 只有整段回答没有任何引用时，才保留原有的单个兜底入口行为。
+  if (!existingIds.size && fallbackLineIndex >= 0) {
     const fallbackThreadId = [...allowedThreadIds].find((threadId) => !existingIds.has(threadId));
     if (fallbackThreadId) {
       lines[fallbackLineIndex] = `${lines[fallbackLineIndex].trimEnd()} [THREAD_REF_${fallbackThreadId}]`;

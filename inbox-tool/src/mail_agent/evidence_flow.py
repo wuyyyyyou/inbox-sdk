@@ -137,8 +137,11 @@ def _explicit_relative_window_days(user_text: str) -> int | None:
         return 1
     if any(token in lowered for token in ("yesterday", "昨天")):
         return 2
-    if any(token in lowered for token in ("this week", "last week", "past week", "本周", "这周", "上周")):
+    if any(token in lowered for token in ("this week", "past week", "本周", "这周")):
         return 7
+    if any(token in lowered for token in ("last week", "上周")):
+        # -2 表示上一个完整自然周，与“最近 7 天”的滚动窗口不同。
+        return -2
     if any(token in text for token in ("上个月", "上月")) or re.search(r"\blast\s+month\b", lowered):
         return -1  # 自然月，由调用方展开为 after/before
     if any(token in lowered for token in ("this month", "本月", "这个月", "过去30天", "近30天", "最近30天")):
@@ -176,6 +179,36 @@ def _calendar_day_utc(now: datetime | None = None) -> datetime:
     return current.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+def _explicit_calendar_date_range(user_text: str) -> tuple[datetime, datetime] | None:
+    """解析用户明确写出的月日区间，返回起始日和结束日（均为 UTC 日历日）。
+
+    中文问题常把“上周（7月14日-7月20日）”作为自然语言补充说明，模型
+    可能只输出主题词，不能依赖 QueryPlan 自己保留日期。这里把该说明转换
+    为确定性的日期边界；结束日由调用方再加一天生成 Gmail 的排他 before。
+    """
+    text = " ".join(str(user_text or "").split())
+    match = re.search(
+        r"(?:(?P<year1>\d{4})\s*年\s*)?(?P<month1>\d{1,2})\s*月\s*(?P<day1>\d{1,2})\s*日?\s*"
+        r"(?:至|到|[-~～])\s*"
+        r"(?:(?P<year2>\d{4})\s*年\s*)?(?P<month2>\d{1,2})\s*月\s*(?P<day2>\d{1,2})\s*日?",
+        text,
+    )
+    if not match:
+        return None
+    current_year = _calendar_day_utc().year
+    year1 = int(match.group("year1") or current_year)
+    year2 = int(match.group("year2") or year1)
+    try:
+        start = datetime(year1, int(match.group("month1")), int(match.group("day1")), tzinfo=timezone.utc)
+        end = datetime(year2, int(match.group("month2")), int(match.group("day2")), tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    # 跨年区间省略结束年份时，按时间顺序推断为下一年。
+    if not match.group("year2") and end < start:
+        end = end.replace(year=end.year + 1)
+    return (start, end) if start <= end else None
+
+
 def _strip_date_clauses(query: str) -> str:
     """去掉 after/before 日期子句，并清理残留的 AND/OR。"""
     cleaned = re.sub(r"\s*(?:after|before):\d{4}-\d{2}-\d{2}\b", "", str(query or ""), flags=re.IGNORECASE).strip()
@@ -210,7 +243,16 @@ def _apply_relative_time_window(plan: dict[str, Any], user_text: str) -> None:
     # 已有日期时仍用确定性窗口替换，保证「最近 3/7/30 天」与「上个月」不被模型写错。
     query = _strip_date_clauses(query)
     today = _calendar_day_utc()
-    if days == -1:
+    explicit_range = _explicit_calendar_date_range(user_text)
+    if explicit_range:
+        start, end = explicit_range
+        date_clause = f"after:{start:%Y-%m-%d} AND before:{(end + timedelta(days=1)):%Y-%m-%d}"
+    elif days == -2:
+        # 上周/last week 指上一个完整的周一至周日，而不是今天往前滚动七天。
+        start = today - timedelta(days=today.weekday() + 7)
+        end = start + timedelta(days=6)
+        date_clause = f"after:{start:%Y-%m-%d} AND before:{(end + timedelta(days=1)):%Y-%m-%d}"
+    elif days == -1:
         # 上个月：自然月 1 日 00:00 起。
         first_this_month = today.replace(day=1)
         if first_this_month.month == 1:
