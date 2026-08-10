@@ -39,27 +39,5 @@
       "sensitive": true
     }
   ],
-  "tools": [],
-  "distribution": {
-    "type": "binary",
-    "binary_artifacts": {
-      "darwin-arm64": {
-        "path": "dist/inbox-tool/{version}/inbox-tool-{version}-darwin-arm64.tar.gz",
-        "entrypoint": "bin/inbox-tool"
-      },
-      "darwin-x86_64": {
-        "path": "dist/inbox-tool/{version}/inbox-tool-{version}-darwin-x86_64.tar.gz",
-        "entrypoint": "bin/inbox-tool"
-      },
-      "linux-x86_64": {
-        "path": "dist/inbox-tool/{version}/inbox-tool-{version}-linux-x86_64.tar.gz",
-        "entrypoint": "bin/inbox-tool"
-      },
-      "windows-x86_64": {
-        "path": "dist/inbox-tool/{version}/inbox-tool-{version}-windows-x86_64.zip",
-        "entrypoint": "bin/inbox-tool.exe",
-        "format": "zip"
-      }
-    }
-  }
+  "tools": []
 }
