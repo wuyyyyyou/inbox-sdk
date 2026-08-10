@@ -2,7 +2,7 @@
   "slug": "inbox-executa",
   "tool_id": "tool-riazm4777-inbox-executa-dnsb9fqu",
   "name": "tool-riazm4777-inbox-executa-dnsb9fqu",
-  "version": "2.4.3",
+  "version": "2.4.4",
   "type": "python",
   "enabled": true,
   "description": "Anna Inbox Gmail backend for sync, thread actions, drafts, attachments, Brief workflows, Ask, and Executa Sampling LLM.",
@@ -39,27 +39,5 @@
       "sensitive": true
     }
   ],
-  "tools": [],
-  "distribution": {
-    "type": "binary",
-    "binary_urls": {
-      "darwin-arm64": {
-        "url": "https://github.com/wuyyyyyou/inbox-sdk/releases/download/inbox-tool-v{version}/inbox-tool-{version}-darwin-arm64.tar.gz",
-        "entrypoint": "bin/inbox-tool"
-      },
-      "darwin-x86_64": {
-        "url": "https://github.com/wuyyyyyou/inbox-sdk/releases/download/inbox-tool-v{version}/inbox-tool-{version}-darwin-x86_64.tar.gz",
-        "entrypoint": "bin/inbox-tool"
-      },
-      "linux-x86_64": {
-        "url": "https://github.com/wuyyyyyou/inbox-sdk/releases/download/inbox-tool-v{version}/inbox-tool-{version}-linux-x86_64.tar.gz",
-        "entrypoint": "bin/inbox-tool"
-      },
-      "windows-x86_64": {
-        "url": "https://github.com/wuyyyyyou/inbox-sdk/releases/download/inbox-tool-v{version}/inbox-tool-{version}-windows-x86_64.zip",
-        "entrypoint": "bin/inbox-tool.exe",
-        "format": "zip"
-      }
-    }
-  }
+  "tools": []
 }
