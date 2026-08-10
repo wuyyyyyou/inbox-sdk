@@ -96,6 +96,16 @@ jobs:
         shell: bash
         run: npm install -g @anna-ai/cli
 
+      - name: Stage binaries for CDN upload
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "anna-inbox/executas/inbox-tool/dist/inbox-tool/$VERSION"
+          cp release-assets/* "anna-inbox/executas/inbox-tool/dist/inbox-tool/$VERSION/"
+          ls -la "anna-inbox/executas/inbox-tool/dist/inbox-tool/$VERSION/"
+
       - name: Upload binaries to Anna CDN via OIDC
         shell: bash
         env:

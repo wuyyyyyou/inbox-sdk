@@ -67,11 +67,50 @@ anna-app executa trusted-publisher remove <id>   # 删除某条注册
 
 也可以在控制台操作：Tool 编辑对话框的 **Binary** 区有 **OIDC Trusted Publishers** 面板（仅 Owner 可见），可增删注册并查看每条注册最近被 CI 使用的时间。
 
-## 四、二进制产物与 Executa 配置
+## 四、executa.json 声明二进制产物
 
-本仓库不在 `executa.json` 中配置 `distribution`。GitHub Actions 将各平台压缩包整理到仓库根目录 `dist/inbox-tool/{version}/`，再通过 `upload-binaries` 的显式 `--tool-id` 和 `--dir` 参数上传。
+在 Executa 项目根目录的 `executa.json` 中声明 `distribution.binary_artifacts`，与本地开发用的 `type: python` / `command` 配置共存：
 
-本仓库压缩包由 `scripts/build/build_binary.sh` 生成，命名规则为 `inbox-tool-<version>-<platform>.<ext>`（Windows 为 `.zip`，其余 `.tar.gz`）。
+```json
+{
+  "distribution": {
+    "type": "binary",
+    "binary_artifacts": {
+      "darwin-arm64": {
+        "path": "dist/inbox-tool/{version}/inbox-tool-{version}-darwin-arm64.tar.gz",
+        "entrypoint": "bin/inbox-tool"
+      },
+      "darwin-x86_64": {
+        "path": "dist/inbox-tool/{version}/inbox-tool-{version}-darwin-x86_64.tar.gz",
+        "entrypoint": "bin/inbox-tool"
+      },
+      "linux-x86_64": {
+        "path": "dist/inbox-tool/{version}/inbox-tool-{version}-linux-x86_64.tar.gz",
+        "entrypoint": "bin/inbox-tool"
+      },
+      "windows-x86_64": {
+        "path": "dist/inbox-tool/{version}/inbox-tool-{version}-windows-x86_64.zip",
+        "entrypoint": "bin/inbox-tool.exe",
+        "format": "zip"
+      }
+    }
+  }
+}
+```
+
+字段说明：
+
+| 字段 | 必填 | 含义 |
+| --- | --- | --- |
+| `path` | 是 | 相对 Executa 项目根目录的压缩包路径；`{version}` / `{platform}` / `{tool_id}` 占位符在上传时展开 |
+| `entrypoint` | 推荐 | 压缩包内可执行入口（多文件包必须） |
+| `format` | 否 | `tar.gz` / `tgz` / `zip`；缺省按路径后缀推断 |
+
+注意事项：
+
+- 平台 key 遵循 [platform key 约定](https://anna.partners/developers/tools/executa-binary#platform-keys)：`darwin-arm64` / `darwin-x86_64` / `linux-x86_64` / `windows-x86_64`。
+- `binary_artifacts` 与 `binary_urls` **二选一**，`type: "binary"` 必须且只能声明其一。
+- 本仓库压缩包由 `scripts/build/build_binary.sh` 生成，命名规则为 `inbox-tool-<version>-<platform>.<ext>`（Windows 为 `.zip`，其余 `.tar.gz`），与上述 `path` 模板一一对应。
 
 ## 五、Workflow 集成
 
@@ -96,6 +135,16 @@ permissions:
         shell: bash
         run: npm install -g @anna-ai/cli
 
+      - name: Stage binaries for CDN upload
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "anna-inbox/executas/inbox-tool/dist/inbox-tool/$VERSION"
+          cp release-assets/* "anna-inbox/executas/inbox-tool/dist/inbox-tool/$VERSION/"
+          ls -la "anna-inbox/executas/inbox-tool/dist/inbox-tool/$VERSION/"
+
       - name: Upload binaries to Anna CDN via OIDC
         shell: bash
         env:
@@ -116,7 +165,7 @@ permissions:
 | `--oidc` | 用当前 GitHub Actions OIDC id-token 换取上传令牌，代替 PAT |
 | `--host` | Anna 平台地址；也可通过环境变量 `ANNA_APP_HOST` 提供 |
 | `--tool-id` | 指定上传归属的 Executa；缺省时读取 `.anna/executa.json` 中的身份 |
-| `--dir` | Executa 项目目录；本仓库用于定位上传上下文，不要求其中的 `executa.json` 配置 `distribution` |
+| `--dir` | Executa 项目根目录（含 `executa.json` 与 `binary_artifacts`） |
 
 > staging 环境地址为 `https://staging.anna.partners`；如切到生产环境请改为正式域名并同步注册对应的 trusted publisher。
 
@@ -148,7 +197,7 @@ permissions:
 | `upload-binaries --oidc` 报 id-token 校验失败 | 未注册 trusted publisher，或注册的 repository / workflow / environment 与本次运行不匹配；先执行 `trusted-publisher add` 并核对参数 |
 | 提示需要 `--host` | 未传 `--host` 且未设置 `ANNA_APP_HOST` 环境变量 |
 | 提示身份未知 | `--tool-id` 拼写错误，或该 Executa 不属于当前账号 |
-| 上传后安装校验失败 | 服务端按 SHA-256 重新校验；确认 CI 产物目录、文件命名与压缩包内 `manifest.json` / 入口正确 |
+| 上传后安装校验失败 | 服务端按 SHA-256 重新校验；确认 `binary_artifacts` 的 `path` 模板与本地产物命名一致，且压缩包内 `manifest.json` / 入口正确 |
 
 ## 七、安全说明
 
