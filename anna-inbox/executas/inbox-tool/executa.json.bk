@@ -42,21 +42,21 @@
   "tools": [],
   "distribution": {
     "type": "binary",
-    "binary_urls": {
+    "binary_artifacts": {
       "darwin-arm64": {
-        "url": "https://github.com/wuyyyyyou/inbox-sdk/releases/download/inbox-tool-v{version}/inbox-tool-{version}-darwin-arm64.tar.gz",
+        "path": "dist/inbox-tool/{version}/inbox-tool-{version}-darwin-arm64.tar.gz",
         "entrypoint": "bin/inbox-tool"
       },
       "darwin-x86_64": {
-        "url": "https://github.com/wuyyyyyou/inbox-sdk/releases/download/inbox-tool-v{version}/inbox-tool-{version}-darwin-x86_64.tar.gz",
+        "path": "dist/inbox-tool/{version}/inbox-tool-{version}-darwin-x86_64.tar.gz",
         "entrypoint": "bin/inbox-tool"
       },
       "linux-x86_64": {
-        "url": "https://github.com/wuyyyyyou/inbox-sdk/releases/download/inbox-tool-v{version}/inbox-tool-{version}-linux-x86_64.tar.gz",
+        "path": "dist/inbox-tool/{version}/inbox-tool-{version}-linux-x86_64.tar.gz",
         "entrypoint": "bin/inbox-tool"
       },
       "windows-x86_64": {
-        "url": "https://github.com/wuyyyyyou/inbox-sdk/releases/download/inbox-tool-v{version}/inbox-tool-{version}-windows-x86_64.zip",
+        "path": "dist/inbox-tool/{version}/inbox-tool-{version}-windows-x86_64.zip",
         "entrypoint": "bin/inbox-tool.exe",
         "format": "zip"
       }

@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build:
@@ -90,6 +91,32 @@ jobs:
         run: |
           set -euo pipefail
           find release-assets -maxdepth 1 -type f -print | sort
+
+      - name: Install anna-app CLI
+        shell: bash
+        run: npm install -g @anna-ai/cli
+
+      - name: Stage binaries for CDN upload
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "anna-inbox/executas/inbox-tool/dist/inbox-tool/$VERSION"
+          cp release-assets/* "anna-inbox/executas/inbox-tool/dist/inbox-tool/$VERSION/"
+          ls -la "anna-inbox/executas/inbox-tool/dist/inbox-tool/$VERSION/"
+
+      - name: Upload binaries to Anna CDN via OIDC
+        shell: bash
+        env:
+          ANNA_APP_HOST: https://staging.anna.partners
+        run: |
+          set -euo pipefail
+          anna-app executa upload-binaries \
+            --oidc \
+            --host "$ANNA_APP_HOST" \
+            --tool-id "tool-riazm4777-inbox-executa-dnsb9fqu" \
+            --dir anna-inbox/executas/inbox-tool
 
       - name: Create or update release
         env:
