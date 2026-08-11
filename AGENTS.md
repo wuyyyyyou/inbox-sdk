@@ -38,8 +38,8 @@
 ## 二、 项目基线
 
 ### 1. 当前版本与权威文件位置
-- **App (前端)**：`2.3.5` — 权威定义文件：`anna-inbox/app.json`
-- **Tool (Executa/后端)**：`2.4.5` — 权威定义文件：`inbox-tool/manifest.json`
+- **App (前端)**：`2.3.6` — 权威定义文件：`anna-inbox/app.json`
+- **Tool (Executa/后端)**：`2.4.6` — 权威定义文件：`inbox-tool/manifest.json`
 
 ### 2. 前端项目基线 (App)
 - **UI 架构与唯一入口**：系统唯一智能入口为 **Inbox Workspace + AI 侧栏**。Brief 产品面已彻底下线，AI 侧栏只读主路径中不再暴露或使用旧的 `search_email` 或 `read_email` 工具直接拉取 Gmail，一律改由 `query_mail_evidence` 托管。
@@ -47,7 +47,7 @@
 - **分页控制**：前端列表分页固定首屏为 100 条（`INBOX_FEED_PAGE_SIZE=100`），触底自动续页（无 Show more 按钮）。Inbox 标签角标上限展示为 `99+`。
 - **引言与引用**：仅将本轮用户确认（Confirmed Evidence）的内容打上 `THREAD_REF` 进行引用。前端自动过滤未确认的引用或直接 Gmail 链接；引用按钮支持打开详情抽屉。
 - **草稿两步确认流**：AI 生成回复草稿必须分两步：第一步输出回复摘要并提请确认，第二步用户确认后，前端才展示 `draft_reply` 编辑卡片。「仅正文」请求不展示任何卡片。
-- **本次发布变更**：Inbox Workspace 收敛为 5 个顶层箱组（Inbox / Done / Sent / Spam / Trash），Inbox 与 Sent 各自使用紧凑子标签（All / Starred / Todos / Snoozed；Sent / Drafts），下线旧 Important/Other/自定义 Split 导航与 Manage Splits 入口；Sent 邮件不再隐含 Done，Done 为独立 workflow 状态；新增归档操作；AI 侧栏产品默认走本地 Sampling，host 仅保留为隐藏 localStorage 调试开关；邮箱发现以平台快照为准，平台删除的邮箱自动清理本地数据；`上周/last week` 检索按完整自然周解析；Tool 版本升级为 `2.4.5`。
+- **本次发布变更**：Inbox Workspace 收敛为 5 个顶层箱组（Inbox / Done / Sent / Spam / Trash），Inbox 与 Sent 各自使用紧凑子标签（All / Starred / Todos / Snoozed；Sent / Drafts），下线旧 Important/Other/自定义 Split 导航与 Manage Splits 入口；Sent 邮件不再隐含 Done，Done 为独立 workflow 状态；新增归档操作；AI 侧栏产品默认走本地 Sampling，host 仅保留为隐藏 localStorage 调试开关；邮箱发现以平台快照为准，平台删除的邮箱自动清理本地数据；`上周/last week` 检索按完整自然周解析；Tool 版本升级为 `2.4.6`。
 
 ### 3. 后端项目基线 (Tool/Executa)
 - **通信与 RPC**：
@@ -109,7 +109,7 @@
 App 与 Tool 采用**主版本/次版本解耦、Patch 同步模式**：
 
 - App 与 Tool 的主版本和次版本可以独立演进。
-- 两端版本号的第三段 Patch 必须始终一致，例如 App `2.3.5` 对应 Tool `2.4.5`。
+- 两端版本号的第三段 Patch 必须始终一致，例如 App `2.3.6` 对应 Tool `2.4.6`。
 - 修改任一端版本时，必须同步检查另一端的 Patch；若不一致，必须先完成版本对齐，再执行提交前校验和发布。
 
 | 端 | 权威文件 | 同步文件清单 |

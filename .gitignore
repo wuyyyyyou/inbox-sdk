@@ -47,4 +47,4 @@ example/
 .claude/
 
 # P0 local harness: track scripts/fixtures, ignore run artifacts
-tests/
+tests/artifacts/
